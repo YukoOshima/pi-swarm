@@ -1,6 +1,5 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import {
-  replaceControlCharacters,
   sliceByColumn,
   stripTerminalSequences,
   truncateToWidth,
@@ -67,6 +66,7 @@ export interface RoleModelsLineOptions {
 }
 
 const ANSI_ESCAPE_RE = /\x1b\[[0-9;]*m/;
+const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f-\u009f]/g;
 
 /**
  * Normalize line breaks and tabs to spaces while preserving ANSI/APC terminal sequences.
@@ -82,7 +82,7 @@ export function normalizeSingleLine(text: string): string {
 export function sanitizePlainText(text: string): string {
   if (!text) return "";
   const stripped = stripTerminalSequences(text);
-  return replaceControlCharacters(stripped).replace(/\s+/g, " ").trim();
+  return stripped.replace(CONTROL_CHARS_RE, " ").replace(/\s+/g, " ").trim();
 }
 
 /**
