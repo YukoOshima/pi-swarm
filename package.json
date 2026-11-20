@@ -1,0 +1,46 @@
+{
+  "name": "pi-swarm",
+  "version": "0.1.0",
+  "description": "Antigravity Swarm-style multi-agent collaboration with interactive upfront Q&A planning, isolated Git worktrees, shared message board, warm persistent sessions, and 3-role Orchestrator/Worker/Validator models for Pi.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi-swarm",
+    "multi-agent",
+    "swarm"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test 'tests/**/*.test.ts'",
+    "test:file": "node --import tsx --test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "1.5.2",
+    "@earendil-works/pi-ai": "1.5.2",
+    "@earendil-works/pi-coding-agent": "1.5.2",
+    "@earendil-works/pi-tui": "1.5.2",
+    "@types/node": "^26.1.1",
+    "tsx": "^4.23.15",
+    "typebox": "^1.3.27",
+    "typescript": "^7.0.2"
+  }
+}
