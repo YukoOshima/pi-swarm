@@ -1,26 +1,15 @@
 import {
-  FINAL_VALIDATOR_BOARD_NAME,
-  ORCHESTRATOR_BOARD_NAME,
-  ORCHESTRATOR_TOOLS,
-  SWARM_BOARD_POST_TOOL,
-  SWARM_BOARD_READ_TOOL,
+  DEFAULT_CHANNEL,
+  ORCHESTRATOR_NAME,
+  POST_MESSAGE_TOOL,
+  READ_BOARD_TOOL,
   SWARM_DIR,
-  SWARM_FINAL_VERDICT_TOOL,
-  SWARM_FINDING_TOOL,
-  SWARM_MISSION_TOOL,
-  SWARM_PLAN_ADD_TOOL,
-  SWARM_REVIEW_VERDICT_TOOL,
-  SWARM_VERIFY_TOOL,
-  SWARM_WORKER_DONE_TOOL,
+  SWARM_TOOL,
+  SWARM_WAIT_TOOL,
 } from "../constants.js";
 import type {
   BoardMessage,
-  DiffSummary,
-  FinalAuditVerdict,
-  MissionRecord,
-  MissionReviewVerdict,
-  MissionTaskItem,
-  SwarmFindingRecord,
+  SwarmMemberRecord,
   SwarmRoleModelConfig,
   SwarmRunState,
   SwarmSnapshot,
@@ -30,738 +19,301 @@ import type {
 // Formatting Helpers
 // ============================================================================
 
-const MAX_INLINE_DIFF_CHARS = 32_000;
-
-function formatScope(scope: readonly string[]): string {
-  if (scope.length === 0) {
-    return "(none declared)";
-  }
-  return scope.map((s) => `\`${s}\``).join(", ");
-}
-
-function formatTasks(tasks: readonly MissionTaskItem[]): string {
-  if (tasks.length === 0) {
-    return "";
-  }
-  const lines = tasks.map((t) => `- [${t.done ? "x" : " "}] \`${t.id}\`: ${t.title}`);
-  return `## Mission Checklist\n${lines.join("\n")}`;
-}
-
-function formatUpstreamFindings(findings: readonly SwarmFindingRecord[]): string {
-  if (findings.length === 0) {
-    return "";
-  }
-  const blocks = findings.map((f) => {
-    const filePart = f.files && f.files.length > 0 ? `\n  Files: ${f.files.join(", ")}` : "";
-    const detailPart = f.details.trim() ? `\n  Details: ${f.details.trim()}` : "";
-    return `- **[${f.missionId}] ${f.title}** (${f.author}): ${f.summary}${filePart}${detailPart}`;
-  });
-  return `## Upstream Findings\n${blocks.join("\n")}`;
-}
-
 function formatRoleConfig(cfg?: SwarmRoleModelConfig): string {
   const model = cfg?.model?.trim() || "host-default";
   return cfg?.thinkingLevel ? `${model} (${cfg.thinkingLevel})` : model;
 }
 
 /**
- * Formats a single board message cleanly for prompts, wakeup deltas, and context summaries.
+ * Formats a single board message concisely for prompts, wakeups, and status summaries.
  */
 export function formatBoardExcerptLine(msg: BoardMessage, maxChars = 240): string {
-  const mentionsPart =
-    msg.mentions.length > 0 ? ` -> ${msg.mentions.map((m) => `@${m}`).join(",")}` : "";
+  const targets: string[] = [];
+  for (const handle of msg.mentions) {
+    targets.push(handle.startsWith("@") ? handle : `@${handle}`);
+  }
+  for (const ch of msg.channelMentions) {
+    const clean = ch.replace(/^@#/, "");
+    targets.push(`@#${clean}`);
+  }
+  const targetPart = targets.length > 0 ? ` -> ${targets.join(",")}` : "";
+  const channelPart = `#${msg.channel || DEFAULT_CHANNEL}`;
+  const kindPart = msg.kind && msg.kind !== "chat" ? ` (${msg.kind})` : "";
   const compact = msg.text.replace(/\s+/g, " ").trim();
   const clipped = compact.length > maxChars ? `${compact.slice(0, maxChars - 1)}…` : compact;
-  return `#${msg.seq} [${msg.from}${mentionsPart}] (${msg.kind}) ${clipped}`;
+  return `#${msg.seq} [${channelPart}] ${msg.from}${targetPart}${kindPart}: ${clipped}`;
 }
 
 /**
- * Formats a slice of board messages for inclusion in prompts or summaries.
+ * Formats a slice of board messages for inclusion in prompts, wakeups, or playbook sections.
  */
-export function formatBoardExcerpt(messages: readonly BoardMessage[], maxCharsPerLine = 240): string {
+export function formatBoardExcerpt(
+  messages: readonly BoardMessage[],
+  maxCharsPerLine = 240,
+): string {
   if (messages.length === 0) {
     return "";
   }
   return messages.map((m) => formatBoardExcerptLine(m, maxCharsPerLine)).join("\n");
 }
 
-function formatValidationFeedback(review: MissionReviewVerdict): string {
-  const lines: string[] = [
-    `## Prior Validation Feedback (Round ${review.round ?? 1}, commit \`${review.commitSha.slice(0, 12)}\`)`,
-    `- **Status**: \`${review.status}\` | **Merge**: \`${review.merge}\``,
-    `- **Decision**: ${review.decision}`,
-  ];
-
-  if (review.findings.length > 0) {
-    lines.push("### Findings to Address");
-    for (const f of review.findings) {
-      const loc = f.file ? ` (${f.file}${f.line !== undefined ? `:${f.line}` : ""})` : "";
-      const suggestion = f.suggestion ? ` Suggestion: ${f.suggestion}` : "";
-      lines.push(`- **[${f.severity.toUpperCase()}] ${f.title}**${loc}: ${f.detail}${suggestion}`);
-    }
-  }
-
-  const failedChecks = review.checks.filter((c) => !c.passed);
-  if (failedChecks.length > 0) {
-    lines.push("### Failed Checks");
-    for (const c of failedChecks) {
-      lines.push(`- [FAIL] ${c.name}${c.detail ? `: ${c.detail}` : ""}`);
-    }
-  }
-
-  lines.push(
-    `Address every P1/P2 finding and failed check, re-run verification, commit your fixes cleanly on your branch, and call \`${SWARM_WORKER_DONE_TOOL}\`.`,
-  );
-
-  return lines.join("\n");
-}
-
 // ============================================================================
-// Worker System & Task Prompts
+// Orchestrator Playbook Section (Prompt-Cache-Safe Tail / sections.swarm)
 // ============================================================================
 
 /**
- * Builds a concise, high-signal system prompt appendix tailored to the worker's
- * mission kind (`build` | `artifact` | `survey`), shared message board protocol,
- * warm persistent session lifecycle, scope, upstream findings, and prior validation feedback.
+ * Builds the Antigravity Swarm Coordinator Playbook + live run state section
+ * injected prompt-cache-safely into `sections.swarm` (or tail context) while a run is active.
  */
-export function buildWorkerSystemPrompt(
-  run: SwarmRunState,
-  mission: MissionRecord,
-  upstreamFindings: readonly SwarmFindingRecord[] = [],
-  boardContext: readonly BoardMessage[] = [],
-): string {
-  const validatorHandle = `validator-${mission.id}`;
-  const sections: string[] = [];
-
-  sections.push(
-    [
-      `# Pi Swarm Worker Assignment — ${mission.id}: ${mission.title}`,
-      `- **Board Handle**: \`${mission.id}\` (peers address you as \`@${mission.id}\`)`,
-      `- **Run Objective**: ${run.objective}`,
-      `- **Mission ID**: ${mission.id} (\`${mission.kind}\`)`,
-      `- **Branch**: \`${mission.branch}\` (base: \`${run.baseBranch}\`)`,
-      `- **Worktree**: \`${mission.worktreePath}\``,
-      `- **Declared Scope**: ${formatScope(mission.scope)}`,
-      mission.deps.length > 0 ? `- **Dependencies**: ${mission.deps.join(", ")}` : `- **Dependencies**: none`,
-    ].join("\n"),
-  );
-
-  sections.push(
-    [
-      "## Shared Message Board & Warm Session Protocol",
-      `1. **Board Tools**: Use \`${SWARM_BOARD_READ_TOOL}\` (\`since?\`, \`seqs?\`, \`limit?\`) to read team context and \`${SWARM_BOARD_POST_TOOL}\` (\`text\`, \`kind?\`) to coordinate with peers.`,
-      "2. **Reference by `#seq`**: Always reference earlier board messages by sequence number (e.g., `#4`) instead of copy-pasting long posts.",
-      `3. **\`@mention\` Discipline**: \`@name\` is a wakeup doorbell, never a CC! Only \`@mention\` the specific peer(s) who must act next (e.g., \`@${ORCHESTRATOR_BOARD_NAME}\`, \`@${validatorHandle}\`, or a sibling worker like \`@M2\`). Use \`@all\` only for genuine swarm-wide interface changes or rules. Unaddressed posts are still logged and read when peers next wake.`,
-      `4. **\`[done]\` & Warm \`waiting\` Persistence**: Calling \`${SWARM_WORKER_DONE_TOOL}\` automatically posts a \`[done]\` handoff on the shared board and parks your session in warm \`waiting\` state (costing zero turns while idle) with your FULL conversation memory intact. If \`@${validatorHandle}\`, a peer worker, or \`@${ORCHESTRATOR_BOARD_NAME}\` later wakes you via \`@${mission.id}\`, answer or apply fixes directly with full context!`,
-      "5. **Keep Posts Short**: Every agent pays for every board message in context. No greetings or empty acknowledgements — post concrete questions, interfaces, or results.",
-    ].join("\n"),
-  );
-
-  if (mission.kind === "build") {
-    sections.push(
-      [
-        "## Build Mission Rules (Enforced by Protocol)",
-        `1. **Strict Scope Boundary**: Only create, edit, or delete files inside your declared scope (${formatScope(mission.scope)}). Never touch \`${SWARM_DIR}/\` or \`.git/\`. If another path is genuinely required, post \`@${ORCHESTRATOR_BOARD_NAME}\` via \`${SWARM_BOARD_POST_TOOL}\` to request a scope patch instead of editing out of scope.`,
-        `2. **Verification First**: Run your verification criteria (\`${mission.verification || run.verificationContract}\`) and ensure checks pass before committing.`,
-        `3. **Clean Git Commits**: Commit all intended changes on branch \`${mission.branch}\` with clear commit message(s). Leave zero uncommitted or untracked files (\`git status --porcelain\` must be empty).`,
-        `4. **No Manual Merges**: Never run \`git merge\` into \`${run.baseBranch}\` or switch to \`${run.baseBranch}\`. Only the Swarm Orchestrator merges after independent validation.`,
-        `5. **Progress & Completion**: Update checklist progress via \`${SWARM_MISSION_TOOL}\` (\`progress\` / \`task_done\`), coordinate via \`${SWARM_BOARD_POST_TOOL}\` / \`${SWARM_BOARD_READ_TOOL}\` as needed, and finish by calling \`${SWARM_WORKER_DONE_TOOL}\` with a concise summary and verification report.`,
-      ].join("\n"),
-    );
-  } else if (mission.kind === "artifact") {
-    sections.push(
-      [
-        "## Artifact Mission Rules (Enforced by Protocol)",
-        `1. **Deliverables Inside Scope**: Produce and verify all requested deliverables strictly within ${formatScope(mission.scope)}. Never touch \`${SWARM_DIR}/\` or \`.git/\`.`,
-        `2. **Clean Git Commits**: Commit all deliverables on branch \`${mission.branch}\` and leave \`git status\` completely clean.`,
-        `3. **Human Sign-Off Handoff**: Artifact missions require explicit human approval (\`/swarm approve ${mission.id}\`) before merge. Document clearly what was produced, how it was verified, and what the human should inspect.`,
-        `4. **Progress & Completion**: Tick off checklist items via \`${SWARM_MISSION_TOOL}\` and finish by calling \`${SWARM_WORKER_DONE_TOOL}\`.`,
-      ].join("\n"),
-    );
-  } else {
-    // survey
-    sections.push(
-      [
-        "## Survey Mission Rules (Strictly Read-Only)",
-        "1. **Zero File Mutations**: You are on a read-only research/exploration mission. Do NOT edit, create, or delete files, and do NOT make git commits. Closure enforces zero diff.",
-        `2. **Record Actionable Findings**: Use \`${SWARM_FINDING_TOOL}\` to persist structured findings (title, summary, details, relevant file paths) so downstream dependent missions receive them automatically.`,
-        `3. **Focus Areas**: Start from informational scope ${formatScope(mission.scope)} and gather exact file paths, symbols, constraints, and edge cases.`,
-        `4. **Completion**: Finish by calling \`${SWARM_WORKER_DONE_TOOL}\` summarizing the findings you recorded.`,
-      ].join("\n"),
-    );
-  }
-
-  sections.push(
-    [
-      "## Mission Specification",
-      mission.description.trim(),
-      "",
-      "### Verification Criteria",
-      mission.verification.trim() || run.verificationContract.trim() || "Verify changes cleanly.",
-      run.verificationContract.trim() &&
-      mission.verification.trim() &&
-      run.verificationContract.trim() !== mission.verification.trim()
-        ? `\n### Global Run Verification Contract\n${run.verificationContract.trim()}`
-        : "",
-    ]
-      .filter(Boolean)
-      .join("\n"),
-  );
-
-  const tasksBlock = formatTasks(mission.tasks);
-  if (tasksBlock) {
-    sections.push(tasksBlock);
-  }
-
-  const findingsBlock = formatUpstreamFindings(upstreamFindings);
-  if (findingsBlock) {
-    sections.push(findingsBlock);
-  }
-
-  if (boardContext.length > 0) {
-    sections.push(`## Recent Shared Board Context\n${formatBoardExcerpt(boardContext)}`);
-  }
-
-  if (mission.reviewRound > 0 && mission.latestReview) {
-    sections.push(formatValidationFeedback(mission.latestReview));
-  }
-
-  return sections.join("\n\n");
-}
-
-export interface BuildWorkerTaskPromptOptions {
-  promptOverride?: string;
-  contextMessages?: readonly string[];
-  fixInstruction?: string;
-  boardContext?: readonly BoardMessage[];
-}
-
-/**
- * Builds the initial user turn prompt that launches a worker session.
- */
-export function buildWorkerTaskPrompt(
-  run: SwarmRunState,
-  mission: MissionRecord,
-  options: BuildWorkerTaskPromptOptions = {},
-): string {
-  const parts: string[] = [];
-
-  if (options.promptOverride?.trim()) {
-    parts.push(options.promptOverride.trim());
-  } else if (options.fixInstruction?.trim()) {
-    parts.push(
-      `Repair required for mission ${mission.id} ("${mission.title}") on branch \`${mission.branch}\`:\n\n${options.fixInstruction.trim()}\n\nResolve the issue cleanly, ensure verification passes and git status is clean (if applicable), and finish by calling \`${SWARM_WORKER_DONE_TOOL}\`.`,
-    );
-  } else if (mission.reviewRound > 0 && mission.latestReview) {
-    parts.push(
-      `Validation round ${mission.reviewRound} returned \`${mission.latestReview.status}\` (\`${mission.latestReview.merge}\`) for mission ${mission.id} ("${mission.title}"). Fix all reported findings on branch \`${mission.branch}\`, re-run verification, make a clean commit, and finish by calling \`${SWARM_WORKER_DONE_TOOL}\`.`,
-    );
-  } else if (mission.kind === "survey") {
-    parts.push(
-      `Execute read-only survey mission ${mission.id} ("${mission.title}") for run objective "${run.objective}". Inspect the codebase without modifying files, record structured findings via \`${SWARM_FINDING_TOOL}\`, and finish by calling \`${SWARM_WORKER_DONE_TOOL}\`.`,
-    );
-  } else if (mission.kind === "artifact") {
-    parts.push(
-      `Execute artifact mission ${mission.id} ("${mission.title}") on branch \`${mission.branch}\`. Produce and commit the deliverables inside ${formatScope(mission.scope)}, verify them, and call \`${SWARM_WORKER_DONE_TOOL}\` with sign-off notes.`,
-    );
-  } else {
-    parts.push(
-      `Execute build mission ${mission.id} ("${mission.title}") on branch \`${mission.branch}\`. Implement the specification strictly inside ${formatScope(mission.scope)}, run verification, commit cleanly, and call \`${SWARM_WORKER_DONE_TOOL}\`.`,
-    );
-  }
-
-  if (options.boardContext && options.boardContext.length > 0) {
-    parts.push(`## Recent Board Messages\n${formatBoardExcerpt(options.boardContext)}`);
-  }
-
-  if (options.contextMessages && options.contextMessages.length > 0) {
-    parts.push(
-      "## Orchestrator / Direct Messages\n" +
-        options.contextMessages.map((msg) => `- ${msg}`).join("\n"),
-    );
-  }
-
-  return parts.join("\n\n");
-}
-
-// ============================================================================
-// Per-Mission Validator System & Task Prompts
-// ============================================================================
-
-/**
- * Builds the independent read-only Per-Mission Validator system prompt for a `build` mission,
- * pinned to the exact branch tip commit SHA. Board handle: `validator-<missionId>`.
- */
-export function buildValidatorSystemPrompt(
-  run: SwarmRunState,
-  mission: MissionRecord,
-  diffSummary: DiffSummary,
-  changedFiles: readonly string[],
-  commitSha: string,
-  boardContext: readonly BoardMessage[] = [],
-): string {
-  const validatorHandle = `validator-${mission.id}`;
-  const sections: string[] = [];
-
-  sections.push(
-    [
-      `# Pi Swarm Independent Validator — ${validatorHandle} (${mission.id}: ${mission.title})`,
-      `- **Board Handle**: \`${validatorHandle}\` (worker handle: \`@${mission.id}\`)`,
-      `- **Role**: Independent read-only auditor (you did NOT author this branch).`,
-      `- **Pinned Commit SHA**: \`${commitSha}\``,
-      `- **Branch**: \`${mission.branch}\` vs base \`${run.baseBranch}\` (${diffSummary.commitsAhead} commit(s) ahead)`,
-      `- **Declared Scope**: ${formatScope(mission.scope)}`,
-      `- **Changed Files (${changedFiles.length})**: ${changedFiles.length > 0 ? changedFiles.map((f) => `\`${f}\``).join(", ") : "(none)"}`,
-      `- **Validation Round**: ${mission.reviewRound + 1} / ${run.maxValidationRounds}`,
-    ].join("\n"),
-  );
-
-  sections.push(
-    [
-      "## Strict Read-Only Validation & Shared Board Rules",
-      "1. **NEVER modify files, stage changes, or create commits.** You may inspect files (`read`, `grep`, `find`, `ls`), read shared board context (`" +
-        SWARM_BOARD_READ_TOOL +
-        "`), and run read-only inspection/verification commands (e.g., `git diff`, `git show`, typecheck, tests) via `bash`.",
-      "2. **Audit Both Intent and Diff**:",
-      "   - **Intent Match**: Does the implementation completely satisfy the verbatim mission description and run objective?",
-      `   - **Scope Compliance**: Are all changed files strictly inside declared \`scope\` (and zero edits to \`${SWARM_DIR}/\` or \`.git/\`)?`,
-      "   - **Correctness & Edge Cases**: Logic bugs, race conditions, null/error handling, protocol invariants.",
-      "   - **Security & Data Integrity**: Injection, path traversal, unsafe mutations, leaked resources.",
-      "   - **Verification & Tests**: Do verification criteria and relevant tests/typechecks actually pass?",
-      "   - **Code Quality**: Clarity, maintainability, no dead debug code or silent regressions.",
-      "3. **Structured Verdict Rubric**:",
-      "   - `p1`: Blocking defect (broken behavior, failed verification, security bug, scope violation, missing core requirement).",
-      "   - `p2`: Non-trivial issue that should be fixed before merge (edge-case bug, missing test coverage for critical path, poor error handling).",
-      "   - `note`: Informational suggestion (does NOT block merge).",
-      "   - `status`: Must match findings — `\"clean\"` (0 p1 & 0 p2), `\"p1-Nitems\"` (N >= 1 p1 findings), or `\"p2-Nitems\"` (0 p1 and N >= 1 p2 findings).",
-      "   - `merge`: `\"merge\"` ONLY when `status === \"clean\"` and required checks pass; `\"fix-then-merge\"` when the worker can fix the findings; `\"hold\"` when blocked on human/design ambiguity.",
-      `4. **Automatic Warm Peer Handoff**: Submitting a non-clean \`fix-then-merge\` verdict via \`${SWARM_REVIEW_VERDICT_TOOL}\` automatically posts \`@${mission.id}\` on the shared board and wakes the warm Worker session with its full conversation memory intact so it can fix every finding, re-verify, and re-commit!`,
-      `5. **Mandatory Completion Tool**: Finish by calling \`${SWARM_REVIEW_VERDICT_TOOL}\` with \`status\`, \`merge\`, \`findings\`, \`checks\`, and \`decision\`.`,
-    ].join("\n"),
-  );
-
-  sections.push(
-    [
-      "## Verbatim Mission Intent",
-      `- **Run Objective**: ${run.objective}`,
-      `- **Mission Title**: ${mission.title}`,
-      `- **Mission Description**:\n${mission.description.trim()}`,
-      `- **Mission Verification**: ${mission.verification.trim() || "(see run contract)"}`,
-      `- **Run Verification Contract**: ${run.verificationContract.trim() || "(none)"}`,
-    ].join("\n"),
-  );
-
-  if (boardContext.length > 0) {
-    sections.push(`## Shared Board Context\n${formatBoardExcerpt(boardContext)}`);
-  }
-
-  if (mission.latestReview) {
-    sections.push(
-      `## Previous Validation Round Summary\nPrior round (${mission.latestReview.round ?? mission.reviewRound}, \`${mission.latestReview.commitSha.slice(0, 12)}\`) was \`${mission.latestReview.status}\` (\`${mission.latestReview.merge}\`): ${mission.latestReview.decision}. Verify all previous findings are properly resolved.`,
-    );
-  }
-
-  return sections.join("\n\n");
-}
-
-/**
- * Builds the initial user turn prompt for a Per-Mission Validator session, including bounded diff stat and patch.
- */
-export function buildValidatorTaskPrompt(
-  mission: MissionRecord,
-  diffSummary: DiffSummary,
-  commitSha: string,
-  boardContext: readonly BoardMessage[] = [],
-): string {
-  let diffText = diffSummary.diff || "";
-  let truncatedNote = "";
-  if (diffText.length > MAX_INLINE_DIFF_CHARS) {
-    diffText = diffText.slice(0, MAX_INLINE_DIFF_CHARS);
-    truncatedNote = `\n\n[Diff truncated at ${MAX_INLINE_DIFF_CHARS} chars. Use \`read\` or read-only \`git diff ${diffSummary.baseBranch}...${commitSha}\` to inspect remaining changes.]`;
-  }
-
-  const lines: string[] = [
-    `Audit mission ${mission.id} ("${mission.title}") at pinned commit \`${commitSha}\` (\`${mission.branch}\` vs \`${diffSummary.baseBranch}\`).`,
-  ];
-
-  if (boardContext.length > 0) {
-    lines.push("", "### Recent Board Context", formatBoardExcerpt(boardContext));
-  }
-
-  lines.push(
-    "",
-    "### Diff Stat",
-    "```",
-    diffSummary.stat.trim() || "(empty stat)",
-    "```",
-    "",
-    "### Branch Diff",
-    "```diff",
-    diffText.trim() || "(empty diff)",
-    "```",
-    truncatedNote,
-    "",
-    `Inspect full files, check \`${SWARM_BOARD_READ_TOOL}\` if helpful, and run read-only verification checks as needed, then submit your structured verdict via \`${SWARM_REVIEW_VERDICT_TOOL}\`.`,
-  );
-
-  return lines
-    .filter((line, idx, arr) => !(line === "" && arr[idx - 1] === ""))
-    .join("\n");
-}
-
-// ============================================================================
-// Run-Level Final Validator / Goal Auditor Prompts
-// ============================================================================
-
-/**
- * Builds the system prompt appendix for the independent, strictly read-only
- * Run-Level Final Validator (`final-validator`) inspecting the integrated base branch
- * at `baseHeadSha` after all missions have merged.
- */
-export function buildFinalValidatorSystemPrompt(
-  run: SwarmRunState,
-  mergedMissions: readonly MissionRecord[],
-  baseHeadSha: string,
-  round: number,
-  boardContext: readonly BoardMessage[] = [],
-): string {
-  const sections: string[] = [];
-
-  sections.push(
-    [
-      `# Pi Swarm Final Validator / Goal Auditor — Run ${run.id}`,
-      `- **Board Handle**: \`${FINAL_VALIDATOR_BOARD_NAME}\``,
-      "- **Role**: Independent, strictly read-only Final Validator / Goal Auditor (you did NOT author any mission branch).",
-      `- **Base Branch**: \`${run.baseBranch}\``,
-      `- **Pinned Base HEAD SHA**: \`${baseHeadSha}\``,
-      `- **Audit Round**: ${round} / ${run.maxFinalAuditRounds}`,
-      `- **Auto-Remediation Enabled**: ${run.autoFixOnAuditFail ? "ON" : "OFF"}`,
-      `- **Merged Missions (${mergedMissions.length})**: ${mergedMissions.map((m) => `${m.id} (${m.kind}: "${m.title}")`).join(", ") || "(none)"}`,
-    ].join("\n"),
-  );
-
-  sections.push(
-    [
-      "## Strict Read-Only Audit Rules",
-      `1. **NEVER modify files, stage changes, switch branches, or create commits.** You are auditing the integrated repository directly on \`${run.baseBranch}\` with read-only tools (\`read\`, \`grep\`, \`find\`, \`ls\`, \`${SWARM_BOARD_READ_TOOL}\`) and read-only \`bash\` inspection/verification commands (e.g., tests, typecheck, build, \`git log\`, \`git diff\`, \`git show\`). Mutating commands and file writes are blocked, and leaving the working tree dirty invalidates your audit.`,
-      "2. **Treat Individual Mission Summaries as Untrusted Claims**: Worker progress reports and mission completion notes are unverified claims — NEVER approve based on summaries alone. Independently verify every claim directly against the integrated source code, git history/diffs, and live verification command outputs.",
-      "3. **Audit Cross-Mission Integration & Overall Goal Satisfaction**:",
-      `   - **Objective Fulfillment**: Does the integrated codebase on \`${run.baseBranch}\` completely satisfy the verbatim Run Objective end-to-end?`,
-      "   - **Verification Contract Compliance**: Execute and verify EVERY requirement in the Run Verification Contract against the integrated tree.",
-      "   - **Cross-Mission Seams & Wiring**: Inspect imports, exports, shared types, registration wiring, CLI/UI integration, and runtime interactions across merged missions for subtle integration regressions, missing glue code, or mismatched assumptions.",
-      "   - **Correctness, Completeness & Safety**: Watch for stubs, placeholder TODOs, broken edge cases, failing tests, type errors, or regressions introduced during merges.",
-      "4. **Structured Verdict Rubric**:",
-      '   - `verdict`: `"approved"` ONLY when the overall objective is genuinely satisfied, every required check in the verification contract passes, and there are ZERO blocking (`p1`) defects; otherwise `"disapproved"`.',
-      "   - `summary`: Concise, evidence-backed explanation of your verdict.",
-      "   - `checks`: Array of `{ name, passed, detail? }` covering each verification contract item and integration check you ran.",
-      '   - `findings`: Array of `{ severity: "p1" | "p2" | "note", title, detail, file?, line?, suggestion? }` (`p1` = blocking failure/missing goal requirement, `p2` = important integration/quality gap, `note` = non-blocking observation).',
-      '   - `recommended_missions`: Optional array of concrete follow-up fix missions (`{ title, description, scope, verification, kind?, tasks? }`) when `verdict === "disapproved"`:',
-      "     - Each `title` MUST be printable ASCII containing at least one letter/digit (used for unique `feat/<slug>` branches; avoid duplicating existing mission titles).",
-      `     - Each \`scope\` MUST be concrete repo-relative POSIX file/directory prefixes (NO globs \`*\`/\`?\`, NO \`..\`, NO absolute paths, NO \`.git\` or \`${SWARM_DIR}\`).`,
-      "     - Multiple recommended `build` missions MUST have **pairwise-disjoint** `scope` paths (zero file/directory overlap) so they can safely execute in parallel.",
-      '     - `kind` defaults to `"build"` (or `"artifact"` for deliverables requiring human approval).',
-      `5. **Mandatory Completion Tool**: Always conclude by calling \`${SWARM_FINAL_VERDICT_TOOL}\` with \`verdict\`, \`summary\`, \`checks\`, \`findings\`, and (when disapproved) optional \`recommended_missions\`.`,
-    ].join("\n"),
-  );
-
-  sections.push(
-    [
-      "## Verbatim Run Objective & Verification Contract",
-      `### Run Objective\n${run.objective.trim()}`,
-      `### Run Verification Contract\n${run.verificationContract.trim() || "(none specified — verify build, typecheck, tests, and end-to-end objective satisfaction)"}`,
-    ].join("\n\n"),
-  );
-
-  if (boardContext.length > 0) {
-    sections.push(`## Recent Shared Board Context\n${formatBoardExcerpt(boardContext)}`);
-  }
-
-  return sections.join("\n\n");
-}
-
-function formatPriorAuditBlock(audit: FinalAuditVerdict): string {
-  const lines: string[] = [
-    `### Round ${audit.round} — \`${audit.verdict}\` @ \`${audit.commitSha.slice(0, 12)}\` (${audit.auditedAt})`,
-    `- **Summary**: ${audit.summary}`,
-  ];
-
-  const failedChecks = audit.checks.filter((c) => !c.passed);
-  if (failedChecks.length > 0) {
-    lines.push("- **Failed Checks**:");
-    for (const c of failedChecks) {
-      lines.push(`  - [FAIL] ${c.name}${c.detail ? `: ${c.detail}` : ""}`);
-    }
-  }
-
-  if (audit.findings.length > 0) {
-    lines.push("- **Findings**:");
-    for (const f of audit.findings) {
-      const loc = f.file ? ` (${f.file}${f.line !== undefined ? `:${f.line}` : ""})` : "";
-      lines.push(`  - [${f.severity.toUpperCase()}] ${f.title}${loc}: ${f.detail}`);
-    }
-  }
-
-  return lines.join("\n");
-}
-
-/**
- * Builds the initial user turn prompt for a Run-Level Final Validator session,
- * presenting merged mission summaries explicitly as untrusted claims alongside
- * recorded run findings and any prior final audit rounds.
- */
-export function buildFinalValidatorTaskPrompt(
-  run: SwarmRunState,
-  mergedMissions: readonly MissionRecord[],
-  findings: readonly SwarmFindingRecord[],
-  priorAudits: readonly FinalAuditVerdict[],
-  baseHeadSha: string,
-  boardContext: readonly BoardMessage[] = [],
-): string {
-  const parts: string[] = [
-    `Perform an independent read-only final validation of integrated branch \`${run.baseBranch}\` at pinned commit \`${baseHeadSha}\` against the Run Objective and Verification Contract.`,
-  ];
-
-  if (mergedMissions.length > 0) {
-    const missionLines = mergedMissions.map((m) => {
-      const mergedSha = m.mergedCommitSha ? ` mergedSha=\`${m.mergedCommitSha.slice(0, 12)}\`` : "";
-      const claim = m.progressSummary?.trim()
-        ? `\n  - Worker summary *(untrusted claim — verify independently)*: ${m.progressSummary.trim()}`
-        : "\n  - Worker summary *(untrusted claim)*: (none provided)";
-      return [
-        `- **${m.id}** (${m.kind}) "${m.title}" branch=\`${m.branch}\`${mergedSha}`,
-        `  - Scope: ${formatScope(m.scope)}`,
-        `  - Mission verification: ${m.verification.trim() || "(none)"}`,
-        claim.slice(1),
-      ].join("\n");
-    });
-    parts.push(
-      `## Merged Missions (Untrusted Claims — Verify Directly Against Code & Tests)\n${missionLines.join("\n")}`,
-    );
-  }
-
-  const abandonedMissions = run.missionOrder
-    .map((id) => run.missions[id])
-    .filter((m): m is MissionRecord => Boolean(m && m.status === "abandoned"));
-  if (abandonedMissions.length > 0) {
-    parts.push(
-      "## Abandoned Missions (Not Merged)\n" +
-        abandonedMissions
-          .map((m) => `- **${m.id}** (${m.kind}) "${m.title}"${m.error ? `: ${m.error}` : ""}`)
-          .join("\n"),
-    );
-  }
-
-  if (findings.length > 0) {
-    const findingBlocks = findings.map((f) => {
-      const filePart = f.files && f.files.length > 0 ? `\n  Files: ${f.files.join(", ")}` : "";
-      const detailPart = f.details.trim() ? `\n  Details: ${f.details.trim()}` : "";
-      return `- **[${f.missionId}] ${f.title}** (${f.author}): ${f.summary}${filePart}${detailPart}`;
-    });
-    parts.push(`## Recorded Run Findings\n${findingBlocks.join("\n")}`);
-  }
-
-  if (boardContext.length > 0) {
-    parts.push(`## Recent Board Excerpts\n${formatBoardExcerpt(boardContext)}`);
-  }
-
-  if (priorAudits.length > 0) {
-    parts.push(
-      "## Prior Final Audit Rounds (Verify All Prior Issues Are Resolved)\n" +
-        priorAudits.map((a) => formatPriorAuditBlock(a)).join("\n\n"),
-    );
-  }
-
-  parts.push(
-    [
-      "## Audit Instructions",
-      `1. Inspect the integrated code on \`${run.baseBranch}\` (e.g., \`git log --oneline -n 20\`, \`read\`, \`grep\`, \`find\`, \`${SWARM_BOARD_READ_TOOL}\`) and run all read-only verification commands required by the Verification Contract.`,
-      "2. Verify cross-mission integration, edge cases, and overall objective completion directly — do not trust worker summaries.",
-      `3. Finish by calling \`${SWARM_FINAL_VERDICT_TOOL}\` with \`verdict\`, \`summary\`, \`checks\`, \`findings\`, and (if \`verdict === "disapproved"\`) concrete \`recommended_missions\` with printable ASCII titles and pairwise-disjoint \`scope\` paths.`,
-    ].join("\n"),
-  );
-
-  return parts.join("\n\n");
-}
-
-// ============================================================================
-// Orchestrator Context Summary (Tail Custom Message — Prompt-Cache-Friendly)
-// ============================================================================
-
-/**
- * Builds a compact, prompt-cache-friendly summary of current Pi Swarm run state
- * injected as a tail custom message so the orchestrator LLM stays aligned with
- * background fleet progress, 3-role models, warm roster, and shared board activity
- * without mutating the leading system prompt.
- */
-export function buildOrchestratorContextSummary(snapshot: SwarmSnapshot): string {
+export function buildOrchestratorPlaybookSection(snapshot: SwarmSnapshot): string {
   const run = snapshot.run;
-  if (!run) {
-    return [
-      "[Pi Swarm Status]",
-      "No active Swarm run. Use `/swarm` to start an interactive mission plan.",
-    ].join("\n");
-  }
+  const sections: string[] = [];
 
-  const missions = run.missionOrder
-    .map((id) => run.missions[id])
-    .filter((m): m is MissionRecord => Boolean(m));
-
-  const mergedCount = missions.filter((m) => m.status === "merged").length;
-  const finalStatus = snapshot.finalAuditStatus ?? run.finalAuditStatus ?? "idle";
-  const latestAudit = snapshot.latestFinalAudit ?? run.latestFinalAudit;
-  const lines: string[] = [];
-
-  lines.push(
-    `[Pi Swarm Run ${run.id} | status=${run.status} | base=${run.baseBranch} | ${mergedCount}/${missions.length} merged | working=${snapshot.workingAgentIds.length}/${snapshot.maxConcurrency} | waiting=${snapshot.waitingAgentIds.length} | board=#${snapshot.boardHead} | validator=${run.validatorEnabled ? "on" : "off"} | final=${run.finalValidatorEnabled ? finalStatus : "off"} | tokens=${snapshot.totalTokens} | cost=$${snapshot.totalCost.toFixed(4)}]`,
+  sections.push(
+    [
+      "# Pi Swarm Orchestrator Playbook (Antigravity Swarm)",
+      "",
+      "## 1. Do Not Do the Technical Work Yourself",
+      `- Delegate ALL technical work (codebase research, scaffolding, coding, integration, builds/tests, verification) to named swarm members via \`${SWARM_TOOL}{action:"add"}\`.`,
+      `- Your job is orchestration: read \`#seq\` board reports, judge quality and completeness, decide the next phase, merge isolated worktrees (\`${SWARM_TOOL}{action:"merge"}\`), retire finished workers (\`${SWARM_TOOL}{action:"kill"}\`), and communicate clearly with the user.`,
+      "",
+      "## 2. Dynamic Phased Collaboration",
+      "- Adapt wave-by-wave instead of locking into a rigid upfront DAG:",
+      "  1. **Discovery**: Spawn read-only researchers/scouts first when unknowns exist → inspect their `#seq` reports.",
+      "  2. **Contract / Scaffold**: Spawn a contract/scaffold worker when shared interfaces must settle before fan-out → inspect its `#seq`.",
+      "  3. **Parallel Execution**: Spawn disjoint named authors in parallel (`workspace:\"share\"` whenever multiple authors edit/build simultaneously; `workspace:\"inherit\"` for read-only scouts or strictly non-overlapping edits; use `n` or `tasks[]` for sharded slices).",
+      "  4. **Independent Read-Only Validation**: Spawn independent `role:\"validator\"` members (~1 validator per 2–4 authors) to audit code, diffs, tests, and runtime behavior. NEVER let authors self-certify!",
+      "  5. **Peer-to-Peer Bug Closure**: Let `@validator` and `@author` resolve defects directly on the board (`@author` <-> `@validator`) without waking `@orchestrator` on intermediate bounces.",
+      `  6. **Land & Complete**: Merge \`share\`/\`branch\` worktrees via \`${SWARM_TOOL}{action:"merge"}\`, kill finished members via \`${SWARM_TOOL}{action:"kill"}\`, and close the run cleanly via \`${SWARM_TOOL}{action:"done", summary}\`.`,
+      "",
+      "## 3. Zero-Copy `#seq` Referencing & `@mention` Discipline",
+      `- Point downstream workers to earlier reports by sequence number (e.g. "Read \`#4\` and \`#6\` via \`${READ_BOARD_TOOL}{seqs:[4,6]}\`") — NEVER copy-paste one worker's report into another worker's brief!`,
+      `- \`@name\` is a wakeup doorbell, never a CC. Use \`@<prefix>\` for sharded groups, \`@#<channel>\` for channel broadcasts (NEVER \`@#main\`), and \`@all\` only for genuine swarm-wide rules or plan changes.`,
+      "",
+      "## 4. Core Swarm Tools (4 Tools)",
+      `- \`${SWARM_TOOL}\`: \`title\` | \`add\` (\`name\`, \`role\`, \`brief\`, \`workspace\`, \`fork\`, \`model\`, \`thinking_level\`, \`channels\`, \`n\`, \`tasks\`) | \`status\` | \`models\` | \`model\` | \`kill\` | \`merge\` | \`channel\` (\`create\`/\`list\`/\`join\`/\`leave\`/\`archive\`) | \`done\`.`,
+      `- \`${POST_MESSAGE_TOOL}\`: Post to the shared board (\`text\`, optional \`channel\`).`,
+      `- \`${READ_BOARD_TOOL}\`: Read board messages (\`since\`, \`seqs\`, \`limit\`, \`channel\`, \`search\`) or inspect roster (\`status:true\`).`,
+      `- \`${SWARM_WAIT_TOOL}\`: Sleep until a member wakes \`@${ORCHESTRATOR_NAME}\` or all workers go idle (\`all_idle\`). Always pass the highest \`#seq\` you have already read as \`since\`.`,
+      "",
+      "## 5. Keep Warm, Context Forking & 3-Role Models",
+      `- **Keep Warm**: Completed members park in \`waiting\` (zero tokens, full history intact). NEVER \`kill\` as a pause!`,
+      `- **Hot Model Switch**: On quota/429 or wrong capability, call \`${SWARM_TOOL}{action:"model", name, model}\` on a \`waiting\` member to hot-switch while keeping conversation history.`,
+      `- **Context Forking**: Pass \`fork:"orchestrator"\` or \`fork:"<member>"\` on \`${SWARM_TOOL}{action:"add"}\` when a new member benefits from branching existing conversation history.`,
+      "- **3-Role Models**: `orchestrator` (host session), `worker` (default for `role:\"worker\"`), `validator` (default for `role:\"validator\"`).",
+    ].join("\n"),
   );
-  lines.push(`Objective: ${run.objective}`);
+
+  if (!run) {
+    sections.push(
+      [
+        "## Current Swarm State",
+        "No active Swarm run. Use `/swarm` to start a run.",
+      ].join("\n"),
+    );
+    return sections.join("\n\n");
+  }
 
   const fallbacks =
     snapshot.roleModels.fallbackModels && snapshot.roleModels.fallbackModels.length > 0
       ? ` | fallbacks=[${snapshot.roleModels.fallbackModels.join(", ")}]`
       : "";
-  lines.push(
-    `Role Models: orchestrator=${formatRoleConfig(snapshot.roleModels.orchestrator)} | worker=${formatRoleConfig(snapshot.roleModels.worker)} | validator=${formatRoleConfig(snapshot.roleModels.validator)}${fallbacks}`,
-  );
 
+  const stateHeader: string[] = [
+    "## Active Swarm Run State",
+    `- **Title**: ${run.title} (\`${run.id}\`)`,
+    `- **Status**: \`${run.status}\` | **Base Branch**: \`${run.baseBranch}\` | **Board Head**: \`#${snapshot.boardHead}\``,
+    `- **Concurrency**: ${snapshot.workingMemberNames.length}/${run.maxConcurrency} working | ${snapshot.waitingMemberNames.length} warm waiting | Validator Policy: ${run.validatorEnabled ? "ON" : "OFF"}`,
+    `- **3-Role Models**: orchestrator=${formatRoleConfig(snapshot.roleModels.orchestrator)} | worker=${formatRoleConfig(snapshot.roleModels.worker)} | validator=${formatRoleConfig(snapshot.roleModels.validator)}${fallbacks}`,
+    `- **Usage**: ${snapshot.totalTokens} tokens | $${snapshot.totalCost.toFixed(4)}`,
+    `- **Objective**: ${run.objective}`,
+  ];
+
+  if (run.strategy.trim()) {
+    stateHeader.push(`- **Strategy**: ${run.strategy.trim()}`);
+  }
+  if (run.acceptanceCriteria.trim()) {
+    stateHeader.push(`- **Acceptance Criteria**: ${run.acceptanceCriteria.trim()}`);
+  }
   if (snapshot.rateLimitUntil && snapshot.rateLimitUntil > Date.now()) {
     const secs = Math.ceil((snapshot.rateLimitUntil - Date.now()) / 1000);
-    lines.push(
-      `RATE-LIMIT BACKOFF: pausing new spawns for ~${secs}s${snapshot.rateLimitReason ? ` (${snapshot.rateLimitReason})` : ""}.`,
+    stateHeader.push(
+      `- **RATE-LIMIT BACKOFF**: pausing new launches for ~${secs}s${snapshot.rateLimitReason ? ` (${snapshot.rateLimitReason})` : ""}.`,
     );
   }
+  sections.push(stateHeader.join("\n"));
 
-  lines.push("");
-  lines.push("Missions:");
-  for (const m of missions) {
-    const deps = m.deps.length > 0 ? ` deps=[${m.deps.join(",")}]` : "";
-    const review =
-      m.kind === "build" && m.latestReview
-        ? ` validation=${m.latestReview.status}/${m.latestReview.merge}@${m.latestReview.commitSha.slice(0, 7)}`
-        : "";
-    const approved =
-      m.kind === "artifact" && m.humanApprovedSha
-        ? ` approved@${m.humanApprovedSha.slice(0, 7)}`
-        : "";
-    const stopped = m.humanStopped ? " [HUMAN-STOPPED]" : "";
-    const err = m.error ? ` err="${m.error.slice(0, 80)}"` : "";
-    lines.push(
-      `- ${m.id} (${m.kind}) [${m.status}] "${m.title}" branch=${m.branch} scope=[${m.scope.join(",")}]${deps}${review}${approved}${stopped}${err}`,
-    );
+  // Channels compact summary
+  const channels = Object.values(run.channels);
+  if (channels.length > 0) {
+    const chLines = channels.map((ch) => {
+      const subs = ch.subscribers.length > 0 ? ch.subscribers.join(",") : "(all)";
+      const topic = ch.topic ? ` — ${ch.topic}` : "";
+      const archived = ch.archived ? " [ARCHIVED]" : "";
+      return `- \`#${ch.name}\`${archived} subscribers=[${subs}]${topic}`;
+    });
+    sections.push(`### Channels\n${chLines.join("\n")}`);
   }
 
-  // Final Validation summary
-  if (run.finalValidatorEnabled || finalStatus !== "idle" || latestAudit) {
-    const shaPart = run.lastAuditedSha ? ` sha=${run.lastAuditedSha.slice(0, 7)}` : "";
-    const runningPart = snapshot.finalAuditRunningAgentId
-      ? ` agent=${snapshot.finalAuditRunningAgentId}`
-      : "";
-    const displayStatus = run.status === "verifying" ? "verifying" : finalStatus;
-    const displayRound =
-      finalStatus === "running" || Boolean(snapshot.finalAuditRunningAgentId)
-        ? run.finalAuditRound + 1
-        : run.finalAuditRound;
-    lines.push("");
-    lines.push(
-      `Final Validation: ${run.finalValidatorEnabled ? "ON" : "OFF"} | status=${displayStatus} | round=${displayRound}/${run.maxFinalAuditRounds} | autoFix=${run.autoFixOnAuditFail ? "on" : "off"}${shaPart}${runningPart}`,
-    );
-    if (finalStatus === "skipped") {
-      lines.push(
-        `- Skipped by ${run.finalAuditSkippedBy ?? "human"}${run.finalAuditSkipReason ? `: ${run.finalAuditSkipReason}` : ""}`,
-      );
-    }
-    if (latestAudit) {
-      const passedChecks = latestAudit.checks.filter((c) => c.passed).length;
-      const p1Count = latestAudit.findings.filter((f) => f.severity === "p1").length;
-      const p2Count = latestAudit.findings.filter((f) => f.severity === "p2").length;
-      lines.push(
-        `- Latest audit (r${latestAudit.round}@${latestAudit.commitSha.slice(0, 7)}): ${latestAudit.verdict} — ${latestAudit.summary} (checks ${passedChecks}/${latestAudit.checks.length}, findings: ${latestAudit.findings.length} [p1=${p1Count}, p2=${p2Count}])`,
-      );
-      const importantFindings = latestAudit.findings
-        .filter((f) => f.severity === "p1" || f.severity === "p2")
-        .slice(0, 5);
-      for (const f of importantFindings) {
-        const loc = f.file ? ` (${f.file}${f.line !== undefined ? `:${f.line}` : ""})` : "";
-        lines.push(`  - [${f.severity.toUpperCase()}] ${f.title}${loc}: ${f.detail.slice(0, 140)}`);
-      }
-      if (latestAudit.recommendedMissions && latestAudit.recommendedMissions.length > 0) {
-        lines.push(
-          `  - Recommended fix missions (${latestAudit.recommendedMissions.length}): ${latestAudit.recommendedMissions.map((m) => `"${m.title}"`).join(", ")}`,
-        );
-      }
-    }
+  // Live members compact summary
+  const members = run.memberOrder
+    .map((name) => run.members[name])
+    .filter((m): m is SwarmMemberRecord => Boolean(m));
+  if (members.length > 0) {
+    const memberLines = members.map((m) => {
+      const ws = m.branch ? `${m.workspace}:${m.branch}` : m.workspace;
+      const model = m.model ? ` model=${m.model}` : "";
+      const post = m.lastPostSeq ? ` lastPost=#${m.lastPostSeq}` : "";
+      const merged = m.mergedCommitSha ? ` merged=${m.mergedCommitSha.slice(0, 7)}` : "";
+      const stopped = m.humanStopped ? " [HUMAN-STOPPED]" : "";
+      const err = m.error ? ` err="${m.error.slice(0, 80)}"` : "";
+      const activity = m.currentActivity
+        ? ` — ${m.currentActivity}`
+        : m.parkedOn
+          ? ` — ${m.parkedOn}`
+          : "";
+      return `- \`@${m.name}\` (${m.role}) [${m.state}] ws=${ws} parent=@${m.parentName}${model} turns=${m.turns}${post}${merged}${stopped}${err}${activity}`;
+    });
+    sections.push(`### Live Members (${members.length})\n${memberLines.join("\n")}`);
+  } else {
+    sections.push("### Live Members (0)\n(none spawned yet — add members with `swarm{action:\"add\"}`)");
   }
 
-  // Roster summary (working / waiting / stopped / killed / failed)
-  const rosterEntries = Object.values(run.roster);
-  if (rosterEntries.length > 0) {
-    lines.push("");
-    lines.push("Roster:");
-    for (const r of rosterEntries) {
-      const modelPart = r.model ? ` model=${r.model}` : "";
-      const act = r.currentActivity ? ` — ${r.currentActivity}` : "";
-      const stopped = r.humanStopped ? " [HUMAN-STOPPED]" : "";
-      lines.push(
-        `- ${r.name} (${r.role} on ${r.missionId}, id=${r.agentId}): [${r.status}]${modelPart} turns=${r.turns} board=#${r.lastReadBoardSeq}${stopped}${act}`,
-      );
-    }
-  }
-
-  // Recent Shared Board excerpts
+  // Recent board excerpts
   if (snapshot.recentBoard.length > 0) {
     const tail = snapshot.recentBoard.slice(-8);
-    lines.push("");
-    lines.push(`Shared Board (head #${snapshot.boardHead}, showing last ${tail.length}):`);
-    for (const msg of tail) {
-      lines.push(`- ${formatBoardExcerptLine(msg, 180)}`);
-    }
-  }
-
-  // Actionable Alerts
-  const alerts: string[] = [];
-  if (snapshot.pendingArtifactApprovals.length > 0) {
-    alerts.push(
-      `Pending human artifact approval: ${snapshot.pendingArtifactApprovals.join(", ")} (user can run /swarm approve <id>)`,
-    );
-  }
-  if (snapshot.pendingReviews.length > 0) {
-    alerts.push(`Awaiting validation: ${snapshot.pendingReviews.join(", ")}`);
-  }
-  if (snapshot.readyToMerge.length > 0) {
-    alerts.push(`Ready to merge: ${snapshot.readyToMerge.join(", ")}`);
-  }
-  if (run.status === "verifying" || snapshot.finalAuditRunningAgentId) {
-    alerts.push(
-      `Final Validator is auditing ${run.baseBranch} (${snapshot.finalAuditRunningAgentId ?? "verifying"}); check details via ${SWARM_VERIFY_TOOL}.`,
-    );
-  } else if (finalStatus === "disapproved") {
-    alerts.push(
-      `Final Validator DISAPPROVED ${run.baseBranch}: inspect via ${SWARM_VERIFY_TOOL} (action="status"), add fix missions with ${SWARM_PLAN_ADD_TOOL}, re-verify via ${SWARM_VERIFY_TOOL} (action="run", force=true), or human may run /swarm verify --skip.`,
-    );
-  }
-  const failedIds = missions.filter((m) => m.status === "failed").map((m) => m.id);
-  if (failedIds.length > 0) {
-    alerts.push(`Failed/escalated missions needing attention: ${failedIds.join(", ")}`);
-  }
-  if (snapshot.unreadOrchestratorMessages > 0) {
-    alerts.push(
-      `Unread @${ORCHESTRATOR_BOARD_NAME} board messages: ${snapshot.unreadOrchestratorMessages} (read via ${SWARM_BOARD_READ_TOOL})`,
+    sections.push(
+      `### Recent Shared Board (head #${snapshot.boardHead}, last ${tail.length})\n${formatBoardExcerpt(tail, 200)}`,
     );
   }
 
-  if (alerts.length > 0) {
-    lines.push("");
-    lines.push("Actionable Alerts:");
-    for (const a of alerts) {
-      lines.push(`- ${a}`);
-    }
-  }
+  return sections.join("\n\n");
+}
 
-  lines.push("");
-  lines.push(
-    `Orchestrator tools (${ORCHESTRATOR_TOOLS.length}): ${ORCHESTRATOR_TOOLS.join(", ")}. Coordinate via the shared board (${SWARM_BOARD_POST_TOOL}/${SWARM_BOARD_READ_TOOL}), hot-switch waiting agent models via swarm_model, kill completed/stuck agents via swarm_kill, inspect/merge/retry/abandon/verify via tools (${SWARM_VERIFY_TOOL}), never edit ${SWARM_DIR}/ manually, and never restart [HUMAN-STOPPED] agents unless explicitly asked.`,
+/**
+ * Convenience alias returning the Orchestrator Playbook + live run state section.
+ */
+export function buildOrchestratorContextSummary(snapshot: SwarmSnapshot): string {
+  return buildOrchestratorPlaybookSection(snapshot);
+}
+
+// ============================================================================
+// Worker & Validator System / Initial / Wakeup Prompts
+// ============================================================================
+
+/**
+ * Builds the concise, high-signal system prompt appendix injected into a
+ * Worker or Validator Pi session.
+ */
+export function buildMemberSystemPrompt(
+  run: SwarmRunState,
+  member: SwarmMemberRecord,
+): string {
+  const sections: string[] = [];
+  const primaryChannel = member.channels[0] ?? DEFAULT_CHANNEL;
+  const workspaceDesc =
+    member.workspace === "inherit"
+      ? `\`inherit\` (shared checkout at \`${member.cwd}\` — edit ONLY files assigned in your brief)`
+      : `\`${member.workspace}\` (isolated git worktree at \`${member.cwd}\` on branch \`${member.branch ?? "unknown"}\`, base \`${run.baseBranch}\`)`;
+
+  const headerLines: string[] = [
+    `# Pi Swarm ${member.role === "validator" ? "Independent Validator" : "Worker"} — @${member.name}`,
+    `- **Handle**: \`@${member.name}\` (role: \`${member.role}\`${member.groupPrefix ? `, group: \`@${member.groupPrefix}\`` : ""})`,
+    `- **Parent**: \`@${member.parentName}\``,
+    `- **Run**: ${run.title} (\`${run.id}\`) | Base Branch: \`${run.baseBranch}\``,
+    `- **Run Objective**: ${run.objective}`,
+    `- **Workspace**: ${workspaceDesc}`,
+    `- **Channels**: ${member.channels.map((c) => `#${c}`).join(", ")} (default post channel: \`#${primaryChannel}\`; \`#main\` is always visible)`,
+  ];
+
+  if (member.forkedFrom) {
+    headerLines.push(
+      `- **Forked History**: Branched from \`@${member.forkedFrom}\`'s conversation history.`,
+    );
+  }
+  if (run.acceptanceCriteria.trim()) {
+    headerLines.push(`- **Acceptance Criteria**: ${run.acceptanceCriteria.trim()}`);
+  }
+  sections.push(headerLines.join("\n"));
+
+  // Shared board & warm session protocol (shared across workers and validators)
+  sections.push(
+    [
+      "## Shared Message Board & Warm Session Rules",
+      `1. **Tools**: Use \`${POST_MESSAGE_TOOL}\` to communicate, \`${READ_BOARD_TOOL}\` (\`since?\`, \`seqs?\`, \`limit?\`, \`channel?\`, \`status?\`) to inspect prior posts or roster, and \`${SWARM_WAIT_TOOL}\` (\`since\`, \`mentions_only?\`) to park cleanly in warm \`waiting\` state when idle.`,
+      "2. **Zero-Copy `#seq` Refs**: Reference earlier board posts by sequence number (e.g. `#4`, `#6`) and fetch them with `read_board{seqs:[4,6]}` — never copy-paste large reports.",
+      `3. **\`@mention\` Discipline**: \`@name\` is a wakeup doorbell, never a CC. Tag ONLY the peer(s) who must act next; do NOT tag \`@${ORCHESTRATOR_NAME}\` on intermediate peer-to-peer handoffs. Tag \`@${member.parentName}\` when your deliverable is ready or you hit a blocker only they can resolve.`,
+      `4. **Completion Convention**: Start your final deliverable post with \`[done]\` right after the \`@mention\` (e.g. \`@${member.parentName} [done] <concise summary of results, files/commits, and verification>\`).`,
+      `5. **Stay Warm via \`${SWARM_WAIT_TOOL}\`**: After posting your result (or while awaiting a peer reply), call \`${SWARM_WAIT_TOOL}{since: <highest-seq-you-read>}\` to park in warm \`waiting\` state (zero tokens, full conversation memory intact). Never poll \`${READ_BOARD_TOOL}\` in a loop!`,
+      "6. **Keep Posts Short**: No greetings or empty acknowledgements — post concrete findings, questions, or results.",
+    ].join("\n"),
   );
 
+  if (member.role === "validator") {
+    sections.push(
+      [
+        "## Independent Read-Only Validator Rules (Strictly Enforced)",
+        "1. **STRICTLY READ-ONLY — NEVER Edit Files**: You are an independent auditor. NEVER create, edit, or delete files, stage changes, or make git commits. `write`, `edit`, `powershell`, and mutating `bash` commands are blocked by protocol.",
+        "2. **Verify Independently**: Treat worker reports as untrusted claims. Inspect source code, git diffs (`git diff` / `git show`), typechecks, tests, and real CLI/runtime behavior directly against the Run Objective, Acceptance Criteria, and your brief.",
+        "3. **Peer-to-Peer Fix Loop**: If you find bugs, regressions, edge-case failures, or missing requirements, post concrete actionable findings (file path, line number, reproduction/command output, and concrete fix) directly to `@<author>` on the board — do NOT bother `@orchestrator` on intermediate bug bounces — then call `swarm_wait` to await their fix and re-audit!",
+        `4. **Sign-Off**: Post \`@${member.parentName} [done] <evidence-backed audit report>\` ONLY when every check passes with zero blocking defects (or escalate clearly to \`@${member.parentName}\` if blocked).`,
+        `5. **Read-Only Helpers**: You may spawn read-only \`role:"validator"\` sub-auditors via \`${SWARM_TOOL}{action:"add"}\` if your audit splits cleanly across independent areas. Tell helpers to report to \`@${member.name}\`, and \`${SWARM_TOOL}{action:"kill"}\` them once integrated.`,
+      ].join("\n"),
+    );
+  } else {
+    const workspaceCommitRule =
+      member.workspace === "inherit"
+        ? `2. **Shared Checkout Discipline**: You are working in \`inherit\` mode at \`${member.cwd}\`. Touch ONLY files owned by your brief so you never collide with sibling workers.`
+        : `2. **Isolated Worktree Commits**: You are working in an isolated worktree at \`${member.cwd}\` on branch \`${member.branch ?? "swarm"}\`. Commit all intended changes cleanly on your branch with a clean \`git status\` before posting \`[done]\`. NEVER run \`git merge\`, \`git push\`, \`git worktree\`, or switch to \`${run.baseBranch}\` — only \`@${ORCHESTRATOR_NAME}\` merges worktrees.`;
+
+    sections.push(
+      [
+        "## Worker Execution & Helper Rules",
+        `1. **Protected Paths**: NEVER touch \`${SWARM_DIR}/\`, \`.swarm/\`, or \`.git/\` directly — use Swarm tools instead.`,
+        workspaceCommitRule,
+        "3. **Verify Before Reporting**: Run relevant typechecks/tests/build checks for your owned slice before posting `[done]`.",
+        `4. **Spawning & Managing Own Helpers**: You may call \`${SWARM_TOOL}{action:"add", name, brief, ...}\` when your assignment splits into independent pieces or needs an investigator/helper. Tell helpers to report back to \`@${member.name}\` by name. You may call \`${SWARM_TOOL}{action:"model"}\` on yourself or your own helpers, and MUST call \`${SWARM_TOOL}{action:"kill"}\` on your own helpers once you integrate their work. You cannot kill other members or call \`title\`/\`merge\`/\`done\`.`,
+      ].join("\n"),
+    );
+  }
+
+  return sections.join("\n\n");
+}
+
+/**
+ * Builds the initial user turn prompt that launches a newly added member.
+ */
+export function buildMemberInitialPrompt(
+  run: SwarmRunState,
+  member: SwarmMemberRecord,
+  briefSeq: number,
+): string {
+  const lines = [
+    `You have just joined Swarm "${run.title}" as \`@${member.name}\` (${member.role}).`,
+    `Your assignment (recorded on the shared board as \`#${briefSeq}\` from \`@${member.parentName}\`):`,
+    "",
+    member.brief.trim(),
+    "",
+    `Start working immediately. Read referenced \`#seq\` posts via \`${READ_BOARD_TOOL}\` if needed, post your result via \`${POST_MESSAGE_TOOL}\`, and call \`${SWARM_WAIT_TOOL}{since: <highest-seq-read>}\` when waiting for follow-ups or finished.`,
+  ];
   return lines.join("\n");
+}
+
+/**
+ * Builds the wakeup prompt delivered to a warm `waiting` (or revived `stopped`) member
+ * when one or more new board messages target it.
+ */
+export function buildWakeupPrompt(
+  member: SwarmMemberRecord,
+  messages: readonly BoardMessage[],
+  head: number,
+): string {
+  const formatted = messages.map((m) => formatBoardExcerptLine(m, 600)).join("\n");
+  return [
+    `New shared board message(s) for \`@${member.name}\` (board head: \`#${head}\`):`,
+    "",
+    formatted,
+    "",
+    `Respond/act on the board via \`${POST_MESSAGE_TOOL}\` as needed, then call \`${SWARM_WAIT_TOOL}{since: ${head}}\` when idle again.`,
+  ].join("\n");
 }

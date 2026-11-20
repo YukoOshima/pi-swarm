@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { promisify } from "node:util";
-import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
@@ -15,25 +15,26 @@ import type {
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
+  ALL_SWARM_EXTENSION_TOOLS,
   DEFAULT_SWARM_SETTINGS,
   DRAFTING_TOOLS,
-  FINAL_AUDIT_MISSION_ID,
-  ORCHESTRATOR_TOOLS,
+  IDLE_SWARM_TOOLS,
+  POST_MESSAGE_TOOL,
   PROPOSE_SWARM_PLAN_TOOL,
-  SWARM_AUDITS_DIR,
+  READ_BOARD_TOOL,
   SWARM_BOARD_FILE,
-  SWARM_BOARD_POST_TOOL,
+  SWARM_CORE_TOOLS,
   SWARM_DIR,
   SWARM_EVENTS_FILE,
   SWARM_FOCUS_ENTRY,
-  SWARM_MISSIONS_FILE,
-  SWARM_MODEL_TOOL,
   SWARM_QUESTIONNAIRE_TOOL,
+  SWARM_ROSTER_FILE,
   SWARM_RUNS_DIR,
+  SWARM_SETTINGS_FILE,
   SWARM_STATE_FILE,
   SWARM_STATUS_KEY,
-  SWARM_STATUS_TOOL,
-  SWARM_VERIFY_TOOL,
+  SWARM_TOOL,
+  SWARM_WAIT_TOOL,
   SWARM_WAKEUP_CUSTOM_TYPE,
   SWARM_WIDGET_KEY,
 } from "../src/constants.js";
@@ -41,23 +42,21 @@ import {
   SWARM_STATUS_CUSTOM_TYPE,
   SWARM_SUBCOMMANDS,
   createPiSwarmExtension,
+  parseSwarmCommand,
 } from "../src/index.js";
 import {
   type AgentTurnResult,
-  type BoardMessage,
-  type FinalAuditVerdict,
-  type FinalValidatorSpawnRequest,
+  type IQuestionnaireUI,
   type ISwarmTransport,
-  type MissionReviewVerdict,
   type ModelSwitchResult,
   type PersistentAgentHandle,
-  type RosterAgentRole,
-  type RosterAgentStatus,
+  type SpawnMemberRequest,
+  type SwarmEvent,
+  type SwarmMemberRole,
+  type SwarmMemberState,
   SwarmProtocolError,
   type SwarmRunState,
   type SwarmSettings,
-  type ValidatorSpawnRequest,
-  type WorkerSpawnRequest,
 } from "../src/types.js";
 
 const execFileAsync = promisify(execFile);
@@ -112,7 +111,7 @@ async function pathExists(p: string): Promise<boolean> {
 async function waitFor(
   predicate: () => boolean | Promise<boolean>,
   timeoutMs = 15_000,
-  intervalMs = 25,
+  intervalMs = 20,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -124,8 +123,36 @@ async function waitFor(
   throw new Error(`Timed out after ${timeoutMs}ms waiting for condition`);
 }
 
+function makeUserMsg(text: string): AgentMessage {
+  return {
+    role: "user",
+    content: [{ type: "text", text }],
+    timestamp: Date.now(),
+  } as unknown as AgentMessage;
+}
+
+function makeAssistantMsg(text: string): AgentMessage {
+  return {
+    role: "assistant",
+    content: [{ type: "text", text }],
+    api: "anthropic-messages",
+    provider: "anthropic",
+    model: "claude-sonnet-4-5",
+    usage: {
+      input: 10,
+      output: 10,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 20,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "stop",
+    timestamp: Date.now(),
+  } as unknown as AgentMessage;
+}
+
 // ============================================================================
-// Mock Model Catalog & Warm Persistent Handle Builder
+// Mock Model Catalog & Warm Persistent Member Handle Builder
 // ============================================================================
 
 function makeCatalogModel(provider: string, id: string, name?: string): Model<Api> {
@@ -166,15 +193,17 @@ function createMockModelRuntime(
   } as unknown as ModelRuntime;
 }
 
-interface MockWarmHandleTracker {
+interface MockMemberTracker {
+  request: SpawnMemberRequest;
   agentId: string;
   name: string;
-  missionId: string;
-  role: RosterAgentRole;
+  role: SwarmMemberRole;
   spawnModel?: string;
   spawnThinkingLevel?: ThinkingLevel;
+  seedMessages?: AgentMessage[];
   wakeCount: number;
-  conversationHistory: string[];
+  wakePrompts: string[];
+  conversationMessages: AgentMessage[];
   modelSwitches: Array<{ model: string; thinkingLevel?: ThinkingLevel }>;
   killed: boolean;
   killReason?: string;
@@ -182,19 +211,12 @@ interface MockWarmHandleTracker {
   handle: PersistentAgentHandle;
 }
 
-function createMockPersistentHandle(spec: {
-  agentId: string;
-  name: string;
-  missionId: string;
-  role: RosterAgentRole;
-  keepWarm: boolean;
-  initialPrompt: string;
-  modelOverride?: string;
-  thinkingLevel?: ThinkingLevel;
+function createMockPersistentMemberHandle(spec: {
+  request: SpawnMemberRequest;
   runInitialTurn: (ctx: {
     getModel: () => string | undefined;
     getThinkingLevel: () => ThinkingLevel | undefined;
-    history: readonly string[];
+    pushAssistantMessage: (text: string) => void;
     isAborted: () => boolean;
   }) => Promise<AgentTurnResult>;
   runWakeTurn?: (
@@ -203,35 +225,44 @@ function createMockPersistentHandle(spec: {
       wakeIndex: number;
       getModel: () => string | undefined;
       getThinkingLevel: () => ThinkingLevel | undefined;
-      history: readonly string[];
+      pushAssistantMessage: (text: string) => void;
       isAborted: () => boolean;
     },
   ) => Promise<AgentTurnResult>;
   onAbort?: () => void;
-}): MockWarmHandleTracker {
-  let state: RosterAgentStatus = "working";
-  let currentModel: string | undefined = spec.modelOverride;
-  let currentThinking: ThinkingLevel | undefined = spec.thinkingLevel;
+}): MockMemberTracker {
+  const { request } = spec;
+  let state: SwarmMemberState = "working";
+  let currentModel: string | undefined = request.modelOverride;
+  let currentThinking: ThinkingLevel | undefined = request.thinkingLevel;
   let aborted = false;
   let killed = false;
   let killReason: string | undefined;
   let wakeCount = 0;
-  const conversationHistory: string[] = [spec.initialPrompt];
+
+  const conversationMessages: AgentMessage[] = [
+    ...(request.seedMessages ?? []),
+    makeUserMsg(request.initialPrompt),
+  ];
+  const wakePrompts: string[] = [];
   const modelSwitches: Array<{ model: string; thinkingLevel?: ThinkingLevel }> = [];
 
+  const pushAssistantMessage = (text: string): void => {
+    conversationMessages.push(makeAssistantMsg(text));
+  };
+
   const finalizeTurn = (result: AgentTurnResult): AgentTurnResult => {
-    if (killed) {
+    if (killed || result.outcome === "killed") {
       state = "killed";
-    } else if (aborted || result.outcome === "aborted") {
+    } else if (aborted || result.outcome === "stopped") {
       state = "stopped";
-    } else if (result.outcome === "failed" || result.outcome === "rate_limited") {
-      state = spec.keepWarm ? "waiting" : "failed";
     } else {
-      state = spec.keepWarm ? "waiting" : "stopped";
+      state = request.keepWarm ? "waiting" : "stopped";
     }
     return {
       ...result,
       model: result.model ?? currentModel,
+      thinkingLevel: result.thinkingLevel ?? currentThinking,
     };
   };
 
@@ -239,37 +270,39 @@ function createMockPersistentHandle(spec: {
     const res = await spec.runInitialTurn({
       getModel: () => currentModel,
       getThinkingLevel: () => currentThinking,
-      history: conversationHistory,
+      pushAssistantMessage,
       isAborted: () => aborted || killed,
     });
     return finalizeTurn(res);
   })();
 
   const handle: PersistentAgentHandle = {
-    agentId: spec.agentId,
-    name: spec.name,
-    missionId: spec.missionId,
-    role: spec.role,
+    agentId: request.agentId,
+    name: request.name,
+    role: request.role,
     getState: () => state,
     getModel: () => currentModel,
+    getThinkingLevel: () => currentThinking,
+    getConversationMessages: () => [...conversationMessages],
     async wake(prompt: string): Promise<AgentTurnResult> {
       if (killed || state === "killed") {
         throw new SwarmProtocolError(
-          "AGENT_KILLED",
-          `Agent "${spec.name}" has been killed and cannot be woken.`,
+          "MEMBER_KILLED",
+          `Member "${request.name}" has been killed and cannot be woken.`,
         );
       }
       if (state === "working") {
         throw new SwarmProtocolError(
-          "AGENT_NOT_WAITING",
-          `Agent "${spec.name}" is already working.`,
+          "MEMBER_NOT_WAITING",
+          `Member "${request.name}" is already working.`,
         );
       }
       state = "working";
       aborted = false;
       wakeCount += 1;
       tracker.wakeCount = wakeCount;
-      conversationHistory.push(prompt);
+      wakePrompts.push(prompt);
+      conversationMessages.push(makeUserMsg(prompt));
 
       const turnPromise = (async () => {
         const res = spec.runWakeTurn
@@ -277,17 +310,17 @@ function createMockPersistentHandle(spec: {
               wakeIndex: wakeCount,
               getModel: () => currentModel,
               getThinkingLevel: () => currentThinking,
-              history: conversationHistory,
+              pushAssistantMessage,
               isAborted: () => aborted || killed,
             })
           : {
-              agentId: spec.agentId,
-              name: spec.name,
-              missionId: spec.missionId,
-              role: spec.role,
-              outcome: "completed" as const,
+              agentId: request.agentId,
+              name: request.name,
+              role: request.role,
+              outcome: "waiting" as const,
               summary: `Woken turn ${wakeCount} completed on ${currentModel ?? "default"}`,
               model: currentModel,
+              thinkingLevel: currentThinking,
               tokens: 150,
               cost: 0.0015,
             };
@@ -305,14 +338,14 @@ function createMockPersistentHandle(spec: {
     ): Promise<ModelSwitchResult> {
       if (killed || state === "killed") {
         throw new SwarmProtocolError(
-          "AGENT_KILLED",
-          `Agent "${spec.name}" has been killed.`,
+          "MEMBER_KILLED",
+          `Member "${request.name}" has been killed.`,
         );
       }
-      if (state === "working") {
+      if (state !== "waiting") {
         throw new SwarmProtocolError(
-          "AGENT_NOT_WAITING",
-          `Agent "${spec.name}" is currently working.`,
+          "MEMBER_NOT_WAITING",
+          `Member "${request.name}" is currently "${state}".`,
         );
       }
       currentModel = modelOverride.trim();
@@ -346,15 +379,17 @@ function createMockPersistentHandle(spec: {
     },
   };
 
-  const tracker: MockWarmHandleTracker = {
-    agentId: spec.agentId,
-    name: spec.name,
-    missionId: spec.missionId,
-    role: spec.role,
-    spawnModel: spec.modelOverride,
-    spawnThinkingLevel: spec.thinkingLevel,
+  const tracker: MockMemberTracker = {
+    request,
+    agentId: request.agentId,
+    name: request.name,
+    role: request.role,
+    spawnModel: request.modelOverride,
+    spawnThinkingLevel: request.thinkingLevel,
+    seedMessages: request.seedMessages,
     wakeCount: 0,
-    conversationHistory,
+    wakePrompts,
+    conversationMessages,
     modelSwitches,
     killed: false,
     killReason,
@@ -366,7 +401,7 @@ function createMockPersistentHandle(spec: {
 }
 
 // ============================================================================
-// Mock Pi 1.5.2 Extension Harness (Lifecycle, Models, Branch, Tools & UI)
+// Mock Pi 1.5.2 Extension Harness (Lifecycle, Models, SessionContext, Tools & UI)
 // ============================================================================
 
 interface RecordedMessage {
@@ -424,23 +459,27 @@ interface MockHarness {
   thinkingLevelCalls: ThinkingLevel[];
   setIdle: (idle: boolean) => void;
   setPendingMessages: (hasPending: boolean) => void;
-  setSetModelResult: (ok: boolean) => void;
+  setSessionMessages: (messages: AgentMessage[]) => void;
   setSelectHandler: (
     fn: (title: string, choices: string[]) => string | undefined,
   ) => void;
   setConfirmHandler: (fn: (title: string, body: string) => boolean) => void;
-  setInputHandler: (fn: (title: string, placeholder?: string) => string | undefined) => void;
+  setInputHandler: (
+    fn: (title: string, placeholder?: string) => string | undefined,
+  ) => void;
   emit: (eventName: string, event: any) => Promise<any[]>;
   runCommand: (name: string, args?: string) => Promise<void>;
-  executeTool: (name: string, params: any) => Promise<any>;
+  executeTool: (name: string, params: any, signal?: AbortSignal) => Promise<any>;
 }
 
 function createMockPiHarness(
   cwd: string,
   options?: {
     sessionId?: string;
+    mode?: "tui" | "rpc";
     initialHostModel?: Model<Api>;
     modelRuntime?: ModelRuntime;
+    initialSessionMessages?: AgentMessage[];
   },
 ): MockHarness {
   const sessionId = options?.sessionId ?? "sess-e2e-1";
@@ -473,7 +512,7 @@ function createMockPiHarness(
   let currentHostModel: Model<Api> | undefined =
     options?.initialHostModel ?? DEFAULT_TEST_MODELS[1];
   let currentThinkingLevel: ThinkingLevel = "medium";
-  let setModelResult = true;
+  let sessionMessages: AgentMessage[] = [...(options?.initialSessionMessages ?? [])];
 
   const modelRuntime = options?.modelRuntime ?? createMockModelRuntime();
 
@@ -526,9 +565,6 @@ function createMockPiHarness(
     },
     async setModel(model: Model<Api>) {
       setModelCalls.push({ provider: model.provider, id: model.id });
-      if (!setModelResult) {
-        return false;
-      }
       currentHostModel = model;
       return true;
     },
@@ -549,7 +585,7 @@ function createMockPiHarness(
 
   const ctx = {
     cwd,
-    mode: "rpc",
+    mode: options?.mode ?? "tui",
     hasUI: true,
     get model() {
       return currentHostModel;
@@ -564,6 +600,13 @@ function createMockPiHarness(
       getBranch: () => [...branch],
       getEntries: () => [...branch],
       getCwd: () => cwd,
+      buildSessionContext: () => ({
+        messages: [...sessionMessages],
+        thinkingLevel: currentThinkingLevel,
+        model: currentHostModel
+          ? { provider: currentHostModel.provider, modelId: currentHostModel.id }
+          : null,
+      }),
     },
     ui: {
       notify(message: string, level?: string) {
@@ -612,13 +655,17 @@ function createMockPiHarness(
     await cmd.handler(args, ctx);
   }
 
-  async function executeTool(name: string, params: any): Promise<any> {
+  async function executeTool(
+    name: string,
+    params: any,
+    signal?: AbortSignal,
+  ): Promise<any> {
     const tool = tools.get(name);
     if (!tool) {
       throw new Error(`Tool "${name}" is not registered`);
     }
     const prepared = tool.prepareArguments ? tool.prepareArguments(params) : params;
-    return tool.execute(`tc-${Date.now()}`, prepared, undefined, undefined, ctx as any);
+    return tool.execute(`tc-${Date.now()}`, prepared, signal, undefined, ctx as any);
   }
 
   return {
@@ -644,8 +691,8 @@ function createMockPiHarness(
     setPendingMessages: (val) => {
       hasPending = val;
     },
-    setSetModelResult: (ok) => {
-      setModelResult = ok;
+    setSessionMessages: (msgs) => {
+      sessionMessages = [...msgs];
     },
     setSelectHandler: (fn) => {
       selectHandler = fn;
@@ -663,7 +710,7 @@ function createMockPiHarness(
 }
 
 // ============================================================================
-// Integration Test Suite
+// Integration Test Suite (Dynamic Antigravity Swarm v0.2.0)
 // ============================================================================
 
 const tempDirs: string[] = [];
@@ -675,9 +722,9 @@ afterEach(async () => {
   }
 });
 
-describe("pi-swarm full cross-module E2E integration", () => {
-  it("runs complete /swarm E2E with 3-Role Models + Warm Board Collaboration + Per-Mission Validator Reject/Wake Fix-Loop + Auto-Kill + Final Validator + Zero-Turn Commands + Teardown", async () => {
-    const repoDir = await createTempGitRepo("full-e2e");
+describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
+  it("1. runs full Dynamic Antigravity Swarm E2E (Q&A -> Plan -> Phase 1 Research + swarm_wait -> Phase 2 share worktree Author + Read-Only Validator warm fix-loop -> Merge/Kill/Done + zero-turn views & disk verification)", async () => {
+    const repoDir = await createTempGitRepo("full-dynamic");
     tempDirs.push(repoDir);
 
     const ORCH_MODEL = "anthropic/claude-opus-4-6";
@@ -686,2032 +733,1084 @@ describe("pi-swarm full cross-module E2E integration", () => {
 
     const testSettings: SwarmSettings = {
       ...DEFAULT_SWARM_SETTINGS,
-      maxConcurrency: 3,
-      validatorEnabled: true,
-      maxValidationRounds: 3,
-      finalValidatorEnabled: true,
-      maxFinalAuditRounds: 2,
-      autoFixOnAuditFail: true,
-      keepWorkersWarm: true,
-      autoMergeClean: true,
-      autoRebase: true,
       orchestratorModel: ORCH_MODEL,
       orchestratorThinkingLevel: "high",
       workerModel: WORKER_MODEL,
       workerThinkingLevel: "medium",
       validatorModel: VALIDATOR_MODEL,
       validatorThinkingLevel: "high",
+      maxConcurrency: 4,
+      validatorEnabled: true,
+      keepWorkersWarm: true,
+      stallWatchdogEnabled: false,
+      autoRebase: true,
     };
 
-    // Track execution facts for assertions
-    let activeWorkers = 0;
-    let maxParallelWorkers = 0;
-    const spawnedWorkersByMission = new Map<string, MockWarmHandleTracker[]>();
-    const spawnedWorkerRequests: WorkerSpawnRequest[] = [];
-    const spawnedValidatorRequests: ValidatorSpawnRequest[] = [];
-    const spawnedFinalValidatorRequests: FinalValidatorSpawnRequest[] = [];
-    const m2ReviewedShas: string[] = [];
-    let m2ValidatorRounds = 0;
-    let m2SawWarmReviewPrompt = false;
-    const m3SawM2File = { value: false };
-    const m3ReceivedM1Finding = { value: false };
-
-    // Deterministic Wave 1 rendezvous proving M1 & M2 run concurrently
-    let notifyM2Spawned!: () => void;
-    const m2SpawnedPromise = new Promise<void>((resolve) => {
-      notifyM2Spawned = resolve;
+    const trackers = new Map<string, MockMemberTracker[]>();
+    let releaseResearcher!: () => void;
+    const researcherGate = new Promise<void>((resolve) => {
+      releaseResearcher = resolve;
     });
+    let authorWorktreePath = "";
+    let validatorAuditCount = 0;
 
     const mockTransport: ISwarmTransport = {
-      async spawnWorker(request: WorkerSpawnRequest): Promise<PersistentAgentHandle> {
-        spawnedWorkerRequests.push(request);
-        if (request.mission.id === "M2") {
-          notifyM2Spawned();
-        }
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        const tracker = createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async ({ pushAssistantMessage }) => {
+            if (request.name === "researcher") {
+              await researcherGate;
+              assert.equal(request.workspace, "inherit");
+              assert.equal(request.modelOverride, WORKER_MODEL);
+              assert.equal(request.thinkingLevel, "medium");
+              pushAssistantMessage("Inspected src/index.ts; contract is compute(x) = x * 2.");
+              await request.engineApi!.postMessage({
+                text: "@orchestrator [done] Contract verified: src/compute.ts must export compute(x) = x * 2.",
+                kind: "done",
+              });
+              return {
+                agentId: request.agentId,
+                name: request.name,
+                role: request.role,
+                outcome: "waiting",
+                summary: "Research done",
+                tokens: 500,
+                cost: 0.005,
+              };
+            }
 
-        const tracker = createMockPersistentHandle({
-          agentId: request.agentId,
-          name: request.name,
-          missionId: request.mission.id,
-          role: "worker",
-          keepWarm: request.keepWarm,
-          initialPrompt: request.prompt,
-          modelOverride: request.modelOverride,
-          thinkingLevel: request.thinkingLevel,
-          runInitialTurn: async () => {
-            activeWorkers += 1;
-            maxParallelWorkers = Math.max(maxParallelWorkers, activeWorkers);
-            try {
-              if (request.mission.id === "M1") {
-                await Promise.race([
-                  m2SpawnedPromise,
-                  new Promise((r) => setTimeout(r, 5_000)),
-                ]);
-                assert.ok(request.store, "Worker request should carry real SwarmStore");
-                await request.store.recordFinding(request.runId, {
-                  missionId: "M1",
-                  author: request.agentId,
-                  title: "Architecture Survey",
-                  summary: "Use Engine.compute() contract for integration wiring",
-                  details: "Verified src/index.ts baseline; core module should export compute(x) = x * 2.",
-                  files: ["src/index.ts"],
+            if (request.name === "author") {
+              assert.equal(request.workspace, "share");
+              assert.ok(request.branch?.startsWith("swarm/"));
+              assert.notEqual(request.cwd, repoDir);
+              authorWorktreePath = request.cwd;
+
+              // Commit buggy implementation (`x * 3`) so independent validator catches it!
+              const targetFile = path.join(request.cwd, "src", "compute.ts");
+              await mkdir(path.dirname(targetFile), { recursive: true });
+              await writeFile(
+                targetFile,
+                "export function compute(x: number): number {\n  return x * 3;\n}\n",
+                "utf8",
+              );
+              await git(request.cwd, ["add", "src/compute.ts"]);
+              await git(request.cwd, ["commit", "-m", "feat: initial compute implementation"]);
+
+              pushAssistantMessage("Committed initial src/compute.ts in isolated share worktree.");
+              await request.engineApi!.postMessage({
+                text: "@validator [done] Implemented src/compute.ts in share worktree — ready for independent audit.",
+                kind: "done",
+              });
+              return {
+                agentId: request.agentId,
+                name: request.name,
+                role: request.role,
+                outcome: "waiting",
+                summary: "Waiting for validator feedback",
+                tokens: 900,
+                cost: 0.009,
+              };
+            }
+
+            if (request.name === "validator") {
+              assert.equal(request.role, "validator");
+              assert.equal(request.modelOverride, VALIDATOR_MODEL);
+              assert.equal(request.thinkingLevel, "high");
+              pushAssistantMessage("Validator ready and standing by for author handoff.");
+              return {
+                agentId: request.agentId,
+                name: request.name,
+                role: request.role,
+                outcome: "waiting",
+                summary: "Standing by for @author handoff",
+                tokens: 200,
+                cost: 0.002,
+              };
+            }
+
+            return {
+              agentId: request.agentId,
+              name: request.name,
+              role: request.role,
+              outcome: "waiting",
+              summary: "Done",
+              tokens: 100,
+              cost: 0.001,
+            };
+          },
+          runWakeTurn: async (prompt, { wakeIndex, pushAssistantMessage }) => {
+            if (request.name === "validator") {
+              validatorAuditCount += 1;
+              const code = await readFile(
+                path.join(authorWorktreePath, "src", "compute.ts"),
+                "utf8",
+              );
+              if (code.includes("x * 3")) {
+                pushAssistantMessage("Found bug: compute returns x * 3 instead of x * 2.");
+                await request.engineApi!.postMessage({
+                  text: "@author Fix edge case in src/compute.ts: return x * 2 instead of x * 3.",
+                  kind: "review",
                 });
                 return {
                   agentId: request.agentId,
                   name: request.name,
-                  missionId: "M1",
-                  role: "worker",
-                  outcome: "completed",
-                  summary: "Completed read-only survey and recorded Architecture Survey finding.",
-                  workerDone: {
-                    missionId: "M1",
-                    summary: "Survey findings recorded cleanly.",
-                  },
-                  model: request.modelOverride,
-                  tokens: 1200,
-                  cost: 0.012,
+                  role: request.role,
+                  outcome: "waiting",
+                  summary: "Requested fix from @author",
+                  tokens: 400,
+                  cost: 0.004,
                 };
               }
-
-              if (request.mission.id === "M2") {
-                // Wave 1 build: deliberately commit bug (`x * 3`) so Validator Round 1 catches it!
-                const targetFile = path.join(request.worktreePath, "src", "core", "engine.ts");
-                await mkdir(path.dirname(targetFile), { recursive: true });
-                await writeFile(
-                  targetFile,
-                  "export function compute(x: number): number {\n  return x * 3;\n}\n",
-                  "utf8",
-                );
-                await git(request.worktreePath, ["add", "src/core/engine.ts"]);
-                await git(request.worktreePath, [
-                  "-c",
-                  "user.name=Worker M2",
-                  "-c",
-                  "user.email=m2@local",
-                  "commit",
-                  "-m",
-                  "feat(core): initial compute engine",
-                ]);
-                return {
-                  agentId: request.agentId,
-                  name: request.name,
-                  missionId: "M2",
-                  role: "worker",
-                  outcome: "completed",
-                  summary: "Initial src/core/engine.ts committed.",
-                  workerDone: {
-                    missionId: "M2",
-                    summary: "Committed initial core engine",
-                    verificationRan: "tsc --noEmit passed",
-                  },
-                  model: request.modelOverride,
-                  tokens: 1800,
-                  cost: 0.018,
-                };
-              }
-
-              if (request.mission.id === "M3") {
-                // Wave 2 build: verify M1 survey finding injected & M2 fixed merged file present!
-                m3ReceivedM1Finding.value = Boolean(
-                  request.systemPromptAppendix?.includes("Architecture Survey") &&
-                    request.systemPromptAppendix?.includes("Engine.compute()"),
-                );
-                const enginePath = path.join(request.worktreePath, "src", "core", "engine.ts");
-                if (await pathExists(enginePath)) {
-                  const content = await readFile(enginePath, "utf8");
-                  m3SawM2File.value = content.includes("return x * 2;");
-                }
-
-                const targetFile = path.join(
-                  request.worktreePath,
-                  "src",
-                  "integration",
-                  "wiring.ts",
-                );
-                await mkdir(path.dirname(targetFile), { recursive: true });
-                await writeFile(
-                  targetFile,
-                  'import { compute } from "../core/engine.js";\nexport const RESULT = compute(21);\n',
-                  "utf8",
-                );
-                await git(request.worktreePath, ["add", "src/integration/wiring.ts"]);
-                await git(request.worktreePath, [
-                  "-c",
-                  "user.name=Worker M3",
-                  "-c",
-                  "user.email=m3@local",
-                  "commit",
-                  "-m",
-                  "feat(integration): wire compute engine",
-                ]);
-                return {
-                  agentId: request.agentId,
-                  name: request.name,
-                  missionId: "M3",
-                  role: "worker",
-                  outcome: "completed",
-                  summary: "Wired integration layer using M2 engine & M1 survey findings.",
-                  workerDone: {
-                    missionId: "M3",
-                    summary: "Integration complete",
-                    verificationRan: "tests passed",
-                  },
-                  model: request.modelOverride,
-                  tokens: 1600,
-                  cost: 0.016,
-                };
-              }
-
-              throw new Error(`Unexpected mission ${request.mission.id}`);
-            } finally {
-              activeWorkers -= 1;
+              assert.ok(code.includes("x * 2"), "Validator should observe author's committed fix");
+              pushAssistantMessage("Verified compute(x) = x * 2 cleanly.");
+              await request.engineApi!.postMessage({
+                text: "@orchestrator [done] approved — compute(x) = x * 2 verified cleanly!",
+                kind: "done",
+              });
+              return {
+                agentId: request.agentId,
+                name: request.name,
+                role: request.role,
+                outcome: "waiting",
+                summary: "Approved",
+                tokens: 450,
+                cost: 0.0045,
+              };
             }
-          },
-          runWakeTurn: async (wakePrompt) => {
-            if (request.mission.id === "M2") {
-              m2SawWarmReviewPrompt =
-                wakePrompt.includes("compute multiplies by 3 instead of 2") ||
-                wakePrompt.includes("review");
-              const targetFile = path.join(request.worktreePath, "src", "core", "engine.ts");
+
+            if (request.name === "author") {
+              assert.equal(wakeIndex, 1, "Exact same warm author handle should wake for fix");
+              assert.match(prompt, /x \* 2/);
+              const targetFile = path.join(request.cwd, "src", "compute.ts");
               await writeFile(
                 targetFile,
                 "export function compute(x: number): number {\n  return x * 2;\n}\n",
                 "utf8",
               );
-              await git(request.worktreePath, ["add", "src/core/engine.ts"]);
-              await git(request.worktreePath, [
-                "-c",
-                "user.name=Worker M2",
-                "-c",
-                "user.email=m2@local",
-                "commit",
-                "-m",
-                "fix(core): multiply by 2 per validation finding",
-              ]);
+              await git(request.cwd, ["add", "src/compute.ts"]);
+              await git(request.cwd, ["commit", "-m", "fix: compute returns x * 2"]);
+              pushAssistantMessage("Committed fix compute(x) = x * 2.");
+              await request.engineApi!.postMessage({
+                text: "@validator [done] Fixed compute(x) = x * 2 and committed cleanly.",
+                kind: "done",
+              });
               return {
                 agentId: request.agentId,
                 name: request.name,
-                missionId: "M2",
-                role: "worker",
-                outcome: "completed",
-                summary: "Fixed compute() multiplier bug in warm M2 session.",
-                workerDone: {
-                  missionId: "M2",
-                  summary: "Fixed multiplier bug cleanly",
-                  verificationRan: "compute(21) === 42",
-                },
-                model: request.modelOverride,
-                tokens: 900,
-                cost: 0.009,
+                role: request.role,
+                outcome: "waiting",
+                summary: "Fix committed",
+                tokens: 1300,
+                cost: 0.013,
               };
             }
-            throw new Error(`Unexpected warm wake for ${request.mission.id}`);
-          },
-        });
-
-        const list = spawnedWorkersByMission.get(request.mission.id) ?? [];
-        list.push(tracker);
-        spawnedWorkersByMission.set(request.mission.id, list);
-        return tracker.handle;
-      },
-
-      async spawnValidator(request: ValidatorSpawnRequest): Promise<PersistentAgentHandle> {
-        spawnedValidatorRequests.push(request);
-        const tracker = createMockPersistentHandle({
-          agentId: request.agentId,
-          name: request.name,
-          missionId: request.mission.id,
-          role: "validator",
-          keepWarm: false,
-          initialPrompt: request.prompt,
-          modelOverride: request.modelOverride,
-          thinkingLevel: request.thinkingLevel,
-          runInitialTurn: async () => {
-            assert.ok(request.targetCommitSha, "Validator must be pinned to exact tip SHA");
-            const actualTip = await git(request.worktreePath, ["rev-parse", "HEAD"]);
-            assert.equal(request.targetCommitSha, actualTip);
-
-            if (request.mission.id === "M2") {
-              m2ValidatorRounds += 1;
-              m2ReviewedShas.push(actualTip);
-
-              if (m2ValidatorRounds === 1) {
-                const verdict: MissionReviewVerdict = {
-                  commitSha: actualTip,
-                  missionId: "M2",
-                  branch: request.branch,
-                  reviewedAt: new Date().toISOString(),
-                  reviewerAgentId: request.agentId,
-                  status: "p1-1items",
-                  merge: "fix-then-merge",
-                  findings: [
-                    {
-                      severity: "p1",
-                      title: "Wrong multiplier",
-                      detail: "compute multiplies by 3 instead of 2",
-                      file: "src/core/engine.ts",
-                      line: 2,
-                    },
-                  ],
-                  checks: [{ name: "compute-contract", passed: false }],
-                  decision: "Fix P1 multiplier bug before merge",
-                  round: 1,
-                };
-                return {
-                  agentId: request.agentId,
-                  name: request.name,
-                  missionId: "M2",
-                  role: "validator",
-                  outcome: "completed",
-                  summary: verdict.decision,
-                  reviewVerdict: verdict,
-                  model: request.modelOverride,
-                  tokens: 500,
-                  cost: 0.005,
-                };
-              }
-            }
-
-            const verdict: MissionReviewVerdict = {
-              commitSha: actualTip,
-              missionId: request.mission.id,
-              branch: request.branch,
-              reviewedAt: new Date().toISOString(),
-              reviewerAgentId: request.agentId,
-              status: "clean",
-              merge: "merge",
-              findings: [],
-              checks: [{ name: "scope-and-diff", passed: true }],
-              decision: `Approved ${request.mission.id} at ${actualTip.slice(0, 7)}`,
-              round: request.mission.id === "M2" ? m2ValidatorRounds : 1,
-            };
 
             return {
               agentId: request.agentId,
               name: request.name,
-              missionId: request.mission.id,
-              role: "validator",
-              outcome: "completed",
-              summary: verdict.decision,
-              reviewVerdict: verdict,
-              model: request.modelOverride,
-              tokens: 550,
-              cost: 0.0055,
-            };
-          },
-        });
-        return tracker.handle;
-      },
-
-      async spawnFinalValidator(
-        request: FinalValidatorSpawnRequest,
-      ): Promise<PersistentAgentHandle> {
-        spawnedFinalValidatorRequests.push(request);
-        const tracker = createMockPersistentHandle({
-          agentId: request.agentId,
-          name: request.name,
-          missionId: FINAL_AUDIT_MISSION_ID,
-          role: "final-validator",
-          keepWarm: false,
-          initialPrompt: request.prompt,
-          modelOverride: request.modelOverride,
-          thinkingLevel: request.thinkingLevel,
-          runInitialTurn: async () => {
-            const actualMainHead = await git(repoDir, ["rev-parse", "HEAD"]);
-            assert.equal(request.targetCommitSha, actualMainHead);
-            assert.equal(await pathExists(path.join(repoDir, "src", "core", "engine.ts")), true);
-            assert.equal(
-              await pathExists(path.join(repoDir, "src", "integration", "wiring.ts")),
-              true,
-            );
-
-            const verdict: FinalAuditVerdict = {
-              commitSha: actualMainHead,
-              baseBranch: "main",
-              auditedAt: new Date().toISOString(),
-              verifierAgentId: request.agentId,
-              verdict: "approved",
-              summary: "Verified integrated engine.ts and wiring.ts on main.",
-              checks: [
-                { name: "engine-compute", passed: true },
-                { name: "integration-wiring", passed: true },
-              ],
-              findings: [],
-              round: request.round,
-            };
-            return {
-              agentId: request.agentId,
-              name: request.name,
-              missionId: FINAL_AUDIT_MISSION_ID,
-              role: "final-validator",
-              outcome: "completed",
-              summary: verdict.summary,
-              finalAuditVerdict: verdict,
-              model: request.modelOverride,
-              tokens: 600,
-              cost: 0.006,
-            };
-          },
-        });
-        return tracker.handle;
-      },
-    };
-
-    const harness = createMockPiHarness(repoDir);
-    let transportCreatedCount = 0;
-
-    const ext = createPiSwarmExtension({
-      transportFactory: () => {
-        transportCreatedCount += 1;
-        return mockTransport;
-      },
-      settingsLoader: async () => testSettings,
-    });
-
-    // 1. Factory body must NOT start timers/subprocesses/transport or touch filesystem
-    ext(harness.pi);
-    assert.equal(transportCreatedCount, 0, "Factory body must defer transport creation");
-    assert.equal(await pathExists(path.join(repoDir, SWARM_DIR)), false);
-    assert.equal(harness.tools.size, DRAFTING_TOOLS.length + ORCHESTRATOR_TOOLS.length);
-    assert.equal(harness.tools.size, 15, "Must register exactly 15 extension tools");
-    assert.deepEqual(
-      Array.from(harness.commands.keys()).sort(),
-      ["swarm", "swarm-direct"],
-      "Must register ONLY /swarm and /swarm-direct commands",
-    );
-
-    // 2. session_start binds authoritative ctx.cwd, syncs idle profile, mounts widget
-    await harness.emit("session_start", { type: "session_start", reason: "startup" });
-    assert.equal(transportCreatedCount, 1);
-    assert.ok(harness.pi.getActiveTools().includes(SWARM_STATUS_TOOL));
-    assert.equal(harness.pi.getActiveTools().includes(PROPOSE_SWARM_PLAN_TOOL), false);
-    assert.equal(harness.pi.getActiveTools().includes("swarm_merge"), false);
-    assert.ok(
-      harness.widgetHistory.some((w) => w.key === SWARM_WIDGET_KEY && typeof w.value === "function"),
-    );
-
-    // 3. `/swarm Build feature X` -> applies orchestratorModel via pi.setModel & swaps to 3 DRAFTING_TOOLS
-    await harness.runCommand("swarm", "Build feature X with core and integration layers");
-    assert.ok(
-      harness.setModelCalls.some(
-        (m) => m.provider === "anthropic" && m.id === "claude-opus-4-6",
-      ),
-      "Orchestrator model must be applied via pi.setModel on /swarm <goal>",
-    );
-    assert.ok(
-      harness.thinkingLevelCalls.includes("high"),
-      "Orchestrator thinking level must be applied via pi.setThinkingLevel",
-    );
-    for (const draftTool of DRAFTING_TOOLS) {
-      assert.ok(harness.pi.getActiveTools().includes(draftTool), `Expected ${draftTool} active`);
-    }
-    assert.equal(harness.pi.getActiveTools().includes("swarm_merge"), false);
-    assert.ok(harness.pi.getActiveTools().includes("read"), "Host tools must be preserved");
-    assert.equal(harness.sentUserMessages.length, 1);
-    assert.match(String(harness.sentUserMessages[0]!.content), /swarm_drafting_kickoff/);
-
-    // Verify before_agent_start injects drafting addendum into `sections.swarm` (never rewrites systemPrompt!)
-    const draftPromptEvent = {
-      type: "before_agent_start",
-      messageType: "user",
-      prompt: "kickoff",
-      systemPrompt: "BASE SYSTEM PROMPT",
-      systemPromptOptions: { sections: {} as Record<string, string> },
-    };
-    const draftHookResults = await harness.emit("before_agent_start", draftPromptEvent);
-    assert.equal(draftHookResults[0], undefined, "Must NOT return systemPrompt replacement");
-    assert.match(draftPromptEvent.systemPromptOptions.sections.swarm ?? "", /swarm_drafting_active/);
-
-    // 4. `swarm_questionnaire` -> answers cleanly via RPC select
-    harness.setSelectHandler((_title, choices) => choices[0]);
-    const qRes = await harness.executeTool(SWARM_QUESTIONNAIRE_TOOL, {
-      questions: [
-        {
-          id: "api_style",
-          question: "Preferred export style?",
-          options: [
-            { label: "Named ESM exports", value: "esm_named" },
-            { label: "Default export", value: "default" },
-          ],
-          recommended: "esm_named",
-        },
-      ],
-    });
-    assert.equal(qRes.isError, undefined);
-    assert.equal(qRes.details.answers.api_style, "esm_named");
-
-    // 5. `propose_swarm_plan` -> Confirm -> swaps to 12 ORCHESTRATOR_TOOLS & launches fleet!
-    harness.setSelectHandler((_title, choices) => {
-      const confirm = choices.find((c) => c.startsWith("Confirm"));
-      return confirm ?? choices[0];
-    });
-    const proposeRes = await harness.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
-      objective: "Build feature X with core and integration layers",
-      base_branch: "main",
-      max_concurrency: 3,
-      validator_enabled: true,
-      final_validator_enabled: true,
-      verification_contract: "src/core/engine.ts compute(x)=x*2 and src/integration/wiring.ts RESULT=42",
-      missions: [
-        {
-          id: "M1",
-          title: "Survey existing architecture",
-          kind: "survey",
-          description: "Inspect repository baseline and record integration contract.",
-          scope: ["src/"],
-          deps: [],
-          verification: "Record Architecture Survey finding with zero diff.",
-        },
-        {
-          id: "M2",
-          title: "Implement core engine",
-          kind: "build",
-          description: "Create src/core/engine.ts exporting compute(x) = x * 2.",
-          scope: ["src/core/"],
-          deps: [],
-          verification: "Unit checks pass for src/core/engine.ts.",
-        },
-        {
-          id: "M3",
-          title: "Wire integration layer",
-          kind: "build",
-          description: "Create src/integration/wiring.ts consuming compute().",
-          scope: ["src/integration/"],
-          deps: ["M1", "M2"],
-          verification: "Integration module imports engine cleanly.",
-        },
-      ],
-    });
-
-    assert.equal(proposeRes.isError, undefined);
-    assert.equal(proposeRes.terminate, true);
-    assert.equal(proposeRes.details.outcome, "confirmed");
-    const runId: string = proposeRes.details.runId;
-    assert.ok(runId);
-
-    // Tool profile swapped cleanly to all 12 orchestrator tools
-    for (const orchTool of ORCHESTRATOR_TOOLS) {
-      assert.ok(harness.pi.getActiveTools().includes(orchTool), `Expected ${orchTool} active`);
-    }
-    assert.equal(harness.pi.getActiveTools().includes(PROPOSE_SWARM_PLAN_TOOL), false);
-
-    // Focus entry recorded on session branch
-    const focusEntries = harness.branch.filter((e) => e.customType === SWARM_FOCUS_ENTRY);
-    assert.ok(focusEntries.length >= 1);
-    assert.equal((focusEntries[focusEntries.length - 1]!.data as { runId: string }).runId, runId);
-
-    // .git/info/exclude protects .pi/swarm/
-    const excludeText = await readFile(path.join(repoDir, ".git", "info", "exclude"), "utf8");
-    assert.match(excludeText, /\.pi\/swarm\//);
-
-    // 6. Wait for full Wave 1 -> Warm Fix-Loop -> Merge -> Wave 2 -> Final Validator -> Completed!
-    const runDir = path.join(repoDir, SWARM_DIR, SWARM_RUNS_DIR, runId);
-    const statePath = path.join(runDir, SWARM_STATE_FILE);
-    let finalState!: SwarmRunState;
-    await waitFor(async () => {
-      if (!(await pathExists(statePath))) return false;
-      finalState = JSON.parse(await readFile(statePath, "utf8")) as SwarmRunState;
-      return finalState.status === "completed";
-    });
-
-    // Verify 3-Role Models routed cleanly to every role!
-    assert.equal(spawnedWorkerRequests.length, 3, "M1, M2, M3 each spawned ONCE (M2 woken warm!)");
-    for (const req of spawnedWorkerRequests) {
-      assert.equal(req.modelOverride, WORKER_MODEL, `Worker ${req.mission.id} must receive workerModel`);
-      assert.equal(req.thinkingLevel, "medium");
-    }
-    assert.equal(spawnedValidatorRequests.length, 3, "M2 validated twice (R1 reject, R2 pass) + M3 once");
-    for (const req of spawnedValidatorRequests) {
-      assert.equal(
-        req.modelOverride,
-        VALIDATOR_MODEL,
-        `Validator for ${req.mission.id} must receive validatorModel`,
-      );
-      assert.equal(req.thinkingLevel, "high");
-    }
-    assert.equal(spawnedFinalValidatorRequests.length, 1);
-    assert.equal(
-      spawnedFinalValidatorRequests[0]!.modelOverride,
-      VALIDATOR_MODEL,
-      "Final Validator must receive validatorModel",
-    );
-    assert.equal(spawnedFinalValidatorRequests[0]!.thinkingLevel, "high");
-
-    // Verify Wave 1 parallel execution & M2 warm board wake (spawnCount === 1, wakeCount === 1!)
-    assert.ok(maxParallelWorkers >= 2, `Expected Wave 1 parallel execution, got max=${maxParallelWorkers}`);
-    const m2Trackers = spawnedWorkersByMission.get("M2") ?? [];
-    assert.equal(m2Trackers.length, 1, "M2 must spawn ONCE and reuse warm session on fix round");
-    assert.equal(m2Trackers[0]!.wakeCount, 1, "M2 warm handle must be woken ONCE by Validator reject");
-    assert.equal(m2Trackers[0]!.conversationHistory.length, 2, "M2 warm session preserves full history");
-    assert.equal(m2SawWarmReviewPrompt, true, "M2 warm wake prompt must include P1 review feedback");
-    assert.notEqual(m2ReviewedShas[0], m2ReviewedShas[1], "Validator R2 must pin new fixed tip SHA");
-
-    // Verify M2 warm handle was auto-killed upon merge!
-    assert.equal(m2Trackers[0]!.handle.getState(), "killed", "M2 warm handle must auto-kill on merge");
-    assert.equal(finalState.roster[m2Trackers[0]!.agentId]?.status, "killed");
-
-    // Verify M3 received M1 findings and M2 fixed code!
-    assert.equal(m3ReceivedM1Finding.value, true, "Wave 2 M3 must receive M1 survey findings");
-    assert.equal(m3SawM2File.value, true, "Wave 2 M3 worktree must contain M2 fixed merged code");
-
-    // Verify all 3 missions merged + Final Validator approved
-    assert.equal(finalState.missions.M1!.status, "merged");
-    assert.equal(finalState.missions.M2!.status, "merged");
-    assert.equal(finalState.missions.M3!.status, "merged");
-    assert.equal(finalState.finalAuditStatus, "approved");
-    assert.equal(finalState.roleModels?.orchestrator?.model, ORCH_MODEL);
-    assert.equal(finalState.roleModels?.worker?.model, WORKER_MODEL);
-    assert.equal(finalState.roleModels?.validator?.model, VALIDATOR_MODEL);
-
-    // Verify real files & real --no-ff merge commits exist on `main`!
-    const mergedEngine = await readFile(path.join(repoDir, "src", "core", "engine.ts"), "utf8");
-    assert.match(mergedEngine, /return x \* 2;/);
-    assert.equal(await pathExists(path.join(repoDir, "src", "integration", "wiring.ts")), true);
-    const mergeLog = await git(repoDir, ["log", "--merges", "--oneline"]);
-    assert.match(mergeLog, /swarm\(M2\):/);
-    assert.match(mergeLog, /swarm\(M3\):/);
-
-    // Verify coalesced wakeup message was emitted ONCE with triggerTurn: true
-    await waitFor(() =>
-      harness.sentMessages.some((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE),
-    );
-    const wakeups = harness.sentMessages.filter(
-      (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
-    );
-    assert.equal(wakeups.length, 1, "run_finished + wakeup_needed must coalesce into 1 wakeup");
-    assert.equal(wakeups[0]!.options?.triggerTurn, true);
-    assert.equal(wakeups[0]!.options?.deliverAs, "followUp");
-
-    // Verify before_agent_start injects Orchestrator summary into `sections.swarm`
-    const orchPromptEvent = {
-      type: "before_agent_start",
-      messageType: "custom",
-      systemPrompt: "BASE SYSTEM PROMPT",
-      systemPromptOptions: { sections: {} as Record<string, string> },
-    };
-    await harness.emit("before_agent_start", orchPromptEvent);
-    assert.match(orchPromptEvent.systemPromptOptions.sections.swarm ?? "", new RegExp(runId));
-
-    // 7. Zero-LLM-turn `/swarm board`, `/swarm models`, `/swarm status`!
-    const userMsgCountBeforeZeroTurn = harness.sentUserMessages.length;
-
-    await harness.runCommand("swarm", "board");
-    const boardMsg = harness.sentMessages
-      .filter((m) => m.message.customType === SWARM_STATUS_CUSTOM_TYPE)
-      .at(-1)!;
-    assert.equal(boardMsg.options?.triggerTurn, false);
-    assert.match(String(boardMsg.message.content), /Swarm Board/);
-    assert.match(String(boardMsg.message.content), /@M2/);
-
-    await harness.runCommand("swarm", "models");
-    const modelsMsg = harness.sentMessages
-      .filter((m) => m.message.customType === SWARM_STATUS_CUSTOM_TYPE)
-      .at(-1)!;
-    assert.equal(modelsMsg.options?.triggerTurn, false);
-    const modelsText = String(modelsMsg.message.content);
-    assert.match(modelsText, /Swarm 3-Role Models/);
-    assert.match(modelsText, new RegExp(ORCH_MODEL));
-    assert.match(modelsText, new RegExp(WORKER_MODEL));
-    assert.match(modelsText, new RegExp(VALIDATOR_MODEL));
-
-    await harness.runCommand("swarm", "status");
-    const statusMsg = harness.sentMessages
-      .filter((m) => m.message.customType === SWARM_STATUS_CUSTOM_TYPE)
-      .at(-1)!;
-    assert.equal(statusMsg.options?.triggerTurn, false);
-    const statusText = String(statusMsg.message.content);
-    assert.match(statusText, new RegExp(runId));
-    assert.match(statusText, /3\/3 merged/);
-    assert.match(statusText, /### Final Verification/);
-
-    assert.equal(
-      harness.sentUserMessages.length,
-      userMsgCountBeforeZeroTurn,
-      "/swarm board, /swarm models, /swarm status must trigger ZERO LLM turns",
-    );
-
-    // 8. Verify board.jsonl, MISSIONS.md, and ZERO duplicate ledger events on disk!
-    const boardLines = (await readFile(path.join(runDir, SWARM_BOARD_FILE), "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line) as BoardMessage);
-    assert.ok(boardLines.length >= 2, "board.jsonl should record review & board activity");
-    assert.ok(boardLines.some((m) => m.text.includes("@M2") && m.kind === "review"));
-    for (let i = 0; i < boardLines.length; i++) {
-      assert.equal(boardLines[i]!.seq, i + 1, "board.jsonl seq must be strictly monotonic 1..N");
-    }
-
-    const missionsMd = await readFile(path.join(runDir, SWARM_MISSIONS_FILE), "utf8");
-    assert.match(missionsMd, /# Swarm Missions/);
-    assert.match(missionsMd, /## Final Verification/);
-    assert.match(missionsMd, new RegExp(WORKER_MODEL));
-
-    const rawEvents = (await readFile(path.join(runDir, SWARM_EVENTS_FILE), "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line) as { type: string });
-    const countType = (type: string) => rawEvents.filter((e) => e.type === type).length;
-    assert.equal(countType("run_created"), 1);
-    assert.equal(countType("worker_spawned"), 3);
-    assert.equal(countType("agent_woken"), 1);
-    assert.equal(countType("validator_spawned"), 3);
-    assert.equal(countType("validation_submitted"), 3);
-    assert.equal(countType("merge_succeeded"), 3);
-    assert.equal(countType("final_audit_started"), 1);
-    assert.equal(countType("final_audit_result"), 1);
-    assert.equal(countType("run_completed"), 1);
-
-    // 9. `/swarm teardown` cleanly removes worktrees while preserving audit/board trail & main commits!
-    const wtM1 = finalState.missions.M1!.worktreePath;
-    const wtM2 = finalState.missions.M2!.worktreePath;
-    const wtM3 = finalState.missions.M3!.worktreePath;
-    assert.equal(await pathExists(wtM2), true);
-
-    await harness.runCommand("swarm", "teardown");
-    assert.equal(await pathExists(wtM1), false, "wt-M1 should be removed");
-    assert.equal(await pathExists(wtM2), false, "wt-M2 should be removed");
-    assert.equal(await pathExists(wtM3), false, "wt-M3 should be removed");
-
-    assert.equal(await pathExists(path.join(runDir, SWARM_STATE_FILE)), true);
-    assert.equal(await pathExists(path.join(runDir, SWARM_BOARD_FILE)), true);
-    assert.equal(await pathExists(path.join(runDir, SWARM_MISSIONS_FILE)), true);
-    assert.equal(await pathExists(path.join(runDir, SWARM_EVENTS_FILE)), true);
-    assert.equal(await pathExists(path.join(repoDir, "src", "core", "engine.ts")), true);
-    assert.equal(await pathExists(path.join(repoDir, "src", "integration", "wiring.ts")), true);
-
-    await harness.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
-  });
-
-  it("supports /swarm model role default updates (orchestrator/worker/validator + persistence), graceful auth warning, and hot-switching a warm waiting agent preserving full conversation history", async () => {
-    const repoDir = await createTempGitRepo("hot-model-switch");
-    tempDirs.push(repoDir);
-
-    let effectiveSettings: SwarmSettings = {
-      ...DEFAULT_SWARM_SETTINGS,
-      maxConcurrency: 2,
-      validatorEnabled: false,
-      finalValidatorEnabled: false,
-      keepWorkersWarm: true,
-      autoMergeClean: true,
-      workerModel: "anthropic/claude-sonnet-4-5",
-    };
-    const savedPatches: Array<{ scope: "global" | "project"; patch: Partial<SwarmSettings> }> = [];
-    let m1Tracker: MockWarmHandleTracker | undefined;
-    let m1WakeObservedModel: string | undefined;
-
-    const mockTransport: ISwarmTransport = {
-      async spawnWorker(request: WorkerSpawnRequest): Promise<PersistentAgentHandle> {
-        const tracker = createMockPersistentHandle({
-          agentId: request.agentId,
-          name: request.name,
-          missionId: request.mission.id,
-          role: "worker",
-          keepWarm: request.keepWarm,
-          initialPrompt: request.prompt,
-          modelOverride: request.modelOverride,
-          thinkingLevel: request.thinkingLevel,
-          runInitialTurn: async () => {
-            const target = path.join(request.worktreePath, "docs", "spec.md");
-            await mkdir(path.dirname(target), { recursive: true });
-            await writeFile(target, "# Architecture Spec\n\nReady for sign-off.\n", "utf8");
-            await git(request.worktreePath, ["add", "docs/spec.md"]);
-            await git(request.worktreePath, [
-              "-c",
-              "user.name=Worker M1",
-              "-c",
-              "user.email=m1@local",
-              "commit",
-              "-m",
-              "docs(spec): draft architecture spec",
-            ]);
-            return {
-              agentId: request.agentId,
-              name: request.name,
-              missionId: request.mission.id,
-              role: "worker",
-              outcome: "completed",
-              summary: "Drafted docs/spec.md; parked waiting warm for sign-off or edits.",
-              workerDone: {
-                missionId: request.mission.id,
-                summary: "Spec drafted",
-              },
-              model: request.modelOverride,
-              tokens: 500,
-              cost: 0.005,
-            };
-          },
-          runWakeTurn: async (_prompt, ctx) => {
-            m1WakeObservedModel = ctx.getModel();
-            return {
-              agentId: request.agentId,
-              name: request.name,
-              missionId: request.mission.id,
-              role: "worker",
-              outcome: "completed",
-              summary: `Confirmed spec exports on switched model ${ctx.getModel()}`,
-              model: ctx.getModel(),
+              role: request.role,
+              outcome: "waiting",
+              summary: "Wake completed",
               tokens: 200,
               cost: 0.002,
             };
           },
         });
-        m1Tracker = tracker;
+
+        const list = trackers.get(request.name) ?? [];
+        list.push(tracker);
+        trackers.set(request.name, list);
         return tracker.handle;
       },
-      async spawnValidator(): Promise<PersistentAgentHandle> {
-        throw new Error("Validator should not spawn when validatorEnabled=false");
+      async listAvailableModels() {
+        return DEFAULT_TEST_MODELS.map((m) => ({
+          id: m.id,
+          provider: m.provider,
+          fullId: `${m.provider}/${m.id}`,
+          name: m.name,
+          reasoning: m.reasoning,
+          contextWindow: m.contextWindow,
+        }));
       },
     };
 
-    const harness = createMockPiHarness(repoDir, { sessionId: "sess-models" });
-    createPiSwarmExtension({
+    const mockUI: IQuestionnaireUI = {
+      async askQuestion() {
+        return { cancelled: false, answer: "TypeScript ESM", isCustom: false };
+      },
+      async askQuestionnaire(_ctx, questions) {
+        const answers: Record<string, string> = {};
+        const items = questions.map((q) => {
+          const ans = q.recommended ?? q.options[0]?.label ?? "Yes";
+          answers[q.id] = ans;
+          return { id: q.id, question: q.question, answer: ans, isCustom: false };
+        });
+        return { cancelled: false, answers, items };
+      },
+      async confirmProposal(_ctx, plan) {
+        return {
+          action: "confirm",
+          validatorEnabled: plan.validatorEnabled,
+          maxConcurrency: plan.maxConcurrency,
+        };
+      },
+    };
+
+    const harness = createMockPiHarness(repoDir, { mode: "tui" });
+    const ext = createPiSwarmExtension({
       transportFactory: () => mockTransport,
-      settingsLoader: async () => effectiveSettings,
-      settingsSaver: async (scope, patch) => {
-        savedPatches.push({ scope, patch });
-        effectiveSettings = { ...effectiveSettings, ...patch };
-        return effectiveSettings;
-      },
-    })(harness.pi);
-
-    await harness.emit("session_start", { type: "session_start", reason: "startup" });
-
-    // Launch an `artifact` mission so M1 completes its commit and parks in `waiting` warm state
-    await harness.runCommand("swarm-direct", "Draft architecture spec artifact");
-    const proposeRes = await harness.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
-      objective: "Draft architecture spec artifact",
-      base_branch: "main",
-      validator_enabled: false,
-      final_validator_enabled: false,
-      verification_contract: "docs/spec.md approved by human",
-      missions: [
-        {
-          id: "M1",
-          title: "Draft architecture spec",
-          kind: "artifact",
-          description: "Write docs/spec.md for human sign-off.",
-          scope: ["docs/"],
-          deps: [],
-          verification: "docs/spec.md exists",
-        },
-      ],
+      settingsLoader: async () => ({
+        ...testSettings,
+        fallbackModels: [...testSettings.fallbackModels],
+      }),
+      questionnaireUI: mockUI,
     });
-    const runId: string = proposeRes.details.runId;
-    const runDir = path.join(repoDir, SWARM_DIR, SWARM_RUNS_DIR, runId);
-    const statePath = path.join(runDir, SWARM_STATE_FILE);
+    ext(harness.pi);
 
-    // Wait until M1 completes and parks in `waiting` warm state!
-    await waitFor(async () => {
-      if (!m1Tracker || m1Tracker.handle.getState() !== "waiting") return false;
-      const st = JSON.parse(await readFile(statePath, "utf8")) as SwarmRunState;
-      return st.missions.M1?.status === "completed" && st.roster[m1Tracker.agentId]?.status === "waiting";
-    });
+    // Zero factory side effects before session_start
+    assert.deepEqual(Array.from(harness.commands.keys()).sort(), [
+      "swarm",
+      "swarm-direct",
+    ]);
+    assert.equal(harness.tools.size, 7);
+    assert.deepEqual(
+      Array.from(harness.tools.keys()).sort(),
+      [...ALL_SWARM_EXTENSION_TOOLS].sort(),
+    );
+    assert.equal(harness.widgetHistory.length, 0);
+    assert.equal(harness.statusHistory.length, 0);
 
-    // 1. Update role defaults via `/swarm model <role> <model> [thinking]`
-    const userMsgsBefore = harness.sentUserMessages.length;
+    await harness.emit("session_start", {});
+    assert.ok(harness.widgetHistory.some((w) => w.key === SWARM_WIDGET_KEY));
+    assert.ok(harness.statusHistory.some((s) => s.key === SWARM_STATUS_KEY));
 
-    await harness.runCommand("swarm", "model worker google/gemini-2.5-pro low");
-    assert.equal(effectiveSettings.workerModel, "google/gemini-2.5-pro");
-    assert.equal(effectiveSettings.workerThinkingLevel, "low");
-
-    await harness.runCommand("swarm", "model validator anthropic/claude-opus-4-6 high");
-    assert.equal(effectiveSettings.validatorModel, "anthropic/claude-opus-4-6");
-    assert.equal(effectiveSettings.validatorThinkingLevel, "high");
-
-    await harness.runCommand("swarm", "model orchestrator openai/gpt-5.2 medium");
-    assert.equal(effectiveSettings.orchestratorModel, "openai/gpt-5.2");
-    assert.equal(effectiveSettings.orchestratorThinkingLevel, "medium");
+    // 1. `/swarm "Build feature"` applies orchestratorModel & enters drafting (3 tools)
+    await harness.runCommand("swarm", "Build compute feature");
     assert.ok(
-      harness.setModelCalls.some((m) => m.provider === "openai" && m.id === "gpt-5.2"),
-      "/swarm model orchestrator must call pi.setModel",
+      harness.setModelCalls.some(
+        (c) => `${c.provider}/${c.id}` === ORCH_MODEL,
+      ),
+      "orchestratorModel must be applied via pi.setModel",
     );
-    assert.equal(harness.thinkingLevelCalls.at(-1), "medium");
+    assert.ok(harness.thinkingLevelCalls.includes("high"));
 
-    // Verify run's persisted `roleModels` synced cleanly
-    let st = JSON.parse(await readFile(statePath, "utf8")) as SwarmRunState;
-    assert.equal(st.roleModels?.worker?.model, "google/gemini-2.5-pro");
-    assert.equal(st.roleModels?.validator?.model, "anthropic/claude-opus-4-6");
-    assert.equal(st.roleModels?.orchestrator?.model, "openai/gpt-5.2");
-
-    // 2. Test graceful warning (no crash!) when `pi.setModel` returns false (unconfigured auth)
-    harness.setSetModelResult(false);
-    const warningsBefore = harness.notifications.filter((n) => n.level === "warning").length;
-    await harness.runCommand("swarm", "model orchestrator anthropic/claude-opus-4-6 high");
-    const warningsAfter = harness.notifications.filter((n) => n.level === "warning").length;
-    assert.ok(warningsAfter > warningsBefore, "Must emit warning when pi.setModel returns false");
-    harness.setSetModelResult(true);
-
-    // 3. Test clearing a role default back to host default via `default`
-    await harness.runCommand("swarm", "model orchestrator default");
-    assert.equal(effectiveSettings.orchestratorModel, undefined);
-
-    // 4. Test `swarm_model` tool callback `onRoleModelChanged("orchestrator", ...)`
-    const toolRes = await harness.executeTool(SWARM_MODEL_TOOL, {
-      target: "orchestrator",
-      model: "anthropic/claude-opus-4-6",
-      thinking_level: "high",
-      reason: "complex architecture decision",
-    });
-    assert.equal(toolRes.isError, undefined);
-    assert.equal(effectiveSettings.orchestratorModel, "anthropic/claude-opus-4-6");
-    assert.ok(
-      harness.setModelCalls.some((m) => m.provider === "anthropic" && m.id === "claude-opus-4-6"),
-    );
-
-    // 5. Hot-switch live warm `waiting` agent M1 via `/swarm model M1 google/gemini-2.5-pro high`!
-    assert.equal(m1Tracker!.conversationHistory.length, 1);
-    await harness.runCommand("swarm", "model M1 google/gemini-2.5-pro high");
-    assert.equal(m1Tracker!.handle.getModel(), "google/gemini-2.5-pro");
-    assert.equal(m1Tracker!.modelSwitches.length, 1);
-    assert.equal(m1Tracker!.handle.getState(), "waiting", "Agent must remain parked warm after switch");
-    assert.equal(
-      m1Tracker!.conversationHistory.length,
-      1,
-      "Hot model switch must preserve prior conversation history",
-    );
-
-    // Verify `/swarm models` zero-turn view reflects M1's new live model
-    await harness.runCommand("swarm", "models");
-    const modelsView = String(
-      harness.sentMessages
-        .filter((m) => m.message.customType === SWARM_STATUS_CUSTOM_TYPE)
-        .at(-1)!.message.content,
-    );
-    assert.match(modelsView, /google\/gemini-2\.5-pro/);
-    assert.equal(harness.sentUserMessages.length, userMsgsBefore, "All /swarm model(s) commands are zero-turn");
-
-    // 6. Wake M1 via `swarm_board_post("@M1 ...")` and verify it runs turn 2 on the NEW model with full history!
-    const postRes = await harness.executeTool(SWARM_BOARD_POST_TOOL, {
-      text: "@M1 double-check spec headings before sign-off",
-      kind: "chat",
-    });
-    assert.equal(postRes.isError, undefined);
-
-    await waitFor(async () => {
-      if (m1Tracker!.wakeCount !== 1 || m1Tracker!.handle.getState() !== "waiting") {
-        return false;
-      }
-      const latest = JSON.parse(await readFile(statePath, "utf8")) as SwarmRunState;
-      return latest.roster[m1Tracker!.agentId]?.status === "waiting";
-    });
-    assert.equal(m1WakeObservedModel, "google/gemini-2.5-pro");
-    assert.equal(
-      m1Tracker!.conversationHistory.length,
-      2,
-      "Warm M1 retained initial prompt + board wake prompt across hot model switch",
-    );
-
-    // Verify ledger & board recorded the model switch
-    const events = (await readFile(path.join(runDir, SWARM_EVENTS_FILE), "utf8"))
-      .trim()
-      .split("\n")
-      .map((l) => JSON.parse(l) as { type: string });
-    assert.equal(events.filter((e) => e.type === "agent_model_switched").length, 1);
-
-    // 7. Human signs off artifact via `/swarm approve M1` -> merges & completes run!
-    await harness.runCommand("swarm", "approve M1");
-    await waitFor(async () => {
-      st = JSON.parse(await readFile(statePath, "utf8")) as SwarmRunState;
-      return st.status === "completed";
-    });
-    assert.equal(await pathExists(path.join(repoDir, "docs", "spec.md")), true);
-    assert.ok(savedPatches.length >= 4);
-
-    await harness.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
-  });
-
-  it("runs full Post-Merge Final Validator + Auto-Remediation E2E (M1 -> merge -> verifying R1 disapproved -> auto-plan F1 -> merge -> R2 approved -> completed)", async () => {
-    const repoDir = await createTempGitRepo("final-validator-autofix");
-    tempDirs.push(repoDir);
-
-    const testSettings: SwarmSettings = {
-      ...DEFAULT_SWARM_SETTINGS,
-      maxConcurrency: 2,
-      validatorEnabled: true,
-      maxValidationRounds: 2,
-      finalValidatorEnabled: true,
-      maxFinalAuditRounds: 2,
-      autoFixOnAuditFail: true,
-      keepWorkersWarm: true,
-      autoMergeClean: true,
-      autoRebase: true,
-      validatorModel: "openai/gpt-5.2",
-    };
-
-    const spawnedWorkerMissions: string[] = [];
-    const validatedMissions: string[] = [];
-    const finalValidatorRequests: FinalValidatorSpawnRequest[] = [];
-    let f1SawM1MergedFile = false;
-    let round1SawVerifyingOnDisk = false;
-    let round2SawFixFileOnMain = false;
-
-    let notifyRound1Started!: () => void;
-    const round1StartedPromise = new Promise<void>((resolve) => {
-      notifyRound1Started = resolve;
-    });
-    let releaseRound1!: () => void;
-    const round1ReleasePromise = new Promise<void>((resolve) => {
-      releaseRound1 = resolve;
-    });
-
-    const mockTransport: ISwarmTransport = {
-      async spawnWorker(request: WorkerSpawnRequest): Promise<PersistentAgentHandle> {
-        spawnedWorkerMissions.push(request.mission.id);
-        return createMockPersistentHandle({
-          agentId: request.agentId,
-          name: request.name,
-          missionId: request.mission.id,
-          role: "worker",
-          keepWarm: request.keepWarm,
-          initialPrompt: request.prompt,
-          modelOverride: request.modelOverride,
-          runInitialTurn: async () => {
-            if (request.mission.id === "M1") {
-              const coreFile = path.join(request.worktreePath, "src", "core", "calc.ts");
-              await mkdir(path.dirname(coreFile), { recursive: true });
-              await writeFile(
-                coreFile,
-                "export const double = (n: number): number => n * 2;\n",
-                "utf8",
-              );
-              await git(request.worktreePath, ["add", "src/core/calc.ts"]);
-              await git(request.worktreePath, [
-                "-c",
-                "user.name=Worker M1",
-                "-c",
-                "user.email=m1@local",
-                "commit",
-                "-m",
-                "feat(core): add double helper",
-              ]);
-              return {
-                agentId: request.agentId,
-                name: request.name,
-                missionId: "M1",
-                role: "worker",
-                outcome: "completed",
-                summary: "Implemented src/core/calc.ts.",
-                workerDone: {
-                  missionId: "M1",
-                  summary: "Added double helper",
-                  verificationRan: "tsc --noEmit passed",
-                },
-                tokens: 900,
-                cost: 0.009,
-              };
-            }
-
-            if (request.mission.id === "F1") {
-              f1SawM1MergedFile = await pathExists(
-                path.join(request.worktreePath, "src", "core", "calc.ts"),
-              );
-              const exportFile = path.join(request.worktreePath, "src", "index-export.ts");
-              await writeFile(
-                exportFile,
-                'export { double } from "./core/calc.js";\n',
-                "utf8",
-              );
-              await git(request.worktreePath, ["add", "src/index-export.ts"]);
-              await git(request.worktreePath, [
-                "-c",
-                "user.name=Worker F1",
-                "-c",
-                "user.email=f1@local",
-                "commit",
-                "-m",
-                "fix(export): add public integration export",
-              ]);
-              return {
-                agentId: request.agentId,
-                name: request.name,
-                missionId: "F1",
-                role: "worker",
-                outcome: "completed",
-                summary: "Added src/index-export.ts re-exporting double().",
-                workerDone: {
-                  missionId: "F1",
-                  summary: "Wired public integration export",
-                  verificationRan: "tsc --noEmit passed",
-                },
-                tokens: 700,
-                cost: 0.007,
-              };
-            }
-
-            throw new Error(`Unexpected worker mission: ${request.mission.id}`);
-          },
-        }).handle;
-      },
-
-      async spawnValidator(request: ValidatorSpawnRequest): Promise<PersistentAgentHandle> {
-        validatedMissions.push(request.mission.id);
-        return createMockPersistentHandle({
-          agentId: request.agentId,
-          name: request.name,
-          missionId: request.mission.id,
-          role: "validator",
-          keepWarm: false,
-          initialPrompt: request.prompt,
-          modelOverride: request.modelOverride,
-          runInitialTurn: async () => {
-            assert.ok(request.targetCommitSha, "Validator must be pinned to tip SHA");
-            const actualTip = await git(request.worktreePath, ["rev-parse", "HEAD"]);
-            assert.equal(request.targetCommitSha, actualTip);
-
-            const verdict: MissionReviewVerdict = {
-              commitSha: actualTip,
-              missionId: request.mission.id,
-              branch: request.branch,
-              reviewedAt: new Date().toISOString(),
-              reviewerAgentId: request.agentId,
-              status: "clean",
-              merge: "merge",
-              findings: [],
-              checks: [{ name: "scope-and-diff", passed: true }],
-              decision: `Approved ${request.mission.id} at ${actualTip.slice(0, 7)}`,
-            };
-            return {
-              agentId: request.agentId,
-              name: request.name,
-              missionId: request.mission.id,
-              role: "validator",
-              outcome: "completed",
-              summary: verdict.decision,
-              reviewVerdict: verdict,
-              tokens: 400,
-              cost: 0.004,
-            };
-          },
-        }).handle;
-      },
-
-      async spawnFinalValidator(
-        request: FinalValidatorSpawnRequest,
-      ): Promise<PersistentAgentHandle> {
-        finalValidatorRequests.push(request);
-        return createMockPersistentHandle({
-          agentId: request.agentId,
-          name: request.name,
-          missionId: FINAL_AUDIT_MISSION_ID,
-          role: "final-validator",
-          keepWarm: false,
-          initialPrompt: request.prompt,
-          modelOverride: request.modelOverride,
-          runInitialTurn: async () => {
-            assert.equal(path.resolve(request.repoRoot), path.resolve(repoDir));
-            assert.equal(request.baseBranch, "main");
-            assert.equal(request.modelOverride, "openai/gpt-5.2");
-            const actualMainHead = await git(repoDir, ["rev-parse", "HEAD"]);
-            assert.equal(
-              request.targetCommitSha,
-              actualMainHead,
-              "Final Validator must audit exact baseHeadSha on main",
-            );
-
-            if (request.round === 1) {
-              const diskState = JSON.parse(
-                await readFile(
-                  path.join(repoDir, SWARM_DIR, SWARM_RUNS_DIR, request.runId, SWARM_STATE_FILE),
-                  "utf8",
-                ),
-              ) as SwarmRunState;
-              round1SawVerifyingOnDisk =
-                diskState.status === "verifying" && diskState.finalAuditStatus === "running";
-              notifyRound1Started();
-              await round1ReleasePromise;
-
-              const verdict: FinalAuditVerdict = {
-                commitSha: actualMainHead,
-                baseBranch: "main",
-                auditedAt: new Date().toISOString(),
-                verifierAgentId: request.agentId,
-                verdict: "disapproved",
-                summary: "Public integration export src/index-export.ts is missing on main.",
-                checks: [
-                  { name: "core-calc", passed: true },
-                  {
-                    name: "public-export",
-                    passed: false,
-                    detail: "src/index-export.ts not found on main",
-                  },
-                ],
-                findings: [
-                  {
-                    severity: "p1",
-                    title: "Missing public integration export",
-                    detail: "Goal requires src/index-export.ts re-exporting double().",
-                    file: "src/index-export.ts",
-                  },
-                ],
-                recommendedMissions: [
-                  {
-                    title: "Fix integration export",
-                    description:
-                      "Create src/index-export.ts re-exporting double from ./core/calc.js.",
-                    scope: ["src/index-export.ts"],
-                    verification: "src/index-export.ts exports double()",
-                    kind: "build",
-                  },
-                ],
-                round: 1,
-              };
-
-              return {
-                agentId: request.agentId,
-                name: request.name,
-                missionId: FINAL_AUDIT_MISSION_ID,
-                role: "final-validator",
-                outcome: "completed",
-                summary: verdict.summary,
-                finalAuditVerdict: verdict,
-                tokens: 550,
-                cost: 0.0055,
-              };
-            }
-
-            if (request.round === 2) {
-              round2SawFixFileOnMain = await pathExists(
-                path.join(repoDir, "src", "index-export.ts"),
-              );
-              assert.notEqual(
-                actualMainHead,
-                finalValidatorRequests[0]!.targetCommitSha,
-                "Round 2 Final Validator must audit the new main tip SHA after F1 merged",
-              );
-              assert.equal(request.priorAudits?.length, 1);
-
-              const verdict: FinalAuditVerdict = {
-                commitSha: actualMainHead,
-                baseBranch: "main",
-                auditedAt: new Date().toISOString(),
-                verifierAgentId: request.agentId,
-                verdict: "approved",
-                summary: "Verified core module and src/index-export.ts on integrated main.",
-                checks: [
-                  { name: "core-calc", passed: true },
-                  { name: "public-export", passed: true },
-                ],
-                findings: [],
-                round: 2,
-              };
-
-              return {
-                agentId: request.agentId,
-                name: request.name,
-                missionId: FINAL_AUDIT_MISSION_ID,
-                role: "final-validator",
-                outcome: "completed",
-                summary: verdict.summary,
-                finalAuditVerdict: verdict,
-                tokens: 480,
-                cost: 0.0048,
-              };
-            }
-
-            throw new Error(`Unexpected Final Validator round: ${request.round}`);
-          },
-        }).handle;
-      },
-    };
-
-    const harness = createMockPiHarness(repoDir, { sessionId: "sess-final-autofix" });
-    createPiSwarmExtension({
-      transportFactory: () => mockTransport,
-      settingsLoader: async () => testSettings,
-    })(harness.pi);
-
-    await harness.emit("session_start", { type: "session_start", reason: "startup" });
-    await harness.runCommand("swarm-direct", "Build calc core and public export");
-
-    const proposeRes = await harness.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
-      objective: "Build calc core and public export",
-      base_branch: "main",
-      max_concurrency: 2,
-      validator_enabled: true,
-      final_validator_enabled: true,
-      verification_contract: "src/core/calc.ts and src/index-export.ts export double() cleanly",
-      missions: [
-        {
-          id: "M1",
-          title: "Implement core calc helper",
-          kind: "build",
-          description: "Create src/core/calc.ts exporting double().",
-          scope: ["src/core/"],
-          deps: [],
-          verification: "src/core/calc.ts compiles cleanly",
-        },
-      ],
-    });
-    assert.equal(proposeRes.details.outcome, "confirmed");
-    const runId: string = proposeRes.details.runId;
-    const runDir = path.join(repoDir, SWARM_DIR, SWARM_RUNS_DIR, runId);
-    const statePath = path.join(runDir, SWARM_STATE_FILE);
-
-    // Wait for Round 1 Final Validator to enter `status === "verifying"`
-    await round1StartedPromise;
-    assert.equal(round1SawVerifyingOnDisk, true, "Run must persist status=verifying while auditing");
-
-    // Verify `session_tree` treats `status === "verifying"` identically to `"active"` (keeps all 12 running tools!)
-    await harness.emit("session_tree", { type: "session_tree" });
-    for (const orchTool of ORCHESTRATOR_TOOLS) {
-      assert.ok(
-        harness.pi.getActiveTools().includes(orchTool),
-        `Expected ${orchTool} active during status=verifying`,
-      );
+    const draftingActiveTools = harness.pi.getActiveTools();
+    for (const t of DRAFTING_TOOLS) {
+      assert.ok(draftingActiveTools.includes(t), `Expected drafting tool ${t}`);
+    }
+    for (const t of SWARM_CORE_TOOLS) {
+      assert.ok(!draftingActiveTools.includes(t), `Core tool ${t} should be inactive in drafting`);
     }
 
-    // Release Round 1 -> auto-remediation F1 -> validate -> merge -> Round 2 -> completed!
-    releaseRound1();
+    // Prompt-cache-safe drafting tail injection
+    const draftStartEv = { systemPromptOptions: { sections: {} as Record<string, string> } };
+    const draftRes = await harness.emit("before_agent_start", draftStartEv);
+    assert.equal(draftRes[0], undefined);
+    assert.match(draftStartEv.systemPromptOptions.sections.swarm ?? "", /swarm_drafting_active/);
 
-    let finalState!: SwarmRunState;
-    await waitFor(async () => {
-      if (!(await pathExists(statePath))) return false;
-      finalState = JSON.parse(await readFile(statePath, "utf8")) as SwarmRunState;
-      return finalState.status === "completed";
-    });
-
-    assert.deepEqual(spawnedWorkerMissions, ["M1", "F1"]);
-    assert.deepEqual(validatedMissions, ["M1", "F1"]);
-    assert.equal(finalValidatorRequests.length, 2);
-    assert.equal(f1SawM1MergedFile, true, "Fix mission F1 worktree must contain M1 merged code");
-    assert.equal(round2SawFixFileOnMain, true, "Round 2 audit must see F1 merged src/index-export.ts");
-
-    assert.equal(finalState.status, "completed");
-    assert.equal(finalState.finalValidatorEnabled, true);
-    assert.equal(finalState.maxFinalAuditRounds, 2);
-    assert.equal(finalState.autoFixOnAuditFail, true);
-    assert.equal(finalState.finalAuditStatus, "approved");
-    assert.equal(finalState.finalAuditRound, 2);
-    assert.equal(finalState.missions.M1?.status, "merged");
-    assert.equal(finalState.missions.F1?.status, "merged");
-
-    // Verify persisted audit-r1.json & audit-r2.json on disk
-    const auditR1Path = path.join(runDir, SWARM_AUDITS_DIR, "audit-r1.json");
-    const auditR2Path = path.join(runDir, SWARM_AUDITS_DIR, "audit-r2.json");
-    assert.equal(await pathExists(auditR1Path), true);
-    assert.equal(await pathExists(auditR2Path), true);
-    const auditR1 = JSON.parse(await readFile(auditR1Path, "utf8")) as FinalAuditVerdict;
-    const auditR2 = JSON.parse(await readFile(auditR2Path, "utf8")) as FinalAuditVerdict;
-    assert.equal(auditR1.verdict, "disapproved");
-    assert.equal(auditR1.round, 1);
-    assert.equal(auditR2.verdict, "approved");
-    assert.equal(auditR2.round, 2);
-    assert.notEqual(auditR1.commitSha, auditR2.commitSha);
-    assert.equal(auditR2.commitSha, await git(repoDir, ["rev-parse", "HEAD"]));
-
-    // Verify zero duplicate Final Validator events
-    const rawEvents = (await readFile(path.join(runDir, SWARM_EVENTS_FILE), "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line) as { type: string });
-    const countType = (type: string) => rawEvents.filter((e) => e.type === type).length;
-    assert.equal(countType("final_audit_started"), 2);
-    assert.equal(countType("final_audit_result"), 2);
-    assert.equal(countType("final_audit_autofix_planned"), 1);
-    assert.equal(countType("run_completed"), 1);
-
-    // Verify clean git status and real merge commits on `main`
-    assert.equal(await git(repoDir, ["status", "--porcelain"]), "");
-    const mergeLog = await git(repoDir, ["log", "--merges", "--oneline"]);
-    assert.match(mergeLog, /swarm\(M1\):/);
-    assert.match(mergeLog, /swarm\(F1\):/);
-
-    await harness.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
-  });
-
-  it("parks cleanly when Final Validator disapproves with no recommendedMissions, enforces ROLE_FORBIDDEN on swarm_verify(skip), supports bare menu + human /swarm verify --skip + completions & settings", async () => {
-    const repoDir = await createTempGitRepo("final-validator-parked-skip");
-    tempDirs.push(repoDir);
-
-    let effectiveSettings: SwarmSettings = {
-      ...DEFAULT_SWARM_SETTINGS,
-      maxConcurrency: 2,
-      validatorEnabled: false,
-      finalValidatorEnabled: true,
-      maxFinalAuditRounds: 2,
-      autoFixOnAuditFail: true,
-      autoMergeClean: true,
-    };
-    const savedPatches: Array<{ scope: "global" | "project"; patch: Partial<SwarmSettings> }> = [];
-
-    let validatorSpawnCount = 0;
-    let releaseRound2Validator!: () => void;
-    const round2ValidatorGate = new Promise<void>((resolve) => {
-      releaseRound2Validator = resolve;
-    });
-
-    const mockTransport: ISwarmTransport = {
-      async spawnWorker(request: WorkerSpawnRequest): Promise<PersistentAgentHandle> {
-        return createMockPersistentHandle({
-          agentId: request.agentId,
-          name: request.name,
-          missionId: request.mission.id,
-          role: "worker",
-          keepWarm: request.keepWarm,
-          initialPrompt: request.prompt,
-          runInitialTurn: async () => {
-            const target = path.join(request.worktreePath, "src", "feature.ts");
-            await writeFile(target, "export const FEATURE_READY = true;\n", "utf8");
-            await git(request.worktreePath, ["add", "src/feature.ts"]);
-            await git(request.worktreePath, [
-              "-c",
-              "user.name=Worker M1",
-              "-c",
-              "user.email=m1@local",
-              "commit",
-              "-m",
-              "feat(feature): add feature flag",
-            ]);
-            return {
-              agentId: request.agentId,
-              name: request.name,
-              missionId: request.mission.id,
-              role: "worker",
-              outcome: "completed",
-              summary: "Added src/feature.ts.",
-              workerDone: { missionId: request.mission.id, summary: "Committed feature flag" },
-              tokens: 450,
-              cost: 0.0045,
-            };
-          },
-        }).handle;
-      },
-
-      async spawnValidator(): Promise<PersistentAgentHandle> {
-        throw new Error("Per-mission Validator should not spawn when validatorEnabled=false");
-      },
-
-      async spawnFinalValidator(
-        request: FinalValidatorSpawnRequest,
-      ): Promise<PersistentAgentHandle> {
-        validatorSpawnCount += 1;
-        const spawnNum = validatorSpawnCount;
-        return createMockPersistentHandle({
-          agentId: request.agentId,
-          name: request.name,
-          missionId: FINAL_AUDIT_MISSION_ID,
-          role: "final-validator",
-          keepWarm: false,
-          initialPrompt: request.prompt,
-          runInitialTurn: async () => {
-            if (spawnNum === 2) {
-              await round2ValidatorGate;
-            }
-            const actualHead = await git(repoDir, ["rev-parse", "HEAD"]);
-            assert.equal(request.targetCommitSha, actualHead);
-
-            const verdict: FinalAuditVerdict = {
-              commitSha: actualHead,
-              baseBranch: "main",
-              auditedAt: new Date().toISOString(),
-              verifierAgentId: request.agentId,
-              verdict: "disapproved",
-              summary: "Known documentation gap in CLI help output.",
-              checks: [
-                { name: "feature-flag-exported", passed: true },
-                { name: "cli-docs-check", passed: false, detail: "CLI docs not updated" },
-              ],
-              findings: [
-                {
-                  severity: "p2",
-                  title: "CLI documentation gap",
-                  detail: "README does not document FEATURE_READY flag yet.",
-                  file: "README.md",
-                },
-              ],
-              round: request.round,
-            };
-
-            return {
-              agentId: request.agentId,
-              name: request.name,
-              missionId: FINAL_AUDIT_MISSION_ID,
-              role: "final-validator",
-              outcome: "completed",
-              summary: verdict.summary,
-              finalAuditVerdict: verdict,
-              tokens: 320,
-              cost: 0.0032,
-            };
-          },
-        }).handle;
-      },
-    };
-
-    const harness = createMockPiHarness(repoDir, { sessionId: "sess-final-skip" });
-    createPiSwarmExtension({
-      transportFactory: () => mockTransport,
-      settingsLoader: async () => effectiveSettings,
-      settingsSaver: async (scope, patch) => {
-        savedPatches.push({ scope, patch });
-        effectiveSettings = { ...effectiveSettings, ...patch };
-        return effectiveSettings;
-      },
-    })(harness.pi);
-
-    await harness.emit("session_start", { type: "session_start", reason: "startup" });
-
-    // 1. Verify `/swarm` completions cover all 17 subcommands + `verify` & `model` sub-completions
-    const swarmCmd = harness.commands.get("swarm")!;
-    const allCompletions = (await swarmCmd.getArgumentCompletions?.("")) as Array<{
-      value: string;
-    }>;
-    assert.equal(allCompletions.length, SWARM_SUBCOMMANDS.length);
-    assert.ok(SWARM_SUBCOMMANDS.some((c) => c.name === "board"));
-    assert.ok(SWARM_SUBCOMMANDS.some((c) => c.name === "models"));
-    assert.ok(SWARM_SUBCOMMANDS.some((c) => c.name === "model"));
-    assert.ok(SWARM_SUBCOMMANDS.some((c) => c.name === "kill"));
-    assert.ok(SWARM_SUBCOMMANDS.some((c) => c.name === "verify"));
-
-    const verifyCompletions = (await swarmCmd.getArgumentCompletions?.("verify ")) as Array<{
-      value: string;
-      label: string;
-    }>;
-    assert.deepEqual(
-      verifyCompletions.map((c) => c.label),
-      ["--force", "--skip", "--reason"],
-    );
-    const modelRoleCompletions = (await swarmCmd.getArgumentCompletions?.("model ")) as Array<{
-      label: string;
-    }>;
-    assert.deepEqual(
-      modelRoleCompletions.map((c) => c.label),
-      ["orchestrator", "worker", "validator"],
-    );
-
-    await harness.runCommand("swarm", "help");
-    const helpMsg = harness.sentMessages.find(
-      (m) =>
-        m.message.customType === SWARM_STATUS_CUSTOM_TYPE &&
-        String(m.message.content).includes("/swarm verify --skip"),
-    );
-    assert.ok(helpMsg, "/swarm help must document /swarm verify --skip");
-    assert.match(String(helpMsg.message.content), /\/swarm board/);
-    assert.match(String(helpMsg.message.content), /\/swarm models/);
-    assert.match(String(helpMsg.message.content), /\/swarm kill/);
-
-    // 2. Verify `/swarm settings` exposes 3-role models, warm sessions & Final Validator settings
-    let settingsStep = 0;
-    harness.setSelectHandler((_title, choices) => {
-      assert.ok(choices.some((c) => c.startsWith("orchestratorModel:")));
-      assert.ok(choices.some((c) => c.startsWith("workerModel:")));
-      assert.ok(choices.some((c) => c.startsWith("validatorModel:")));
-      assert.ok(choices.some((c) => c.startsWith("keepWorkersWarm:")));
-      assert.ok(choices.some((c) => c.startsWith("validatorEnabled:")));
-      assert.ok(choices.some((c) => c.startsWith("finalValidatorEnabled:")));
-      assert.ok(choices.some((c) => c.startsWith("autoFixOnAuditFail:")));
-      assert.ok(choices.some((c) => c.startsWith("maxValidationRounds:")));
-      assert.ok(choices.some((c) => c.startsWith("maxFinalAuditRounds:")));
-      settingsStep += 1;
-      if (settingsStep === 1) return choices.find((c) => c.startsWith("autoFixOnAuditFail:"));
-      if (settingsStep === 2) return choices.find((c) => c.startsWith("autoFixOnAuditFail:"));
-      return "Done";
-    });
-    await harness.runCommand("swarm", "settings");
-    assert.equal(savedPatches.length, 2);
-    assert.equal(savedPatches[0]!.patch.autoFixOnAuditFail, false);
-    assert.equal(savedPatches[1]!.patch.autoFixOnAuditFail, true);
-
-    // 3. Launch run -> M1 merges -> Final Validator disapproves with NO recommendedMissions
-    await harness.runCommand("swarm-direct", "Add feature flag");
-    const proposeRes = await harness.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
-      objective: "Add feature flag",
-      base_branch: "main",
-      validator_enabled: false,
-      final_validator_enabled: true,
-      verification_contract: "src/feature.ts exports FEATURE_READY and docs updated",
-      missions: [
+    // 2. Upfront Q&A + Plan Confirmation -> swaps to 4 core tools
+    const qRes = await harness.executeTool(SWARM_QUESTIONNAIRE_TOOL, {
+      questions: [
         {
-          id: "M1",
-          title: "Add feature flag module",
-          kind: "build",
-          description: "Create src/feature.ts exporting FEATURE_READY.",
-          scope: ["src/feature.ts"],
-          deps: [],
-          verification: "file committed cleanly",
+          id: "api",
+          question: "Export signature?",
+          options: [{ label: "compute(x)" }],
+          recommended: "compute(x)",
         },
       ],
     });
-    const runId: string = proposeRes.details.runId;
-    const runDir = path.join(repoDir, SWARM_DIR, SWARM_RUNS_DIR, runId);
-    const statePath = path.join(runDir, SWARM_STATE_FILE);
+    assert.equal(qRes.isError, undefined);
 
-    let parkedState!: SwarmRunState;
-    await waitFor(async () => {
-      if (!(await pathExists(statePath))) return false;
-      parkedState = JSON.parse(await readFile(statePath, "utf8")) as SwarmRunState;
-      return (
-        parkedState.status === "active" &&
-        parkedState.finalAuditStatus === "disapproved" &&
-        parkedState.finalAuditRound === 1
-      );
+    const planRes = await harness.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Compute Feature",
+      objective: "Add compute(x) = x * 2 module",
+      strategy: "Phase 1 researcher -> Phase 2 isolated share author + independent validator",
+      acceptance_criteria: "src/compute.ts exports compute(x) = x * 2 merged onto main",
+      base_branch: "main",
+      max_concurrency: 4,
+      validator_enabled: true,
     });
+    assert.equal(planRes.isError, undefined);
+    assert.equal(planRes.details.outcome, "confirmed");
+    const runId: string = planRes.details.runId;
+    assert.ok(runId);
 
-    // Zero tight loop
-    await new Promise((r) => setTimeout(r, 80));
-    parkedState = JSON.parse(await readFile(statePath, "utf8")) as SwarmRunState;
-    assert.equal(validatorSpawnCount, 1, "Parked disapproved run must NOT tight-loop validator");
-    assert.equal(parkedState.status, "active");
-    assert.equal(parkedState.finalAuditStatus, "disapproved");
+    // Core 4 tools active, drafting tools inactive
+    const runningTools = harness.pi.getActiveTools();
+    for (const t of SWARM_CORE_TOOLS) {
+      assert.ok(runningTools.includes(t), `Expected core tool ${t}`);
+    }
+    for (const t of DRAFTING_TOOLS) {
+      assert.ok(!runningTools.includes(t), `Drafting tool ${t} should be inactive while running`);
+    }
 
-    // 4. `swarm_verify(status)` works, while `action="skip"` returns ROLE_FORBIDDEN!
-    const verifyStatusRes = await harness.executeTool(SWARM_VERIFY_TOOL, {
-      action: "status",
-    });
-    assert.equal(verifyStatusRes.isError, undefined);
-    assert.equal(verifyStatusRes.details.finalAuditStatus, "disapproved");
-    assert.equal(verifyStatusRes.details.findings.length, 1);
+    // Focus entry persisted (version: 2)
+    const focusEntry = harness.branch.find((e) => e.customType === SWARM_FOCUS_ENTRY);
+    assert.ok(focusEntry);
+    assert.deepEqual((focusEntry.data as any).version, 2);
+    assert.equal((focusEntry.data as any).runId, runId);
 
-    const forbiddenSkipRes = await harness.executeTool(SWARM_VERIFY_TOOL, {
-      action: "skip",
-    });
-    assert.equal(forbiddenSkipRes.isError, true);
-    assert.equal(forbiddenSkipRes.details.errorCode, "ROLE_FORBIDDEN");
-
-    // 5. Bare `/swarm` menu includes Board, Models, Tasks Overlay, Run & Skip Final Validator
-    let capturedMenuChoices: string[] = [];
-    harness.setSelectHandler((_title, choices) => {
-      capturedMenuChoices = [...choices];
-      return undefined;
-    });
-    await harness.runCommand("swarm", "");
-    assert.ok(capturedMenuChoices.some((c) => c.includes("View Board")));
-    assert.ok(capturedMenuChoices.some((c) => c.includes("Manage Models")));
-    assert.ok(capturedMenuChoices.some((c) => c.includes("Open Tasks & Board Overlay")));
-    assert.ok(capturedMenuChoices.includes("Run Final Validator (/swarm verify)"));
-    assert.ok(capturedMenuChoices.includes("Skip Final Validator (/swarm verify --skip)"));
-
-    // 6. Human `/swarm verify --skip "accepted known gap"` overrides & completes run!
-    await harness.runCommand("swarm", 'verify --skip "accepted known gap"');
-    const completedState = JSON.parse(await readFile(statePath, "utf8")) as SwarmRunState;
-    assert.equal(completedState.status, "completed");
-    assert.equal(completedState.finalAuditStatus, "skipped");
-    assert.equal(completedState.finalAuditSkippedBy, "human");
-    assert.equal(completedState.finalAuditSkipReason, "accepted known gap");
-
-    // 7. `/swarm verify --force` re-triggers Round 2 and displays active round (round 2/2, NOT 1/2!)
-    await harness.runCommand("swarm", "verify --force");
-    const verifyTriggerMsg = harness.sentMessages
-      .filter((m) => m.message.customType === SWARM_STATUS_CUSTOM_TYPE)
-      .at(-1);
-    assert.ok(verifyTriggerMsg);
+    // Prompt-cache-safe orchestrator playbook injection
+    const runStartEv = { systemPromptOptions: { sections: {} as Record<string, string> } };
+    await harness.emit("before_agent_start", runStartEv);
     assert.match(
-      String(verifyTriggerMsg.message.content),
-      /\(round 2\/2\)/,
-      "Running Round 2 must display (round 2/2) while finalAuditStatus === 'running'",
-    );
-    assert.equal(
-      (verifyTriggerMsg.message.details as { round?: number; finalAuditStatus?: string })
-        ?.finalAuditStatus,
-      "running",
-    );
-    assert.equal(
-      (verifyTriggerMsg.message.details as { round?: number })?.round,
-      2,
+      runStartEv.systemPromptOptions.sections.swarm ?? "",
+      /Pi Swarm Orchestrator Playbook/,
     );
 
-    releaseRound2Validator();
-    await waitFor(async () => {
-      const latest = JSON.parse(await readFile(statePath, "utf8")) as SwarmRunState;
-      return (
-        latest.status === "active" &&
-        latest.finalAuditRound === 2 &&
-        latest.finalAuditStatus === "disapproved"
-      );
+    // Settled-boundary kickoff message dispatched cleanly once
+    await waitFor(() =>
+      harness.sentMessages.some(
+        (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE && (m.message.details as any)?.kickoff,
+      ),
+    );
+    const kickoffWakeups = harness.sentMessages.filter(
+      (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
+    );
+    assert.equal(kickoffWakeups.length, 1);
+    assert.equal(kickoffWakeups[0]!.options?.triggerTurn, true);
+    assert.equal(kickoffWakeups[0]!.options?.deliverAs, "followUp");
+
+    // 3. Phase 1: spawn researcher -> call blocking swarm_wait -> release researcher -> resolves immediately with NO duplicate wakeup
+    const addResearcherRes = await harness.executeTool(SWARM_TOOL, {
+      action: "add",
+      name: "researcher",
+      role: "worker",
+      workspace: "inherit",
+      brief: "Inspect src/index.ts and report compute(x) contract.",
     });
-    assert.equal(validatorSpawnCount, 2);
+    assert.equal(addResearcherRes.isError, undefined);
 
-    await harness.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
+    const wakeupsBeforeWait = harness.sentMessages.filter(
+      (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
+    ).length;
+
+    const waitPromise = harness.executeTool(SWARM_WAIT_TOOL, {
+      since: 1,
+      mentions_only: true,
+    });
+    // Give waitForBoard a moment to register before releasing researcher
+    await new Promise((r) => setTimeout(r, 30));
+    releaseResearcher();
+
+    const waitRes = await waitPromise;
+    assert.equal(waitRes.isError, undefined);
+    assert.equal(waitRes.details.wokeBy, "message");
+    assert.match(waitRes.content[0].text, /compute\(x\) = x \* 2/);
+
+    // Allow any microtasks to flush and confirm active swarm_wait suppressed duplicate wakeup turn
+    await new Promise((r) => setTimeout(r, 40));
+    const wakeupsAfterWait = harness.sentMessages.filter(
+      (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
+    ).length;
+    assert.equal(
+      wakeupsAfterWait,
+      wakeupsBeforeWait,
+      "Active swarm_wait must suppress duplicate background SWARM_WAKEUP_CUSTOM_TYPE turn",
+    );
+
+    // 4. Phase 2: spawn independent validator + share-worktree author -> peer-to-peer warm fix loop!
+    const addValidatorRes = await harness.executeTool(SWARM_TOOL, {
+      action: "add",
+      name: "validator",
+      role: "validator",
+      workspace: "inherit",
+      brief: "Audit author's src/compute.ts implementation and verify compute(x) = x * 2.",
+    });
+    assert.equal(addValidatorRes.isError, undefined);
+
+    // Wait for validator to park in waiting before author hands off to @validator
+    await waitFor(() => trackers.get("validator")?.[0]?.handle.getState() === "waiting");
+
+    const addAuthorRes = await harness.executeTool(SWARM_TOOL, {
+      action: "add",
+      name: "author",
+      role: "worker",
+      workspace: "share",
+      brief: "Implement src/compute.ts per #2 and post @validator [done] when ready.",
+    });
+    assert.equal(addAuthorRes.isError, undefined);
+
+    // Wait for full peer-to-peer bounce: author(bug) -> validator(review) -> author(warm wake #1 fix) -> validator(approved -> @orchestrator)
+    await waitFor(async () => {
+      const board = await harness.executeTool(READ_BOARD_TOOL, { since: 0, limit: 50 });
+      return String(board.content[0].text).includes("approved");
+    });
+
+    // Verify exact SAME warm author handle was woken (not respawned!)
+    const authorTrackers = trackers.get("author") ?? [];
+    assert.equal(authorTrackers.length, 1, "Author must stay warm with 1 single handle spawn");
+    assert.equal(authorTrackers[0]!.wakeCount, 1, "Warm author handle must be woken exactly once");
+    assert.equal(validatorAuditCount, 2, "Validator should audit twice (reject then approve)");
+    await waitFor(() => authorTrackers[0]!.handle.getState() === "waiting");
+    await waitFor(() => trackers.get("validator")?.[0]?.handle.getState() === "waiting");
+
+    // 5. Verify zero-turn commands (`/swarm status`, `/swarm board`, `/swarm graph`, `/swarm models`)
+    const zeroTurnStartCount = harness.sentMessages.length;
+    await harness.runCommand("swarm", "status");
+    await harness.runCommand("swarm", "board");
+    await harness.runCommand("swarm", "graph");
+    await harness.runCommand("swarm", "models");
+
+    const zeroTurnSlice = harness.sentMessages.slice(zeroTurnStartCount);
+    const statusMsgs = zeroTurnSlice.filter(
+      (m) => m.message.customType === SWARM_STATUS_CUSTOM_TYPE,
+    );
+    assert.equal(statusMsgs.length, 4);
+    for (const msg of statusMsgs) {
+      assert.equal(msg.options?.triggerTurn, false, "All 4 views must be zero-LLM-turn");
+    }
+    assert.match(String(statusMsgs[0]!.message.content), /Compute Feature/);
+    assert.match(String(statusMsgs[1]!.message.content), /Swarm Board/);
+    assert.match(String(statusMsgs[2]!.message.content), /Swarm Graph/);
+    assert.match(String(statusMsgs[2]!.message.content), /author ⇄ validator/);
+    assert.match(String(statusMsgs[3]!.message.content), /Swarm 3-Role Models/);
+    assert.match(String(statusMsgs[3]!.message.content), /claude-opus-4-6/);
+    assert.match(String(statusMsgs[3]!.message.content), /gpt-5\.2/);
+
+    // 6. Merge author's share worktree into main (real git merge --no-ff), kill members, complete run!
+    const mergeRes = await harness.executeTool(SWARM_TOOL, {
+      action: "merge",
+      name: "author",
+    });
+    assert.equal(mergeRes.isError, undefined, `Merge failed: ${JSON.stringify(mergeRes)}`);
+    assert.equal(mergeRes.details.strategy, "merge");
+
+    // Verify committed fix landed on `main`!
+    const mainCompute = await readFile(path.join(repoDir, "src", "compute.ts"), "utf8");
+    assert.match(mainCompute, /return x \* 2;/);
+
+    // Kill all 3 members -> worktree for author cleanly removed
+    for (const name of ["researcher", "author", "validator"]) {
+      const killRes = await harness.executeTool(SWARM_TOOL, {
+        action: "kill",
+        name,
+        reason: "Integrated cleanly",
+      });
+      assert.equal(killRes.isError, undefined);
+    }
+    assert.equal(await pathExists(authorWorktreePath), false, "Killed share worktree should be removed");
+
+    // Complete run via swarm{action:"done"} -> restores "idle" tool profile & emits ZERO extra wakeup turns!
+    const wakeupsBeforeDone = harness.sentMessages.filter(
+      (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
+    ).length;
+    harness.setIdle(false);
+    const doneRes = await harness.executeTool(SWARM_TOOL, {
+      action: "done",
+      summary: "Delivered compute(x) = x * 2 verified by independent validator.",
+    });
+    assert.equal(doneRes.isError, undefined);
+    assert.equal(doneRes.details.status, "completed");
+
+    // Flush microtasks + simulate agent_settled after Orchestrator's final reply: 0 extra LLM turns!
+    harness.setIdle(true);
+    await new Promise((r) => setTimeout(r, 30));
+    await harness.emit("agent_settled", { aborted: false });
+    await new Promise((r) => setTimeout(r, 30));
+    const wakeupsAfterDone = harness.sentMessages.filter(
+      (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
+    ).length;
+    assert.equal(
+      wakeupsAfterDone,
+      wakeupsBeforeDone,
+      'swarm{action:"done"} must emit 0 SWARM_WAKEUP_CUSTOM_TYPE follow-up turns',
+    );
+
+    const idleTools = harness.pi.getActiveTools();
+    assert.ok(idleTools.includes(IDLE_SWARM_TOOLS[0]));
+    assert.ok(!idleTools.includes(POST_MESSAGE_TOOL));
+    assert.ok(!idleTools.includes(READ_BOARD_TOOL));
+    assert.ok(!idleTools.includes(SWARM_WAIT_TOOL));
+
+    // 7. Verify disk artifacts (`board.jsonl`, `ROSTER.md`, `state.json`, `events.jsonl` zero duplicates, clean git status)
+    const runDir = path.join(repoDir, SWARM_DIR, SWARM_RUNS_DIR, runId);
+    const boardRaw = await readFile(path.join(runDir, SWARM_BOARD_FILE), "utf8");
+    assert.match(boardRaw, /\[done\] Delivered compute\(x\)/);
+    assert.match(boardRaw, /approved/);
+
+    const rosterMd = await readFile(path.join(runDir, SWARM_ROSTER_FILE), "utf8");
+    assert.match(rosterMd, /researcher/);
+    assert.match(rosterMd, /author/);
+    assert.match(rosterMd, /validator/);
+
+    const stateJson = JSON.parse(
+      await readFile(path.join(runDir, SWARM_STATE_FILE), "utf8"),
+    ) as SwarmRunState;
+    assert.equal(stateJson.version, 2);
+    assert.equal(stateJson.status, "completed");
+
+    const eventsRaw = await readFile(path.join(runDir, SWARM_EVENTS_FILE), "utf8");
+    const events = eventsRaw
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as SwarmEvent);
+    const runCreatedEvents = events.filter((e) => e.type === "run_created");
+    const runCompletedEvents = events.filter((e) => e.type === "run_completed");
+    const authorAddedEvents = events.filter(
+      (e) => e.type === "member_added" && e.memberName === "author",
+    );
+    const authorMergedEvents = events.filter(
+      (e) => e.type === "member_merged" && e.memberName === "author",
+    );
+    const authorKilledEvents = events.filter(
+      (e) => e.type === "member_killed" && e.memberName === "author",
+    );
+    assert.equal(runCreatedEvents.length, 1, "Zero duplicate run_created events");
+    assert.equal(runCompletedEvents.length, 1, "Zero duplicate run_completed events");
+    assert.equal(authorAddedEvents.length, 1, "Zero duplicate member_added events");
+    assert.equal(authorMergedEvents.length, 1, "Zero duplicate member_merged events");
+    assert.equal(authorKilledEvents.length, 1, "Zero duplicate member_killed events");
+
+    const gitStatus = await git(repoDir, ["status", "--porcelain"]);
+    assert.equal(gitStatus, "", ".pi/swarm/ must be excluded so git status stays clean");
+
+    await harness.emit("session_shutdown", {});
   });
 
-  it("verifies /swarm direct, /swarm cancel (draft & run), /swarm pause/resume, /swarm kill, settled-boundary wakeup, idempotent session_shutdown, and exact registered commands", async () => {
-    const repoDir = await createTempGitRepo("controls-lifecycle");
+  it("2. supports True Conversation fork (orchestrator & member), Sharded tasks[], Channels (@#area), and Hot Model Switching (/swarm model & swarm{action:'model'})", async () => {
+    const repoDir = await createTempGitRepo("fork-channels-models");
     tempDirs.push(repoDir);
 
-    const testSettings: SwarmSettings = {
-      ...DEFAULT_SWARM_SETTINGS,
-      maxConcurrency: 2,
-      validatorEnabled: false,
-      finalValidatorEnabled: false,
-      keepWorkersWarm: true,
-      autoMergeClean: true,
-    };
-
-    let releaseWorker!: () => void;
-    const workerGate = new Promise<void>((resolve) => {
-      releaseWorker = resolve;
-    });
-    const trackersByRun: MockWarmHandleTracker[] = [];
+    const spawnedByName = new Map<string, MockMemberTracker>();
 
     const mockTransport: ISwarmTransport = {
-      async spawnWorker(request: WorkerSpawnRequest): Promise<PersistentAgentHandle> {
-        const tracker = createMockPersistentHandle({
-          agentId: request.agentId,
-          name: request.name,
-          missionId: request.mission.id,
-          role: "worker",
-          keepWarm: request.keepWarm,
-          initialPrompt: request.prompt,
-          onAbort: () => {
-            releaseWorker();
-          },
-          runInitialTurn: async (ctx) => {
-            await workerGate;
-            if (ctx.isAborted()) {
-              return {
-                agentId: request.agentId,
-                name: request.name,
-                missionId: request.mission.id,
-                role: "worker",
-                outcome: "aborted",
-                summary: "Aborted",
-                tokens: 50,
-                cost: 0.0005,
-              };
-            }
-            const filePath = path.join(request.worktreePath, "src", "ctrl.ts");
-            await writeFile(filePath, "export const OK = true;\n", "utf8");
-            await git(request.worktreePath, ["add", "src/ctrl.ts"]);
-            await git(request.worktreePath, [
-              "-c",
-              "user.name=Ctrl Worker",
-              "-c",
-              "user.email=ctrl@local",
-              "commit",
-              "-m",
-              "feat(ctrl): add ctrl flag",
-            ]);
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        const tracker = createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async ({ pushAssistantMessage }) => {
+            pushAssistantMessage(`Initial turn by ${request.name} completed.`);
             return {
               agentId: request.agentId,
               name: request.name,
-              missionId: request.mission.id,
-              role: "worker",
-              outcome: "completed",
-              summary: "Added ctrl flag",
-              workerDone: { missionId: request.mission.id, summary: "Added ctrl flag" },
+              role: request.role,
+              outcome: "waiting",
+              summary: `${request.name} ready`,
               tokens: 300,
               cost: 0.003,
             };
           },
+          runWakeTurn: async (prompt, { pushAssistantMessage }) => {
+            pushAssistantMessage(`Woken by: ${prompt.slice(0, 60)}`);
+            return {
+              agentId: request.agentId,
+              name: request.name,
+              role: request.role,
+              outcome: "waiting",
+              summary: `${request.name} handled wake`,
+              tokens: 500,
+              cost: 0.005,
+            };
+          },
         });
-        trackersByRun.push(tracker);
+        spawnedByName.set(request.name, tracker);
         return tracker.handle;
       },
-      async spawnValidator(): Promise<PersistentAgentHandle> {
-        throw new Error("Unexpected validator spawn");
+      async listAvailableModels() {
+        return DEFAULT_TEST_MODELS.map((m) => ({
+          id: m.id,
+          provider: m.provider,
+          fullId: `${m.provider}/${m.id}`,
+          name: m.name,
+        }));
       },
     };
 
-    const harness = createMockPiHarness(repoDir, { sessionId: "sess-ctrl" });
-    createPiSwarmExtension({
+    // Host session history including a dangling unresolved toolCall that fork sanitization must strip!
+    const hostMessages: AgentMessage[] = [
+      makeUserMsg("Design a modular backend API."),
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "Spawning architect now." },
+          { type: "toolCall", id: "dangling-tc-1", name: "swarm", arguments: { action: "add" } },
+        ],
+        api: "anthropic-messages",
+        provider: "anthropic",
+        model: "claude-sonnet-4-5",
+        usage: {
+          input: 10,
+          output: 10,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 20,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "toolUse",
+        timestamp: Date.now(),
+      } as unknown as AgentMessage,
+    ];
+
+    const harness = createMockPiHarness(repoDir, {
+      initialSessionMessages: hostMessages,
+    });
+    const ext = createPiSwarmExtension({
       transportFactory: () => mockTransport,
-      settingsLoader: async () => testSettings,
-    })(harness.pi);
+      // Use real project settings persistence on repoDir!
+    });
+    ext(harness.pi);
+    await harness.emit("session_start", {});
 
-    // Strictly verify ONLY `/swarm` and `/swarm-direct` are registered
-    assert.deepEqual(Array.from(harness.commands.keys()).sort(), ["swarm", "swarm-direct"]);
-
-    await harness.emit("session_start", { type: "session_start", reason: "startup" });
-
-    // 1. `/swarm <goal>` starts draft -> `/swarm cancel` cancels draft & restores idle profile
-    await harness.runCommand("swarm", "Draft something temporary");
-    assert.ok(harness.pi.getActiveTools().includes(PROPOSE_SWARM_PLAN_TOOL));
-
-    await harness.runCommand("swarm", "cancel");
-    assert.equal(harness.pi.getActiveTools().includes(PROPOSE_SWARM_PLAN_TOOL), false);
-    assert.equal(harness.pi.getActiveTools().includes("swarm_merge"), false);
-    assert.ok(harness.pi.getActiveTools().includes(SWARM_STATUS_TOOL));
-
-    // 2. `/swarm direct <goal>` auto-confirms WITHOUT opening modal
-    await harness.runCommand("swarm", "direct Add ctrl flag");
-    assert.match(String(harness.sentUserMessages.at(-1)!.content), /swarm_direct_plan/);
-    const selectCountBeforeDirect = harness.selectCalls.length;
-    const proposeRes = await harness.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
-      objective: "Add ctrl flag",
+    // Launch via /swarm direct
+    await harness.runCommand("swarm", "direct Build backend endpoints");
+    const planRes = await harness.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Backend API Swarm",
+      objective: "Build modular auth and billing endpoints",
+      strategy: "Fork architect -> channel #backend -> sharded workers -> hot model switch",
+      acceptance_criteria: "All endpoints tested and verified",
       base_branch: "main",
-      validator_enabled: false,
-      final_validator_enabled: false,
-      verification_contract: "tsc passes",
-      missions: [
+      max_concurrency: 6,
+      validator_enabled: true,
+    });
+    assert.equal(planRes.isError, undefined);
+    assert.equal(planRes.details.autoConfirmed, true);
+
+    // A. True conversation fork from "orchestrator" (with dangling toolCall stripped!)
+    const addArchRes = await harness.executeTool(SWARM_TOOL, {
+      action: "add",
+      name: "architect",
+      role: "worker",
+      workspace: "inherit",
+      fork: "orchestrator",
+      brief: "Draft API spec based on our host session discussion.",
+    });
+    assert.equal(addArchRes.isError, undefined);
+    await waitFor(() => spawnedByName.get("architect")?.handle.getState() === "waiting");
+
+    const archTracker = spawnedByName.get("architect")!;
+    assert.ok(archTracker.seedMessages && archTracker.seedMessages.length === 2);
+    const secondSeed = archTracker.seedMessages![1] as any;
+    assert.equal(
+      secondSeed.content.some((p: any) => p.type === "toolCall"),
+      false,
+      "Dangling unresolved toolCall must be stripped from orchestrator fork seed",
+    );
+
+    // B. True conversation fork from a warm member ("architect" -> "verifier")
+    const addVerRes = await harness.executeTool(SWARM_TOOL, {
+      action: "add",
+      name: "verifier",
+      role: "validator",
+      workspace: "inherit",
+      fork: "architect",
+      brief: "Audit API spec derived from architect's conversation.",
+    });
+    assert.equal(addVerRes.isError, undefined);
+    await waitFor(() => spawnedByName.get("verifier")?.handle.getState() === "waiting");
+
+    const verTracker = spawnedByName.get("verifier")!;
+    assert.ok(
+      verTracker.seedMessages!.some((m: any) =>
+        JSON.stringify(m.content).includes("Initial turn by architect completed"),
+      ),
+      "Forking from warm member must seed that member's conversation messages",
+    );
+
+    // C. Channels + Sharded `tasks[]` + `@#backend` wakeup + rejecting `@#main`
+    const chRes = await harness.executeTool(SWARM_TOOL, {
+      action: "channel",
+      op: "create",
+      channel: "backend",
+      topic: "Backend endpoints",
+    });
+    assert.equal(chRes.isError, undefined);
+
+    const shardRes = await harness.executeTool(SWARM_TOOL, {
+      action: "add",
+      name: "api",
+      role: "worker",
+      workspace: "inherit",
+      channels: ["backend"],
+      tasks: ["auth endpoint", "billing endpoint"],
+      brief: "Implement assigned endpoint slice",
+    });
+    assert.equal(shardRes.isError, undefined);
+    assert.equal(shardRes.details.members.length, 2);
+
+    await waitFor(
+      () =>
+        spawnedByName.get("api-1")?.handle.getState() === "waiting" &&
+        spawnedByName.get("api-2")?.handle.getState() === "waiting",
+    );
+
+    // Broadcast to @#backend wakes BOTH api-1 and api-2 (NOT architect)
+    const chPost = await harness.executeTool(POST_MESSAGE_TOOL, {
+      channel: "backend",
+      text: "@#backend Align on shared error envelope schema.",
+    });
+    assert.equal(chPost.isError, undefined);
+
+    await waitFor(
+      () =>
+        (spawnedByName.get("api-1")?.wakeCount ?? 0) === 1 &&
+        (spawnedByName.get("api-2")?.wakeCount ?? 0) === 1,
+    );
+    await waitFor(
+      () =>
+        spawnedByName.get("api-1")?.handle.getState() === "waiting" &&
+        spawnedByName.get("api-2")?.handle.getState() === "waiting",
+    );
+    assert.equal(spawnedByName.get("architect")?.wakeCount, 0);
+
+    // `@#main` mention must be rejected cleanly
+    const badMainPost = await harness.executeTool(POST_MESSAGE_TOOL, {
+      text: "@#main should be rejected",
+    });
+    assert.equal(badMainPost.isError, true);
+    assert.match(badMainPost.content[0].text, /INVALID_CHANNEL/);
+
+    // Verify `/swarm board --channel backend --search envelope` zero-turn filter
+    const beforeBoardIdx = harness.sentMessages.length;
+    await harness.runCommand("swarm", "board 10 --channel backend --search envelope");
+    const boardView = harness.sentMessages[beforeBoardIdx]!;
+    assert.equal(boardView.options?.triggerTurn, false);
+    assert.match(String(boardView.message.content), /\[#backend\]/);
+    assert.match(String(boardView.message.content), /error envelope schema/);
+
+    // D. Hot Model Switch via `/swarm model` (role default + null clear + live waiting member) & `swarm{action:"model"}`
+    // 1) Set role default persisted to project `.pi/pi-swarm-settings.json`
+    await harness.runCommand("swarm", "model worker google/gemini-2.5-pro high");
+    const projSettingsPath = path.join(repoDir, ".pi", SWARM_SETTINGS_FILE);
+    const saved1 = JSON.parse(await readFile(projSettingsPath, "utf8"));
+    assert.equal(saved1.workerModel, "google/gemini-2.5-pro");
+    assert.equal(saved1.workerThinkingLevel, "high");
+
+    // 2) Clear role default with `default` -> writes explicit `null` in project JSON!
+    await harness.runCommand("swarm", "model worker default");
+    const saved2 = JSON.parse(await readFile(projSettingsPath, "utf8"));
+    assert.equal(saved2.workerModel, null, "Clearing role default must persist null in project settings");
+
+    // 3) Hot-switch live waiting member via `/swarm model api-1 openai/gpt-5.2 high`
+    const api1Tracker = spawnedByName.get("api-1")!;
+    const msgCountBeforeSwitch = api1Tracker.conversationMessages.length;
+    await harness.runCommand("swarm", "model api-1 openai/gpt-5.2 high");
+    assert.equal(api1Tracker.modelSwitches.length, 1);
+    assert.deepEqual(api1Tracker.modelSwitches[0], {
+      model: "openai/gpt-5.2",
+      thinkingLevel: "high",
+    });
+    assert.equal(
+      api1Tracker.conversationMessages.length,
+      msgCountBeforeSwitch,
+      "Hot model switch must preserve full conversation history",
+    );
+
+    // 4) Orchestrator self-switch via `swarm{action:"model"}` (omitted name -> orchestrator!)
+    const orchSwitchRes = await harness.executeTool(SWARM_TOOL, {
+      action: "model",
+      model: "anthropic/claude-opus-4-6",
+      thinking_level: "high",
+      reason: "Complex synthesis phase",
+    });
+    assert.equal(orchSwitchRes.isError, undefined);
+    assert.ok(
+      harness.setModelCalls.some(
+        (c) => c.provider === "anthropic" && c.id === "claude-opus-4-6",
+      ),
+      "swarm{action:'model'} targeting orchestrator must call pi.setModel()",
+    );
+    assert.equal(harness.ctx.model?.id, "claude-opus-4-6");
+
+    // Complete cleanly via `/swarm done` -> zero-turn (0 SWARM_WAKEUP_CUSTOM_TYPE messages!)
+    const wakeupsBeforeSlashDone = harness.sentMessages.filter(
+      (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
+    ).length;
+    await harness.runCommand("swarm", "done Backend API shipped");
+    assert.ok(!harness.pi.getActiveTools().includes(POST_MESSAGE_TOOL));
+    assert.ok(harness.pi.getActiveTools().includes(SWARM_TOOL));
+
+    await new Promise((r) => setTimeout(r, 30));
+    await harness.emit("agent_settled", { aborted: false });
+    await new Promise((r) => setTimeout(r, 30));
+    const wakeupsAfterSlashDone = harness.sentMessages.filter(
+      (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
+    ).length;
+    assert.equal(
+      wakeupsAfterSlashDone,
+      wakeupsBeforeSlashDone,
+      "/swarm done must stay zero-turn (0 SWARM_WAKEUP_CUSTOM_TYPE messages)",
+    );
+
+    await harness.emit("session_shutdown", {});
+  });
+
+  it("3. covers /swarm-direct, /swarm pause/resume, Stall Watchdog [stall] wakeup, /swarm settings, /swarm cancel, completions, and clean session_shutdown disposal", async () => {
+    const repoDir = await createTempGitRepo("lifecycle-stall");
+    tempDirs.push(repoDir);
+
+    // Verify all 19 SWARM_SUBCOMMANDS & parser routing
+    const expectedSubcommands = [
+      "direct",
+      "status",
+      "board",
+      "graph",
+      "tasks",
+      "ui",
+      "models",
+      "model",
+      "merge",
+      "kill",
+      "done",
+      "pause",
+      "resume",
+      "cancel",
+      "teardown",
+      "runs",
+      "focus",
+      "settings",
+      "help",
+    ];
+    assert.deepEqual(
+      SWARM_SUBCOMMANDS.map((c) => c.name),
+      expectedSubcommands,
+    );
+    assert.deepEqual(parseSwarmCommand("graph"), { kind: "graph", rest: "" });
+    assert.deepEqual(parseSwarmCommand("ui members"), { kind: "ui", rest: "members" });
+    assert.deepEqual(parseSwarmCommand("merge author"), { kind: "merge", rest: "author" });
+    assert.deepEqual(parseSwarmCommand("done All verified"), {
+      kind: "done",
+      rest: "All verified",
+    });
+    assert.deepEqual(parseSwarmCommand("status of parser module"), {
+      kind: "goal",
+      rest: "status of parser module",
+    });
+
+    let mutableSettings: SwarmSettings = {
+      ...DEFAULT_SWARM_SETTINGS,
+      stallWatchdogEnabled: true,
+      stallTimeoutMs: 60,
+      keepWorkersWarm: true,
+    };
+
+    const spawned: MockMemberTracker[] = [];
+    const mockTransport: ISwarmTransport = {
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        const tracker = createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async ({ pushAssistantMessage }) => {
+            pushAssistantMessage(`${request.name} finished quietly without pinging orchestrator.`);
+            return {
+              agentId: request.agentId,
+              name: request.name,
+              role: request.role,
+              outcome: "waiting",
+              summary: "Parked silently",
+              tokens: 120,
+              cost: 0.001,
+            };
+          },
+        });
+        spawned.push(tracker);
+        return tracker.handle;
+      },
+    };
+
+    let confirmModalCalled = false;
+    const guardUI: IQuestionnaireUI = {
+      async askQuestion() {
+        return { cancelled: false, answer: "ok", isCustom: false };
+      },
+      async askQuestionnaire() {
+        return { cancelled: false, answers: {}, items: [] };
+      },
+      async confirmProposal() {
+        confirmModalCalled = true;
+        return { action: "confirm", validatorEnabled: true, maxConcurrency: 6 };
+      },
+    };
+
+    const harness = createMockPiHarness(repoDir, { mode: "tui" });
+    const ext = createPiSwarmExtension({
+      transportFactory: () => mockTransport,
+      settingsLoader: async () => ({
+        ...mutableSettings,
+        fallbackModels: [...mutableSettings.fallbackModels],
+      }),
+      settingsSaver: async (_scope, patch) => {
+        mutableSettings = { ...mutableSettings, ...patch };
+        return { ...mutableSettings, fallbackModels: [...mutableSettings.fallbackModels] };
+      },
+      questionnaireUI: guardUI,
+    });
+    ext(harness.pi);
+    await harness.emit("session_start", {});
+
+    // Verify exact registered commands (`["swarm", "swarm-direct"]`) and 7 tools
+    assert.deepEqual(Array.from(harness.commands.keys()).sort(), [
+      "swarm",
+      "swarm-direct",
+    ]);
+    assert.equal(harness.tools.size, 7);
+
+    // Completions include all 19 subcommands
+    const swarmCmd = harness.commands.get("swarm")!;
+    const allCompletions = (await swarmCmd.getArgumentCompletions?.("")) as Array<{
+      label: string;
+    }>;
+    assert.equal(allCompletions.length, expectedSubcommands.length);
+
+    // A. `/swarm-direct` with initial_members spawns immediately without modal!
+    await harness.runCommand("swarm-direct", "Quick audit of repo layout");
+    assert.equal(harness.sentUserMessages.length, 1);
+    assert.match(String(harness.sentUserMessages[0]!.content), /swarm_direct_plan/);
+
+    // Hold idle=false during proposal confirm so we also verify settled-boundary kickoff on agent_settled!
+    harness.setIdle(false);
+    const planRes = await harness.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Quick Audit",
+      objective: "Audit repository files quickly",
+      strategy: "Single initial scout then synthesize",
+      acceptance_criteria: "Summary delivered",
+      base_branch: "main",
+      initial_members: [
         {
-          id: "M1",
-          title: "Add ctrl flag",
-          kind: "build",
-          description: "Write src/ctrl.ts",
-          scope: ["src/ctrl.ts"],
-          deps: [],
-          verification: "file exists",
+          name: "scout",
+          role: "worker",
+          workspace: "inherit",
+          brief: "Inspect project files and stand by.",
         },
       ],
     });
-    assert.equal(harness.selectCalls.length, selectCountBeforeDirect, "autoConfirm skips modal");
-    assert.equal(proposeRes.details.autoConfirmed, true);
-    const runId: string = proposeRes.details.runId;
-    const statePath = path.join(repoDir, SWARM_DIR, SWARM_RUNS_DIR, runId, SWARM_STATE_FILE);
+    assert.equal(planRes.isError, undefined);
+    assert.equal(confirmModalCalled, false, "/swarm-direct must autoConfirm without modal");
+    await waitFor(() => spawned.length === 1);
+    assert.equal(spawned.length, 1, "initial_members must spawn immediately on confirmation");
+    assert.equal(spawned[0]!.name, "scout");
 
-    // 3. `/swarm pause` & `/swarm resume`
-    await harness.runCommand("swarm", "pause Waiting on human review");
-    let st = JSON.parse(await readFile(statePath, "utf8")) as SwarmRunState;
-    assert.equal(st.status, "paused");
-
-    await harness.runCommand("swarm", "resume");
-    st = JSON.parse(await readFile(statePath, "utf8")) as SwarmRunState;
-    assert.equal(st.status, "active");
-
-    // 4. Settled-boundary wakeup coalescing (queued while streaming, ignores aborted, fires once!)
-    harness.setIdle(false);
-    releaseWorker();
-
-    await waitFor(async () => {
-      const latest = JSON.parse(await readFile(statePath, "utf8")) as SwarmRunState;
-      return latest.status === "completed";
-    });
+    // While busy (idle=false), no wakeup should fire yet
     await new Promise((r) => setTimeout(r, 30));
     assert.equal(
       harness.sentMessages.filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE).length,
       0,
-      "Wakeup must NOT dispatch while ctx.isIdle() === false",
     );
 
+    // Transition to idle and emit `agent_settled` -> single kickoff wakeup fires!
     harness.setIdle(true);
-    await harness.emit("agent_settled", { type: "agent_settled", aborted: true });
+    await harness.emit("agent_settled", { aborted: false });
     assert.equal(
       harness.sentMessages.filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE).length,
-      0,
+      1,
     );
 
-    await harness.emit("agent_settled", { type: "agent_settled", aborted: false });
-    const wakeups = harness.sentMessages.filter(
+    // B. Zero-Token Stall Watchdog `[stall]` alert + coalesced wakeup!
+    // `scout` parked silently in `waiting` and no `swarm_wait` is active -> watchdog fires after 60ms!
+    await waitFor(() =>
+      harness.sentMessages.some(
+        (m) =>
+          m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE &&
+          (m.message.details as any)?.stallDetected === true,
+      ),
+    );
+    const stallWakeups = harness.sentMessages.filter(
+      (m) =>
+        m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE &&
+        (m.message.details as any)?.stallDetected === true,
+    );
+    assert.equal(
+      stallWakeups.length,
+      1,
+      "Stall watchdog stall_detected + wakeup_needed must coalesce into 1 wakeup message",
+    );
+    assert.match(String(stallWakeups[0]!.message.content), /Stall Alert|stalled/i);
+
+    // Verify `[stall]` message was posted by `monitor` on the board
+    const boardAfterStall = await harness.executeTool(READ_BOARD_TOOL, { since: 0, limit: 20 });
+    assert.match(String(boardAfterStall.content[0].text), /\[stall\]/);
+
+    // C. `/swarm pause` purges stale queued wakeups (0 ghost wakeup turns), then `/swarm resume`
+    const wakeupsBeforePause = harness.sentMessages.filter(
       (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
-    );
-    assert.equal(wakeups.length, 1);
-    assert.equal(wakeups[0]!.options?.triggerTurn, true);
-
-    await harness.emit("agent_settled", { type: "agent_settled", aborted: false });
+    ).length;
+    harness.setIdle(false);
+    await spawned[0]!.request.engineApi!.postMessage({
+      text: "@orchestrator queued update right before pause",
+      kind: "update",
+    });
+    await harness.runCommand("swarm", "pause taking a short break");
+    harness.setIdle(true);
+    await new Promise((r) => setTimeout(r, 30));
+    await harness.emit("agent_settled", { aborted: false });
     assert.equal(
       harness.sentMessages.filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE).length,
-      1,
+      wakeupsBeforePause,
+      "/swarm pause must purge stale queued wakeups",
     );
+    const statusPaused = await harness.executeTool(SWARM_TOOL, { action: "status" });
+    assert.match(String(statusPaused.content[0].text), /status=paused/);
 
-    // 5. `/swarm kill` & `/swarm cancel` on a live run (disposes BOTH working & waiting warm handles and writes exactly ONE `run_abandoned` event!)
-    let releaseM1Gate!: () => void;
-    const m1Gate = new Promise<void>((resolve) => {
-      releaseM1Gate = resolve;
-    });
-    let releaseM3Gate!: () => void;
-    const m3Gate = new Promise<void>((resolve) => {
-      releaseM3Gate = resolve;
-    });
-    const cancelTrackers = new Map<string, MockWarmHandleTracker>();
+    await harness.runCommand("swarm", "resume");
+    const statusActive = await harness.executeTool(SWARM_TOOL, { action: "status" });
+    assert.match(String(statusActive.content[0].text), /status=active/);
 
-    const killHarness = createMockPiHarness(repoDir, { sessionId: "sess-kill-cancel" });
-    createPiSwarmExtension({
-      transportFactory: () => ({
-        async spawnWorker(request: WorkerSpawnRequest): Promise<PersistentAgentHandle> {
-          const t = createMockPersistentHandle({
-            agentId: request.agentId,
-            name: request.name,
-            missionId: request.mission.id,
-            role: "worker",
-            keepWarm: true,
-            initialPrompt: request.prompt,
-            onAbort: () => {
-              if (request.mission.id === "M1") releaseM1Gate();
-              if (request.mission.id === "M3") releaseM3Gate();
-            },
-            runInitialTurn: async () => {
-              if (request.mission.id === "M2") {
-                // Artifact completes quickly and parks in warm `waiting` state awaiting human sign-off
-                const docPath = path.join(request.worktreePath, "docs", "cancel-artifact.md");
-                await mkdir(path.dirname(docPath), { recursive: true });
-                await writeFile(docPath, "# Pending artifact\n", "utf8");
-                await git(request.worktreePath, ["add", "docs/cancel-artifact.md"]);
-                await git(request.worktreePath, [
-                  "-c",
-                  "user.name=Worker M2",
-                  "-c",
-                  "user.email=m2@local",
-                  "commit",
-                  "-m",
-                  "docs: add pending artifact",
-                ]);
-                return {
-                  agentId: request.agentId,
-                  name: request.name,
-                  missionId: "M2",
-                  role: "worker",
-                  outcome: "completed",
-                  summary: "Artifact ready and parked warm",
-                  workerDone: { missionId: "M2", summary: "Artifact ready" },
-                  tokens: 50,
-                  cost: 0,
-                };
-              }
-              if (request.mission.id === "M1") {
-                await m1Gate;
-              } else {
-                await m3Gate;
-              }
-              return {
-                agentId: request.agentId,
-                name: request.name,
-                missionId: request.mission.id,
-                role: "worker",
-                outcome: "aborted",
-                summary: "Terminated",
-                tokens: 20,
-                cost: 0,
-              };
-            },
-          });
-          cancelTrackers.set(request.mission.id, t);
-          return t.handle;
-        },
-        async spawnValidator(): Promise<PersistentAgentHandle> {
-          throw new Error("Unexpected validator");
-        },
-      }),
-      settingsLoader: async () => ({
-        ...testSettings,
-        maxConcurrency: 3,
-      }),
-    })(killHarness.pi);
-
-    await killHarness.emit("session_start", { type: "session_start", reason: "startup" });
-    await killHarness.runCommand("swarm-direct", "Killable and cancellable fleet");
-    const cancelPropose = await killHarness.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
-      objective: "Killable and cancellable fleet",
-      base_branch: "main",
-      max_concurrency: 3,
-      validator_enabled: false,
-      final_validator_enabled: false,
-      verification_contract: "none",
-      missions: [
-        {
-          id: "M1",
-          title: "Working build mission",
-          kind: "build",
-          description: "Remains actively working until /swarm cancel.",
-          scope: ["src/cancel-m1.ts"],
-          deps: [],
-          verification: "n/a",
-        },
-        {
-          id: "M2",
-          title: "Warm waiting artifact",
-          kind: "artifact",
-          description: "Completes and parks in waiting warm state until /swarm cancel.",
-          scope: ["docs/"],
-          deps: [],
-          verification: "n/a",
-        },
-        {
-          id: "M3",
-          title: "Killable work item",
-          kind: "build",
-          description: "Killed explicitly via /swarm kill.",
-          scope: ["src/kill-m3.ts"],
-          deps: [],
-          verification: "n/a",
-        },
-      ],
-    });
-    const cancelRunId: string = cancelPropose.details.runId;
-    const cancelStatePath = path.join(
-      repoDir,
-      SWARM_DIR,
-      SWARM_RUNS_DIR,
-      cancelRunId,
-      SWARM_STATE_FILE,
-    );
-
-    await waitFor(async () => {
-      const m1 = cancelTrackers.get("M1");
-      const m2 = cancelTrackers.get("M2");
-      const m3 = cancelTrackers.get("M3");
-      if (!m1 || !m2 || !m3) return false;
-      if (m1.handle.getState() !== "working" || m2.handle.getState() !== "waiting" || m3.handle.getState() !== "working") {
-        return false;
+    // D. `/swarm settings` interactive toggle
+    let settingsStep = 0;
+    harness.setSelectHandler((_title, choices) => {
+      settingsStep += 1;
+      if (settingsStep === 1) {
+        return choices.find((c) => c.startsWith("stallWatchdogEnabled:"));
       }
-      const latest = JSON.parse(await readFile(cancelStatePath, "utf8")) as SwarmRunState;
-      return latest.roster[m2.agentId]?.status === "waiting";
+      return "Done";
     });
+    await harness.runCommand("swarm", "settings");
+    assert.equal(mutableSettings.stallWatchdogEnabled, false);
 
-    const m1Tracker = cancelTrackers.get("M1")!;
-    const m2Tracker = cancelTrackers.get("M2")!;
-    const m3Tracker = cancelTrackers.get("M3")!;
+    // E. `/swarm runs`, `/swarm focus none` (purges queued wakeups), `/swarm focus <id>`, `/swarm help`
+    await harness.runCommand("swarm", "runs");
+    await harness.runCommand("swarm", "help");
+    const wakeupsBeforeUnfocus = harness.sentMessages.filter(
+      (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
+    ).length;
+    harness.setIdle(false);
+    await spawned[0]!.request.engineApi!.postMessage({
+      text: "@orchestrator queued update right before focus none",
+      kind: "update",
+    });
+    await harness.runCommand("swarm", "focus none");
+    harness.setIdle(true);
+    await new Promise((r) => setTimeout(r, 30));
+    await harness.emit("agent_settled", { aborted: false });
+    assert.equal(
+      harness.sentMessages.filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE).length,
+      wakeupsBeforeUnfocus,
+      "/swarm focus none must purge stale queued wakeups",
+    );
+    assert.ok(!harness.pi.getActiveTools().includes(POST_MESSAGE_TOOL));
 
-    // Kill M3 explicitly via `/swarm kill M3 "stuck test"`
-    await killHarness.runCommand("swarm", 'kill M3 "stuck test"');
-    assert.equal(m3Tracker.killed, true);
-    assert.equal(m3Tracker.handle.getState(), "killed");
-    assert.equal(m1Tracker.handle.getState(), "working");
-    assert.equal(m2Tracker.handle.getState(), "waiting");
+    const runId: string = planRes.details.runId;
+    await harness.runCommand("swarm", `focus ${runId}`);
+    assert.ok(harness.pi.getActiveTools().includes(POST_MESSAGE_TOOL));
 
-    // Abandon run via `/swarm cancel` -> MUST dispose BOTH working (M1) AND waiting warm (M2) handles!
-    killHarness.setConfirmHandler(() => true);
-    await killHarness.runCommand("swarm", "cancel");
+    // F. `/swarm cancel` on focused run -> purges queued wakeups, stops/kills members, marks abandoned, restores idle tools
+    const wakeupsBeforeCancel = harness.sentMessages.filter(
+      (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
+    ).length;
+    harness.setIdle(false);
+    await spawned[0]!.request.engineApi!.postMessage({
+      text: "@orchestrator queued update right before cancel",
+      kind: "update",
+    });
+    harness.setConfirmHandler(() => true);
+    await harness.runCommand("swarm", "cancel");
+    harness.setIdle(true);
+    await new Promise((r) => setTimeout(r, 30));
+    await harness.emit("agent_settled", { aborted: false });
+    assert.equal(
+      harness.sentMessages.filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE).length,
+      wakeupsBeforeCancel,
+      "/swarm cancel must purge stale queued wakeups",
+    );
+    assert.ok(!harness.pi.getActiveTools().includes(POST_MESSAGE_TOOL));
+    assert.equal(spawned[0]!.killed, true);
 
-    assert.equal(
-      m1Tracker.killed,
-      true,
-      "/swarm cancel must kill & dispose actively working warm handle (M1)",
-    );
-    assert.equal(m1Tracker.handle.getState(), "killed");
-    assert.equal(
-      m2Tracker.killed,
-      true,
-      "/swarm cancel must kill & dispose warm waiting handle (M2)",
-    );
-    assert.equal(m2Tracker.handle.getState(), "killed");
-
-    const cancelledState = JSON.parse(await readFile(cancelStatePath, "utf8")) as SwarmRunState;
-    assert.equal(cancelledState.status, "abandoned");
-    assert.equal(cancelledState.roster[m1Tracker.agentId]?.status, "killed");
-    assert.equal(cancelledState.roster[m2Tracker.agentId]?.status, "killed");
-    assert.equal(cancelledState.roster[m3Tracker.agentId]?.status, "killed");
-
-    const cancelEvents = (
-      await readFile(
-        path.join(repoDir, SWARM_DIR, SWARM_RUNS_DIR, cancelRunId, SWARM_EVENTS_FILE),
-        "utf8",
-      )
-    )
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line) as { type: string });
-    assert.equal(
-      cancelEvents.filter((e) => e.type === "agent_killed").length,
-      3,
-      "All 3 handles (M3 explicit kill + M1 working + M2 waiting on cancel) must record agent_killed",
-    );
-    assert.equal(
-      cancelEvents.filter((e) => e.type === "run_abandoned").length,
-      1,
-      "/swarm cancel must write exactly ONE run_abandoned ledger event",
-    );
-
-    // 6. Idempotent `session_shutdown` cleans up widget, status, shortcuts & orchestrator cleanly
-    await harness.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
-    await harness.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
-    await killHarness.emit("session_shutdown", { type: "session_shutdown", reason: "quit" });
-
-    assert.equal(
-      harness.widgetHistory[harness.widgetHistory.length - 1]?.key,
-      SWARM_WIDGET_KEY,
-    );
-    assert.equal(
-      harness.widgetHistory[harness.widgetHistory.length - 1]?.value,
-      undefined,
-    );
-    assert.equal(
-      harness.statusHistory[harness.statusHistory.length - 1]?.key,
-      SWARM_STATUS_KEY,
-    );
-    assert.equal(
-      harness.statusHistory[harness.statusHistory.length - 1]?.text,
-      undefined,
-    );
+    // G. Clean idempotent `session_shutdown` disposal
+    assert.ok(harness.terminalInputHandlers.size > 0);
+    await harness.emit("session_shutdown", {});
+    await harness.emit("session_shutdown", {}); // idempotent second call
     assert.equal(harness.terminalInputHandlers.size, 0);
+    assert.equal(harness.widgetHistory[harness.widgetHistory.length - 1]?.value, undefined);
+    assert.equal(harness.statusHistory[harness.statusHistory.length - 1]?.text, undefined);
   });
 });

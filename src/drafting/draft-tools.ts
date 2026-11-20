@@ -10,36 +10,34 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
 import {
-  DEFAULT_SWARM_SETTINGS,
+  CHANNEL_NAME_PATTERN,
+  MEMBER_NAME_PATTERN,
   PROPOSE_SWARM_PLAN_TOOL,
+  RESERVED_MEMBER_NAMES,
   SWARM_QUESTIONNAIRE_TOOL,
   SWARM_QUESTION_TOOL,
+  type ReservedMemberName,
 } from "../constants.js";
 import {
   isSwarmProtocolError,
+  type InitialMemberProposal,
   type IQuestionnaireUI,
   type ISwarmStore,
   type IWorktreeManager,
-  type MissionKind,
-  type MissionPlanInput,
-  type MissionTaskInput,
-  type PlanValidationIssue,
-  type PlanValidationResult,
   type ProposalDialogOutcome,
   type ProposedSwarmPlan,
   type QuestionAnswer,
   type QuestionOption,
   type QuestionSpec,
+  type SwarmErrorCode,
+  type SwarmMemberRole,
   type SwarmRoleModelConfig,
   type SwarmRoleModels,
   type SwarmRunState,
   type SwarmSettings,
+  type SwarmWorkspaceMode,
 } from "../types.js";
-import {
-  computePreviewBranches,
-  computePreviewWaves,
-  formatProposalTranscriptSummary,
-} from "./draft-prompts.js";
+import { formatProposalTranscriptSummary } from "./draft-prompts.js";
 import { DraftStateController, type SwarmDraftState } from "./draft-state.js";
 
 // ============================================================================
@@ -47,8 +45,8 @@ import { DraftStateController, type SwarmDraftState } from "./draft-state.js";
 // ============================================================================
 
 export interface DraftingDeps {
-  store: ISwarmStore;
-  worktree: IWorktreeManager;
+  store?: ISwarmStore;
+  worktree?: IWorktreeManager;
   ui: IQuestionnaireUI;
   getSettings: () => SwarmSettings;
   onPlanConfirmed: (
@@ -61,6 +59,13 @@ export interface DraftingDeps {
   draftController?: DraftStateController;
   /** Optional hook fired when active draft state changes (for widget/status sync). */
   onDraftChanged?: (draft: SwarmDraftState | null, ctx: ExtensionContext) => void;
+}
+
+export interface DraftPlanValidationIssue {
+  code: SwarmErrorCode;
+  message: string;
+  memberName?: string;
+  field?: string;
 }
 
 export interface SwarmQuestionToolDetails {
@@ -83,12 +88,10 @@ export interface ProposeSwarmPlanToolDetails {
   outcome: "confirmed" | "continue" | "cancelled" | "validation_error" | "error";
   runId?: string;
   plan?: ProposedSwarmPlan;
-  waves?: string[][];
-  branches?: Record<string, string>;
   autoConfirmed?: boolean;
   feedback?: string;
-  errors?: PlanValidationIssue[];
-  errorCode?: string;
+  errors?: DraftPlanValidationIssue[];
+  errorCode?: SwarmErrorCode | string;
   errorMessage?: string;
 }
 
@@ -152,84 +155,87 @@ export const SwarmQuestionnaireParamsSchema = Type.Object({
   }),
 });
 
-const MissionKindSchema = Type.Unsafe<MissionKind>(
-  StringEnum(["build", "artifact", "survey"] as const, {
+const InitialMemberRoleSchema = Type.Unsafe<SwarmMemberRole>(
+  StringEnum(["worker", "validator"] as const, {
     description:
-      'Mission kind: "build" (code changes, disjoint scope, Per-Mission Validator gate + merge), "artifact" (deliverables requiring human approval before merge), or "survey" (read-only research, non-exclusive scope, zero-diff closure).',
+      'Member role: "worker" (full workspace access & able to add helpers) or "validator" (independent read-only auditor).',
   }),
 );
 
-const MissionTaskObjectSchema = Type.Object({
-  id: Type.Optional(Type.String({ description: "Optional checklist task ID." })),
-  title: Type.String({ description: "Checklist task title." }),
-  done: Type.Optional(Type.Boolean({ description: "Whether already completed (default false)." })),
-});
-
-const MissionPlanItemSchema = Type.Object({
-  id: Type.String({ description: 'Short unique mission ID (e.g. "M1", "M2").' }),
-  title: Type.String({
-    description: "Printable ASCII mission title used to derive the feat/<slug> git branch.",
-  }),
-  kind: MissionKindSchema,
-  description: Type.String({ description: "Clear, self-contained mission specification." }),
-  scope: Type.Array(Type.String(), {
+const InitialMemberWorkspaceSchema = Type.Unsafe<SwarmWorkspaceMode>(
+  StringEnum(["inherit", "share", "branch"] as const, {
     description:
-      "POSIX relative paths/prefixes owned by this mission. Must be pairwise-disjoint across all build missions.",
+      'Workspace mode: "inherit" (default, shared repo root for read-only scouting/validation), "share" (isolated Git worktree on a new branch), or "branch" (isolated Git worktree clone).',
   }),
-  deps: Type.Array(Type.String(), {
-    description: "Upstream mission IDs that must finish/merge before this mission starts.",
+);
+
+export const InitialMemberProposalSchema = Type.Object({
+  name: Type.String({
+    description:
+      'Unique short lowercase member handle matching /^[a-z][a-z0-9-]{0,31}$/ (e.g. "scout", "parser", "verifier"). Reserved names (orchestrator, coordinator, all, monitor) are forbidden.',
   }),
-  verification: Type.String({
-    description: "Concrete commands or checks proving this mission is complete.",
+  role: InitialMemberRoleSchema,
+  brief: Type.String({
+    description:
+      "Public assignment posted on the shared Message Board: what this member owns, constraints, and what done looks like.",
   }),
-  tasks: Type.Optional(
-    Type.Array(MissionTaskObjectSchema, {
-      description: "Optional checklist subtasks for progress tracking.",
+  workspace: Type.Optional(InitialMemberWorkspaceSchema),
+  channels: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        'Optional additional board channels to subscribe this member to (e.g. ["backend", "api"]). "main" is always included.',
     }),
   ),
 });
 
 export const ProposeSwarmPlanParamsSchema = Type.Object({
-  objective: Type.String({ description: "Overall objective of this Swarm run." }),
+  title: Type.String({
+    description: "Short human-readable title for this Dynamic Swarm run.",
+  }),
+  objective: Type.String({
+    description: "Overall objective of this Swarm run.",
+  }),
+  strategy: Type.String({
+    description:
+      "Phased dynamic orchestration plan — how the Orchestrator will scout, partition work, spawn/adapt members wave-by-wave, and verify results on the shared Message Board.",
+  }),
+  acceptance_criteria: Type.String({
+    description:
+      'Concrete, testable definition of "what done looks like" (commands, test suites, typechecks, and behavioral checks).',
+  }),
   base_branch: Type.Optional(
     Type.String({
-      description: "Target local git branch to fork mission branches from and merge back into.",
+      description:
+        "Target local git branch to base isolated worktrees on and merge clean work back into.",
     }),
   ),
   max_concurrency: Type.Optional(
-    Type.Number({
+    Type.Integer({
       minimum: 1,
-      description: "Maximum parallel Workers/Validators (defaults to draft/settings).",
+      description: "Maximum parallel working Swarm members (defaults to draft/settings).",
     }),
   ),
   validator_enabled: Type.Optional(
     Type.Boolean({
       description:
-        "Whether build missions require an independent read-only Per-Mission Validator gate pinned to tip SHA.",
+        "Whether independent read-only Validator review policy is enabled by default for this Swarm run.",
     }),
   ),
-  final_validator_enabled: Type.Optional(
-    Type.Boolean({
+  initial_members: Type.Optional(
+    Type.Array(InitialMemberProposalSchema, {
       description:
-        "Whether an independent read-only Final Validator audits the integrated base branch against verification_contract after all missions merge.",
+        "Optional initial researchers/scouts or first wave of workers/validators to spawn at launch. Leave omitted/empty to spawn dynamically after launch.",
     }),
   ),
-  verification_contract: Type.String({
-    description:
-      "Run-level verification contract proving the full objective is met (audited post-merge by the independent Final Validator).",
-  }),
-  missions: Type.Array(MissionPlanItemSchema, {
-    minItems: 1,
-    description: "Acyclic Mission DAG with pairwise-disjoint build scopes and ASCII titles.",
-  }),
 });
 
 export type SwarmQuestionParams = Static<typeof SwarmQuestionParamsSchema>;
 export type SwarmQuestionnaireParams = Static<typeof SwarmQuestionnaireParamsSchema>;
+export type InitialMemberProposalParams = Static<typeof InitialMemberProposalSchema>;
 export type ProposeSwarmPlanParams = Static<typeof ProposeSwarmPlanParamsSchema>;
 
 // ============================================================================
-// Normalization & Helper Utilities
+// Normalization, Role Models & Pre-Modal Validation Helpers
 // ============================================================================
 
 function buildRoleModelConfig(
@@ -245,8 +251,8 @@ function buildRoleModelConfig(
 
 /**
  * Derives the active 3-role model configuration (`orchestrator`, `worker`, `validator`,
- * plus `fallbackModels`) from `SwarmSettings` so the confirmation modal and plan summary
- * display the exact model trio that will execute the run.
+ * plus `fallbackModels`) from `SwarmSettings` so the confirmation modal and proposal
+ * transcript display the exact model trio that will execute the run.
  */
 export function buildRoleModelsFromSettings(
   settings: Pick<
@@ -338,67 +344,220 @@ function normalizeRawOptions(raw: unknown): QuestionOption[] {
   return normalized;
 }
 
-function normalizeRawTasks(
-  raw: unknown,
-): Array<{ id?: string; title: string; done?: boolean }> | undefined {
-  if (!Array.isArray(raw)) {
-    return undefined;
-  }
-  const tasks: Array<{ id?: string; title: string; done?: boolean }> = [];
-  for (const item of raw) {
-    if (typeof item === "string") {
-      const title = item.trim();
-      if (title) {
-        tasks.push({ title });
-      }
-      continue;
-    }
-    if (item && typeof item === "object") {
-      const obj = item as Record<string, unknown>;
-      const title = typeof obj.title === "string" ? obj.title.trim() : "";
-      if (!title) {
-        continue;
-      }
-      const normalized: { id?: string; title: string; done?: boolean } = { title };
-      if (typeof obj.id === "string" && obj.id.trim()) {
-        normalized.id = obj.id.trim();
-      }
-      if (typeof obj.done === "boolean") {
-        normalized.done = obj.done;
-      }
-      tasks.push(normalized);
-    }
-  }
-  return tasks.length > 0 ? tasks : undefined;
+function isValidMemberRole(value: unknown): value is SwarmMemberRole {
+  return value === "worker" || value === "validator";
 }
 
-function normalizeMissionInputs(
-  rawMissions: ProposeSwarmPlanParams["missions"],
-): MissionPlanInput[] {
-  return rawMissions.map((m) => {
-    const tasks: MissionTaskInput[] | undefined = m.tasks
-      ? m.tasks.map((t) => ({
-          ...(t.id ? { id: t.id.trim() } : {}),
-          title: t.title.trim(),
-          ...(t.done !== undefined ? { done: t.done } : {}),
-        }))
-      : undefined;
+function isValidWorkspaceMode(value: unknown): value is SwarmWorkspaceMode {
+  return value === "inherit" || value === "share" || value === "branch";
+}
 
-    return {
-      id: m.id.trim(),
-      title: m.title.trim(),
-      kind: m.kind,
-      description: m.description.trim(),
-      scope: m.scope.map((s) => s.trim()).filter(Boolean),
-      deps: m.deps.map((d) => d.trim()).filter(Boolean),
-      verification: m.verification.trim(),
-      ...(tasks && tasks.length > 0 ? { tasks } : {}),
-    };
-  });
+function isReservedMemberName(name: string): name is ReservedMemberName {
+  return (RESERVED_MEMBER_NAMES as readonly string[]).includes(name);
+}
+
+/**
+ * Validates `propose_swarm_plan` parameters BEFORE opening any confirmation modal.
+ * Verifies non-empty `title`/`objective`/`strategy`/`acceptance_criteria`, and checks
+ * `initial_members` against `MEMBER_NAME_PATTERN`, `RESERVED_MEMBER_NAMES`, uniqueness,
+ * valid role/workspace/brief, and valid `CHANNEL_NAME_PATTERN` channels.
+ */
+export function validateProposedSwarmPlan(
+  params: ProposeSwarmPlanParams,
+):
+  | {
+      valid: true;
+      title: string;
+      objective: string;
+      strategy: string;
+      acceptanceCriteria: string;
+      initialMembers?: InitialMemberProposal[];
+    }
+  | {
+      valid: false;
+      issues: DraftPlanValidationIssue[];
+    } {
+  const issues: DraftPlanValidationIssue[] = [];
+
+  const title = typeof params.title === "string" ? params.title.trim() : "";
+  const objective =
+    typeof params.objective === "string" ? params.objective.trim() : "";
+  const strategy =
+    typeof params.strategy === "string" ? params.strategy.trim() : "";
+  const acceptanceCriteria =
+    typeof params.acceptance_criteria === "string"
+      ? params.acceptance_criteria.trim()
+      : "";
+
+  if (!title) {
+    issues.push({
+      code: "INVALID_INPUT",
+      field: "title",
+      message: "Plan title must not be empty.",
+    });
+  }
+  if (!objective) {
+    issues.push({
+      code: "INVALID_INPUT",
+      field: "objective",
+      message: "Plan objective must not be empty.",
+    });
+  }
+  if (!strategy) {
+    issues.push({
+      code: "INVALID_INPUT",
+      field: "strategy",
+      message: "Plan strategy must not be empty.",
+    });
+  }
+  if (!acceptanceCriteria) {
+    issues.push({
+      code: "INVALID_INPUT",
+      field: "acceptance_criteria",
+      message: "Plan acceptance_criteria must not be empty.",
+    });
+  }
+
+  const normalizedMembers: InitialMemberProposal[] = [];
+  const seenNames = new Set<string>();
+  const rawMembers = Array.isArray(params.initial_members)
+    ? params.initial_members
+    : [];
+
+  for (let i = 0; i < rawMembers.length; i++) {
+    const raw = rawMembers[i];
+    if (!raw || typeof raw !== "object") {
+      issues.push({
+        code: "INVALID_INPUT",
+        field: "initial_members",
+        memberName: `#${i + 1}`,
+        message: `Initial member #${i + 1} must be an object.`,
+      });
+      continue;
+    }
+
+    const name = typeof raw.name === "string" ? raw.name.trim() : "";
+    const memberTag = name || `#${i + 1}`;
+
+    if (!name || !MEMBER_NAME_PATTERN.test(name)) {
+      issues.push({
+        code: "INVALID_NAME",
+        field: "initial_members",
+        memberName: memberTag,
+        message: `Initial member name "${name}" is invalid — must match ${MEMBER_NAME_PATTERN.source} (lowercase letters, digits, hyphens; 1–32 chars starting with a–z).`,
+      });
+    } else if (isReservedMemberName(name)) {
+      issues.push({
+        code: "INVALID_NAME",
+        field: "initial_members",
+        memberName: name,
+        message: `Initial member name "${name}" is reserved (${RESERVED_MEMBER_NAMES.join(", ")}) and cannot be used.`,
+      });
+    } else if (seenNames.has(name)) {
+      issues.push({
+        code: "DUPLICATE_MEMBER",
+        field: "initial_members",
+        memberName: name,
+        message: `Duplicate initial member name "${name}" — every member must have a unique name.`,
+      });
+    } else {
+      seenNames.add(name);
+    }
+
+    if (!isValidMemberRole(raw.role)) {
+      issues.push({
+        code: "INVALID_INPUT",
+        field: "role",
+        memberName: memberTag,
+        message: `Initial member "${memberTag}" has invalid role "${String(raw.role)}"; expected "worker" or "validator".`,
+      });
+    }
+
+    const brief = typeof raw.brief === "string" ? raw.brief.trim() : "";
+    if (!brief) {
+      issues.push({
+        code: "INVALID_INPUT",
+        field: "brief",
+        memberName: memberTag,
+        message: `Initial member "${memberTag}" must have a non-empty brief.`,
+      });
+    }
+
+    if (raw.workspace !== undefined && !isValidWorkspaceMode(raw.workspace)) {
+      issues.push({
+        code: "INVALID_INPUT",
+        field: "workspace",
+        memberName: memberTag,
+        message: `Initial member "${memberTag}" has invalid workspace "${String(raw.workspace)}"; expected "inherit", "share", or "branch".`,
+      });
+    }
+
+    let normalizedChannels: string[] | undefined;
+    if (raw.channels !== undefined) {
+      if (!Array.isArray(raw.channels)) {
+        issues.push({
+          code: "INVALID_CHANNEL",
+          field: "channels",
+          memberName: memberTag,
+          message: `Initial member "${memberTag}" channels must be an array of channel names.`,
+        });
+      } else {
+        const deduped: string[] = [];
+        const seenChannels = new Set<string>();
+        for (const ch of raw.channels) {
+          const trimmedCh = typeof ch === "string" ? ch.trim() : "";
+          if (!trimmedCh || !CHANNEL_NAME_PATTERN.test(trimmedCh)) {
+            issues.push({
+              code: "INVALID_CHANNEL",
+              field: "channels",
+              memberName: memberTag,
+              message: `Initial member "${memberTag}" has invalid channel "${trimmedCh}" — must match ${CHANNEL_NAME_PATTERN.source}.`,
+            });
+            continue;
+          }
+          if (!seenChannels.has(trimmedCh)) {
+            seenChannels.add(trimmedCh);
+            deduped.push(trimmedCh);
+          }
+        }
+        if (deduped.length > 0) {
+          normalizedChannels = deduped;
+        }
+      }
+    }
+
+    if (
+      name &&
+      isValidMemberRole(raw.role) &&
+      brief &&
+      (raw.workspace === undefined || isValidWorkspaceMode(raw.workspace))
+    ) {
+      normalizedMembers.push({
+        name,
+        role: raw.role,
+        brief,
+        ...(raw.workspace !== undefined ? { workspace: raw.workspace } : {}),
+        ...(normalizedChannels ? { channels: normalizedChannels } : {}),
+      });
+    }
+  }
+
+  if (issues.length > 0) {
+    return { valid: false, issues };
+  }
+
+  return {
+    valid: true,
+    title,
+    objective,
+    strategy,
+    acceptanceCriteria,
+    ...(normalizedMembers.length > 0 ? { initialMembers: normalizedMembers } : {}),
+  };
 }
 
 async function resolveBaseBranch(
-  worktree: IWorktreeManager,
+  worktree: IWorktreeManager | undefined,
   explicitBranch: string | undefined,
   draftBranch: string | undefined,
   cwd: string,
@@ -409,38 +568,28 @@ async function resolveBaseBranch(
   if (draftBranch?.trim()) {
     return draftBranch.trim();
   }
-  try {
-    const current = await worktree.getCurrentBranch(cwd);
-    if (current.trim()) {
-      return current.trim();
+  if (worktree) {
+    try {
+      const current = await worktree.getCurrentBranch(cwd);
+      if (current.trim()) {
+        return current.trim();
+      }
+    } catch {
+      // Repo may not be initialized yet during upfront drafting; fall back cleanly.
     }
-  } catch {
-    // Repo may not be initialized yet during upfront drafting; fall back cleanly.
   }
   return "main";
 }
 
-async function safeListLocalBranches(worktree: IWorktreeManager): Promise<string[]> {
-  try {
-    return await worktree.listLocalBranches();
-  } catch {
-    return [];
-  }
-}
-
-function formatValidationErrors(issues: readonly PlanValidationIssue[]): string {
+function formatValidationErrors(issues: readonly DraftPlanValidationIssue[]): string {
   const lines: string[] = [
     `Swarm plan validation failed — please fix the following protocol error(s) and call \`${PROPOSE_SWARM_PLAN_TOOL}\` again:`,
     "",
   ];
 
   for (const issue of issues) {
-    const missionTag = issue.missionId ? ` (${issue.missionId})` : "";
-    const detailSuffix =
-      issue.details && Object.keys(issue.details).length > 0
-        ? ` — ${JSON.stringify(issue.details)}`
-        : "";
-    lines.push(`- [SwarmProtocolError:${issue.code}]${missionTag} ${issue.message}${detailSuffix}`);
+    const targetTag = issue.memberName ? ` (${issue.memberName})` : "";
+    lines.push(`- [SwarmProtocolError:${issue.code}]${targetTag} ${issue.message}`);
   }
 
   return lines.join("\n");
@@ -809,11 +958,11 @@ export function createProposeSwarmPlanTool(
     name: PROPOSE_SWARM_PLAN_TOOL,
     label: "Swarm Plan",
     description:
-      "Validate a Mission DAG plan against Swarm protocol invariants, render the full wave schedule and 3-role models into scrollback, and ask the user to Confirm, Continue refining, or Cancel.",
+      "Validate a Flexible Dynamic Swarm Plan, render the full formatted strategy, acceptance criteria, 3-role models, and optional initial members into scrollback, and ask the user to Confirm, Continue refining, or Cancel.",
     promptSnippet:
-      "Validate and present the complete Mission DAG plan for user confirmation before launching Swarm agents.",
+      "Validate and present a Flexible Dynamic Swarm Plan (title, objective, strategy, acceptance criteria, optional initial members) for user confirmation before launching.",
     promptGuidelines: [
-      `Call \`${PROPOSE_SWARM_PLAN_TOOL}\` once requirements are clear; do NOT duplicate the full plan in prose beforehand because \`${PROPOSE_SWARM_PLAN_TOOL}\` renders the full formatted Mission DAG into scrollback automatically.`,
+      `Call \`${PROPOSE_SWARM_PLAN_TOOL}\` once requirements are clear; do NOT duplicate the full plan in prose beforehand because \`${PROPOSE_SWARM_PLAN_TOOL}\` renders the full formatted proposal into scrollback automatically.`,
     ],
     exposure: "model-only",
     defaultActive: false,
@@ -830,90 +979,60 @@ export function createProposeSwarmPlanTool(
         return raw as ProposeSwarmPlanParams;
       }
       const obj = raw as Record<string, unknown>;
-      const rawMissions = Array.isArray(obj.missions) ? obj.missions : [];
-      const missions = rawMissions.map((item) => {
-        if (!item || typeof item !== "object") {
-          return item;
-        }
-        const m = item as Record<string, unknown>;
-        const normalizedTasks = normalizeRawTasks(m.tasks);
-        return {
-          ...m,
-          scope: Array.isArray(m.scope)
-            ? m.scope.filter((s): s is string => typeof s === "string")
-            : [],
-          deps: Array.isArray(m.deps)
-            ? m.deps.filter((d): d is string => typeof d === "string")
-            : [],
-          ...(normalizedTasks ? { tasks: normalizedTasks } : {}),
-        };
-      });
-
-      return {
-        ...(obj as ProposeSwarmPlanParams),
-        missions: missions as ProposeSwarmPlanParams["missions"],
+      const prepared: Record<string, unknown> = {
+        ...obj,
+        title: typeof obj.title === "string" ? obj.title : "",
+        objective: typeof obj.objective === "string" ? obj.objective : "",
+        strategy: typeof obj.strategy === "string" ? obj.strategy : "",
+        acceptance_criteria:
+          typeof obj.acceptance_criteria === "string"
+            ? obj.acceptance_criteria
+            : "",
       };
+
+      if (Array.isArray(obj.initial_members)) {
+        prepared.initial_members = obj.initial_members.map((item) => {
+          if (!item || typeof item !== "object") {
+            return item;
+          }
+          const m = item as Record<string, unknown>;
+          return {
+            ...m,
+            name: typeof m.name === "string" ? m.name : "",
+            brief: typeof m.brief === "string" ? m.brief : "",
+            ...(Array.isArray(m.channels)
+              ? {
+                  channels: m.channels.filter(
+                    (c): c is string => typeof c === "string",
+                  ),
+                }
+              : {}),
+          };
+        });
+      }
+
+      return prepared as ProposeSwarmPlanParams;
     },
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const currentDraft = ensureDraftSynced(draftController, ctx);
       const settings = deps.getSettings();
 
-      const objective = params.objective.trim();
-      const verificationContract = params.verification_contract.trim();
-
-      if (!objective) {
+      // Step 1: Pre-modal validation (non-empty required fields + valid/unique/non-reserved initial_members)
+      const validation = validateProposedSwarmPlan(params);
+      if (!validation.valid) {
         return {
           isError: true,
-          content: [{ type: "text", text: "Plan objective must not be empty." }],
+          content: [{ type: "text", text: formatValidationErrors(validation.issues) }],
           details: {
             outcome: "validation_error",
-            errors: [
-              { code: "INVALID_DAG", message: "Plan objective must not be empty." },
-            ],
+            errors: validation.issues,
+            errorCode: validation.issues[0]?.code,
+            errorMessage: validation.issues[0]?.message,
           } satisfies ProposeSwarmPlanToolDetails,
         };
       }
 
-      if (!verificationContract) {
-        return {
-          isError: true,
-          content: [
-            { type: "text", text: "Plan verification_contract must not be empty." },
-          ],
-          details: {
-            outcome: "validation_error",
-            errors: [
-              {
-                code: "INVALID_DAG",
-                message: "Plan verification_contract must not be empty.",
-              },
-            ],
-          } satisfies ProposeSwarmPlanToolDetails,
-        };
-      }
-
-      const missions = normalizeMissionInputs(params.missions ?? []);
-      if (missions.length === 0) {
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text: formatValidationErrors([
-                { code: "INVALID_DAG", message: "Plan must define at least one mission." },
-              ]),
-            },
-          ],
-          details: {
-            outcome: "validation_error",
-            errors: [
-              { code: "INVALID_DAG", message: "Plan must define at least one mission." },
-            ],
-          } satisfies ProposeSwarmPlanToolDetails,
-        };
-      }
-
-      // Step 1: Resolve baseBranch, concurrency, Validator/Final Validator flags, roleModels, and local branches
+      // Step 2: Resolve baseBranch, concurrency, validator policy, and 3-role model trio
       const baseBranch = await resolveBaseBranch(
         deps.worktree,
         params.base_branch,
@@ -930,86 +1049,35 @@ export function createProposeSwarmPlanTool(
         params.validator_enabled ??
         currentDraft?.validatorEnabled ??
         settings.validatorEnabled;
-      const finalValidatorEnabled =
-        params.final_validator_enabled ??
-        currentDraft?.finalValidatorEnabled ??
-        settings.finalValidatorEnabled ??
-        DEFAULT_SWARM_SETTINGS.finalValidatorEnabled;
       const roleModels = buildRoleModelsFromSettings(settings);
-      const existingBranches = await safeListLocalBranches(deps.worktree);
-
-      // Step 2: Validate BEFORE opening any confirmation modal
-      let validation: PlanValidationResult;
-      try {
-        validation = deps.store.validatePlan(missions, {
-          existingBranches,
-          baseBranch,
-        });
-      } catch (err) {
-        if (isSwarmProtocolError(err)) {
-          const issues: PlanValidationIssue[] = [
-            { code: err.code, message: err.message, details: err.details },
-          ];
-          return {
-            isError: true,
-            content: [{ type: "text", text: formatValidationErrors(issues) }],
-            details: {
-              outcome: "validation_error",
-              errors: issues,
-              errorCode: err.code,
-              errorMessage: err.message,
-            } satisfies ProposeSwarmPlanToolDetails,
-          };
-        }
-        throw err;
-      }
-
-      if (!validation.valid) {
-        const issues: PlanValidationIssue[] =
-          validation.errors.length > 0
-            ? validation.errors
-            : [
-                {
-                  code: "INVALID_DAG",
-                  message: "Plan failed validation without detailed issues.",
-                },
-              ];
-        return {
-          isError: true,
-          content: [{ type: "text", text: formatValidationErrors(issues) }],
-          details: {
-            outcome: "validation_error",
-            errors: issues,
-          } satisfies ProposeSwarmPlanToolDetails,
-        };
-      }
 
       const proposedPlan: ProposedSwarmPlan = {
-        objective,
+        title: validation.title,
+        objective: validation.objective,
+        strategy: validation.strategy,
+        acceptanceCriteria: validation.acceptanceCriteria,
         baseBranch,
         maxConcurrency,
         validatorEnabled,
-        finalValidatorEnabled,
-        verificationContract,
         roleModels,
-        missions,
+        ...(validation.initialMembers
+          ? { initialMembers: validation.initialMembers }
+          : {}),
       };
 
-      // Step 3: Show bounded confirmation modal (or auto-confirm for `/swarm direct`)
+      // Step 3: Show confirmation modal (or auto-confirm for `/swarm direct`)
       const autoConfirm = Boolean(currentDraft?.autoConfirm);
       let outcome: ProposalDialogOutcome;
       if (autoConfirm) {
         outcome = {
           action: "confirm",
           validatorEnabled,
-          finalValidatorEnabled,
           maxConcurrency,
         };
       } else {
         outcome = await withModalGuard(deps, () =>
           deps.ui.confirmProposal(ctx, proposedPlan, {
             mode: currentDraft?.mode ?? "swarm",
-            validation,
             signal,
           }),
         );
@@ -1017,14 +1085,9 @@ export function createProposeSwarmPlanTool(
 
       // Step 4: Execute user's decision
       if (outcome.action === "confirm") {
-        const finalValidator =
-          outcome.finalValidatorEnabled ??
-          proposedPlan.finalValidatorEnabled ??
-          DEFAULT_SWARM_SETTINGS.finalValidatorEnabled;
         const finalPlan: ProposedSwarmPlan = {
           ...proposedPlan,
           validatorEnabled: outcome.validatorEnabled,
-          finalValidatorEnabled: finalValidator,
           maxConcurrency: sanitizePositiveInt(
             outcome.maxConcurrency,
             proposedPlan.maxConcurrency,
@@ -1069,28 +1132,27 @@ export function createProposeSwarmPlanTool(
           };
         }
 
+        // Clear draft and swap tool profile to `"running"` (the 4 core Swarm tools)
         draftController.clear("running");
         deps.onDraftChanged?.(null, ctx);
 
-        const summary = formatProposalTranscriptSummary(
-          finalPlan,
-          validation.waves,
-          validation.branches,
-        );
+        const summary = formatProposalTranscriptSummary(finalPlan);
+        const memberCount =
+          run.memberOrder.length || finalPlan.initialMembers?.length || 0;
+        const memberLabel =
+          memberCount > 0 ? `, ${memberCount} initial member(s)` : "";
 
         return {
           content: [
             {
               type: "text",
-              text: `${summary}\n\n---\nStatus: CONFIRMED — Swarm run \`${run.id}\` created and launched on \`${run.baseBranch}\` (${run.missionOrder.length} mission(s), concurrency: ${finalPlan.maxConcurrency}, Validator: ${finalPlan.validatorEnabled ? "ON" : "OFF"}, Final Validator: ${(finalPlan.finalValidatorEnabled ?? true) ? "ON" : "OFF"}).`,
+              text: `${summary}\n\n---\nStatus: CONFIRMED — Swarm run \`${run.id}\` ("${run.title}") created and launched on \`${run.baseBranch}\` (concurrency: ${finalPlan.maxConcurrency}, Validator: ${finalPlan.validatorEnabled ? "ON" : "OFF"}${memberLabel}).`,
             },
           ],
           details: {
             outcome: "confirmed",
             runId: run.id,
             plan: finalPlan,
-            waves: validation.waves,
-            branches: validation.branches,
             autoConfirmed: autoConfirm,
           } satisfies ProposeSwarmPlanToolDetails,
           terminate: true,
@@ -1101,11 +1163,7 @@ export function createProposeSwarmPlanTool(
         draftController.clear("idle");
         deps.onDraftChanged?.(null, ctx);
 
-        const summary = formatProposalTranscriptSummary(
-          proposedPlan,
-          validation.waves,
-          validation.branches,
-        );
+        const summary = formatProposalTranscriptSummary(proposedPlan);
 
         return {
           content: [
@@ -1117,19 +1175,13 @@ export function createProposeSwarmPlanTool(
           details: {
             outcome: "cancelled",
             plan: proposedPlan,
-            waves: validation.waves,
-            branches: validation.branches,
           } satisfies ProposeSwarmPlanToolDetails,
           terminate: true,
         };
       }
 
-      // "continue" (refine) — keep draft active and persist any toggled Validator/Final Validator/concurrency settings
+      // "continue" (refine) — keep draft active and persist any toggled Validator / concurrency settings
       const refinedValidatorEnabled = outcome.validatorEnabled;
-      const refinedFinalValidatorEnabled =
-        outcome.finalValidatorEnabled ??
-        proposedPlan.finalValidatorEnabled ??
-        DEFAULT_SWARM_SETTINGS.finalValidatorEnabled;
       const refinedMaxConcurrency = sanitizePositiveInt(
         outcome.maxConcurrency,
         proposedPlan.maxConcurrency,
@@ -1137,7 +1189,6 @@ export function createProposeSwarmPlanTool(
       const refinedPlan: ProposedSwarmPlan = {
         ...proposedPlan,
         validatorEnabled: refinedValidatorEnabled,
-        finalValidatorEnabled: refinedFinalValidatorEnabled,
         maxConcurrency: refinedMaxConcurrency,
       };
 
@@ -1145,17 +1196,15 @@ export function createProposeSwarmPlanTool(
       if (draftController.isActive()) {
         updatedDraft = draftController.update({
           validatorEnabled: refinedValidatorEnabled,
-          finalValidatorEnabled: refinedFinalValidatorEnabled,
           maxConcurrency: refinedMaxConcurrency,
           baseBranch,
         });
       } else {
         updatedDraft = draftController.start({
           mode: currentDraft?.mode ?? "swarm",
-          seed: currentDraft?.seed || objective,
+          seed: currentDraft?.seed || validation.objective,
           targetRunId: currentDraft?.targetRunId,
           validatorEnabled: refinedValidatorEnabled,
-          finalValidatorEnabled: refinedFinalValidatorEnabled,
           maxConcurrency: refinedMaxConcurrency,
           baseBranch,
           questionnaireEcho: currentDraft?.questionnaireEcho,
@@ -1163,11 +1212,7 @@ export function createProposeSwarmPlanTool(
       }
       deps.onDraftChanged?.(updatedDraft, ctx);
 
-      const summary = formatProposalTranscriptSummary(
-        refinedPlan,
-        validation.waves,
-        validation.branches,
-      );
+      const summary = formatProposalTranscriptSummary(refinedPlan);
       const feedbackNote = outcome.feedback?.trim()
         ? `\nUser feedback: ${outcome.feedback.trim()}`
         : "";
@@ -1176,14 +1221,12 @@ export function createProposeSwarmPlanTool(
         content: [
           {
             type: "text",
-            text: `${summary}\n\n---\nStatus: CONTINUE REFINING — Draft remains active (Validator: ${refinedValidatorEnabled ? "ON" : "OFF"}, Final Validator: ${refinedFinalValidatorEnabled ? "ON" : "OFF"}, concurrency: ${refinedMaxConcurrency}).${feedbackNote}\nAsk the user what they would like to adjust, refine the Mission DAG, and call \`${PROPOSE_SWARM_PLAN_TOOL}\` again when ready.`,
+            text: `${summary}\n\n---\nStatus: CONTINUE REFINING — Draft remains active (Validator: ${refinedValidatorEnabled ? "ON" : "OFF"}, concurrency: ${refinedMaxConcurrency}).${feedbackNote}\nAsk the user what they would like to adjust, refine the Dynamic Swarm Plan, and call \`${PROPOSE_SWARM_PLAN_TOOL}\` again when ready.`,
           },
         ],
         details: {
           outcome: "continue",
           plan: refinedPlan,
-          waves: validation.waves,
-          branches: validation.branches,
           ...(outcome.feedback?.trim()
             ? { feedback: outcome.feedback.trim() }
             : {}),
@@ -1193,27 +1236,35 @@ export function createProposeSwarmPlanTool(
     renderCall(args: ProposeSwarmPlanParams, theme: Theme) {
       const settings = deps.getSettings();
       const draft = draftController.getDraft();
-      const rawMissions = Array.isArray(args?.missions) ? args.missions : [];
-      const previewMissions: MissionPlanInput[] = rawMissions.map((m, idx) => ({
-        id: typeof m?.id === "string" && m.id.trim() ? m.id.trim() : `M${idx + 1}`,
-        title: typeof m?.title === "string" ? m.title.trim() : "(untitled)",
-        kind:
-          m?.kind === "build" || m?.kind === "artifact" || m?.kind === "survey"
-            ? m.kind
-            : "build",
-        description: typeof m?.description === "string" ? m.description.trim() : "",
-        scope: Array.isArray(m?.scope)
-          ? m.scope.filter((s): s is string => typeof s === "string")
-          : [],
-        deps: Array.isArray(m?.deps)
-          ? m.deps.filter((d): d is string => typeof d === "string")
-          : [],
-        verification: typeof m?.verification === "string" ? m.verification.trim() : "",
-        ...(Array.isArray(m?.tasks) && m.tasks.length > 0 ? { tasks: m.tasks } : {}),
-      }));
+      const rawMembers = Array.isArray(args?.initial_members)
+        ? args.initial_members
+        : [];
+      const previewMembers: InitialMemberProposal[] = rawMembers
+        .filter((item): item is InitialMemberProposalParams =>
+          Boolean(item && typeof item === "object"),
+        )
+        .map((m) => ({
+          name: typeof m.name === "string" ? m.name.trim() : "",
+          role: isValidMemberRole(m.role) ? m.role : "worker",
+          brief: typeof m.brief === "string" ? m.brief.trim() : "",
+          ...(isValidWorkspaceMode(m.workspace) ? { workspace: m.workspace } : {}),
+          ...(Array.isArray(m.channels) && m.channels.length > 0
+            ? {
+                channels: m.channels.filter(
+                  (c): c is string => typeof c === "string" && c.trim().length > 0,
+                ),
+              }
+            : {}),
+        }));
 
       const previewPlan: ProposedSwarmPlan = {
+        title: typeof args?.title === "string" ? args.title.trim() : "",
         objective: typeof args?.objective === "string" ? args.objective.trim() : "",
+        strategy: typeof args?.strategy === "string" ? args.strategy.trim() : "",
+        acceptanceCriteria:
+          typeof args?.acceptance_criteria === "string"
+            ? args.acceptance_criteria.trim()
+            : "",
         baseBranch:
           (typeof args?.base_branch === "string" && args.base_branch.trim()) ||
           draft?.baseBranch ||
@@ -1228,28 +1279,11 @@ export function createProposeSwarmPlanTool(
           typeof args?.validator_enabled === "boolean"
             ? args.validator_enabled
             : draft?.validatorEnabled ?? settings.validatorEnabled,
-        finalValidatorEnabled:
-          typeof args?.final_validator_enabled === "boolean"
-            ? args.final_validator_enabled
-            : draft?.finalValidatorEnabled ??
-              settings.finalValidatorEnabled ??
-              DEFAULT_SWARM_SETTINGS.finalValidatorEnabled,
-        verificationContract:
-          typeof args?.verification_contract === "string"
-            ? args.verification_contract.trim()
-            : "",
         roleModels: buildRoleModelsFromSettings(settings),
-        missions: previewMissions,
+        ...(previewMembers.length > 0 ? { initialMembers: previewMembers } : {}),
       };
 
-      const previewWaves = computePreviewWaves(previewMissions);
-      const previewBranches = computePreviewBranches(previewMissions);
-      const summary = formatProposalTranscriptSummary(
-        previewPlan,
-        previewWaves,
-        previewBranches,
-      );
-
+      const summary = formatProposalTranscriptSummary(previewPlan);
       const header = `${theme.fg("toolTitle", theme.bold("Swarm Plan"))} ${theme.fg("muted", `(${PROPOSE_SWARM_PLAN_TOOL})`)}`;
       return new Text(`${header}\n${theme.fg("toolOutput", summary)}`, 0, 0);
     },
@@ -1268,7 +1302,7 @@ export function createProposeSwarmPlanTool(
       if (details?.outcome === "confirmed") {
         const autoTag = details.autoConfirmed ? " (direct)" : "";
         const flagsSuffix = details.plan
-          ? ` (Validator: ${details.plan.validatorEnabled ? "ON" : "OFF"}, Final Validator: ${(details.plan.finalValidatorEnabled ?? true) ? "ON" : "OFF"})`
+          ? ` (Validator: ${details.plan.validatorEnabled ? "ON" : "OFF"}, concurrency: ${details.plan.maxConcurrency})`
           : "";
         return new Text(
           `${theme.fg("success", "✓")} ${theme.fg("toolOutput", `Swarm Plan confirmed${autoTag} — launched run ${details.runId ?? ""}${flagsSuffix}`)}`,
@@ -1285,9 +1319,13 @@ export function createProposeSwarmPlanTool(
       }
       if (details?.outcome === "continue") {
         const validator = details.plan?.validatorEnabled ? "ON" : "OFF";
-        const finalValidator = (details.plan?.finalValidatorEnabled ?? true) ? "ON" : "OFF";
+        const concurrency = details.plan?.maxConcurrency;
+        const suffix =
+          concurrency !== undefined
+            ? `Validator: ${validator}, concurrency: ${concurrency}`
+            : `Validator: ${validator}`;
         return new Text(
-          `${theme.fg("warning", "✎")} ${theme.fg("toolOutput", `Continuing Swarm Plan refinement (Validator: ${validator}, Final Validator: ${finalValidator}).`)}`,
+          `${theme.fg("warning", "✎")} ${theme.fg("toolOutput", `Continuing Swarm Plan refinement (${suffix}).`)}`,
           0,
           0,
         );

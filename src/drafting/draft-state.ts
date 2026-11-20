@@ -3,10 +3,10 @@ import {
   ALL_SWARM_EXTENSION_TOOLS,
   DEFAULT_SWARM_SETTINGS,
   DRAFTING_TOOLS,
-  ORCHESTRATOR_TOOLS,
+  IDLE_SWARM_TOOLS,
+  SWARM_CORE_TOOLS,
   SWARM_DRAFT_ENTRY,
   SWARM_DRAFT_VERSION,
-  SWARM_STATUS_TOOL,
 } from "../constants.js";
 import type { ActiveSwarmDraft, SwarmDraftMode, SwarmSettings } from "../types.js";
 
@@ -17,20 +17,16 @@ import type { ActiveSwarmDraft, SwarmDraftMode, SwarmSettings } from "../types.j
 export type SwarmToolProfileMode = "idle" | "drafting" | "running";
 
 /**
- * Branch-local durable Swarm draft state persisted via `pi.appendEntry`.
- * Extends `ActiveSwarmDraft` with optional `autoConfirm` for `/swarm direct`.
+ * Branch-local durable Swarm draft state persisted via `pi.appendEntry` (`version: 2`).
  */
-export interface SwarmDraftState extends ActiveSwarmDraft {
-  autoConfirm?: boolean;
-}
+export type SwarmDraftState = ActiveSwarmDraft;
 
 export interface StartDraftOptions {
   mode?: SwarmDraftMode;
   seed: string;
   targetRunId?: string;
   validatorEnabled?: boolean;
-  finalValidatorEnabled?: boolean;
-  maxConcurrency: number;
+  maxConcurrency?: number;
   baseBranch?: string;
   autoConfirm?: boolean;
   questionnaireEcho?: Record<string, string>;
@@ -38,7 +34,7 @@ export interface StartDraftOptions {
 
 export interface StartDraftExecutionOptions {
   applyToolProfile?: boolean;
-  settings?: Partial<Pick<SwarmSettings, "validatorEnabled" | "finalValidatorEnabled">>;
+  settings?: Partial<Pick<SwarmSettings, "validatorEnabled" | "maxConcurrency">>;
 }
 
 export type UpdateDraftPatch = Partial<
@@ -66,23 +62,27 @@ export type DraftPersistenceAPI = Pick<
 // Tool Profile Swap (Idempotent — Preserves Host & Third-Party Tools)
 // ============================================================================
 
-export const IDLE_SWARM_TOOLS = [SWARM_STATUS_TOOL] as const;
+export { IDLE_SWARM_TOOLS };
 
 export function getSwarmToolsForMode(mode: SwarmToolProfileMode): readonly string[] {
   switch (mode) {
     case "drafting":
       return DRAFTING_TOOLS;
     case "running":
-      return ORCHESTRATOR_TOOLS;
+      return SWARM_CORE_TOOLS;
     case "idle":
       return IDLE_SWARM_TOOLS;
   }
 }
 
 /**
- * Swaps ONLY `pi-swarm`'s own extension tools (`ALL_SWARM_EXTENSION_TOOLS`) to the
- * target profile while leaving all host tools (`read`, `grep`, `find`, `ls`, `bash`,
- * `edit`, `write`, etc.) and any other extensions' tools completely untouched.
+ * Swaps ONLY `pi-swarm`'s own extension tools (`ALL_SWARM_EXTENSION_TOOLS`, 7 tools)
+ * to the target profile while leaving all host tools (`read`, `grep`, `find`, `ls`,
+ * `bash`, `edit`, `write`, etc.) and any third-party extension tools completely untouched.
+ *
+ * - `"idle"`     -> `IDLE_SWARM_TOOLS` (`["swarm"]`)
+ * - `"drafting"` -> `DRAFTING_TOOLS` (`["swarm_question", "swarm_questionnaire", "propose_swarm_plan"]`)
+ * - `"running"`  -> `SWARM_CORE_TOOLS` (`["swarm", "post_message", "read_board", "swarm_wait"]`)
  *
  * Calls `pi.setActiveTools()` ONLY when the sorted tool membership actually changes,
  * preventing unnecessary LLM prompt-cache invalidation.
@@ -152,20 +152,17 @@ function cloneDraft(draft: SwarmDraftState): SwarmDraftState {
     validatorEnabled: draft.validatorEnabled,
     maxConcurrency: sanitizeConcurrency(draft.maxConcurrency),
   };
-  if (draft.finalValidatorEnabled !== undefined) {
-    cloned.finalValidatorEnabled = draft.finalValidatorEnabled;
-  }
   if (draft.targetRunId !== undefined) {
     cloned.targetRunId = draft.targetRunId;
   }
   if (draft.baseBranch !== undefined) {
     cloned.baseBranch = draft.baseBranch;
   }
+  if (typeof draft.autoConfirm === "boolean") {
+    cloned.autoConfirm = draft.autoConfirm;
+  }
   if (echo !== undefined) {
     cloned.questionnaireEcho = echo;
-  }
-  if (draft.autoConfirm !== undefined) {
-    cloned.autoConfirm = draft.autoConfirm;
   }
   if (draft.clearedAt !== undefined) {
     cloned.clearedAt = draft.clearedAt;
@@ -188,10 +185,12 @@ function isSwarmDraftState(value: unknown): value is SwarmDraftState {
     typeof obj.seed === "string" &&
     typeof obj.startedAt === "string" &&
     typeof obj.validatorEnabled === "boolean" &&
-    (obj.finalValidatorEnabled === undefined ||
-      typeof obj.finalValidatorEnabled === "boolean") &&
     typeof obj.maxConcurrency === "number" &&
-    Number.isFinite(obj.maxConcurrency)
+    Number.isFinite(obj.maxConcurrency) &&
+    (obj.targetRunId === undefined || typeof obj.targetRunId === "string") &&
+    (obj.baseBranch === undefined || typeof obj.baseBranch === "string") &&
+    (obj.autoConfirm === undefined || typeof obj.autoConfirm === "boolean") &&
+    (obj.clearedAt === undefined || typeof obj.clearedAt === "string")
   );
 }
 
@@ -205,12 +204,13 @@ export function isDraftActive(
 }
 
 /**
- * Rehydrates the latest branch-local active Swarm draft by scanning
+ * Rehydrates the latest branch-local active Swarm draft (`version: 2`) by scanning
  * `ctx.sessionManager.getBranch()` backwards for `SWARM_DRAFT_ENTRY`.
  *
  * - Survives compaction (compaction entries sit alongside custom entries on the branch).
  * - Respects session tree navigation (`getBranch()` only walks root -> current leaf).
- * - Returns `null` if no entry exists or if the latest entry is tombstoned (`clearedAt`).
+ * - Returns `null` if no entry exists, if the latest entry is tombstoned (`clearedAt`),
+ *   or if the latest entry does not match `version: 2`.
  */
 export function rehydrateDraft(
   ctx: Pick<ExtensionContext, "sessionManager">,
@@ -246,7 +246,8 @@ export function rehydrateDraft(
 // ============================================================================
 
 /**
- * Starts a new durable branch-local draft without writing anything under `.pi/swarm/runs/`.
+ * Starts a new durable branch-local draft (`version: 2`) without writing anything
+ * under `.pi/swarm/runs/`.
  * Optionally swaps the active tool profile into `"drafting"` mode (default `true`).
  */
 export function startDraft(
@@ -258,10 +259,11 @@ export function startDraft(
     options.validatorEnabled ??
     opts?.settings?.validatorEnabled ??
     DEFAULT_SWARM_SETTINGS.validatorEnabled;
-  const finalValidatorEnabled =
-    options.finalValidatorEnabled ??
-    opts?.settings?.finalValidatorEnabled ??
-    DEFAULT_SWARM_SETTINGS.finalValidatorEnabled;
+  const maxConcurrency = sanitizeConcurrency(
+    options.maxConcurrency ??
+      opts?.settings?.maxConcurrency ??
+      DEFAULT_SWARM_SETTINGS.maxConcurrency,
+  );
 
   const draft: SwarmDraftState = {
     version: SWARM_DRAFT_VERSION,
@@ -269,8 +271,7 @@ export function startDraft(
     seed: options.seed.trim(),
     startedAt: new Date().toISOString(),
     validatorEnabled,
-    finalValidatorEnabled,
-    maxConcurrency: sanitizeConcurrency(options.maxConcurrency),
+    maxConcurrency,
   };
 
   if (options.targetRunId?.trim()) {
@@ -279,12 +280,12 @@ export function startDraft(
   if (options.baseBranch?.trim()) {
     draft.baseBranch = options.baseBranch.trim();
   }
+  if (options.autoConfirm) {
+    draft.autoConfirm = true;
+  }
   const echo = cloneEcho(options.questionnaireEcho);
   if (echo) {
     draft.questionnaireEcho = echo;
-  }
-  if (options.autoConfirm) {
-    draft.autoConfirm = true;
   }
 
   pi.appendEntry(SWARM_DRAFT_ENTRY, cloneDraft(draft));
@@ -320,9 +321,6 @@ export function updateDraft(
     ...(patch.targetRunId !== undefined ? { targetRunId: patch.targetRunId } : {}),
     ...(patch.validatorEnabled !== undefined
       ? { validatorEnabled: patch.validatorEnabled }
-      : {}),
-    ...(patch.finalValidatorEnabled !== undefined
-      ? { finalValidatorEnabled: patch.finalValidatorEnabled }
       : {}),
     ...(patch.maxConcurrency !== undefined
       ? { maxConcurrency: sanitizeConcurrency(patch.maxConcurrency) }
@@ -364,8 +362,7 @@ export function clearDraft(
         seed: "",
         startedAt: clearedAt,
         validatorEnabled: DEFAULT_SWARM_SETTINGS.validatorEnabled,
-        finalValidatorEnabled: DEFAULT_SWARM_SETTINGS.finalValidatorEnabled,
-        maxConcurrency: 1,
+        maxConcurrency: DEFAULT_SWARM_SETTINGS.maxConcurrency,
         clearedAt,
       };
 
@@ -467,7 +464,7 @@ export class DraftStateController {
   private readonly pi: DraftPersistenceAPI;
   private readonly hooks?: DraftModalHooks;
   private readonly getSettings?: () => Partial<
-    Pick<SwarmSettings, "validatorEnabled" | "finalValidatorEnabled">
+    Pick<SwarmSettings, "validatorEnabled" | "maxConcurrency">
   >;
   private current: SwarmDraftState | null = null;
 
@@ -475,7 +472,7 @@ export class DraftStateController {
     pi: DraftPersistenceAPI,
     hooks?: DraftModalHooks,
     getSettings?: () => Partial<
-      Pick<SwarmSettings, "validatorEnabled" | "finalValidatorEnabled">
+      Pick<SwarmSettings, "validatorEnabled" | "maxConcurrency">
     >,
   ) {
     this.pi = pi;

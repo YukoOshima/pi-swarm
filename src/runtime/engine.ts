@@ -1,0 +1,3630 @@
+import { randomBytes } from "node:crypto";
+import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+  ALL_MENTION_NAME,
+  CHANNEL_NAME_PATTERN,
+  DEFAULT_CHANNEL,
+  DEFAULT_SWARM_SETTINGS,
+  MEMBER_NAME_PATTERN,
+  MONITOR_NAME,
+  ORCHESTRATOR_NAME,
+  RESERVED_MEMBER_NAMES,
+  SWARM_BRANCH_PREFIX,
+  SWARM_MAX_BOARD_HOPS,
+} from "../constants.js";
+import {
+  type AddHelperInput,
+  type AddMemberInput,
+  type AgentTelemetryEvent,
+  type AgentTurnResult,
+  type AvailableModelInfo,
+  type BoardMessage,
+  type BoardMessageKind,
+  type CallerRole,
+  type CompleteRunOptions,
+  type ISwarmEngine,
+  type ISwarmStore,
+  type ISwarmTransport,
+  type IWorktreeManager,
+  type KillMemberOptions,
+  type ManageChannelInput,
+  type ManageChannelResult,
+  type MemberEngineBridge,
+  type MergeBranchResult,
+  type MergeMemberOptions,
+  type PersistentAgentHandle,
+  type PostBoardMessageInput,
+  type ReadBoardOptions,
+  type ReadBoardResult,
+  type SafeTeardownResult,
+  type SafeTeardownTarget,
+  type StopMemberOptions,
+  type SwarmChannelRecord,
+  type SwarmEngineEvent,
+  type SwarmEngineEventType,
+  type SwarmEvent,
+  type SwarmMemberRecord,
+  type SwarmMemberRole,
+  type SwarmMemberStatusEntry,
+  type SwarmModelRole,
+  SwarmProtocolError,
+  type SwarmRoleModels,
+  type SwarmRosterStatus,
+  type SwarmRunState,
+  type SwarmSettings,
+  type SwarmSnapshot,
+  type SwarmWorkspaceMode,
+  type SwitchModelOptions,
+  type SwitchModelResult,
+  type TeardownOptions,
+  type WaitForBoardOptions,
+  type WaitForBoardResult,
+} from "../types.js";
+import {
+  ConcurrencyGate,
+  RateLimitBreaker,
+  selectFallbackModel,
+} from "./rate-limit.js";
+import {
+  buildMemberInitialPrompt,
+  buildMemberSystemPrompt,
+  buildWakeupPrompt,
+} from "./role-prompts.js";
+import {
+  extractSessionMessages,
+  resolveRoleModel,
+  sanitizeForkSeedMessages,
+} from "./transport.js";
+
+// ============================================================================
+// Parsing & Helper Utilities
+// ============================================================================
+
+const RESERVED_SET: ReadonlySet<string> = new Set<string>(RESERVED_MEMBER_NAMES);
+
+/** Matches `@<name>` handles (not emails, not `@@`, and NOT `@#channel`). */
+const HANDLE_MENTION_RE =
+  /(?<![A-Za-z0-9._%+@-])@(?!#)([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)/g;
+
+/** Matches `@#<channel>` channel broadcasts (not emails or `@@#`). */
+const CHANNEL_MENTION_RE =
+  /(?<![A-Za-z0-9._%+@-])@#([A-Za-z0-9][A-Za-z0-9-]{0,31})/g;
+
+const WAIT_TELEMETRY_RE = /^swarm_wait since=#(\d+) mentions_only=(true|false)$/;
+
+const BOARD_CACHE_LIMIT = 200;
+const EVENT_CACHE_LIMIT = 50;
+const MAX_SHARD_COUNT = 32;
+
+function parseHandleMentions(text: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  HANDLE_MENTION_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = HANDLE_MENTION_RE.exec(text)) !== null) {
+    const handle = match[1]!;
+    const key = handle.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(handle);
+    }
+  }
+  return out;
+}
+
+function parseChannelMentions(text: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  CHANNEL_MENTION_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = CHANNEL_MENTION_RE.exec(text)) !== null) {
+    const ch = match[1]!.toLowerCase();
+    if (!seen.has(ch)) {
+      seen.add(ch);
+      out.push(ch);
+    }
+  }
+  return out;
+}
+
+function mergeUniqueLower(lists: ReadonlyArray<readonly string[] | undefined>): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const list of lists) {
+    if (!list) continue;
+    for (const raw of list) {
+      const cleaned = raw.trim().replace(/^@#?/, "").toLowerCase();
+      if (!cleaned || seen.has(cleaned)) continue;
+      seen.add(cleaned);
+      out.push(cleaned);
+    }
+  }
+  return out;
+}
+
+function validateMemberName(rawName: string): string {
+  const name = rawName.trim();
+  if (!name || !MEMBER_NAME_PATTERN.test(name)) {
+    throw new SwarmProtocolError(
+      "INVALID_NAME",
+      `Invalid member name "${rawName}". Names must match ${MEMBER_NAME_PATTERN.source} (short lowercase alphanumeric/hyphen).`,
+      { name: rawName },
+    );
+  }
+  if (RESERVED_SET.has(name.toLowerCase())) {
+    throw new SwarmProtocolError(
+      "INVALID_NAME",
+      `Member name "${name}" is reserved (${RESERVED_MEMBER_NAMES.join(", ")}).`,
+      { name },
+    );
+  }
+  return name;
+}
+
+function validateChannelName(rawName: string): string {
+  const name = rawName.trim().toLowerCase();
+  if (!name || !CHANNEL_NAME_PATTERN.test(name)) {
+    throw new SwarmProtocolError(
+      "INVALID_CHANNEL",
+      `Invalid channel name "${rawName}". Channel names must match ${CHANNEL_NAME_PATTERN.source}.`,
+      { channel: rawName },
+    );
+  }
+  return name;
+}
+
+function isOrchestratorOrHuman(role: CallerRole | undefined): boolean {
+  return role === undefined || role === "orchestrator" || role === "human";
+}
+
+function buildRoleModelsSnapshot(
+  settings: SwarmSettings,
+  runRoleModels?: SwarmRoleModels,
+): SwarmRoleModels {
+  return {
+    orchestrator: {
+      model: settings.orchestratorModel ?? runRoleModels?.orchestrator?.model,
+      thinkingLevel:
+        settings.orchestratorThinkingLevel ?? runRoleModels?.orchestrator?.thinkingLevel,
+    },
+    worker: {
+      model: settings.workerModel ?? runRoleModels?.worker?.model,
+      thinkingLevel: settings.workerThinkingLevel ?? runRoleModels?.worker?.thinkingLevel,
+    },
+    validator: {
+      model: settings.validatorModel ?? runRoleModels?.validator?.model,
+      thinkingLevel: settings.validatorThinkingLevel ?? runRoleModels?.validator?.thinkingLevel,
+    },
+    fallbackModels:
+      settings.fallbackModels.length > 0
+        ? [...settings.fallbackModels]
+        : [...(runRoleModels?.fallbackModels ?? [])],
+  };
+}
+
+function isAbortError(err: unknown): boolean {
+  return err instanceof Error && err.name === "AbortError";
+}
+
+// ============================================================================
+// Internal Runtime Structures
+// ============================================================================
+
+interface LiveMember {
+  name: string;
+  agentId: string;
+  role: SwarmMemberRole;
+  handle?: PersistentAgentHandle;
+  /** True while waiting for concurrency slot or spawning transport handle. */
+  spawning: boolean;
+  /** Synchronous lock while dispatching a wake/revive to prevent concurrent wake() races. */
+  waking: boolean;
+  /** True from turn launch through the end of handleTurnFinished (closes async post-turn race window). */
+  turnActive: boolean;
+  /** Synchronous lock while hot-switching models on a waiting session. */
+  switchingModel: boolean;
+  /** Whether this parked member only wakes on mentions (`true`) or any channel message (`false`). */
+  parkedMentionsOnly: boolean;
+  /** Board messages queued while spawning, waking, working, or switching models (coalesced on next wake). */
+  pendingWakes: BoardMessage[];
+  /** Sequence numbers already delivered to this member (prevents duplicate delivery). */
+  deliveredSeqs: Set<number>;
+  /** Models already attempted on this member (for quota fallback selection). */
+  triedModels: Set<string>;
+  /** Last known conversation snapshot (for forking even if session later pauses/stops). */
+  lastMessages: AgentMessage[];
+  /** Live telemetry log tail preserved across cache refreshes and persisted on turn end. */
+  logTail: string[];
+  /** Live last tool name preserved across cache refreshes. */
+  lastTool?: string;
+  /** Live activity description while working, preserved across cache refreshes. */
+  currentActivity?: string;
+  /** Latest swarm_wait request captured during current turn. */
+  lastWaitRequest?: { since: number; mentionsOnly: boolean };
+  /** AbortController for cancelling in-flight concurrency/backoff waits on stop/kill/dispose. */
+  launchAbort?: AbortController;
+  /** Active concurrency slot release callback, if currently holding a slot. */
+  releaseSlot?: () => void;
+}
+
+interface BoardWaiter {
+  since: number;
+  mentionsOnly: boolean;
+  targetName: string;
+  targetChannels: readonly string[];
+  onProgress?: (summary: string) => void;
+  resolve: (result: WaitForBoardResult) => void;
+  cleanup: () => void;
+}
+
+// ============================================================================
+// SwarmEngine Dependencies & Implementation
+// ============================================================================
+
+export interface SwarmEngineDeps {
+  store: ISwarmStore;
+  worktree: IWorktreeManager;
+  transport: ISwarmTransport;
+  settings?: Partial<SwarmSettings>;
+  getSettings?: () => SwarmSettings;
+  now?: () => number;
+  generateAgentId?: (name: string) => string;
+}
+
+/**
+ * Dynamic Antigravity Swarm execution engine (`ISwarmEngine`).
+ *
+ * Orchestrates:
+ * - Dynamic member lifecycle (`addMembers` single / `n` / `tasks[]`, helpers, `fork`, `killMember`, `stopMember`)
+ * - 3-role model resolution (`orchestrator` / `worker` / `validator`) + warm hot model switching (`switchModel`) + quota auto-fallback
+ * - Shared Message Board & channels (`postMessage`, `readBoard`, `manageChannel`) with `@name`, `@prefix`, `@#channel`, `@all` wakeup routing, zero-drop coalescing, and hop-cap safety
+ * - Blocking `waitForBoard` with anti-deadlock `all_idle` exit, `AbortSignal`, and live progress callbacks
+ * - Zero-token Stall Watchdog timer posting `[stall]` from `monitor` when the swarm goes silent
+ * - Isolated `share` / `branch` Git worktree provisioning, auto-rebase, merge, dirty-worktree guards, and safe teardown
+ */
+export class SwarmEngine implements ISwarmEngine {
+  private readonly store: ISwarmStore;
+  private readonly worktree: IWorktreeManager;
+  private readonly transport: ISwarmTransport;
+  private readonly staticSettings?: Partial<SwarmSettings>;
+  private readonly getSettingsFn?: () => SwarmSettings;
+  private readonly nowFn: () => number;
+  private readonly generateAgentIdFn: (name: string) => string;
+
+  private activeRunId: string | null = null;
+  private cachedRun: SwarmRunState | null = null;
+  private cachedBoard: BoardMessage[] = [];
+  private cachedEvents: SwarmEvent[] = [];
+  private hostContext?: ExtensionContext;
+
+  private readonly liveMembers = new Map<string, LiveMember>();
+  private readonly listeners = new Set<(event: SwarmEngineEvent) => void>();
+  private readonly boardWaiters = new Set<BoardWaiter>();
+  private readonly rateLimitBreaker: RateLimitBreaker;
+  private readonly concurrencyGate: ConcurrencyGate;
+
+  private stallTimer: ReturnType<typeof setTimeout> | null = null;
+  private stallNoticePostedAtHead: number | null = null;
+  private runDonePosted = false;
+  private boardHopCount = 0;
+  private hopCapAlerted = false;
+  private disposed = false;
+
+  constructor(deps: SwarmEngineDeps) {
+    this.store = deps.store;
+    this.worktree = deps.worktree;
+    this.transport = deps.transport;
+    this.staticSettings = deps.settings;
+    this.getSettingsFn = deps.getSettings;
+    this.nowFn = deps.now ?? (() => Date.now());
+    this.generateAgentIdFn =
+      deps.generateAgentId ??
+      ((name: string) => `${name}-${randomBytes(3).toString("hex")}`);
+
+    const initialSettings = this.getEffectiveSettings();
+    this.rateLimitBreaker = new RateLimitBreaker({
+      baseBackoffMs: initialSettings.rateLimitBaseBackoffMs,
+      maxBackoffMs: initialSettings.rateLimitMaxBackoffMs,
+      now: this.nowFn,
+    });
+    this.concurrencyGate = new ConcurrencyGate(
+      initialSettings.maxConcurrency,
+      this.rateLimitBreaker,
+    );
+  }
+
+  // --------------------------------------------------------------------------
+  // Run Lifecycle (startRun / attachRun / setTitle / pause / resume / completeRun)
+  // --------------------------------------------------------------------------
+
+  async startRun(
+    runId: string,
+    hostContext?: ExtensionContext,
+  ): Promise<SwarmRunState> {
+    if (hostContext) {
+      this.hostContext = hostContext;
+    }
+    const snapshot = await this.attachRun(runId, hostContext);
+    if (!snapshot.run) {
+      throw new SwarmProtocolError("NOT_FOUND", `Swarm run "${runId}" could not be loaded.`);
+    }
+    if (snapshot.run.status === "paused") {
+      return this.resume(runId, hostContext);
+    }
+    if (snapshot.run.status === "active") {
+      this.concurrencyGate.resume();
+    }
+    return snapshot.run;
+  }
+
+  async attachRun(
+    runId: string | null,
+    hostContext?: ExtensionContext,
+  ): Promise<SwarmSnapshot> {
+    if (hostContext) {
+      this.hostContext = hostContext;
+    }
+
+    if (runId === null) {
+      this.cancelStallWatchdog();
+      this.resolveAllWaiters("run_ended", "Detached from Swarm run.");
+      this.activeRunId = null;
+      this.cachedRun = null;
+      this.cachedBoard = [];
+      this.cachedEvents = [];
+      this.runDonePosted = false;
+      this.stallNoticePostedAtHead = null;
+      this.boardHopCount = 0;
+      this.hopCapAlerted = false;
+      const snap = this.getSnapshot();
+      this.emitEngineEvent("snapshot_changed", "Detached from Swarm run.");
+      return snap;
+    }
+
+    const isSameRun = this.activeRunId === runId;
+    if (this.activeRunId && !isSameRun) {
+      this.cancelStallWatchdog();
+      this.resolveAllWaiters("run_ended", `Switched focus to run ${runId}.`);
+      await this.disposeLiveHandles("Switched active run");
+    }
+
+    const run = await this.store.loadRun(runId);
+    const boardRes = await this.store
+      .readBoard(runId, { channel: "*", limit: BOARD_CACHE_LIMIT })
+      .catch(() => ({ messages: [] as BoardMessage[], head: run.boardHead }));
+    const events = await this.store
+      .getRecentEvents(runId, EVENT_CACHE_LIMIT)
+      .catch(() => [] as SwarmEvent[]);
+
+    this.activeRunId = run.id;
+    this.setCachedRun(run);
+    this.cachedBoard = boardRes.messages;
+    this.cachedEvents = events;
+    this.runDonePosted = run.status === "completed" || run.status === "abandoned";
+    if (!isSameRun) {
+      this.stallNoticePostedAtHead = null;
+      this.boardHopCount = 0;
+      this.hopCapAlerted = false;
+    }
+
+    const settings = this.getEffectiveSettings();
+    this.rateLimitBreaker.configure({
+      baseBackoffMs: settings.rateLimitBaseBackoffMs,
+      maxBackoffMs: settings.rateLimitMaxBackoffMs,
+    });
+    this.concurrencyGate.setMaxConcurrency(run.maxConcurrency || settings.maxConcurrency);
+    if (run.status === "paused") {
+      this.concurrencyGate.pause();
+    } else {
+      this.concurrencyGate.resume();
+    }
+
+    const snap = this.getSnapshot();
+    this.emitEngineEvent("snapshot_changed", `Attached to Swarm run "${run.title}" (${run.id}).`);
+    return snap;
+  }
+
+  async setTitle(
+    title: string,
+    options?: { callerRole?: CallerRole; actor?: string },
+  ): Promise<SwarmRunState> {
+    if (!isOrchestratorOrHuman(options?.callerRole)) {
+      throw new SwarmProtocolError(
+        "PERMISSION_DENIED",
+        `Role "${options?.callerRole}" is not allowed to change the swarm title.`,
+      );
+    }
+    const trimmed = title.trim();
+    if (!trimmed) {
+      throw new SwarmProtocolError("INVALID_INPUT", "Swarm title must be non-empty.");
+    }
+    const run = this.requireActiveRun();
+    const updated = await this.store.updateRun(run.id, {
+      title: trimmed,
+      actor: options?.actor ?? ORCHESTRATOR_NAME,
+    });
+    await this.refreshCache(updated);
+    this.emitEngineEvent("snapshot_changed", `Swarm titled "${updated.title}".`);
+    return updated;
+  }
+
+  async pause(runId?: string, reason?: string): Promise<SwarmRunState> {
+    const targetRunId = runId?.trim() || this.activeRunId;
+    if (!targetRunId) {
+      throw new SwarmProtocolError("NOT_FOUND", "No active Swarm run to pause.");
+    }
+    this.cancelStallWatchdog();
+    this.concurrencyGate.pause();
+    this.resolveAllWaiters("run_ended", reason ?? "Swarm run paused.");
+
+    // Abort in-flight working turns gracefully while keeping worktrees intact
+    for (const live of this.liveMembers.values()) {
+      live.launchAbort?.abort();
+      live.pendingWakes.length = 0;
+      if (live.handle && live.handle.getState() === "working") {
+        await live.handle.abort(reason ?? "Swarm run paused").catch(() => {});
+      }
+    }
+
+    const updated = await this.store.updateRun(targetRunId, {
+      status: "paused",
+      actor: ORCHESTRATOR_NAME,
+    });
+    await this.refreshCache(updated);
+    this.emitEngineEvent("snapshot_changed", `Paused Swarm run ${targetRunId}.`);
+    return updated;
+  }
+
+  async resume(
+    runId?: string,
+    hostContext?: ExtensionContext,
+  ): Promise<SwarmRunState> {
+    if (hostContext) {
+      this.hostContext = hostContext;
+    }
+    const targetRunId = runId?.trim() || this.activeRunId;
+    if (!targetRunId) {
+      throw new SwarmProtocolError("NOT_FOUND", "No Swarm run specified to resume.");
+    }
+    if (this.activeRunId !== targetRunId) {
+      await this.attachRun(targetRunId, hostContext);
+    }
+    const updated = await this.store.updateRun(targetRunId, {
+      status: "active",
+      actor: ORCHESTRATOR_NAME,
+    });
+    this.runDonePosted = false;
+    this.stallNoticePostedAtHead = null;
+    this.concurrencyGate.resume();
+    await this.refreshCache(updated);
+    this.emitEngineEvent("snapshot_changed", `Resumed Swarm run ${targetRunId}.`);
+    return updated;
+  }
+
+  async completeRun(options: CompleteRunOptions): Promise<SwarmRunState> {
+    if (!isOrchestratorOrHuman(options.callerRole)) {
+      throw new SwarmProtocolError(
+        "PERMISSION_DENIED",
+        `Role "${options.callerRole}" is not allowed to complete the Swarm run.`,
+      );
+    }
+    const summary = options.summary.trim();
+    if (!summary) {
+      throw new SwarmProtocolError("INVALID_INPUT", "Completion summary must be non-empty.");
+    }
+    const run = this.requireActiveRun();
+    const actor = options.actor ?? ORCHESTRATOR_NAME;
+
+    // Silence watchdog immediately and prevent any further wakes
+    this.cancelStallWatchdog();
+    this.runDonePosted = true;
+
+    // Post `[done] <summary>` (NO @mentions!) on board directly so Stall Watchdog stays quiet
+    const safeSummary = summary.replace(/@(?=#?[A-Za-z0-9])/g, "");
+    const doneMsg = await this.store.postBoardMessage(run.id, {
+      from: actor,
+      fromRole: options.callerRole ?? "orchestrator",
+      channel: DEFAULT_CHANNEL,
+      kind: "done",
+      text: `[done] ${safeSummary}`,
+      mentions: [],
+      channelMentions: [],
+    });
+    this.recordBoardMessageInCache(doneMsg);
+    this.emitEngineEvent("board_posted", `Posted completion #${doneMsg.seq}`, {
+      seq: doneMsg.seq,
+    });
+
+    // Dispose all warm/live AgentSession handles cleanly (preserving worktrees safely!)
+    await this.disposeLiveHandles("Run completed");
+
+    // Mark any still-working or warm-waiting member records as stopped (0 active)
+    const latestRun = await this.store.loadRun(run.id);
+    const nowIso = new Date(this.nowFn()).toISOString();
+    for (const member of Object.values(latestRun.members)) {
+      if (member.state === "working" || member.state === "waiting") {
+        await this.store.updateMember(run.id, member.name, {
+          state: "stopped",
+          currentActivity: null,
+          parkedOn: "run completed",
+          endedAt: nowIso,
+          actor,
+        });
+      }
+    }
+
+    const completed = await this.store.updateRun(run.id, {
+      status: "completed",
+      completionSummary: summary,
+      actor,
+    });
+
+    if (options.teardown) {
+      await this.teardown({
+        runId: run.id,
+        deleteBranches: options.deleteBranches,
+      });
+    }
+
+    const finalRun = await this.store.loadRun(run.id);
+    await this.refreshCache(finalRun);
+    this.resolveAllWaiters("run_ended", `Swarm run completed: ${summary}`);
+    this.emitEngineEvent("run_finished", `Swarm run "${completed.title}" completed: ${summary}`);
+    this.emitEngineEvent("snapshot_changed", `Swarm run "${completed.title}" completed.`);
+    return finalRun;
+  }
+
+  // --------------------------------------------------------------------------
+  // Dynamic Member Management (addMembers, switchModel, steer, stop, kill, merge)
+  // --------------------------------------------------------------------------
+
+  async addMembers(input: AddMemberInput): Promise<SwarmMemberRecord[]> {
+    if (input.hostContext) {
+      this.hostContext = input.hostContext;
+    }
+    const run = this.requireActiveRun();
+    if (run.status === "completed" || run.status === "abandoned") {
+      throw new SwarmProtocolError(
+        "INVALID_INPUT",
+        `Cannot add members to a ${run.status} Swarm run.`,
+      );
+    }
+
+    const callerRole: CallerRole = input.callerRole ?? "orchestrator";
+    const callerName =
+      input.callerName?.trim() ||
+      (callerRole === "human" ? "human" : ORCHESTRATOR_NAME);
+
+    // Permission & role validation
+    let parentName: string = ORCHESTRATOR_NAME;
+    let parentMember: SwarmMemberRecord | undefined;
+
+    if (callerRole === "worker" || callerRole === "validator") {
+      parentMember = this.findMember(run, callerName);
+      if (!parentMember) {
+        throw new SwarmProtocolError(
+          "MEMBER_NOT_FOUND",
+          `Caller member "${callerName}" was not found in run "${run.id}".`,
+        );
+      }
+      if (parentMember.state === "killed") {
+        throw new SwarmProtocolError(
+          "MEMBER_KILLED",
+          `Killed member "${callerName}" cannot add helpers.`,
+        );
+      }
+      parentName = parentMember.name;
+      if (callerRole === "validator" && input.role && input.role !== "validator") {
+        throw new SwarmProtocolError(
+          "ROLE_FORBIDDEN",
+          `Read-only validator "@${parentName}" may only add read-only "validator" helpers.`,
+        );
+      }
+    } else if (!isOrchestratorOrHuman(callerRole)) {
+      throw new SwarmProtocolError(
+        "PERMISSION_DENIED",
+        `Role "${callerRole}" is not allowed to add swarm members.`,
+      );
+    }
+
+    const memberRole: SwarmMemberRole =
+      callerRole === "validator" ? "validator" : (input.role ?? "worker");
+
+    const baseName = validateMemberName(input.name);
+    const brief = input.brief?.trim() ?? "";
+    if (!brief) {
+      throw new SwarmProtocolError("INVALID_INPUT", "Member brief must be non-empty.");
+    }
+
+    const hasTasks = Array.isArray(input.tasks) && input.tasks.length > 0;
+    const hasCount = input.n !== undefined && input.n > 1;
+    if (hasTasks && hasCount) {
+      throw new SwarmProtocolError(
+        "INVALID_INPUT",
+        'Specify either "n" or "tasks", not both.',
+      );
+    }
+
+    // Build member spawn specifications (single, n copies, or sharded tasks[])
+    interface MemberSpec {
+      name: string;
+      groupPrefix?: string;
+      brief: string;
+    }
+
+    const specs: MemberSpec[] = [];
+    if (hasTasks) {
+      if (input.tasks!.length > MAX_SHARD_COUNT) {
+        throw new SwarmProtocolError(
+          "INVALID_INPUT",
+          `Too many sharded tasks (${input.tasks!.length}); maximum is ${MAX_SHARD_COUNT}.`,
+        );
+      }
+      for (let i = 0; i < input.tasks!.length; i++) {
+        const target = input.tasks![i]!.trim();
+        if (!target) {
+          throw new SwarmProtocolError(
+            "INVALID_INPUT",
+            `Task slice at index ${i} must be non-empty.`,
+          );
+        }
+        const shardName = validateMemberName(`${baseName}-${i + 1}`);
+        specs.push({
+          name: shardName,
+          groupPrefix: baseName,
+          brief: `${brief}\n\nAssigned slice (${i + 1}/${input.tasks!.length}): ${target}`,
+        });
+      }
+    } else if (hasCount) {
+      const count = input.n!;
+      if (!Number.isInteger(count) || count < 1 || count > MAX_SHARD_COUNT) {
+        throw new SwarmProtocolError(
+          "INVALID_INPUT",
+          `Invalid member copy count n=${String(count)} (expected integer 1..${MAX_SHARD_COUNT}).`,
+        );
+      }
+      for (let i = 1; i <= count; i++) {
+        const shardName = validateMemberName(`${baseName}-${i}`);
+        specs.push({
+          name: shardName,
+          groupPrefix: baseName,
+          brief,
+        });
+      }
+    } else {
+      specs.push({
+        name: baseName,
+        brief,
+      });
+    }
+
+    // Reject duplicates (including previously killed names — killed names are never reused!)
+    const batchNames = new Set<string>();
+    for (const spec of specs) {
+      const lower = spec.name.toLowerCase();
+      if (batchNames.has(lower) || this.findMember(run, spec.name)) {
+        throw new SwarmProtocolError(
+          "DUPLICATE_MEMBER",
+          `Member name "${spec.name}" already exists in this Swarm run (killed names cannot be reused).`,
+          { name: spec.name },
+        );
+      }
+      batchNames.add(lower);
+    }
+
+    // Resolve and validate channels
+    let channels: string[];
+    if (input.channels && input.channels.length > 0) {
+      channels = [];
+      const seen = new Set<string>();
+      for (const rawCh of input.channels) {
+        const ch = validateChannelName(rawCh);
+        const record = run.channels[ch];
+        if (!record) {
+          throw new SwarmProtocolError(
+            "INVALID_CHANNEL",
+            `Channel "#${ch}" does not exist. Create it first via swarm{action:"channel", op:"create"}.`,
+            { channel: ch },
+          );
+        }
+        if (record.archived) {
+          throw new SwarmProtocolError(
+            "CHANNEL_ARCHIVED",
+            `Channel "#${ch}" is archived and cannot accept new members.`,
+            { channel: ch },
+          );
+        }
+        if (!seen.has(ch)) {
+          seen.add(ch);
+          channels.push(ch);
+        }
+      }
+    } else if (parentMember) {
+      const inherited = parentMember.channels.filter(
+        (ch) => run.channels[ch] && !run.channels[ch]!.archived,
+      );
+      channels = inherited.length > 0 ? [...inherited] : [DEFAULT_CHANNEL];
+    } else {
+      channels = [DEFAULT_CHANNEL];
+    }
+    const primaryChannel = channels[0] ?? DEFAULT_CHANNEL;
+
+    // Resolve TRUE Conversation Fork (`input.fork`) before creating worktrees/members
+    let forkedFrom: string | undefined;
+    let seedMessages: AgentMessage[] | undefined;
+    if (input.fork?.trim()) {
+      const forkTarget = input.fork.trim();
+      const forkLower = forkTarget.toLowerCase();
+      if (forkLower === ORCHESTRATOR_NAME || forkLower === "coordinator") {
+        const ctx = input.hostContext ?? this.hostContext;
+        seedMessages = sanitizeForkSeedMessages(extractSessionMessages(ctx?.sessionManager));
+        forkedFrom = ORCHESTRATOR_NAME;
+      } else {
+        const sourceMember = this.findMember(run, forkTarget);
+        if (!sourceMember) {
+          throw new SwarmProtocolError(
+            "MEMBER_NOT_FOUND",
+            `Cannot fork from unknown member "${forkTarget}".`,
+            { fork: forkTarget },
+          );
+        }
+        const sourceLive = this.liveMembers.get(sourceMember.name);
+        if (sourceLive?.handle) {
+          seedMessages = sanitizeForkSeedMessages(sourceLive.handle.getConversationMessages());
+        } else if (sourceLive && sourceLive.lastMessages.length > 0) {
+          seedMessages = sanitizeForkSeedMessages(sourceLive.lastMessages);
+        } else if (sourceMember.state === "killed") {
+          throw new SwarmProtocolError(
+            "MEMBER_KILLED",
+            `Cannot fork from killed member "@${sourceMember.name}" (session disposed).`,
+            { fork: sourceMember.name },
+          );
+        } else {
+          seedMessages = [];
+        }
+        forkedFrom = sourceMember.name;
+      }
+    }
+
+    // Resolve 3-role model (`worker` vs `validator`, with explicit override taking precedence)
+    const settings = this.getEffectiveSettings();
+    const roleDefaultFromRun = run.roleModels[memberRole];
+    const resolvedFromSettings = resolveRoleModel(
+      memberRole,
+      settings,
+      input.model,
+      input.thinkingLevel,
+    );
+    const effectiveModel =
+      resolvedFromSettings.model ?? roleDefaultFromRun?.model?.trim() ?? undefined;
+    const effectiveThinking =
+      resolvedFromSettings.thinkingLevel ?? roleDefaultFromRun?.thinkingLevel;
+
+    const workspaceMode: SwarmWorkspaceMode = input.workspace ?? "inherit";
+    const safeRunBranchSegment =
+      run.id
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]+/g, "-")
+        .replace(/^-+|-+$/g, "") || "run";
+    const createdRecords: SwarmMemberRecord[] = [];
+    const launches: Array<{
+      memberName: string;
+      briefSeq: number;
+      seedMessages?: AgentMessage[];
+    }> = [];
+
+    this.cancelStallWatchdog();
+
+    for (const spec of specs) {
+      let cwd: string;
+      let branch: string | undefined;
+
+      if (workspaceMode === "share" || workspaceMode === "branch") {
+        branch = `${SWARM_BRANCH_PREFIX}${safeRunBranchSegment}/${spec.name}`;
+        const worktreePath = this.store.getWorktreePath(run.id, spec.name);
+        const createdWt = await this.worktree.createWorktree({
+          branch,
+          baseBranch: run.baseBranch,
+          worktreePath,
+        });
+        cwd = createdWt.worktreePath;
+        branch = createdWt.branch;
+      } else {
+        cwd =
+          parentMember && parentMember.workspace !== "inherit"
+            ? parentMember.cwd
+            : this.worktree.repoRoot;
+      }
+
+      const agentId = this.generateAgentIdFn(spec.name);
+      await this.store.addMember(
+        run.id,
+        {
+          name: spec.name,
+          agentId,
+          role: memberRole,
+          parentName,
+          groupPrefix: spec.groupPrefix,
+          brief: spec.brief,
+          workspace: workspaceMode,
+          cwd,
+          branch,
+          forkedFrom,
+          channels,
+          state: "working",
+          model: effectiveModel,
+          thinkingLevel: effectiveThinking,
+          lastReadSeq: this.cachedRun?.boardHead ?? run.boardHead,
+        },
+        { actor: callerName },
+      );
+
+      // Post public brief on the shared board as callerName
+      const briefMsg = await this.store.postBoardMessage(run.id, {
+        from: callerName,
+        fromRole: callerRole,
+        channel: primaryChannel,
+        kind: "brief",
+        text: `@${spec.name} ${spec.brief}`,
+      });
+      this.recordBoardMessageInCache(briefMsg);
+
+      const updatedRun = await this.store.updateMember(run.id, spec.name, {
+        briefSeq: briefMsg.seq,
+        lastReadSeq: briefMsg.seq,
+        currentActivity: "queued to start",
+        actor: callerName,
+      });
+      this.setCachedRun(updatedRun);
+
+      const memberRecord = updatedRun.members[spec.name]!;
+      createdRecords.push(memberRecord);
+
+      // Register LiveMember SYNCHRONOUSLY as spawning so waitForBoard never falsely sees all_idle!
+      const live: LiveMember = {
+        name: spec.name,
+        agentId,
+        role: memberRole,
+        spawning: true,
+        waking: false,
+        turnActive: false,
+        switchingModel: false,
+        parkedMentionsOnly: true,
+        pendingWakes: [],
+        deliveredSeqs: new Set<number>([briefMsg.seq]),
+        triedModels: new Set<string>(effectiveModel ? [effectiveModel] : []),
+        lastMessages: seedMessages ? sanitizeForkSeedMessages(seedMessages) : [],
+        logTail: [...memberRecord.logTail],
+        currentActivity: "queued to start",
+      };
+      this.liveMembers.set(spec.name, live);
+
+      this.emitEngineEvent("board_posted", `Posted brief #${briefMsg.seq} for @${spec.name}`, {
+        memberName: spec.name,
+        seq: briefMsg.seq,
+      });
+      this.notifyWaitersOnMessage(briefMsg);
+
+      launches.push({
+        memberName: spec.name,
+        briefSeq: briefMsg.seq,
+        seedMessages: seedMessages ? sanitizeForkSeedMessages(seedMessages) : undefined,
+      });
+    }
+
+    await this.refreshCache();
+    this.emitEngineEvent(
+      "snapshot_changed",
+      `Added ${createdRecords.length} member(s): ${createdRecords.map((m) => `@${m.name}`).join(", ")}`,
+    );
+
+    // Launch all newly registered members asynchronously
+    const effectiveCtx = input.hostContext ?? this.hostContext;
+    for (const launch of launches) {
+      void this.launchMemberInitialTurn(
+        run.id,
+        launch.memberName,
+        launch.briefSeq,
+        launch.seedMessages,
+        effectiveCtx,
+      );
+    }
+
+    return createdRecords;
+  }
+
+  async postMessage(input: PostBoardMessageInput): Promise<BoardMessage> {
+    const run = this.requireActiveRun();
+    const text = input.text?.trim() ?? "";
+    if (!text) {
+      throw new SwarmProtocolError("INVALID_INPUT", "Board message text must be non-empty.");
+    }
+
+    // Parse & validate channel mentions (`@#<ch>`): reject `@#main`, unknown, or archived channels
+    const parsedChMentions = mergeUniqueLower([
+      parseChannelMentions(text),
+      input.channelMentions,
+    ]);
+    for (const ch of parsedChMentions) {
+      if (ch === DEFAULT_CHANNEL) {
+        throw new SwarmProtocolError(
+          "INVALID_CHANNEL",
+          'Cannot mention "@#main". Use "@all" for swarm-wide notices or target a specific channel.',
+          { channel: ch },
+        );
+      }
+      const chRecord = run.channels[ch];
+      if (!chRecord) {
+        throw new SwarmProtocolError(
+          "INVALID_CHANNEL",
+          `Channel "#${ch}" does not exist.`,
+          { channel: ch },
+        );
+      }
+      if (chRecord.archived) {
+        throw new SwarmProtocolError(
+          "CHANNEL_ARCHIVED",
+          `Channel "#${ch}" is archived and cannot be mentioned.`,
+          { channel: ch },
+        );
+      }
+    }
+
+    // Resolve and validate target post channel
+    const senderMember = this.findMember(run, input.from);
+    const channel = (
+      input.channel?.trim().toLowerCase() ||
+      senderMember?.channels[0] ||
+      DEFAULT_CHANNEL
+    );
+    const channelRecord = run.channels[channel];
+    if (!channelRecord) {
+      throw new SwarmProtocolError(
+        "INVALID_CHANNEL",
+        `Channel "#${channel}" does not exist.`,
+        { channel },
+      );
+    }
+    if (channelRecord.archived) {
+      throw new SwarmProtocolError(
+        "CHANNEL_ARCHIVED",
+        `Channel "#${channel}" is archived and cannot receive posts.`,
+        { channel },
+      );
+    }
+
+    // Parse handle mentions (`@name`, `@prefix`, `@all`) ignoring emails and `@#channel`
+    const parsedMentions = mergeUniqueLower([parseHandleMentions(text), input.mentions]);
+
+    const msg = await this.store.postBoardMessage(run.id, {
+      ...input,
+      text,
+      channel,
+      mentions: parsedMentions,
+      channelMentions: parsedChMentions,
+    });
+
+    // Ensure consistent normalized mentions on returned object even with minimal mock stores
+    const normalizedMsg: BoardMessage = {
+      ...msg,
+      channel: msg.channel || channel,
+      mentions: mergeUniqueLower([msg.mentions, parsedMentions]),
+      channelMentions: mergeUniqueLower([msg.channelMentions, parsedChMentions]),
+    };
+
+    this.recordBoardMessageInCache(normalizedMsg);
+    this.cancelStallWatchdog();
+    this.stallNoticePostedAtHead = null;
+
+    if (normalizedMsg.fromRole === "orchestrator" || normalizedMsg.fromRole === "human") {
+      this.boardHopCount = 0;
+      this.hopCapAlerted = false;
+    }
+
+    // Keep cached run synced with new boardHead / sender lastPostSeq
+    const latestRun = await this.store.loadRun(run.id);
+    this.setCachedRun(latestRun);
+
+    this.emitEngineEvent("board_posted", `Posted #${normalizedMsg.seq} from ${normalizedMsg.from}`, {
+      memberName: senderMember?.name,
+      seq: normalizedMsg.seq,
+    });
+
+    // Route wakeups SYNCHRONOUSLY marking `live.waking = true` BEFORE resolving waiters or returning!
+    if (latestRun.status === "active" && normalizedMsg.fromRole !== "monitor") {
+      await this.routeBoardMessageWakeups(latestRun, normalizedMsg);
+    }
+
+    // Notify blocking `waitForBoard` waiters immediately
+    this.notifyWaitersOnMessage(normalizedMsg);
+
+    // Re-arm watchdog if 0 working and no waiter is blocked (and not done)
+    this.maybeArmStallWatchdog();
+
+    return normalizedMsg;
+  }
+
+  async readBoard(options?: ReadBoardOptions): Promise<ReadBoardResult> {
+    const run = this.requireActiveRun();
+    const res = await this.store.readBoard(run.id, options);
+    return res;
+  }
+
+  async waitForBoard(options: WaitForBoardOptions): Promise<WaitForBoardResult> {
+    const since = Number.isFinite(options.since) ? Math.max(0, Math.floor(options.since)) : 0;
+    const mentionsOnly = options.mentionsOnly ?? true;
+    const targetName = (options.targetName?.trim() || ORCHESTRATOR_NAME).toLowerCase();
+    const targetChannels = options.targetChannels ?? [];
+
+    const currentHead = this.cachedRun?.boardHead ?? 0;
+
+    if (options.signal?.aborted) {
+      return {
+        wokeBy: "aborted",
+        messages: [],
+        head: currentHead,
+        summary: "Wait cancelled by abort signal.",
+      };
+    }
+
+    if (!this.activeRunId || !this.cachedRun || this.cachedRun.status !== "active") {
+      return {
+        wokeBy: "run_ended",
+        messages: [],
+        head: currentHead,
+        summary: "Swarm run is not active.",
+      };
+    }
+
+    const runId = this.activeRunId;
+    const initial = await this.store.readBoard(runId, {
+      since,
+      channel: "*",
+      limit: Number.MAX_SAFE_INTEGER,
+    });
+
+    // Re-check abort, run lifecycle, and mid-await messages synchronously BEFORE adding waiter!
+    const latestHead = Math.max(initial.head, this.cachedRun?.boardHead ?? 0);
+    const mergedBySeq = new Map<number, BoardMessage>();
+    for (const m of initial.messages) {
+      mergedBySeq.set(m.seq, m);
+    }
+    for (const m of this.getCachedMessagesSince(since)) {
+      mergedBySeq.set(m.seq, m);
+    }
+    const mergedUnread = Array.from(mergedBySeq.values()).sort((a, b) => a.seq - b.seq);
+
+    if (options.signal?.aborted) {
+      return {
+        wokeBy: "aborted",
+        messages: mergedUnread,
+        head: latestHead,
+        summary: "Wait cancelled by abort signal.",
+      };
+    }
+
+    if (
+      this.disposed ||
+      this.activeRunId !== runId ||
+      !this.cachedRun ||
+      this.cachedRun.status !== "active"
+    ) {
+      return {
+        wokeBy: "run_ended",
+        messages: mergedUnread,
+        head: latestHead,
+        summary: "Swarm run is not active.",
+      };
+    }
+
+    const immediateMatches = mergedUnread.filter((m) =>
+      this.doesMessageMatchWaiter(m, targetName, mentionsOnly, targetChannels),
+    );
+    if (immediateMatches.length > 0) {
+      return {
+        wokeBy: "message",
+        messages: mergedUnread,
+        head: latestHead,
+        summary: `${immediateMatches.length} matching board message(s) already waiting since #${since}.`,
+      };
+    }
+
+    // Anti-deadlock check: if NO member is working, spawning, waking, or switching models -> return immediately!
+    const activeNames = this.getWorkingOrPendingMemberNames();
+    if (activeNames.length === 0) {
+      return {
+        wokeBy: "all_idle",
+        messages: mergedUnread,
+        head: latestHead,
+        summary: "All swarm members are idle (0 working/pending); nothing left to wait for.",
+      };
+    }
+
+    // Orchestrator is actively waiting -> cancel Stall Watchdog so it won't double-alert
+    this.cancelStallWatchdog();
+
+    return new Promise<WaitForBoardResult>((resolve) => {
+      let settled = false;
+      let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+      let progressInterval: ReturnType<typeof setInterval> | null = null;
+
+      const emitProgress = (): void => {
+        if (!options.onProgress || settled) return;
+        const working = this.getWorkingOrPendingMemberNames();
+        const head = this.cachedRun?.boardHead ?? initial.head;
+        const statusParts = working.map((name) => {
+          const m = this.cachedRun?.members[name];
+          const act = m?.currentActivity ? ` (${m.currentActivity})` : "";
+          return `@${name}${act}`;
+        });
+        try {
+          options.onProgress(
+            `Waiting on ${working.length} active member(s): ${statusParts.join(", ") || "none"} | board=#${head}`,
+          );
+        } catch {
+          // progress callback errors must not break waitForBoard
+        }
+      };
+
+      const onAbort = (): void => {
+        finish({
+          wokeBy: "aborted",
+          messages: this.getCachedMessagesSince(since),
+          head: this.cachedRun?.boardHead ?? initial.head,
+          summary: "Wait cancelled by abort signal.",
+        });
+      };
+
+      const cleanup = (): void => {
+        this.boardWaiters.delete(waiter);
+        if (timeoutHandle) {
+          clearTimeout(timeoutHandle);
+          timeoutHandle = null;
+        }
+        if (progressInterval) {
+          clearInterval(progressInterval);
+          progressInterval = null;
+        }
+        if (options.signal) {
+          options.signal.removeEventListener("abort", onAbort);
+        }
+      };
+
+      const finish = (result: WaitForBoardResult): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(result);
+      };
+
+      const waiter: BoardWaiter = {
+        since,
+        mentionsOnly,
+        targetName,
+        targetChannels,
+        onProgress: options.onProgress,
+        resolve: finish,
+        cleanup,
+      };
+
+      this.boardWaiters.add(waiter);
+
+      if (options.signal) {
+        options.signal.addEventListener("abort", onAbort, { once: true });
+      }
+
+      if (
+        options.timeoutMs !== undefined &&
+        Number.isFinite(options.timeoutMs) &&
+        options.timeoutMs > 0
+      ) {
+        timeoutHandle = setTimeout(() => {
+          finish({
+            wokeBy: "timeout",
+            messages: this.getCachedMessagesSince(since),
+            head: this.cachedRun?.boardHead ?? initial.head,
+            summary: `Timed out after ${Math.round(options.timeoutMs!)}ms while waiting on board.`,
+          });
+        }, options.timeoutMs);
+      }
+
+      if (options.onProgress) {
+        emitProgress();
+        progressInterval = setInterval(emitProgress, 1000);
+      }
+    });
+  }
+
+  async switchModel(options: SwitchModelOptions): Promise<SwitchModelResult> {
+    return this.performSwitchModel(options, { holdSwitchingLock: false });
+  }
+
+  private async performSwitchModel(
+    options: SwitchModelOptions,
+    internal: { holdSwitchingLock: boolean },
+  ): Promise<SwitchModelResult> {
+    if (options.hostContext) {
+      this.hostContext = options.hostContext;
+    }
+    const run = this.requireActiveRun();
+    const modelOverride = options.model?.trim() ?? "";
+    if (!modelOverride) {
+      throw new SwarmProtocolError("INVALID_INPUT", "Model identifier must be non-empty.");
+    }
+
+    const callerRole: CallerRole = options.callerRole ?? "orchestrator";
+    const callerName =
+      options.callerName?.trim() ||
+      (callerRole === "human" ? "human" : ORCHESTRATOR_NAME);
+    const targetRaw = options.targetName?.trim() || callerName;
+
+    // Switching orchestrator role model
+    if (
+      targetRaw.toLowerCase() === ORCHESTRATOR_NAME ||
+      targetRaw.toLowerCase() === "coordinator"
+    ) {
+      if (!isOrchestratorOrHuman(callerRole)) {
+        throw new SwarmProtocolError(
+          "PERMISSION_DENIED",
+          `Member "@${callerName}" cannot switch the orchestrator's model.`,
+        );
+      }
+      const nextRoleModels: SwarmRoleModels = {
+        ...run.roleModels,
+        orchestrator: {
+          model: modelOverride,
+          thinkingLevel: options.thinkingLevel ?? run.roleModels.orchestrator?.thinkingLevel,
+        },
+      };
+      const updated = await this.store.updateRun(run.id, {
+        roleModels: nextRoleModels,
+        actor: callerName,
+      });
+      await this.refreshCache(updated);
+      this.emitEngineEvent(
+        "snapshot_changed",
+        `Switched orchestrator model -> ${modelOverride}`,
+      );
+      return {
+        targetName: ORCHESTRATOR_NAME,
+        model: modelOverride,
+        thinkingLevel: options.thinkingLevel,
+      };
+    }
+
+    const member = this.findMember(run, targetRaw);
+    if (!member) {
+      throw new SwarmProtocolError(
+        "MEMBER_NOT_FOUND",
+        `Member "${targetRaw}" was not found in Swarm run "${run.id}".`,
+        { targetName: targetRaw },
+      );
+    }
+
+    // Permission boundary: workers/validators may switch ONLY themselves or helpers they added!
+    if (callerRole === "worker" || callerRole === "validator") {
+      if (member.name !== callerName && member.parentName !== callerName) {
+        throw new SwarmProtocolError(
+          "PERMISSION_DENIED",
+          `Member "@${callerName}" may only switch models for itself or helpers it added, not "@${member.name}".`,
+          { callerName, targetName: member.name },
+        );
+      }
+    } else if (!isOrchestratorOrHuman(callerRole)) {
+      throw new SwarmProtocolError(
+        "PERMISSION_DENIED",
+        `Role "${callerRole}" cannot switch member models.`,
+      );
+    }
+
+    if (member.state === "killed") {
+      throw new SwarmProtocolError(
+        "MEMBER_KILLED",
+        `Member "@${member.name}" has been killed and cannot switch models.`,
+        { memberName: member.name },
+      );
+    }
+    const live = this.liveMembers.get(member.name);
+    const liveState = live?.handle?.getState() ?? member.state;
+    if (
+      member.state !== "waiting" ||
+      liveState !== "waiting" ||
+      live?.spawning ||
+      live?.waking ||
+      live?.turnActive ||
+      (!internal.holdSwitchingLock && live?.switchingModel)
+    ) {
+      throw new SwarmProtocolError(
+        "MEMBER_NOT_WAITING",
+        `Member "@${member.name}" is currently "${live?.switchingModel ? "switchingModel" : liveState}" (not waiting). Wait until it parks in waiting state before switching models.`,
+        { memberName: member.name, state: live?.switchingModel ? "switchingModel" : liveState },
+      );
+    }
+
+    // Acquire synchronous switchingModel lock BEFORE any await so concurrent @mentions queue safely!
+    const acquiredLock = !internal.holdSwitchingLock && Boolean(live);
+    if (acquiredLock && live) {
+      live.switchingModel = true;
+    }
+
+    try {
+      let resolvedModel = modelOverride;
+      let resolvedThinking = options.thinkingLevel;
+
+      if (live?.handle) {
+        const switched = await live.handle.switchModel(modelOverride, options.thinkingLevel);
+        resolvedModel = switched.model;
+        resolvedThinking = switched.thinkingLevel ?? options.thinkingLevel;
+        live.triedModels.add(resolvedModel);
+      }
+
+      const updatedRun = await this.store.updateMember(run.id, member.name, {
+        model: resolvedModel,
+        thinkingLevel: resolvedThinking ?? null,
+        error: null,
+        actor: callerName,
+      });
+
+      await this.store.appendEvent({
+        runId: run.id,
+        type: "member_model_switched",
+        actor: callerName,
+        memberName: member.name,
+        agentId: member.agentId,
+        summary: `Switched @${member.name} model -> ${resolvedModel}${resolvedThinking ? ` (${resolvedThinking})` : ""}${options.reason ? ` (${options.reason})` : ""}`,
+        data: {
+          previousModel: member.model,
+          model: resolvedModel,
+          thinkingLevel: resolvedThinking,
+          reason: options.reason,
+        },
+      });
+
+      // Post non-waking `[model]` notice on board (no `@` so it doesn't wake members)
+      const noticeMsg = await this.store.postBoardMessage(run.id, {
+        from: callerName,
+        fromRole: callerRole,
+        channel: member.channels[0] ?? DEFAULT_CHANNEL,
+        kind: "model_switch",
+        text: `[model] ${member.name} switched to ${resolvedModel}${resolvedThinking ? ` (${resolvedThinking})` : ""}${options.reason ? ` — ${options.reason}` : ""}`,
+        mentions: [],
+        channelMentions: [],
+      });
+      this.recordBoardMessageInCache(noticeMsg);
+      this.emitEngineEvent("board_posted", `Posted model switch #${noticeMsg.seq}`, {
+        memberName: member.name,
+        seq: noticeMsg.seq,
+      });
+
+      await this.refreshCache(updatedRun);
+      this.emitEngineEvent(
+        "snapshot_changed",
+        `Hot-switched @${member.name} model -> ${resolvedModel}`,
+        { memberName: member.name },
+      );
+
+      return {
+        targetName: member.name,
+        model: resolvedModel,
+        thinkingLevel: resolvedThinking,
+        member: this.cachedRun?.members[member.name],
+      };
+    } finally {
+      if (acquiredLock && live) {
+        const stillLive = this.liveMembers.get(member.name) === live;
+        const currentMember = this.cachedRun?.members[member.name];
+        if (
+          stillLive &&
+          !this.disposed &&
+          this.activeRunId === run.id &&
+          this.cachedRun?.status === "active" &&
+          currentMember?.state === "waiting" &&
+          live.pendingWakes.length > 0
+        ) {
+          // Atomically hand off switchingModel -> waking to drain wakes queued during switch!
+          live.switchingModel = false;
+          live.waking = true;
+          void this.drainMemberPendingWakes(run.id, member.name);
+        } else {
+          live.switchingModel = false;
+          this.checkAllIdleAndNotifyWaiters();
+          this.maybeArmStallWatchdog();
+        }
+      }
+    }
+  }
+
+  async steerMember(
+    memberName: string,
+    message: string,
+    mode: "steer" | "followUp" = "steer",
+  ): Promise<void> {
+    const run = this.requireActiveRun();
+    const member = this.findMember(run, memberName);
+    if (!member) {
+      throw new SwarmProtocolError("MEMBER_NOT_FOUND", `Member "${memberName}" not found.`);
+    }
+    if (member.state === "killed") {
+      throw new SwarmProtocolError("MEMBER_KILLED", `Member "@${member.name}" has been killed.`);
+    }
+    const live = this.liveMembers.get(member.name);
+    if (!live?.handle) {
+      throw new SwarmProtocolError(
+        "MEMBER_NOT_WAITING",
+        `Member "@${member.name}" does not have an active live session.`,
+      );
+    }
+    if (mode === "followUp") {
+      await live.handle.followUp(message);
+    } else {
+      await live.handle.steer(message);
+    }
+  }
+
+  async stopMember(memberName: string, options?: StopMemberOptions): Promise<void> {
+    const run = this.requireActiveRun();
+    const member = this.findMember(run, memberName);
+    if (!member) {
+      throw new SwarmProtocolError("MEMBER_NOT_FOUND", `Member "${memberName}" not found.`);
+    }
+
+    const callerRole: CallerRole = options?.callerRole ?? "orchestrator";
+    const callerName =
+      options?.callerName?.trim() ||
+      (callerRole === "human" ? "human" : ORCHESTRATOR_NAME);
+
+    if (callerRole === "worker" || callerRole === "validator") {
+      if (member.name !== callerName && member.parentName !== callerName) {
+        throw new SwarmProtocolError(
+          "PERMISSION_DENIED",
+          `Member "@${callerName}" may only stop itself or helpers it added, not "@${member.name}".`,
+        );
+      }
+    } else if (!isOrchestratorOrHuman(callerRole)) {
+      throw new SwarmProtocolError("PERMISSION_DENIED", `Role "${callerRole}" cannot stop members.`);
+    }
+
+    if (member.state === "killed") {
+      throw new SwarmProtocolError("MEMBER_KILLED", `Member "@${member.name}" is already killed.`);
+    }
+
+    const live = this.liveMembers.get(member.name);
+    if (live) {
+      live.launchAbort?.abort();
+      live.spawning = false;
+      live.waking = false;
+      live.turnActive = false;
+      live.switchingModel = false;
+      live.parkedMentionsOnly = true;
+      live.currentActivity = undefined;
+      live.pendingWakes.length = 0;
+      if (live.handle) {
+        live.lastMessages = sanitizeForkSeedMessages(live.handle.getConversationMessages());
+        await live.handle.abort(options?.reason ?? "Stopped").catch(() => {});
+      }
+      live.releaseSlot?.();
+      live.releaseSlot = undefined;
+    }
+
+    const humanStopped = options?.humanStopped ?? callerRole === "human";
+    const updated = await this.store.updateMember(run.id, member.name, {
+      state: "stopped",
+      humanStopped,
+      currentActivity: null,
+      parkedOn: options?.reason ?? (humanStopped ? "stopped by user" : "stopped"),
+      actor: callerName,
+    });
+    await this.refreshCache(updated);
+    this.emitEngineEvent("snapshot_changed", `Stopped @${member.name}`, {
+      memberName: member.name,
+    });
+    this.checkAllIdleAndNotifyWaiters();
+    this.maybeArmStallWatchdog();
+  }
+
+  async killMember(memberName: string, options?: KillMemberOptions): Promise<void> {
+    const run = this.requireActiveRun();
+    const member = this.findMember(run, memberName);
+    if (!member) {
+      throw new SwarmProtocolError("MEMBER_NOT_FOUND", `Member "${memberName}" not found.`);
+    }
+
+    const callerRole: CallerRole = options?.callerRole ?? "orchestrator";
+    const callerName =
+      options?.callerName?.trim() ||
+      (callerRole === "human" ? "human" : ORCHESTRATOR_NAME);
+
+    // Permission boundary: workers/validators may ONLY kill helpers they added!
+    if (callerRole === "worker" || callerRole === "validator") {
+      if (member.parentName !== callerName) {
+        throw new SwarmProtocolError(
+          "PERMISSION_DENIED",
+          `Member "@${callerName}" may only kill helpers it added, not "@${member.name}".`,
+          { callerName, targetName: member.name, parentName: member.parentName },
+        );
+      }
+    } else if (!isOrchestratorOrHuman(callerRole)) {
+      throw new SwarmProtocolError("PERMISSION_DENIED", `Role "${callerRole}" cannot kill members.`);
+    }
+
+    if (member.state === "killed") {
+      return;
+    }
+
+    const hasOwnWorktree =
+      (member.workspace === "share" || member.workspace === "branch") &&
+      Boolean(member.cwd) &&
+      member.cwd !== this.worktree.repoRoot;
+
+    // Dirty worktree guard BEFORE killing / deleting worktree!
+    if (hasOwnWorktree && !options?.force) {
+      const dirty = await this.worktree.isWorktreeDirty(member.cwd).catch(() => false);
+      if (dirty) {
+        throw new SwarmProtocolError(
+          "DIRTY_WORKTREE",
+          `Refusing to delete dirty worktree for "@${member.name}" (${member.cwd}). Commit/merge its changes first or pass force=true.`,
+          { memberName: member.name, worktreePath: member.cwd },
+        );
+      }
+    }
+
+    const live = this.liveMembers.get(member.name);
+    if (live) {
+      live.launchAbort?.abort();
+      live.spawning = false;
+      live.waking = false;
+      live.turnActive = false;
+      live.switchingModel = false;
+      live.parkedMentionsOnly = true;
+      live.currentActivity = undefined;
+      live.pendingWakes.length = 0;
+      if (live.handle) {
+        await live.handle.kill(options?.reason ?? "Killed").catch(() => {});
+      }
+      live.releaseSlot?.();
+      live.releaseSlot = undefined;
+      this.liveMembers.delete(member.name);
+    }
+
+    if (hasOwnWorktree) {
+      await this.worktree.removeWorktree(member.cwd, { force: Boolean(options?.force) });
+    }
+
+    const nowIso = new Date(this.nowFn()).toISOString();
+    const updated = await this.store.updateMember(run.id, member.name, {
+      state: "killed",
+      currentActivity: null,
+      parkedOn: options?.reason ?? "killed",
+      endedAt: nowIso,
+      actor: callerName,
+    });
+    await this.refreshCache(updated);
+    this.emitEngineEvent("snapshot_changed", `Killed @${member.name}`, {
+      memberName: member.name,
+    });
+    this.checkAllIdleAndNotifyWaiters();
+    this.maybeArmStallWatchdog();
+  }
+
+  async mergeMember(
+    memberName: string,
+    options?: MergeMemberOptions,
+  ): Promise<MergeBranchResult | null> {
+    if (!isOrchestratorOrHuman(options?.callerRole)) {
+      throw new SwarmProtocolError(
+        "PERMISSION_DENIED",
+        `Role "${options?.callerRole}" is not allowed to merge worktrees. Only @${ORCHESTRATOR_NAME} can merge.`,
+      );
+    }
+    const run = this.requireActiveRun();
+    const member = this.findMember(run, memberName);
+    if (!member) {
+      throw new SwarmProtocolError("MEMBER_NOT_FOUND", `Member "${memberName}" not found.`);
+    }
+
+    if (member.workspace === "inherit" || !member.branch) {
+      return null;
+    }
+
+    const live = this.liveMembers.get(member.name);
+    const liveState = live?.handle?.getState() ?? member.state;
+    if (
+      member.state === "working" ||
+      liveState === "working" ||
+      live?.spawning ||
+      live?.waking ||
+      live?.turnActive ||
+      live?.switchingModel
+    ) {
+      throw new SwarmProtocolError(
+        "MEMBER_NOT_WAITING",
+        `Cannot merge "@${member.name}" while it is still working. Wait until it parks in waiting state.`,
+        { memberName: member.name },
+      );
+    }
+
+    // 1. Verify member worktree is clean (skip if already removed after kill — branch still exists!)
+    if (member.state !== "killed" && member.cwd && member.cwd !== this.worktree.repoRoot) {
+      const dirty = await this.worktree.isWorktreeDirty(member.cwd);
+      if (dirty) {
+        throw new SwarmProtocolError(
+          "DIRTY_WORKTREE",
+          `Worktree for "@${member.name}" (${member.cwd}) has uncommitted changes. Ask @${member.name} to commit cleanly before merging.`,
+          { memberName: member.name, worktreePath: member.cwd },
+        );
+      }
+    }
+
+    // 2. Verify base checkout is clean and on run.baseBranch
+    const baseCheck = await this.worktree.isBaseCleanOnBranch(run.baseBranch);
+    if (!baseCheck.ok) {
+      if (baseCheck.currentBranch && baseCheck.currentBranch !== run.baseBranch) {
+        throw new SwarmProtocolError(
+          "WRONG_BRANCH",
+          baseCheck.reason ??
+            `Base repository is on "${baseCheck.currentBranch}", expected "${run.baseBranch}".`,
+          { expected: run.baseBranch, actual: baseCheck.currentBranch },
+        );
+      }
+      throw new SwarmProtocolError(
+        "DIRTY_BASE",
+        baseCheck.reason ?? `Base branch "${run.baseBranch}" has uncommitted changes.`,
+        { baseBranch: run.baseBranch },
+      );
+    }
+
+    // 3. Auto-rebase onto baseBranch when enabled and worktree is live
+    const settings = this.getEffectiveSettings();
+    if (
+      settings.autoRebase &&
+      member.state !== "killed" &&
+      member.cwd &&
+      member.cwd !== this.worktree.repoRoot
+    ) {
+      const rebaseRes = await this.worktree.autoRebase(member.cwd, run.baseBranch);
+      if (rebaseRes.status === "conflict") {
+        throw new SwarmProtocolError(
+          "REBASE_CONFLICT",
+          rebaseRes.message ??
+            `Rebase conflict while rebasing "${member.branch}" onto "${run.baseBranch}".`,
+          {
+            memberName: member.name,
+            branch: member.branch,
+            conflictFiles: rebaseRes.conflictFiles ?? [],
+          },
+        );
+      }
+      if (rebaseRes.status === "skipped_dirty") {
+        throw new SwarmProtocolError(
+          "DIRTY_WORKTREE",
+          rebaseRes.message ?? `Worktree for "@${member.name}" is dirty.`,
+          { memberName: member.name },
+        );
+      }
+    }
+
+    // 4. Merge branch into baseBranch
+    const mergeRes = await this.worktree.mergeBranch({
+      baseBranch: run.baseBranch,
+      branch: member.branch,
+      commitMessage:
+        options?.commitMessage ?? `swarm(${member.name}): merge ${member.branch}`,
+      noFf: options?.noFf ?? true,
+    });
+
+    const actor = options?.callerName ?? ORCHESTRATOR_NAME;
+    const updated = await this.store.updateMember(run.id, member.name, {
+      mergedCommitSha: mergeRes.mergedCommitSha,
+      actor,
+    });
+    await this.refreshCache(updated);
+    this.emitEngineEvent(
+      "snapshot_changed",
+      `Merged @${member.name} (${member.branch}) -> ${mergeRes.mergedCommitSha.slice(0, 12)}`,
+      { memberName: member.name },
+    );
+
+    return mergeRes;
+  }
+
+  // --------------------------------------------------------------------------
+  // Channels
+  // --------------------------------------------------------------------------
+
+  async manageChannel(input: ManageChannelInput): Promise<ManageChannelResult> {
+    const run = this.requireActiveRun();
+    const callerRole: CallerRole = input.callerRole ?? "orchestrator";
+    const callerName =
+      input.callerName?.trim() ||
+      (callerRole === "human" ? "human" : ORCHESTRATOR_NAME);
+
+    switch (input.action) {
+      case "list": {
+        const channels = Object.values(run.channels);
+        const lines = channels.map(
+          (c) =>
+            `#${c.name}${c.archived ? " [archived]" : ""} (${c.subscribers.length} subscribers)${c.topic ? ` — ${c.topic}` : ""}`,
+        );
+        return {
+          action: "list",
+          channels,
+          summary:
+            channels.length > 0
+              ? `Channels (${channels.length}):\n${lines.join("\n")}`
+              : "No channels.",
+        };
+      }
+
+      case "create": {
+        if (!isOrchestratorOrHuman(callerRole)) {
+          throw new SwarmProtocolError(
+            "PERMISSION_DENIED",
+            `Role "${callerRole}" cannot create channels. Ask @${ORCHESTRATOR_NAME}.`,
+          );
+        }
+        const name = validateChannelName(input.name ?? "");
+        if (name === DEFAULT_CHANNEL) {
+          throw new SwarmProtocolError(
+            "INVALID_CHANNEL",
+            'Channel "#main" already exists by default.',
+          );
+        }
+        if (run.channels[name]) {
+          throw new SwarmProtocolError(
+            "INVALID_CHANNEL",
+            `Channel "#${name}" already exists.`,
+            { channel: name },
+          );
+        }
+        const created = await this.store.createChannel(run.id, {
+          name,
+          topic: input.topic?.trim() || undefined,
+          createdBy: callerName,
+        });
+        await this.refreshCache();
+        this.emitEngineEvent("snapshot_changed", `Created channel #${created.name}`);
+        return {
+          action: "create",
+          channel: created,
+          summary: `Created channel #${created.name}${created.topic ? ` — ${created.topic}` : ""}.`,
+        };
+      }
+
+      case "archive": {
+        if (!isOrchestratorOrHuman(callerRole)) {
+          throw new SwarmProtocolError(
+            "PERMISSION_DENIED",
+            `Role "${callerRole}" cannot archive channels. Ask @${ORCHESTRATOR_NAME}.`,
+          );
+        }
+        const name = validateChannelName(input.name ?? "");
+        if (name === DEFAULT_CHANNEL) {
+          throw new SwarmProtocolError(
+            "INVALID_CHANNEL",
+            'Default channel "#main" cannot be archived.',
+          );
+        }
+        if (!run.channels[name]) {
+          throw new SwarmProtocolError("INVALID_CHANNEL", `Channel "#${name}" does not exist.`);
+        }
+        const archived = await this.store.archiveChannel(run.id, name, callerName);
+        await this.refreshCache();
+        this.emitEngineEvent("snapshot_changed", `Archived channel #${archived.name}`);
+        return {
+          action: "archive",
+          channel: archived,
+          summary: `Archived channel #${archived.name}.`,
+        };
+      }
+
+      case "join":
+      case "leave": {
+        const name = validateChannelName(input.name ?? "");
+        const channelRecord = run.channels[name];
+        if (!channelRecord) {
+          throw new SwarmProtocolError("INVALID_CHANNEL", `Channel "#${name}" does not exist.`);
+        }
+        if (input.action === "join" && channelRecord.archived) {
+          throw new SwarmProtocolError(
+            "CHANNEL_ARCHIVED",
+            `Channel "#${name}" is archived and cannot be joined.`,
+          );
+        }
+        if (input.action === "leave" && name === DEFAULT_CHANNEL) {
+          throw new SwarmProtocolError(
+            "INVALID_CHANNEL",
+            'Members cannot leave default channel "#main".',
+          );
+        }
+
+        const targetName =
+          input.member?.trim() ||
+          (callerRole === "worker" || callerRole === "validator" ? callerName : "");
+        if (!targetName) {
+          throw new SwarmProtocolError(
+            "INVALID_INPUT",
+            `Member name is required for channel "${input.action}".`,
+          );
+        }
+        const member = this.findMember(run, targetName);
+        if (!member) {
+          throw new SwarmProtocolError("MEMBER_NOT_FOUND", `Member "${targetName}" not found.`);
+        }
+        if (member.state === "killed") {
+          throw new SwarmProtocolError("MEMBER_KILLED", `Member "@${member.name}" is killed.`);
+        }
+
+        if (callerRole === "worker" || callerRole === "validator") {
+          if (member.name !== callerName && member.parentName !== callerName) {
+            throw new SwarmProtocolError(
+              "PERMISSION_DENIED",
+              `Member "@${callerName}" may only change channel membership for itself or its helpers, not "@${member.name}".`,
+            );
+          }
+        } else if (!isOrchestratorOrHuman(callerRole)) {
+          throw new SwarmProtocolError(
+            "PERMISSION_DENIED",
+            `Role "${callerRole}" cannot modify channel subscriptions.`,
+          );
+        }
+
+        const updatedChannel =
+          input.action === "join"
+            ? await this.store.subscribeChannel(run.id, name, member.name)
+            : await this.store.unsubscribeChannel(run.id, name, member.name);
+        await this.refreshCache();
+        this.emitEngineEvent(
+          "snapshot_changed",
+          `${member.name} ${input.action === "join" ? "joined" : "left"} #${name}`,
+          { memberName: member.name },
+        );
+        return {
+          action: input.action,
+          channel: updatedChannel,
+          summary: `@${member.name} ${input.action === "join" ? "joined" : "left"} #${name}.`,
+        };
+      }
+
+      default:
+        throw new SwarmProtocolError(
+          "INVALID_INPUT",
+          `Unsupported channel action: ${String(input.action)}`,
+        );
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Teardown, Models, Snapshot, Subscription & Dispose
+  // --------------------------------------------------------------------------
+
+  async teardown(options?: TeardownOptions): Promise<SafeTeardownResult> {
+    const targetRunId = options?.runId?.trim() || this.activeRunId;
+    if (!targetRunId) {
+      throw new SwarmProtocolError("NOT_FOUND", "No Swarm run specified for teardown.");
+    }
+    const run = await this.store.loadRun(targetRunId);
+    const targets: SafeTeardownTarget[] = [];
+
+    for (const member of Object.values(run.members)) {
+      if (
+        (member.workspace === "share" || member.workspace === "branch") &&
+        member.cwd &&
+        member.branch &&
+        member.cwd !== this.worktree.repoRoot
+      ) {
+        const live = this.liveMembers.get(member.name);
+        const hasActiveAgent =
+          member.state === "working" ||
+          Boolean(live?.spawning) ||
+          Boolean(live?.waking) ||
+          Boolean(live?.turnActive) ||
+          Boolean(live?.switchingModel) ||
+          live?.handle?.getState() === "working";
+        targets.push({
+          memberName: member.name,
+          worktreePath: member.cwd,
+          branch: member.branch,
+          hasActiveAgent,
+        });
+      }
+    }
+
+    const result = await this.worktree.safeTeardown(targets, {
+      deleteBranches: options?.deleteBranches ?? false,
+    });
+
+    await this.store.appendEvent({
+      runId: run.id,
+      type: "teardown_completed",
+      actor: ORCHESTRATOR_NAME,
+      summary: `Teardown removed ${result.removed.length}, skipped ${result.skipped.length}, errors ${result.errors.length}`,
+      data: {
+        removed: result.removed.map((r) => r.memberName),
+        skipped: result.skipped.map((s) => ({ memberName: s.memberName, action: s.action })),
+        errors: result.errors.map((e) => ({ memberName: e.memberName, reason: e.reason })),
+      },
+    });
+
+    if (this.activeRunId === run.id) {
+      await this.refreshCache();
+      this.emitEngineEvent("snapshot_changed", `Teardown completed for run ${run.id}.`);
+    }
+
+    return result;
+  }
+
+  async listModels(options?: {
+    all?: boolean;
+    hostContext?: ExtensionContext;
+  }): Promise<AvailableModelInfo[]> {
+    const ctx = options?.hostContext ?? this.hostContext;
+    const raw = (await this.transport.listAvailableModels?.(ctx)) ?? [];
+    const settings = this.getEffectiveSettings();
+
+    const roleMap = new Map<string, SwarmModelRole[]>();
+    const addRole = (model: string | undefined, role: SwarmModelRole): void => {
+      const key = model?.trim().toLowerCase();
+      if (!key) return;
+      const list = roleMap.get(key) ?? [];
+      if (!list.includes(role)) {
+        list.push(role);
+      }
+      roleMap.set(key, list);
+    };
+    addRole(settings.orchestratorModel, "orchestrator");
+    addRole(settings.workerModel, "worker");
+    addRole(settings.validatorModel, "validator");
+
+    const enriched: AvailableModelInfo[] = raw.map((m) => {
+      const roles = [
+        ...(roleMap.get(m.fullId.toLowerCase()) ?? []),
+        ...(roleMap.get(m.id.toLowerCase()) ?? []),
+      ];
+      const uniqueRoles = Array.from(new Set(roles));
+      return {
+        ...m,
+        suggested: m.suggested ?? uniqueRoles.length > 0,
+        ...(uniqueRoles.length > 0 ? { activeRoles: uniqueRoles } : {}),
+      };
+    });
+
+    if (options?.all || enriched.length <= 20) {
+      return enriched;
+    }
+    const suggested = enriched.filter((m) => m.suggested || (m.activeRoles?.length ?? 0) > 0);
+    return suggested.length > 0 ? suggested : enriched.slice(0, 20);
+  }
+
+  getSnapshot(): SwarmSnapshot {
+    const run = this.cachedRun;
+    const settings = this.getEffectiveSettings();
+    const roleModels = buildRoleModelsSnapshot(settings, run?.roleModels);
+
+    let totalTokens = 0;
+    let totalCost = 0;
+    const workingMemberNames: string[] = [];
+    const waitingMemberNames: string[] = [];
+
+    if (run) {
+      for (const name of run.memberOrder) {
+        const m = run.members[name];
+        if (!m) continue;
+        totalTokens += m.tokens;
+        totalCost += m.cost;
+        const live = this.liveMembers.get(m.name);
+        const isWorking =
+          m.state === "working" ||
+          Boolean(live?.spawning) ||
+          Boolean(live?.waking) ||
+          Boolean(live?.turnActive) ||
+          Boolean(live?.switchingModel) ||
+          live?.handle?.getState() === "working";
+        if (isWorking && m.state !== "killed") {
+          workingMemberNames.push(m.name);
+        } else if (m.state === "waiting") {
+          waitingMemberNames.push(m.name);
+        }
+      }
+    }
+
+    const backoffUntil = this.rateLimitBreaker.getBackoffUntil();
+    return {
+      run,
+      activeRunId: this.activeRunId,
+      workingMemberNames,
+      waitingMemberNames,
+      boardHead: run?.boardHead ?? 0,
+      recentBoard: [...this.cachedBoard],
+      recentEvents: [...this.cachedEvents],
+      roleModels,
+      totalTokens,
+      totalCost,
+      ...(backoffUntil > 0
+        ? {
+            rateLimitUntil: backoffUntil,
+            rateLimitReason: this.rateLimitBreaker.getLastReason(),
+          }
+        : {}),
+      updatedAt: new Date(this.nowFn()).toISOString(),
+    };
+  }
+
+  subscribe(listener: (event: SwarmEngineEvent) => void): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  async dispose(): Promise<void> {
+    this.disposed = true;
+    this.cancelStallWatchdog();
+    this.resolveAllWaiters("run_ended", "Swarm engine disposed.");
+    await this.disposeLiveHandles("Engine disposed");
+    this.listeners.clear();
+  }
+
+  // --------------------------------------------------------------------------
+  // Internal Member Launch, Wakeup & Turn Lifecycle
+  // --------------------------------------------------------------------------
+
+  private async launchMemberInitialTurn(
+    runId: string,
+    memberName: string,
+    briefSeq: number,
+    seedMessages: AgentMessage[] | undefined,
+    hostContext: ExtensionContext | undefined,
+  ): Promise<void> {
+    const live = this.liveMembers.get(memberName);
+    if (!live || this.disposed) {
+      return;
+    }
+
+    const launchAbort = new AbortController();
+    live.launchAbort = launchAbort;
+
+    const isCancelled = (): boolean =>
+      this.disposed ||
+      this.activeRunId !== runId ||
+      this.liveMembers.get(memberName) !== live ||
+      launchAbort.signal.aborted;
+
+    let release: (() => void) | undefined;
+    try {
+      release = await this.concurrencyGate.acquire(launchAbort.signal);
+      live.releaseSlot = release;
+
+      if (isCancelled()) {
+        live.spawning = false;
+        return;
+      }
+
+      const run = await this.store.loadRun(runId);
+      const member = run.members[memberName];
+      if (isCancelled() || !member || member.state === "killed" || member.state === "stopped" || run.status !== "active") {
+        live.spawning = false;
+        return;
+      }
+
+      const systemPrompt = buildMemberSystemPrompt(run, member);
+      const initialPrompt = buildMemberInitialPrompt(run, member, briefSeq);
+      const engineApi = this.createMemberBridge(runId, member);
+
+      const handle = await this.transport.spawnMember({
+        agentId: member.agentId,
+        name: member.name,
+        role: member.role,
+        runId,
+        cwd: member.cwd,
+        branch: member.branch,
+        workspace: member.workspace,
+        parentName: member.parentName,
+        brief: member.brief,
+        systemPrompt,
+        initialPrompt,
+        keepWarm: run.keepWorkersWarm,
+        modelOverride: member.model,
+        thinkingLevel: member.thinkingLevel,
+        seedMessages,
+        hostContext,
+        onTelemetry: (evt) => this.handleTelemetry(runId, evt),
+        engineApi,
+      });
+
+      if (isCancelled()) {
+        live.spawning = false;
+        await handle.kill("Cancelled during launch").catch(() => {});
+        return;
+      }
+
+      live.handle = handle;
+      live.spawning = false;
+      live.turnActive = true;
+
+      const resolvedModel = handle.getModel();
+      if (resolvedModel) {
+        live.triedModels.add(resolvedModel);
+      }
+
+      const startActivity =
+        member.role === "validator" ? "validating" : "working on assignment";
+      live.currentActivity = startActivity;
+
+      const updated = await this.store.updateMember(runId, memberName, {
+        state: "working",
+        model: resolvedModel ?? member.model,
+        thinkingLevel: handle.getThinkingLevel() ?? member.thinkingLevel ?? null,
+        currentActivity: startActivity,
+      });
+
+      if (isCancelled()) {
+        live.turnActive = false;
+        await handle.kill("Cancelled after launch").catch(() => {});
+        await this.ensureNotResurrectedAfterCancel(runId, memberName);
+        return;
+      }
+
+      if (live.launchAbort === launchAbort) {
+        live.launchAbort = undefined;
+      }
+
+      this.setCachedRun(updated);
+      this.emitEngineEvent("snapshot_changed", `Started @${memberName}`, { memberName });
+
+      const result = await handle.currentTurn;
+      release();
+      release = undefined;
+      live.releaseSlot = undefined;
+
+      await this.handleTurnFinished(runId, memberName, result);
+    } catch (err) {
+      live.spawning = false;
+      live.turnActive = false;
+      if (live.launchAbort === launchAbort) {
+        live.launchAbort = undefined;
+      }
+      if (release) {
+        release();
+        release = undefined;
+        live.releaseSlot = undefined;
+      }
+      if (isAbortError(err) || isCancelled()) {
+        this.checkAllIdleAndNotifyWaiters();
+        return;
+      }
+      const errMsg = err instanceof Error ? err.message : String(err);
+      await this.handleLaunchError(runId, memberName, errMsg);
+    } finally {
+      if (live.launchAbort === launchAbort) {
+        live.launchAbort = undefined;
+      }
+      if (release) {
+        release();
+        live.releaseSlot = undefined;
+      }
+    }
+  }
+
+  private async drainMemberPendingWakes(
+    runId: string,
+    memberName: string,
+    directPrompt?: string,
+  ): Promise<void> {
+    const live = this.liveMembers.get(memberName);
+    if (!live || this.disposed) {
+      return;
+    }
+
+    const launchAbort = new AbortController();
+    live.launchAbort = launchAbort;
+
+    const isCancelled = (): boolean =>
+      this.disposed ||
+      this.activeRunId !== runId ||
+      this.liveMembers.get(memberName) !== live ||
+      launchAbort.signal.aborted;
+
+    let release: (() => void) | undefined;
+    try {
+      release = await this.concurrencyGate.acquire(launchAbort.signal);
+      live.releaseSlot = release;
+
+      if (isCancelled()) {
+        live.waking = false;
+        return;
+      }
+
+      const run = await this.store.loadRun(runId);
+      const member = run.members[memberName];
+      if (isCancelled() || !member || member.state === "killed" || member.state === "stopped" || run.status !== "active") {
+        live.waking = false;
+        live.pendingWakes.length = 0;
+        return;
+      }
+
+      const batch = live.pendingWakes.splice(0, live.pendingWakes.length);
+      if (batch.length === 0 && !directPrompt) {
+        live.waking = false;
+        return;
+      }
+
+      // If no live handle or handle isn't waiting (e.g. stopped/reloaded), revive fresh handle
+      if (!live.handle || live.handle.getState() !== "waiting") {
+        live.pendingWakes.unshift(...batch);
+        release();
+        release = undefined;
+        live.releaseSlot = undefined;
+        await this.reviveMemberWithPendingWakes(runId, memberName, directPrompt);
+        return;
+      }
+
+      const maxSeq = batch.reduce((acc, m) => Math.max(acc, m.seq), member.lastReadSeq);
+      const prompt =
+        directPrompt && batch.length > 0
+          ? `${directPrompt}\n\n${buildWakeupPrompt(member, batch, run.boardHead)}`
+          : (directPrompt ?? buildWakeupPrompt(member, batch, run.boardHead));
+
+      live.parkedMentionsOnly = true;
+      live.currentActivity = "woken by board";
+
+      const updated = await this.store.updateMember(runId, memberName, {
+        state: "working",
+        humanStopped: false,
+        lastReadSeq: Math.max(member.lastReadSeq, maxSeq),
+        currentActivity: "woken by board",
+        error: null,
+      });
+
+      if (isCancelled()) {
+        live.waking = false;
+        live.turnActive = false;
+        await this.ensureNotResurrectedAfterCancel(runId, memberName);
+        return;
+      }
+
+      this.setCachedRun(updated);
+
+      await this.store.appendEvent({
+        runId,
+        type: "member_woken",
+        actor: batch[0]?.from ?? ORCHESTRATOR_NAME,
+        memberName: member.name,
+        agentId: member.agentId,
+        summary:
+          batch.length > 0
+            ? `Woke @${member.name} with ${batch.length} board message(s) (${batch.map((m) => `#${m.seq}`).join(", ")})`
+            : `Woke @${member.name} after model hot-switch`,
+      });
+
+      if (isCancelled() || !live.handle || live.handle.getState() !== "waiting") {
+        live.waking = false;
+        live.turnActive = false;
+        await this.ensureNotResurrectedAfterCancel(runId, memberName);
+        return;
+      }
+
+      this.emitEngineEvent("snapshot_changed", `Woke @${memberName}`, { memberName });
+
+      live.turnActive = true;
+      const turnPromise = live.handle.wake(prompt);
+      // Handle is now synchronously in `working` state; clear waking lock so new posts queue into pendingWakes!
+      live.waking = false;
+      if (live.launchAbort === launchAbort) {
+        live.launchAbort = undefined;
+      }
+
+      const result = await turnPromise;
+      release();
+      release = undefined;
+      live.releaseSlot = undefined;
+
+      await this.handleTurnFinished(runId, memberName, result);
+    } catch (err) {
+      live.waking = false;
+      live.turnActive = false;
+      if (live.launchAbort === launchAbort) {
+        live.launchAbort = undefined;
+      }
+      if (release) {
+        release();
+        release = undefined;
+        live.releaseSlot = undefined;
+      }
+      if (isAbortError(err) || isCancelled()) {
+        this.checkAllIdleAndNotifyWaiters();
+        return;
+      }
+      const errMsg = err instanceof Error ? err.message : String(err);
+      await this.handleLaunchError(runId, memberName, errMsg);
+    } finally {
+      if (live.launchAbort === launchAbort) {
+        live.launchAbort = undefined;
+      }
+      if (release) {
+        release();
+        live.releaseSlot = undefined;
+      }
+    }
+  }
+
+  private async reviveMemberWithPendingWakes(
+    runId: string,
+    memberName: string,
+    directPrompt?: string,
+  ): Promise<void> {
+    const live = this.liveMembers.get(memberName);
+    if (!live || this.disposed) {
+      return;
+    }
+
+    const launchAbort = new AbortController();
+    live.launchAbort = launchAbort;
+
+    const isCancelled = (): boolean =>
+      this.disposed ||
+      this.activeRunId !== runId ||
+      this.liveMembers.get(memberName) !== live ||
+      launchAbort.signal.aborted;
+
+    let release: (() => void) | undefined;
+    try {
+      release = await this.concurrencyGate.acquire(launchAbort.signal);
+      live.releaseSlot = release;
+
+      if (isCancelled()) {
+        live.waking = false;
+        return;
+      }
+
+      const run = await this.store.loadRun(runId);
+      const member = run.members[memberName];
+      if (isCancelled() || !member || member.state === "killed" || run.status !== "active") {
+        live.waking = false;
+        live.pendingWakes.length = 0;
+        return;
+      }
+
+      const batch = live.pendingWakes.splice(0, live.pendingWakes.length);
+      if (batch.length === 0 && !directPrompt) {
+        live.waking = false;
+        return;
+      }
+
+      // Cleanly dispose any stale handle before spawning replacement
+      if (live.handle) {
+        live.lastMessages = sanitizeForkSeedMessages(live.handle.getConversationMessages());
+        await live.handle.kill("Reviving stopped member").catch(() => {});
+        live.handle = undefined;
+      }
+
+      if (isCancelled()) {
+        live.waking = false;
+        return;
+      }
+
+      const maxSeq = batch.reduce((acc, m) => Math.max(acc, m.seq), member.lastReadSeq);
+      const prompt =
+        directPrompt && batch.length > 0
+          ? `${directPrompt}\n\n${buildWakeupPrompt(member, batch, run.boardHead)}`
+          : (directPrompt ?? buildWakeupPrompt(member, batch, run.boardHead));
+      const systemPrompt = buildMemberSystemPrompt(run, member);
+      const engineApi = this.createMemberBridge(runId, member);
+
+      const handle = await this.transport.spawnMember({
+        agentId: member.agentId,
+        name: member.name,
+        role: member.role,
+        runId,
+        cwd: member.cwd,
+        branch: member.branch,
+        workspace: member.workspace,
+        parentName: member.parentName,
+        brief: member.brief,
+        systemPrompt,
+        initialPrompt: prompt,
+        keepWarm: run.keepWorkersWarm,
+        modelOverride: member.model,
+        thinkingLevel: member.thinkingLevel,
+        seedMessages: live.lastMessages.length > 0 ? live.lastMessages : undefined,
+        hostContext: this.hostContext,
+        onTelemetry: (evt) => this.handleTelemetry(runId, evt),
+        engineApi,
+      });
+
+      // Critically check cancellation IMMEDIATELY after spawnMember so stopped/killed/paused/disposed runs never leak handles!
+      if (isCancelled()) {
+        live.waking = false;
+        await handle.kill("Cancelled during revive").catch(() => {});
+        return;
+      }
+
+      live.handle = handle;
+      live.turnActive = true;
+      live.waking = false;
+      live.parkedMentionsOnly = true;
+      live.currentActivity = "revived by board";
+
+      const updated = await this.store.updateMember(runId, memberName, {
+        state: "working",
+        humanStopped: false,
+        lastReadSeq: Math.max(member.lastReadSeq, maxSeq),
+        currentActivity: "revived by board",
+        error: null,
+      });
+
+      if (isCancelled()) {
+        live.turnActive = false;
+        await handle.kill("Cancelled after revive").catch(() => {});
+        await this.ensureNotResurrectedAfterCancel(runId, memberName);
+        return;
+      }
+
+      this.setCachedRun(updated);
+
+      await this.store.appendEvent({
+        runId,
+        type: "member_woken",
+        actor: batch[0]?.from ?? ORCHESTRATOR_NAME,
+        memberName: member.name,
+        agentId: member.agentId,
+        summary: `Revived @${member.name} with ${batch.length} board message(s)`,
+      });
+
+      if (isCancelled()) {
+        live.turnActive = false;
+        await handle.kill("Cancelled after revive").catch(() => {});
+        await this.ensureNotResurrectedAfterCancel(runId, memberName);
+        return;
+      }
+
+      if (live.launchAbort === launchAbort) {
+        live.launchAbort = undefined;
+      }
+
+      this.emitEngineEvent("snapshot_changed", `Revived @${memberName}`, { memberName });
+
+      const result = await handle.currentTurn;
+      release();
+      release = undefined;
+      live.releaseSlot = undefined;
+
+      await this.handleTurnFinished(runId, memberName, result);
+    } catch (err) {
+      live.waking = false;
+      live.turnActive = false;
+      if (live.launchAbort === launchAbort) {
+        live.launchAbort = undefined;
+      }
+      if (release) {
+        release();
+        release = undefined;
+        live.releaseSlot = undefined;
+      }
+      if (isAbortError(err) || isCancelled()) {
+        this.checkAllIdleAndNotifyWaiters();
+        return;
+      }
+      const errMsg = err instanceof Error ? err.message : String(err);
+      await this.handleLaunchError(runId, memberName, errMsg);
+    } finally {
+      if (live.launchAbort === launchAbort) {
+        live.launchAbort = undefined;
+      }
+      if (release) {
+        release();
+        live.releaseSlot = undefined;
+      }
+    }
+  }
+
+  private async ensureNotResurrectedAfterCancel(
+    runId: string,
+    memberName: string,
+  ): Promise<void> {
+    if (this.disposed) return;
+    try {
+      const current = await this.store.loadRun(runId);
+      const m = current.members[memberName];
+      if (m && m.state === "working") {
+        const reverted = await this.store.updateMember(runId, memberName, {
+          state: "stopped",
+          currentActivity: null,
+        });
+        this.setCachedRun(reverted);
+      }
+    } catch {
+      // ignore cleanup error
+    }
+  }
+
+  private async handleTurnFinished(
+    runId: string,
+    memberName: string,
+    result: AgentTurnResult,
+  ): Promise<void> {
+    const live = this.liveMembers.get(memberName);
+    if (this.disposed || this.activeRunId !== runId) {
+      if (live) live.turnActive = false;
+      return;
+    }
+
+    if (live?.handle) {
+      live.lastMessages = sanitizeForkSeedMessages(live.handle.getConversationMessages());
+    }
+
+    const run = await this.store.loadRun(runId);
+    const member = run.members[memberName];
+    if (!member || member.state === "killed") {
+      if (live) live.turnActive = false;
+      this.checkAllIdleAndNotifyWaiters();
+      return;
+    }
+
+    const waitReq = live?.lastWaitRequest;
+    if (live) {
+      live.lastWaitRequest = undefined;
+      live.currentActivity = undefined;
+    }
+
+    const nextTurns = member.turns + 1;
+    const nextTokens = Math.max(member.tokens, result.tokens);
+    const nextCost = Math.max(member.cost, result.cost);
+    const effectiveModel = result.model ?? live?.handle?.getModel() ?? member.model;
+    const effectiveThinking =
+      result.thinkingLevel ?? live?.handle?.getThinkingLevel() ?? member.thinkingLevel;
+    const persistedTelemetry = {
+      ...(live && live.logTail.length > 0 ? { logTail: [...live.logTail] } : {}),
+      ...(live?.lastTool !== undefined ? { lastTool: live.lastTool } : {}),
+    };
+
+    if (result.outcome === "killed") {
+      const nowIso = new Date(this.nowFn()).toISOString();
+      const updated = await this.store.updateMember(runId, memberName, {
+        state: "killed",
+        turns: nextTurns,
+        tokens: nextTokens,
+        tokenBreakdown: result.tokenBreakdown,
+        cost: nextCost,
+        model: effectiveModel,
+        thinkingLevel: effectiveThinking ?? null,
+        currentActivity: null,
+        parkedOn: result.summary || "killed",
+        endedAt: nowIso,
+        ...persistedTelemetry,
+      });
+      this.liveMembers.delete(memberName);
+      await this.refreshCache(updated);
+      this.emitEngineEvent("snapshot_changed", `@${memberName} killed`, { memberName });
+      this.checkAllIdleAndNotifyWaiters();
+      this.maybeArmStallWatchdog();
+      return;
+    }
+
+    if (result.outcome === "stopped") {
+      const updated = await this.store.updateMember(runId, memberName, {
+        state: "stopped",
+        turns: nextTurns,
+        tokens: nextTokens,
+        tokenBreakdown: result.tokenBreakdown,
+        cost: nextCost,
+        model: effectiveModel,
+        thinkingLevel: effectiveThinking ?? null,
+        currentActivity: null,
+        parkedOn: result.summary?.slice(0, 120) || "stopped",
+        ...persistedTelemetry,
+      });
+      await this.refreshCache(updated);
+      if (live) {
+        live.parkedMentionsOnly = true;
+        live.turnActive = false;
+      }
+      this.emitEngineEvent("snapshot_changed", `@${memberName} stopped`, { memberName });
+      this.checkAllIdleAndNotifyWaiters();
+      this.maybeArmStallWatchdog();
+      return;
+    }
+
+    if (result.outcome === "waiting") {
+      this.rateLimitBreaker.recordSuccess();
+      const parkedOn = waitReq
+        ? `waiting (since #${waitReq.since})`
+        : result.summary.replace(/\s+/g, " ").trim().slice(0, 120) || "waiting";
+
+      const updated = await this.store.updateMember(runId, memberName, {
+        state: "waiting",
+        turns: nextTurns,
+        tokens: nextTokens,
+        tokenBreakdown: result.tokenBreakdown,
+        cost: nextCost,
+        model: effectiveModel,
+        thinkingLevel: effectiveThinking ?? null,
+        lastReadSeq: Math.max(member.lastReadSeq, waitReq?.since ?? 0),
+        parkedOn,
+        currentActivity: null,
+        error: null,
+        ...persistedTelemetry,
+      });
+      await this.refreshCache(updated);
+
+      // Remember whether this parked member asked for mentions_only=false so future non-mention posts wake it!
+      if (live) {
+        live.parkedMentionsOnly = waitReq ? waitReq.mentionsOnly : true;
+      }
+
+      // Check for unread non-mention messages if the member explicitly called swarm_wait{mentions_only:false}
+      if (live && waitReq && !waitReq.mentionsOnly && run.status === "active") {
+        const unread = await this.store.readBoard(runId, {
+          since: waitReq.since,
+          memberChannels: member.channels,
+          limit: 50,
+        });
+        for (const msg of unread.messages) {
+          if (msg.from !== memberName && !live.deliveredSeqs.has(msg.seq)) {
+            live.deliveredSeqs.add(msg.seq);
+            live.pendingWakes.push(msg);
+          }
+        }
+      }
+
+      // Atomically hand off turnActive -> waking if any wakes coalesced while working/finishing!
+      if (live && live.pendingWakes.length > 0 && run.status === "active") {
+        live.turnActive = false;
+        live.waking = true;
+        this.emitEngineEvent("snapshot_changed", `@${memberName} parked in waiting`, {
+          memberName,
+        });
+        void this.drainMemberPendingWakes(runId, memberName);
+        return;
+      }
+
+      if (live) live.turnActive = false;
+      this.emitEngineEvent("snapshot_changed", `@${memberName} parked in waiting`, {
+        memberName,
+      });
+      this.checkAllIdleAndNotifyWaiters();
+      this.maybeArmStallWatchdog();
+      return;
+    }
+
+    if (result.outcome === "rate_limited") {
+      if (live && effectiveModel) {
+        live.triedModels.add(effectiveModel);
+      }
+
+      const settings = this.getEffectiveSettings();
+      const errorText = result.error ?? "Provider rate limited (429)";
+      const nextState = live?.handle?.getState() === "waiting" ? "waiting" : "stopped";
+
+      const updated = await this.store.updateMember(runId, memberName, {
+        state: nextState,
+        turns: nextTurns,
+        tokens: nextTokens,
+        tokenBreakdown: result.tokenBreakdown,
+        cost: nextCost,
+        model: effectiveModel,
+        thinkingLevel: effectiveThinking ?? null,
+        currentActivity: null,
+        parkedOn: `rate limited: ${errorText.slice(0, 80)}`,
+        error: errorText,
+        ...persistedTelemetry,
+      });
+      await this.refreshCache(updated);
+
+      // Attempt automatic hot-switch to next untried fallback model with ZERO lock gap!
+      const fallback = selectFallbackModel(
+        effectiveModel,
+        settings.fallbackModels,
+        live?.triedModels,
+      );
+      if (fallback && live && live.handle?.getState() === "waiting" && run.status === "active") {
+        live.triedModels.add(fallback);
+        // Atomic handoff: turnActive -> switchingModel (prevents concurrent @mention from racing wake!)
+        live.switchingModel = true;
+        live.turnActive = false;
+        try {
+          await this.performSwitchModel(
+            {
+              targetName: memberName,
+              model: fallback,
+              reason: `Auto-fallback after rate limit (${errorText})`,
+              callerName: ORCHESTRATOR_NAME,
+              callerRole: "orchestrator",
+            },
+            { holdSwitchingLock: true },
+          );
+          // Atomic handoff: switchingModel -> waking!
+          live.waking = true;
+          live.switchingModel = false;
+          void this.drainMemberPendingWakes(
+            runId,
+            memberName,
+            `Model automatically hot-switched to "${fallback}" after provider rate limit (${errorText}). Continue your work with your preserved conversation history.`,
+          );
+          return;
+        } catch {
+          live.switchingModel = false;
+          // Fall through to shared rate-limit backoff if fallback switch itself fails
+        }
+      } else if (live) {
+        live.turnActive = false;
+      }
+
+      // Engage shared fleet rate-limit breaker and alert @orchestrator
+      const delayMs = this.rateLimitBreaker.recordRateLimit(result.retryAfterMs, errorText);
+      await this.store.appendEvent({
+        runId,
+        type: "rate_limit_backoff",
+        actor: MONITOR_NAME,
+        memberName,
+        agentId: member.agentId,
+        summary: `Rate-limit backoff (${Math.ceil(delayMs / 1000)}s) after ${memberName} hit: ${errorText}`,
+        data: { delayMs, error: errorText, model: effectiveModel },
+      });
+
+      await this.postMonitorOrchestratorAlert(
+        runId,
+        `@${ORCHESTRATOR_NAME} [rate-limit] Member ${memberName} hit rate limit (${errorText}); backoff ${Math.ceil(delayMs / 1000)}s. Hot-switch with swarm{action:"model"} or message member to retry.`,
+        "update",
+      );
+      this.checkAllIdleAndNotifyWaiters();
+      this.maybeArmStallWatchdog();
+      return;
+    }
+
+    // `failed` -> park in `waiting` (when warm handle alive) with error recorded so Orchestrator can hot-switch or retry!
+    const errorText = result.error ?? "Member turn failed";
+    const parkedState = live?.handle?.getState() === "waiting" ? "waiting" : "stopped";
+    const updated = await this.store.updateMember(runId, memberName, {
+      state: parkedState,
+      turns: nextTurns,
+      tokens: nextTokens,
+      tokenBreakdown: result.tokenBreakdown,
+      cost: nextCost,
+      model: effectiveModel,
+      thinkingLevel: effectiveThinking ?? null,
+      currentActivity: null,
+      parkedOn: `error: ${errorText.slice(0, 100)}`,
+      error: errorText,
+      ...persistedTelemetry,
+    });
+    await this.store.appendEvent({
+      runId,
+      type: "member_error",
+      actor: memberName,
+      memberName,
+      agentId: member.agentId,
+      summary: `Member ${memberName} failed: ${errorText}`,
+      data: { error: errorText, stopReason: result.stopReason },
+    });
+    await this.refreshCache(updated);
+    if (live) live.turnActive = false;
+    await this.postMonitorOrchestratorAlert(
+      runId,
+      `@${ORCHESTRATOR_NAME} [error] Member ${memberName} encountered an error: ${errorText}. Switch its model or message it to retry.`,
+      "update",
+    );
+    this.checkAllIdleAndNotifyWaiters();
+    this.maybeArmStallWatchdog();
+  }
+
+  private async handleLaunchError(
+    runId: string,
+    memberName: string,
+    errMsg: string,
+  ): Promise<void> {
+    if (this.disposed || this.activeRunId !== runId) {
+      return;
+    }
+    try {
+      const latestRun = await this.store.loadRun(runId);
+      const current = latestRun.members[memberName];
+      // Never resurrect killed or stopped members back to "waiting"!
+      if (!current || current.state === "killed" || current.state === "stopped") {
+        this.setCachedRun(latestRun);
+        return;
+      }
+      const updated = await this.store.updateMember(runId, memberName, {
+        state: "waiting",
+        currentActivity: null,
+        parkedOn: `launch error: ${errMsg.slice(0, 100)}`,
+        error: errMsg,
+      });
+      await this.store.appendEvent({
+        runId,
+        type: "member_error",
+        actor: memberName,
+        memberName,
+        summary: `Launch error for ${memberName}: ${errMsg}`,
+        data: { error: errMsg },
+      });
+      await this.refreshCache(updated);
+      await this.postMonitorOrchestratorAlert(
+        runId,
+        `@${ORCHESTRATOR_NAME} [error] Member ${memberName} failed to launch: ${errMsg}`,
+        "update",
+      );
+    } catch {
+      // avoid cascading errors
+    } finally {
+      this.checkAllIdleAndNotifyWaiters();
+      this.maybeArmStallWatchdog();
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Board Wakeup Routing & Coalescing
+  // --------------------------------------------------------------------------
+
+  private async routeBoardMessageWakeups(
+    run: SwarmRunState,
+    msg: BoardMessage,
+  ): Promise<void> {
+    const senderLower = msg.from.toLowerCase();
+    const mentionsLower = new Set(msg.mentions.map((m) => m.toLowerCase()));
+    const chMentionsLower = new Set(msg.channelMentions.map((c) => c.toLowerCase()));
+
+    // Check if @orchestrator / @coordinator / @all / @#channel should wake the main Pi session
+    const wakesOrchestrator =
+      msg.fromRole !== "orchestrator" &&
+      (mentionsLower.has(ORCHESTRATOR_NAME) ||
+        mentionsLower.has("coordinator") ||
+        mentionsLower.has(ALL_MENTION_NAME) ||
+        chMentionsLower.size > 0);
+
+    if (wakesOrchestrator) {
+      this.emitEngineEvent(
+        "wakeup_needed",
+        `Board #${msg.seq} from ${msg.from} addressed @${ORCHESTRATOR_NAME}`,
+        { seq: msg.seq },
+      );
+    }
+
+    // Resolve all target non-killed members (never wake the sender!)
+    const targetNames = new Set<string>();
+    const allMembers = Object.values(run.members).filter(
+      (m) => m.state !== "killed" && m.name.toLowerCase() !== senderLower,
+    );
+
+    for (const handle of mentionsLower) {
+      if (handle === ALL_MENTION_NAME) {
+        for (const m of allMembers) {
+          targetNames.add(m.name);
+        }
+        continue;
+      }
+      if (handle === ORCHESTRATOR_NAME || handle === "coordinator" || handle === MONITOR_NAME) {
+        continue;
+      }
+      const exact = allMembers.find((m) => m.name.toLowerCase() === handle);
+      if (exact) {
+        targetNames.add(exact.name);
+        continue;
+      }
+      // Group prefix wakeup (`@parser` wakes `parser-1..k`)
+      for (const m of allMembers) {
+        if (m.groupPrefix && m.groupPrefix.toLowerCase() === handle) {
+          targetNames.add(m.name);
+        }
+      }
+    }
+
+    // Channel broadcast wakeup (`@#backend` wakes every subscribed non-killed member)
+    for (const ch of chMentionsLower) {
+      const chRecord = run.channels[ch];
+      if (!chRecord || chRecord.archived) continue;
+      for (const m of allMembers) {
+        if (m.channels.includes(ch) || chRecord.subscribers.includes(m.name)) {
+          targetNames.add(m.name);
+        }
+      }
+    }
+
+    // Wake parked members who explicitly waited with `swarm_wait{mentions_only: false}`
+    // on any non-self post in DEFAULT_CHANNEL or one of their subscribed channels!
+    for (const m of allMembers) {
+      if (m.state !== "waiting") continue;
+      const live = this.liveMembers.get(m.name);
+      if (live && live.parkedMentionsOnly === false) {
+        if (msg.channel === DEFAULT_CHANNEL || m.channels.includes(msg.channel)) {
+          targetNames.add(m.name);
+        }
+      }
+    }
+
+    // Respect human-stop sovereignty: peer @mentions NEVER revive humanStopped members,
+    // while explicit human or orchestrator messages MAY revive them!
+    const eligibleTargets: string[] = [];
+    for (const name of targetNames) {
+      const member = run.members[name];
+      if (!member || member.state === "killed") continue;
+      if (member.state === "stopped" && member.humanStopped) {
+        if (msg.fromRole !== "human" && msg.fromRole !== "orchestrator") {
+          continue;
+        }
+      }
+      eligibleTargets.push(name);
+    }
+
+    if (eligibleTargets.length === 0) {
+      return;
+    }
+
+    // Enforce SWARM_MAX_BOARD_HOPS safety cap on peer-to-peer bounce chains!
+    if (msg.fromRole === "worker" || msg.fromRole === "validator") {
+      if (this.boardHopCount >= SWARM_MAX_BOARD_HOPS) {
+        if (!this.hopCapAlerted) {
+          this.hopCapAlerted = true;
+          await this.postMonitorOrchestratorAlert(
+            run.id,
+            `@${ORCHESTRATOR_NAME} [hop-cap] Reached SWARM_MAX_BOARD_HOPS (${SWARM_MAX_BOARD_HOPS}) peer-to-peer wakeups at #${msg.seq}. Inspect the board and post an orchestrator decision to reset hops.`,
+            "update",
+          );
+        }
+        return;
+      }
+      this.boardHopCount += 1;
+    }
+
+    // Deliver to each eligible target cleanly with synchronous waking lock + coalescing
+    for (const targetName of eligibleTargets) {
+      this.deliverBoardMessageToMember(run.id, targetName, msg);
+    }
+  }
+
+  private deliverBoardMessageToMember(
+    runId: string,
+    memberName: string,
+    msg: BoardMessage,
+  ): void {
+    const run = this.cachedRun;
+    const member = run?.members[memberName];
+    if (!member || member.state === "killed") {
+      return;
+    }
+
+    let live = this.liveMembers.get(memberName);
+    if (!live) {
+      live = {
+        name: member.name,
+        agentId: member.agentId,
+        role: member.role,
+        spawning: false,
+        waking: false,
+        turnActive: false,
+        switchingModel: false,
+        parkedMentionsOnly: true,
+        pendingWakes: [],
+        deliveredSeqs: new Set<number>(),
+        triedModels: new Set<string>(member.model ? [member.model] : []),
+        lastMessages: [],
+        logTail: [...member.logTail],
+        lastTool: member.lastTool,
+      };
+      this.liveMembers.set(memberName, live);
+    }
+
+    if (live.deliveredSeqs.has(msg.seq)) {
+      return;
+    }
+    live.deliveredSeqs.add(msg.seq);
+    live.pendingWakes.push(msg);
+
+    // If currently spawning, waking, finishing/running a turn, or switching models -> queue safely!
+    if (
+      live.spawning ||
+      live.waking ||
+      live.turnActive ||
+      live.switchingModel ||
+      live.handle?.getState() === "working"
+    ) {
+      return;
+    }
+
+    // Synchronously acquire `waking` lock before scheduling async dispatch so simultaneous posts coalesce!
+    live.waking = true;
+    this.cancelStallWatchdog();
+
+    if (live.handle && live.handle.getState() === "waiting") {
+      void this.drainMemberPendingWakes(runId, memberName);
+    } else {
+      void this.reviveMemberWithPendingWakes(runId, memberName);
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Waiter Matching, Anti-Deadlock & Zero-Token Stall Watchdog
+  // --------------------------------------------------------------------------
+
+  private doesMessageMatchWaiter(
+    msg: BoardMessage,
+    targetName: string,
+    mentionsOnly: boolean,
+    targetChannels: readonly string[],
+  ): boolean {
+    if (msg.from.toLowerCase() === targetName) {
+      return false;
+    }
+    if (!mentionsOnly) {
+      return true;
+    }
+    const mentions = msg.mentions.map((m) => m.toLowerCase());
+    if (mentions.includes(targetName) || mentions.includes(ALL_MENTION_NAME)) {
+      return true;
+    }
+    if (targetName === ORCHESTRATOR_NAME && mentions.includes("coordinator")) {
+      return true;
+    }
+    if (msg.channelMentions.length > 0) {
+      if (targetName === ORCHESTRATOR_NAME) {
+        return true;
+      }
+      const chSet = new Set(targetChannels.map((c) => c.toLowerCase()));
+      if (msg.channelMentions.some((ch) => chSet.has(ch.toLowerCase()))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private notifyWaitersOnMessage(msg: BoardMessage): void {
+    if (this.boardWaiters.size === 0) {
+      return;
+    }
+    const head = Math.max(this.cachedRun?.boardHead ?? 0, msg.seq);
+    for (const waiter of Array.from(this.boardWaiters)) {
+      if (msg.seq <= waiter.since) {
+        continue;
+      }
+      if (
+        this.doesMessageMatchWaiter(
+          msg,
+          waiter.targetName,
+          waiter.mentionsOnly,
+          waiter.targetChannels,
+        )
+      ) {
+        const unread = this.getCachedMessagesSince(waiter.since);
+        waiter.resolve({
+          wokeBy: "message",
+          messages: unread.length > 0 ? unread : [msg],
+          head,
+          summary: `New message #${msg.seq} from ${msg.from} in #${msg.channel}.`,
+        });
+      }
+    }
+  }
+
+  private checkAllIdleAndNotifyWaiters(): void {
+    if (this.boardWaiters.size === 0) {
+      return;
+    }
+    const active = this.getWorkingOrPendingMemberNames();
+    if (active.length > 0) {
+      return;
+    }
+    const head = this.cachedRun?.boardHead ?? 0;
+    for (const waiter of Array.from(this.boardWaiters)) {
+      waiter.resolve({
+        wokeBy: "all_idle",
+        messages: this.getCachedMessagesSince(waiter.since),
+        head,
+        summary: "All active swarm members have finished and parked in waiting/stopped state.",
+      });
+    }
+  }
+
+  private resolveAllWaiters(
+    wokeBy: WaitForBoardResult["wokeBy"],
+    summary: string,
+  ): void {
+    const head = this.cachedRun?.boardHead ?? 0;
+    for (const waiter of Array.from(this.boardWaiters)) {
+      waiter.resolve({
+        wokeBy,
+        messages: this.getCachedMessagesSince(waiter.since),
+        head,
+        summary,
+      });
+    }
+  }
+
+  private cancelStallWatchdog(): void {
+    if (this.stallTimer) {
+      clearTimeout(this.stallTimer);
+      this.stallTimer = null;
+    }
+  }
+
+  private maybeArmStallWatchdog(): void {
+    this.cancelStallWatchdog();
+    if (this.disposed || this.runDonePosted) {
+      return;
+    }
+    const settings = this.getEffectiveSettings();
+    if (!settings.stallWatchdogEnabled) {
+      return;
+    }
+    const run = this.cachedRun;
+    if (!run || run.status !== "active") {
+      return;
+    }
+    if (this.boardWaiters.size > 0) {
+      return;
+    }
+    // Require at least one live (non-killed) member parked before considering swarm stalled
+    const nonKilled = Object.values(run.members).filter((m) => m.state !== "killed");
+    if (nonKilled.length === 0) {
+      return;
+    }
+    if (this.getWorkingOrPendingMemberNames().length > 0) {
+      return;
+    }
+    if (this.stallNoticePostedAtHead === run.boardHead) {
+      return;
+    }
+
+    const armedHead = run.boardHead;
+    const armedRunId = run.id;
+    const timeoutMs = Math.max(10, settings.stallTimeoutMs);
+
+    this.stallTimer = setTimeout(() => {
+      this.stallTimer = null;
+      void this.fireStallWatchdog(armedRunId, armedHead, timeoutMs);
+    }, timeoutMs);
+  }
+
+  private async fireStallWatchdog(
+    runId: string,
+    armedHead: number,
+    timeoutMs: number,
+  ): Promise<void> {
+    if (
+      this.disposed ||
+      this.runDonePosted ||
+      this.activeRunId !== runId ||
+      this.boardWaiters.size > 0
+    ) {
+      return;
+    }
+    const run = this.cachedRun;
+    if (!run || run.status !== "active" || run.boardHead !== armedHead) {
+      return;
+    }
+    if (this.getWorkingOrPendingMemberNames().length > 0) {
+      return;
+    }
+
+    const rosterSummary = run.memberOrder
+      .map((name) => run.members[name])
+      .filter((m): m is SwarmMemberRecord => Boolean(m && m.state !== "killed"))
+      .map((m) => `${m.name}[${m.state}${m.parkedOn ? `:${m.parkedOn.slice(0, 32)}` : ""}]`)
+      .join(", ");
+
+    const latestSeqs =
+      this.cachedBoard.length > 0
+        ? this.cachedBoard
+            .slice(-3)
+            .map((m) => `#${m.seq}(${m.from})`)
+            .join(", ")
+        : "none";
+
+    const seconds = Math.max(1, Math.round(timeoutMs / 1000));
+    const text = `@${ORCHESTRATOR_NAME} [stall] Swarm has been idle for ${seconds}s with 0 working members (board #${armedHead}). Roster: ${rosterSummary}. Latest posts: ${latestSeqs}. Wake a member, spawn next phase, or call swarm{action:"done"}.`;
+
+    try {
+      const stallMsg = await this.store.postBoardMessage(runId, {
+        from: MONITOR_NAME,
+        fromRole: "monitor",
+        channel: DEFAULT_CHANNEL,
+        kind: "stall",
+        text,
+        mentions: [ORCHESTRATOR_NAME],
+        channelMentions: [],
+      });
+      this.recordBoardMessageInCache(stallMsg);
+      this.stallNoticePostedAtHead = stallMsg.seq;
+
+      await this.store.appendEvent({
+        runId,
+        type: "stall_detected",
+        actor: MONITOR_NAME,
+        summary: `Stall detected after ${timeoutMs}ms idle at board #${armedHead}`,
+        data: { armedHead, stallSeq: stallMsg.seq, timeoutMs },
+      });
+
+      const refreshed = await this.store.loadRun(runId);
+      await this.refreshCache(refreshed);
+
+      this.emitEngineEvent("board_posted", `Posted stall alert #${stallMsg.seq}`, {
+        seq: stallMsg.seq,
+      });
+      this.emitEngineEvent("stall_detected", `Swarm stalled at #${armedHead} (alert #${stallMsg.seq})`, {
+        seq: stallMsg.seq,
+      });
+      this.emitEngineEvent("wakeup_needed", `Stall alert #${stallMsg.seq} for @${ORCHESTRATOR_NAME}`, {
+        seq: stallMsg.seq,
+      });
+      this.notifyWaitersOnMessage(stallMsg);
+    } catch {
+      // watchdog must never crash host process
+    }
+  }
+
+  private async postMonitorOrchestratorAlert(
+    runId: string,
+    text: string,
+    kind: BoardMessageKind,
+  ): Promise<void> {
+    try {
+      const alertMsg = await this.store.postBoardMessage(runId, {
+        from: MONITOR_NAME,
+        fromRole: "monitor",
+        channel: DEFAULT_CHANNEL,
+        kind,
+        text,
+        mentions: [ORCHESTRATOR_NAME],
+        channelMentions: [],
+      });
+      this.recordBoardMessageInCache(alertMsg);
+      const refreshed = await this.store.loadRun(runId);
+      this.setCachedRun(refreshed);
+      this.emitEngineEvent("board_posted", `Posted monitor alert #${alertMsg.seq}`, {
+        seq: alertMsg.seq,
+      });
+      this.emitEngineEvent("wakeup_needed", text, { seq: alertMsg.seq });
+      this.notifyWaitersOnMessage(alertMsg);
+    } catch {
+      this.emitEngineEvent("wakeup_needed", text);
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Telemetry & Member Engine Bridge
+  // --------------------------------------------------------------------------
+
+  private handleTelemetry(runId: string, evt: AgentTelemetryEvent): void {
+    if (this.disposed || this.activeRunId !== runId) {
+      return;
+    }
+
+    const live = this.liveMembers.get(evt.name);
+    if (live) {
+      if (evt.activity !== undefined) {
+        live.currentActivity = evt.activity;
+      }
+      if (evt.toolName !== undefined) {
+        live.lastTool = evt.toolName;
+      }
+      if (evt.logLine) {
+        live.logTail = [...live.logTail, evt.logLine].slice(-50);
+        const waitMatch = evt.logLine.match(WAIT_TELEMETRY_RE);
+        if (waitMatch) {
+          live.lastWaitRequest = {
+            since: Number.parseInt(waitMatch[1]!, 10),
+            mentionsOnly: waitMatch[2] === "true",
+          };
+        }
+      }
+    }
+
+    // Fast in-memory cachedRun patch for crisp real-time UI rendering
+    const member = this.cachedRun?.members[evt.name];
+    if (member) {
+      if (evt.activity !== undefined) {
+        member.currentActivity = evt.activity;
+      }
+      if (evt.toolName !== undefined) {
+        member.lastTool = evt.toolName;
+      }
+      if (evt.tokens !== undefined) {
+        member.tokens = Math.max(member.tokens, evt.tokens);
+      }
+      if (evt.tokenBreakdown !== undefined) {
+        member.tokenBreakdown = evt.tokenBreakdown;
+      }
+      if (evt.cost !== undefined) {
+        member.cost = Math.max(member.cost, evt.cost);
+      }
+      if (evt.logLine) {
+        member.logTail = live ? [...live.logTail] : [...member.logTail, evt.logLine].slice(-50);
+      }
+      member.updatedAt = evt.timestamp;
+    }
+
+    this.emitEngineEvent(
+      "snapshot_changed",
+      evt.logLine ?? evt.activity ?? `${evt.name}: ${evt.type}`,
+      { memberName: evt.name },
+    );
+  }
+
+  private createMemberBridge(
+    runId: string,
+    member: SwarmMemberRecord,
+  ): MemberEngineBridge {
+    return {
+      postMessage: async ({ text, channel, kind }) => {
+        const latest = this.cachedRun?.members[member.name] ?? member;
+        return this.postMessage({
+          from: latest.name,
+          fromRole: latest.role,
+          text,
+          channel: channel ?? latest.channels[0] ?? DEFAULT_CHANNEL,
+          kind,
+        });
+      },
+
+      readBoard: async (options?: ReadBoardOptions) => {
+        const latest = this.cachedRun?.members[member.name] ?? member;
+        const effectiveOptions: ReadBoardOptions = {
+          ...options,
+          ...(options?.channel === undefined
+            ? { memberChannels: latest.channels }
+            : {}),
+        };
+        const res = await this.readBoard(effectiveOptions);
+        if (res.head > latest.lastReadSeq && this.activeRunId === runId) {
+          void this.store
+            .updateMember(runId, latest.name, { lastReadSeq: res.head })
+            .then((u) => {
+              this.setCachedRun(u);
+            })
+            .catch(() => {});
+        }
+        return res;
+      },
+
+      getStatus: async (): Promise<SwarmRosterStatus> => {
+        const run = await this.store.loadRun(runId);
+        const members: SwarmMemberStatusEntry[] = run.memberOrder
+          .map((n) => run.members[n])
+          .filter((m): m is SwarmMemberRecord => Boolean(m))
+          .map((m) => ({
+            name: m.name,
+            role: m.role,
+            state: m.state,
+            parentName: m.parentName,
+            groupPrefix: m.groupPrefix,
+            workspace: m.workspace,
+            branch: m.branch,
+            model: m.model,
+            thinkingLevel: m.thinkingLevel,
+            channels: m.channels,
+            parkedOn: m.parkedOn,
+            currentActivity: m.currentActivity,
+            lastPostSeq: m.lastPostSeq,
+            lastPostTime: m.lastPostTime,
+            turns: m.turns,
+            tokens: m.tokens,
+            cost: m.cost,
+          }));
+        return {
+          runId: run.id,
+          title: run.title,
+          status: run.status,
+          baseBranch: run.baseBranch,
+          boardHead: run.boardHead,
+          members,
+          channels: Object.values(run.channels),
+        };
+      },
+
+      listModels: async (options?: { all?: boolean }) => this.listModels(options),
+
+      addHelper: async (input: AddHelperInput) =>
+        this.addMembers({
+          ...input,
+          callerName: member.name,
+          callerRole: member.role,
+          hostContext: this.hostContext,
+        }),
+
+      killHelper: async (name: string, reason?: string) =>
+        this.killMember(name, {
+          reason,
+          callerName: member.name,
+          callerRole: member.role,
+        }),
+
+      switchModel: async (
+        targetName: string | undefined,
+        model: string,
+        thinkingLevel?: ThinkingLevel,
+        reason?: string,
+      ) =>
+        this.switchModel({
+          targetName: targetName?.trim() || member.name,
+          model,
+          thinkingLevel,
+          reason,
+          callerName: member.name,
+          callerRole: member.role,
+          hostContext: this.hostContext,
+        }),
+
+      manageChannel: async (input: ManageChannelInput) =>
+        this.manageChannel({
+          ...input,
+          callerName: member.name,
+          callerRole: member.role,
+        }),
+    };
+  }
+
+  // --------------------------------------------------------------------------
+  // Internal State & Cache Helpers
+  // --------------------------------------------------------------------------
+
+  private getEffectiveSettings(): SwarmSettings {
+    const base = this.getSettingsFn
+      ? this.getSettingsFn()
+      : { ...DEFAULT_SWARM_SETTINGS, ...this.staticSettings };
+    return {
+      ...DEFAULT_SWARM_SETTINGS,
+      ...base,
+      fallbackModels: [...(base.fallbackModels ?? [])],
+    };
+  }
+
+  private requireActiveRun(): SwarmRunState {
+    if (!this.activeRunId || !this.cachedRun) {
+      throw new SwarmProtocolError(
+        "NOT_FOUND",
+        "No active Swarm run. Start or attach to a Swarm run first.",
+      );
+    }
+    return this.cachedRun;
+  }
+
+  private findMember(run: SwarmRunState, name: string): SwarmMemberRecord | undefined {
+    const direct = run.members[name];
+    if (direct) return direct;
+    const lower = name.trim().toLowerCase();
+    return Object.values(run.members).find((m) => m.name.toLowerCase() === lower);
+  }
+
+  private getWorkingOrPendingMemberNames(): string[] {
+    const run = this.cachedRun;
+    if (!run) return [];
+    const active = new Set<string>();
+    for (const member of Object.values(run.members)) {
+      if (member.state === "killed") continue;
+      const live = this.liveMembers.get(member.name);
+      if (
+        member.state === "working" ||
+        live?.spawning ||
+        live?.waking ||
+        live?.turnActive ||
+        live?.switchingModel ||
+        (live && live.pendingWakes.length > 0) ||
+        live?.handle?.getState() === "working"
+      ) {
+        active.add(member.name);
+      }
+    }
+    return Array.from(active);
+  }
+
+  private recordBoardMessageInCache(msg: BoardMessage): void {
+    const idx = this.cachedBoard.findIndex((m) => m.seq === msg.seq);
+    if (idx >= 0) {
+      this.cachedBoard[idx] = msg;
+    } else {
+      this.cachedBoard.push(msg);
+      if (this.cachedBoard.length > BOARD_CACHE_LIMIT) {
+        this.cachedBoard = this.cachedBoard.slice(-BOARD_CACHE_LIMIT);
+      }
+    }
+    if (this.cachedRun && msg.seq > this.cachedRun.boardHead) {
+      this.cachedRun.boardHead = msg.seq;
+    }
+  }
+
+  private getCachedMessagesSince(since: number): BoardMessage[] {
+    return this.cachedBoard.filter((m) => m.seq > since);
+  }
+
+  private setCachedRun(nextRun: SwarmRunState): void {
+    if (
+      this.cachedRun &&
+      this.cachedRun.id === nextRun.id &&
+      nextRun.revision < this.cachedRun.revision
+    ) {
+      return;
+    }
+    const prevHead =
+      this.cachedRun && this.cachedRun.id === nextRun.id
+        ? this.cachedRun.boardHead
+        : 0;
+    const mergedMembers: Record<string, SwarmMemberRecord> = { ...nextRun.members };
+    if (this.liveMembers.size > 0) {
+      for (const [name, m] of Object.entries(mergedMembers)) {
+        const live = this.liveMembers.get(name);
+        if (!live) continue;
+        const preserveLogTail =
+          live.logTail.length > m.logTail.length ? [...live.logTail] : m.logTail;
+        const preserveLastTool = live.lastTool ?? m.lastTool;
+        const isWorking = m.state === "working" || live.turnActive || live.spawning;
+        const preserveActivity =
+          isWorking && live.currentActivity ? live.currentActivity : m.currentActivity;
+        if (
+          preserveLogTail !== m.logTail ||
+          preserveLastTool !== m.lastTool ||
+          preserveActivity !== m.currentActivity
+        ) {
+          mergedMembers[name] = {
+            ...m,
+            logTail: preserveLogTail,
+            lastTool: preserveLastTool,
+            currentActivity: preserveActivity,
+          };
+        }
+      }
+    }
+    this.cachedRun = {
+      ...nextRun,
+      members: mergedMembers,
+      boardHead: Math.max(nextRun.boardHead, prevHead),
+    };
+  }
+
+  private async refreshCache(knownRun?: SwarmRunState): Promise<void> {
+    if (!this.activeRunId) return;
+    try {
+      const next = knownRun ?? (await this.store.loadRun(this.activeRunId));
+      this.setCachedRun(next);
+      this.cachedEvents = await this.store
+        .getRecentEvents(this.activeRunId, EVENT_CACHE_LIMIT)
+        .catch(() => this.cachedEvents);
+    } catch {
+      // retain prior cache on transient read failure
+    }
+  }
+
+  private async disposeLiveHandles(reason: string): Promise<void> {
+    const entries = Array.from(this.liveMembers.values());
+    this.liveMembers.clear();
+    await Promise.all(
+      entries.map(async (live) => {
+        live.launchAbort?.abort();
+        live.spawning = false;
+        live.waking = false;
+        live.turnActive = false;
+        live.switchingModel = false;
+        live.parkedMentionsOnly = true;
+        live.currentActivity = undefined;
+        live.pendingWakes.length = 0;
+        live.releaseSlot?.();
+        live.releaseSlot = undefined;
+        if (live.handle) {
+          await live.handle.kill(reason).catch(() => {});
+        }
+      }),
+    );
+  }
+
+  private emitEngineEvent(
+    type: SwarmEngineEventType,
+    summary: string,
+    extra?: { memberName?: string; seq?: number },
+  ): void {
+    if (this.listeners.size === 0) return;
+    const event: SwarmEngineEvent = {
+      type,
+      runId: this.activeRunId,
+      memberName: extra?.memberName,
+      seq: extra?.seq,
+      summary,
+      snapshot: this.getSnapshot(),
+    };
+    for (const listener of Array.from(this.listeners)) {
+      try {
+        listener(event);
+      } catch {
+        // listener errors must never disrupt the engine
+      }
+    }
+  }
+}

@@ -9,9 +9,8 @@ import {
   type TUI,
 } from "@earendil-works/pi-tui";
 import type {
+  InitialMemberProposal,
   IQuestionnaireUI,
-  MissionPlanInput,
-  PlanValidationResult,
   ProposalDialogAction,
   ProposalDialogOutcome,
   ProposedSwarmPlan,
@@ -22,10 +21,10 @@ import type {
   SwarmDraftMode,
 } from "../types.js";
 import {
-  computeMissionWaves,
   fitLine,
-  formatMissionKindBadge,
+  formatMemberRoleBadge,
   formatRoleModelsLine,
+  formatWorkspaceBadge,
   joinColumns,
   renderBox,
   renderHorizontalRule,
@@ -134,61 +133,44 @@ async function withModalGuard<T>(
 }
 
 /**
- * Build compact wave summary lines for a proposed Swarm plan.
+ * Build compact initial-member preview lines for a proposed dynamic Swarm plan.
  */
-export function buildPlanWaveSummaryLines(
-  plan: ProposedSwarmPlan,
-  validation: PlanValidationResult | undefined,
+export function buildInitialMembersSummaryLines(
+  members: readonly InitialMemberProposal[] | undefined,
   width: number,
   theme?: Theme,
-  maxLines = 4,
+  maxLines = 3,
 ): string[] {
-  const byId = new Map<string, MissionPlanInput>();
-  for (const m of plan.missions) {
-    byId.set(m.id, m);
-  }
+  const targetWidth = Math.max(0, Math.floor(width));
+  if (targetWidth === 0 || !members || members.length === 0) return [];
 
-  let waves: MissionPlanInput[][];
-  if (validation?.waves && validation.waves.length > 0) {
-    waves = validation.waves.map((ids) =>
-      ids
-        .map((id) => byId.get(id))
-        .filter((m): m is MissionPlanInput => m !== undefined),
-    );
-  } else {
-    waves = computeMissionWaves(plan.missions);
-  }
-
-  if (waves.length === 0) {
-    const empty = theme ? theme.fg("muted", "  (no missions)") : "  (no missions)";
-    return [fitLine(empty, width)];
-  }
-
-  const lines: string[] = [];
   const limit = Math.max(1, maxLines);
-  const visibleWaves =
-    waves.length > limit ? waves.slice(0, Math.max(1, limit - 1)) : waves;
+  const visible =
+    members.length > limit ? members.slice(0, Math.max(1, limit - 1)) : members;
+  const out: string[] = [];
 
-  for (let i = 0; i < visibleWaves.length; i++) {
-    const wave = visibleWaves[i] ?? [];
-    const label = theme
-      ? theme.fg("muted", `  Wave ${i + 1}: `)
-      : `  Wave ${i + 1}: `;
-    const entries = wave.map((m) => {
-      const idStr = theme ? theme.bold(m.id) : m.id;
-      const kindStr = formatMissionKindBadge(m.kind, theme);
-      return `${idStr}(${kindStr})`;
-    });
-    lines.push(fitLine(label + entries.join(", "), width));
+  for (const m of visible) {
+    const nameStr = theme ? theme.bold(sanitizePlainText(m.name)) : sanitizePlainText(m.name);
+    const roleStr = formatMemberRoleBadge(m.role, theme);
+    const wsStr = formatWorkspaceBadge(m.workspace ?? "inherit", undefined, theme);
+    const briefStr = sanitizePlainText(m.brief);
+    const briefPart = briefStr
+      ? theme
+        ? theme.fg("muted", ` — ${briefStr}`)
+        : ` — ${briefStr}`
+      : "";
+    out.push(
+      fitLine(`  • ${nameStr} (${roleStr}, ${wsStr})${briefPart}`, targetWidth),
+    );
   }
 
-  if (waves.length > visibleWaves.length) {
-    const remaining = waves.length - visibleWaves.length;
-    const more = `  … +${remaining} more wave${remaining === 1 ? "" : "s"}`;
-    lines.push(fitLine(theme ? theme.fg("muted", more) : more, width));
+  if (members.length > visible.length) {
+    const extra = members.length - visible.length;
+    const more = `  … +${extra} more initial member${extra === 1 ? "" : "s"}`;
+    out.push(fitLine(theme ? theme.fg("dim", more) : more, targetWidth));
   }
 
-  return lines;
+  return out;
 }
 
 // ============================================================================
@@ -237,7 +219,6 @@ async function askQuestionBasic(
     if (opt.description && !opt.isCustom) {
       display += ` — ${opt.description}`;
     }
-    // Ensure uniqueness for select map
     let uniqueDisplay = display;
     let suffix = 2;
     while (labelToOption.has(uniqueDisplay)) {
@@ -281,51 +262,54 @@ async function confirmProposalBasic(
   plan: ProposedSwarmPlan,
   options?: {
     mode?: SwarmDraftMode;
-    validation?: PlanValidationResult;
     signal?: AbortSignal;
   },
 ): Promise<ProposalDialogOutcome> {
   let validatorEnabled = plan.validatorEnabled;
-  let finalValidatorEnabled = plan.finalValidatorEnabled ?? true;
-  const maxConcurrency = Math.max(
+  let maxConcurrency = Math.max(
     MIN_CONCURRENCY,
-    Math.min(MAX_CONCURRENCY, Math.round(plan.maxConcurrency || 3)),
+    Math.min(MAX_CONCURRENCY, Math.round(plan.maxConcurrency || 6)),
   );
   const signal = options?.signal;
   const dialogOpts = signal ? { signal } : undefined;
 
-  const waveCount =
-    options?.validation?.waves.length ??
-    computeMissionWaves(plan.missions).length;
   const modelsLine = formatRoleModelsLine(plan.roleModels, "host default");
+  const initialCount = plan.initialMembers?.length ?? 0;
+  const membersNote =
+    initialCount > 0
+      ? ` · ${initialCount} initial member${initialCount === 1 ? "" : "s"}`
+      : "";
+  const planTitle = sanitizePlainText(plan.title);
 
   while (!signal?.aborted) {
-    const title = [
+    const header = [
       options?.mode === "tweak"
         ? "Swarm Plan Confirmation (Revision)"
         : "Swarm Plan Confirmation",
-      `${plan.missions.length} mission(s) · ${waveCount} wave(s) · base:${plan.baseBranch}`,
+      planTitle ? `${planTitle}` : sanitizePlainText(plan.objective),
+      `base:${plan.baseBranch}${membersNote}`,
       `Models: ${modelsLine}`,
-      `Validator: ${validatorEnabled ? "ON" : "OFF"} · Final Validator: ${finalValidatorEnabled ? "ON" : "OFF"} · Concurrency: ${maxConcurrency}`,
+      `Independent Validator Policy: ${validatorEnabled ? "ON" : "OFF"} · Max Concurrency: ${maxConcurrency}`,
     ].join(" — ");
 
-    const confirmOpt = "Confirm — launch Swarm fleet now (recommended)";
-    const continueOpt = "Continue refining — keep chatting";
-    const toggleValOpt = `Toggle Validator (currently ${validatorEnabled ? "ON" : "OFF"})`;
-    const toggleFinalValOpt = `Toggle Final Validator (currently ${finalValidatorEnabled ? "ON" : "OFF"})`;
-    const cancelOpt = "Cancel — discard this draft";
+    const confirmOpt = "Confirm — launch dynamic Swarm (recommended)";
+    const continueOpt = "Continue refining";
+    const toggleValOpt = `Toggle Independent Validator Policy (currently ${validatorEnabled ? "ON" : "OFF"})`;
+    const incConcOpt = `Increase Max Concurrency (currently ${maxConcurrency})`;
+    const decConcOpt = `Decrease Max Concurrency (currently ${maxConcurrency})`;
+    const cancelOpt = "Cancel — discard draft";
 
-    const choice = await ctx.ui.select(
-      title,
-      [confirmOpt, continueOpt, toggleValOpt, toggleFinalValOpt, cancelOpt],
-      dialogOpts,
-    );
+    const selectOptions: string[] = [confirmOpt, continueOpt, toggleValOpt];
+    if (maxConcurrency < MAX_CONCURRENCY) selectOptions.push(incConcOpt);
+    if (maxConcurrency > MIN_CONCURRENCY) selectOptions.push(decConcOpt);
+    selectOptions.push(cancelOpt);
+
+    const choice = await ctx.ui.select(header, selectOptions, dialogOpts);
 
     if (choice === undefined || signal?.aborted) {
       return {
         action: "continue",
         validatorEnabled,
-        finalValidatorEnabled,
         maxConcurrency,
       };
     }
@@ -333,15 +317,18 @@ async function confirmProposalBasic(
       validatorEnabled = !validatorEnabled;
       continue;
     }
-    if (choice === toggleFinalValOpt) {
-      finalValidatorEnabled = !finalValidatorEnabled;
+    if (choice === incConcOpt) {
+      maxConcurrency = Math.min(MAX_CONCURRENCY, maxConcurrency + 1);
+      continue;
+    }
+    if (choice === decConcOpt) {
+      maxConcurrency = Math.max(MIN_CONCURRENCY, maxConcurrency - 1);
       continue;
     }
     if (choice === confirmOpt) {
       return {
         action: "confirm",
         validatorEnabled,
-        finalValidatorEnabled,
         maxConcurrency,
       };
     }
@@ -349,14 +336,12 @@ async function confirmProposalBasic(
       return {
         action: "cancel",
         validatorEnabled,
-        finalValidatorEnabled,
         maxConcurrency,
       };
     }
     return {
       action: "continue",
       validatorEnabled,
-      finalValidatorEnabled,
       maxConcurrency,
     };
   }
@@ -364,7 +349,6 @@ async function confirmProposalBasic(
   return {
     action: "continue",
     validatorEnabled,
-    finalValidatorEnabled,
     maxConcurrency,
   };
 }
@@ -558,7 +542,6 @@ class SingleQuestionComponent implements Component, Focusable {
 
     const body: string[] = [];
 
-    // Question text
     const qWrapped = wrapLines(
       this.theme.bold(sanitizePlainText(this.spec.question)),
       innerWidth,
@@ -659,7 +642,10 @@ function renderOptionListWindow(
   }
 
   for (let i = start; i < end; i++) {
-    if (out.length - startOutLen >= budgetLines - (end < options.length && indicatorReserve > 0 ? 1 : 0)) {
+    if (
+      out.length - startOutLen >=
+      budgetLines - (end < options.length && indicatorReserve > 0 ? 1 : 0)
+    ) {
       break;
     }
     const opt = options[i]!;
@@ -685,7 +671,8 @@ function renderOptionListWindow(
     if (
       canShowDesc &&
       opt.description &&
-      out.length - startOutLen < budgetLines - (end < options.length && indicatorReserve > 0 ? 1 : 0)
+      out.length - startOutLen <
+        budgetLines - (end < options.length && indicatorReserve > 0 ? 1 : 0)
     ) {
       out.push(
         fitLine(theme.fg("dim", `     ${opt.description}`), innerWidth),
@@ -693,7 +680,11 @@ function renderOptionListWindow(
     }
   }
 
-  if (end < options.length && indicatorReserve > 0 && out.length - startOutLen < budgetLines) {
+  if (
+    end < options.length &&
+    indicatorReserve > 0 &&
+    out.length - startOutLen < budgetLines
+  ) {
     out.push(
       fitLine(theme.fg("dim", `  ↓ ${options.length - end} more below`), innerWidth),
     );
@@ -810,7 +801,6 @@ class MultiQuestionComponent implements Component, Focusable {
   }
 
   private advanceAfterAnswer(): void {
-    // Move to next tab (toward Submit tab)
     if (this.activeTab < this.submitTabIndex) {
       this.activeTab += 1;
       if (this.activeTab === this.submitTabIndex) {
@@ -864,7 +854,10 @@ class MultiQuestionComponent implements Component, Focusable {
     }
   }
 
-  private getSubmitActions(): { id: "jump" | "submit" | "cancel"; label: string }[] {
+  private getSubmitActions(): {
+    id: "jump" | "submit" | "cancel";
+    label: string;
+  }[] {
     const answeredCount = this.answers.size;
     const total = this.questions.length;
     if (answeredCount >= total) {
@@ -905,7 +898,6 @@ class MultiQuestionComponent implements Component, Focusable {
       return;
     }
 
-    // Tab switching
     if (matchesKey(data, Key.shift("tab")) || matchesKey(data, Key.left)) {
       this.switchTab(-1);
       this.tui.requestRender();
@@ -952,7 +944,6 @@ class MultiQuestionComponent implements Component, Focusable {
       return;
     }
 
-    // Question tab navigation
     const tabMeta = this.normalizedByTab[this.activeTab];
     const spec = this.questions[this.activeTab];
     if (!tabMeta || !spec) return;
@@ -1013,7 +1004,7 @@ class MultiQuestionComponent implements Component, Focusable {
       pieces.push({ idx: i, text: styled });
     }
 
-    const submitLabel = `✓ Submit`;
+    const submitLabel = "✓ Submit";
     pieces.push({
       idx: this.submitTabIndex,
       text: this.isOnSubmitTab
@@ -1027,7 +1018,6 @@ class MultiQuestionComponent implements Component, Focusable {
       return full;
     }
 
-    // Center window around active tab on narrow widths
     const activePiece = pieces[this.activeTab]!;
     const selected: typeof pieces = [activePiece];
     let usedW = visibleWidth(activePiece.text);
@@ -1161,7 +1151,10 @@ class MultiQuestionComponent implements Component, Focusable {
       if (saved) {
         body.push(
           fitLine(
-            this.theme.fg("success", `Current answer: ${sanitizePlainText(saved.answer)}`),
+            this.theme.fg(
+              "success",
+              `Current answer: ${sanitizePlainText(saved.answer)}`,
+            ),
             innerWidth,
           ),
         );
@@ -1223,7 +1216,6 @@ class MultiQuestionComponent implements Component, Focusable {
 class ConfirmProposalComponent implements Component {
   private selectedIndex = 0;
   private validatorEnabled: boolean;
-  private finalValidatorEnabled: boolean;
   private maxConcurrency: number;
   private settled = false;
   private readonly onAbort?: () => void;
@@ -1236,17 +1228,17 @@ class ConfirmProposalComponent implements Component {
   }[] = [
     {
       action: "confirm",
-      label: "Confirm — launch Swarm fleet now",
+      label: "Confirm — launch dynamic Swarm",
       recommended: true,
     },
     {
       action: "continue",
-      label: "Continue refining — keep chatting",
+      label: "Continue refining",
       hint: "Esc",
     },
     {
       action: "cancel",
-      label: "Cancel — discard this draft",
+      label: "Cancel — discard draft",
     },
   ];
 
@@ -1257,17 +1249,15 @@ class ConfirmProposalComponent implements Component {
     private readonly options:
       | {
           mode?: SwarmDraftMode;
-          validation?: PlanValidationResult;
           signal?: AbortSignal;
         }
       | undefined,
     private readonly done: (result: ProposalDialogOutcome) => void,
   ) {
     this.validatorEnabled = plan.validatorEnabled;
-    this.finalValidatorEnabled = plan.finalValidatorEnabled ?? true;
     this.maxConcurrency = Math.max(
       MIN_CONCURRENCY,
-      Math.min(MAX_CONCURRENCY, Math.round(plan.maxConcurrency || 3)),
+      Math.min(MAX_CONCURRENCY, Math.round(plan.maxConcurrency || 6)),
     );
 
     const signal = options?.signal;
@@ -1288,7 +1278,6 @@ class ConfirmProposalComponent implements Component {
     this.done({
       action,
       validatorEnabled: this.validatorEnabled,
-      finalValidatorEnabled: this.finalValidatorEnabled,
       maxConcurrency: this.maxConcurrency,
     });
   }
@@ -1314,14 +1303,8 @@ class ConfirmProposalComponent implements Component {
 
     const ch = decodePrintableChar(data);
 
-    if (ch === "r" || ch === "R") {
-      this.validatorEnabled = !this.validatorEnabled;
-      this.tui.requestRender();
-      return;
-    }
-
     if (ch === "v" || ch === "V") {
-      this.finalValidatorEnabled = !this.finalValidatorEnabled;
+      this.validatorEnabled = !this.validatorEnabled;
       this.tui.requestRender();
       return;
     }
@@ -1376,11 +1359,11 @@ class ConfirmProposalComponent implements Component {
 
     const verbose =
       `${this.theme.fg("muted", "Models: ")}` +
-      `${this.theme.fg("muted", "Orchestrator:")}${styleVal(orch, Boolean(rm?.orchestrator?.model))}` +
+      `${this.theme.fg("muted", "O:")}${styleVal(orch, Boolean(rm?.orchestrator?.model))}` +
       `${this.theme.fg("dim", " · ")}` +
-      `${this.theme.fg("muted", "Worker:")}${styleVal(work, Boolean(rm?.worker?.model))}` +
+      `${this.theme.fg("muted", "W:")}${styleVal(work, Boolean(rm?.worker?.model))}` +
       `${this.theme.fg("dim", " · ")}` +
-      `${this.theme.fg("muted", "Validator:")}${styleVal(val, Boolean(rm?.validator?.model))}`;
+      `${this.theme.fg("muted", "V:")}${styleVal(val, Boolean(rm?.validator?.model))}`;
 
     if (visibleWidth(verbose) <= innerWidth) {
       return verbose;
@@ -1403,103 +1386,117 @@ class ConfirmProposalComponent implements Component {
 
     const body: string[] = [];
 
-    // Objective snippet
-    const objLines = wrapLines(
-      this.theme.bold(sanitizePlainText(this.plan.objective)),
-      innerWidth,
-      maxInnerLines <= 10 ? 1 : 2,
-    );
-    body.push(...objLines);
-
-    // Stats bar
-    const wavesCount =
-      this.options?.validation?.waves.length ??
-      computeMissionWaves(this.plan.missions).length;
-    const counts = { build: 0, artifact: 0, survey: 0 };
-    for (const m of this.plan.missions) {
-      counts[m.kind] += 1;
+    // Plan title & objective snippet
+    const cleanTitle = sanitizePlainText(this.plan.title);
+    const cleanObjective = sanitizePlainText(this.plan.objective);
+    if (cleanTitle) {
+      body.push(
+        fitLine(this.theme.fg("accent", this.theme.bold(cleanTitle)), innerWidth),
+      );
     }
-    const kindParts: string[] = [];
-    if (counts.build > 0) kindParts.push(`${counts.build} build`);
-    if (counts.artifact > 0) kindParts.push(`${counts.artifact} artifact`);
-    if (counts.survey > 0) kindParts.push(`${counts.survey} survey`);
+    if (cleanObjective && cleanObjective !== cleanTitle) {
+      const objLines = wrapLines(
+        this.theme.bold(cleanObjective),
+        innerWidth,
+        maxInnerLines <= 12 ? 1 : 2,
+      );
+      body.push(...objLines);
+    }
 
-    const statsLeft = [
-      `base:${this.theme.fg("accent", this.plan.baseBranch)}`,
-      `${this.plan.missions.length} mission${this.plan.missions.length === 1 ? "" : "s"}`,
-      `${wavesCount} wave${wavesCount === 1 ? "" : "s"}`,
-    ].join(" · ");
-    const statsRight =
-      kindParts.length > 0 ? this.theme.fg("muted", kindParts.join(", ")) : "";
+    // Base branch + optional initialMembers count
+    const initialMembers = this.plan.initialMembers ?? [];
+    const basePart = `base:${this.theme.fg("accent", sanitizePlainText(this.plan.baseBranch))}`;
+    const membersSummary =
+      initialMembers.length > 0
+        ? `${this.theme.fg("accent", String(initialMembers.length))} initial member${initialMembers.length === 1 ? "" : "s"}`
+        : this.theme.fg("muted", "dynamic on-demand spawning");
     body.push(
-      innerWidth >= 56
-        ? joinColumns(statsLeft, statsRight, innerWidth)
-        : fitLine(statsLeft, innerWidth),
+      innerWidth >= 52
+        ? joinColumns(basePart, membersSummary, innerWidth)
+        : fitLine(`${basePart} · ${membersSummary}`, innerWidth),
     );
 
-    // Active 3-role models line
+    // Active 3-role models (O / W / V)
     body.push(this.renderModelsLine(innerWidth));
 
-    // Toggleable validator, final validator & concurrency strip
+    // Interactive toggles: [v] Independent Validator Policy + [+/-] Max Concurrency
     const valPill = this.validatorEnabled
       ? this.theme.fg("success", this.theme.bold("ON"))
       : this.theme.fg("warning", this.theme.bold("OFF"));
-    const finalValPill = this.finalValidatorEnabled
-      ? this.theme.fg("success", this.theme.bold("ON"))
-      : this.theme.fg("warning", this.theme.bold("OFF"));
-    const togglesPart = `${this.theme.fg("dim", "[r]")} Validator: ${valPill} · ${this.theme.fg("dim", "[v]")} Final Validator: ${finalValPill}`;
-    const slotsPart = `${this.theme.fg("dim", "[+/-]")} Concurrency: ${this.theme.fg("accent", String(this.maxConcurrency))}`;
+    const valPart = `${this.theme.fg("dim", "[v]")} Independent Validator Policy: ${valPill}`;
+    const concPart = `${this.theme.fg("dim", "[+/-]")} Max Concurrency: ${this.theme.fg("accent", String(this.maxConcurrency))}`;
+
     if (innerWidth >= 66) {
-      body.push(fitLine(`${togglesPart} · ${slotsPart}`, innerWidth));
-    } else if (maxInnerLines >= 12) {
-      body.push(fitLine(togglesPart, innerWidth));
-      body.push(fitLine(slotsPart, innerWidth));
+      body.push(fitLine(`${valPart} · ${concPart}`, innerWidth));
+    } else if (maxInnerLines >= 13) {
+      body.push(fitLine(valPart, innerWidth));
+      body.push(fitLine(concPart, innerWidth));
     } else {
       body.push(
         fitLine(
-          `${togglesPart} · ${this.theme.fg("dim", "[+/-]")} ${this.theme.fg("accent", String(this.maxConcurrency))}`,
+          `${this.theme.fg("dim", "[v]")} Validator: ${valPill} · ${this.theme.fg("dim", "[+/-]")} Max: ${this.theme.fg("accent", String(this.maxConcurrency))}`,
           innerWidth,
         ),
       );
     }
 
-    // Validation warning if invalid
-    const validation = this.options?.validation;
-    if (validation && !validation.valid && validation.errors.length > 0) {
-      const firstErr = validation.errors[0]!;
-      body.push(
-        fitLine(
-          this.theme.fg(
-            "error",
-            `⚠ ${validation.errors.length} validation issue(s): ${sanitizePlainText(firstErr.message)}`,
-          ),
+    // Reserve lines for bottom rule + 3 choices + hint
+    const bottomReserved = 1 + this.choices.length + 1;
+    let previewBudget = Math.max(0, maxInnerLines - body.length - bottomReserved);
+
+    // Compact Strategy & Acceptance Criteria preview
+    const cleanStrategy = sanitizePlainText(this.plan.strategy);
+    const cleanAcceptance = sanitizePlainText(this.plan.acceptanceCriteria);
+
+    if (previewBudget >= 2 && (cleanStrategy || cleanAcceptance)) {
+      body.push(renderHorizontalRule(innerWidth, "Plan Strategy & Criteria", this.theme));
+      previewBudget -= 1;
+
+      if (cleanStrategy && previewBudget > 0) {
+        const stratMax = cleanAcceptance && previewBudget >= 3 ? 2 : 1;
+        const stratLines = wrapLines(
+          `${this.theme.fg("muted", "Strategy: ")}${cleanStrategy}`,
           innerWidth,
-        ),
-      );
+          Math.min(stratMax, previewBudget),
+        );
+        body.push(...stratLines);
+        previewBudget -= stratLines.length;
+      }
+
+      if (cleanAcceptance && previewBudget > 0) {
+        const accMax = initialMembers.length > 0 && previewBudget >= 3 ? 1 : 2;
+        const accLines = wrapLines(
+          `${this.theme.fg("muted", "Acceptance: ")}${cleanAcceptance}`,
+          innerWidth,
+          Math.min(accMax, previewBudget),
+        );
+        body.push(...accLines);
+        previewBudget -= accLines.length;
+      }
     }
 
-    // Compact wave preview (bounded to remaining budget above the 3 choices)
-    const reservedForChoicesAndFooter = this.choices.length + 3;
-    const waveBudget = Math.min(
-      4,
-      Math.max(0, maxInnerLines - body.length - reservedForChoicesAndFooter),
-    );
-    if (waveBudget > 0) {
-      body.push(renderHorizontalRule(innerWidth, "Waves", this.theme));
+    // Optional initialMembers summary preview
+    if (initialMembers.length > 0 && previewBudget >= 2) {
       body.push(
-        ...buildPlanWaveSummaryLines(
-          this.plan,
-          validation,
+        renderHorizontalRule(
           innerWidth,
+          `Initial Members (${initialMembers.length})`,
           this.theme,
-          waveBudget,
         ),
       );
+      previewBudget -= 1;
+      const memberLines = buildInitialMembersSummaryLines(
+        initialMembers,
+        innerWidth,
+        this.theme,
+        Math.min(3, previewBudget),
+      );
+      body.push(...memberLines);
     }
 
     body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
 
-    // 3 Choices
+    // 3 Clear Choices
     for (let i = 0; i < this.choices.length; i++) {
       const choice = this.choices[i]!;
       const isSel = i === this.selectedIndex;
@@ -1520,7 +1517,7 @@ class ConfirmProposalComponent implements Component {
       fitLine(
         this.theme.fg(
           "dim",
-          "[↑↓] [Enter] · [r] validator · [v] final validator · [+/-] slots · [Esc] refine",
+          "[↑↓] [Enter] · [v] validator policy · [+/-] concurrency · [Esc] refine",
         ),
         innerWidth,
       ),
@@ -1622,14 +1619,12 @@ export function createQuestionnaireUI(
     async confirmProposal(ctx, plan, options) {
       const safeConcurrency = Math.max(
         MIN_CONCURRENCY,
-        Math.min(MAX_CONCURRENCY, Math.round(plan.maxConcurrency || 3)),
+        Math.min(MAX_CONCURRENCY, Math.round(plan.maxConcurrency || 6)),
       );
-      const finalValidatorEnabled = plan.finalValidatorEnabled ?? true;
       if (!ctx.hasUI) {
         return {
           action: "cancel",
           validatorEnabled: plan.validatorEnabled,
-          finalValidatorEnabled,
           maxConcurrency: safeConcurrency,
         };
       }
@@ -1637,7 +1632,6 @@ export function createQuestionnaireUI(
         return {
           action: "continue",
           validatorEnabled: plan.validatorEnabled,
-          finalValidatorEnabled,
           maxConcurrency: safeConcurrency,
         };
       }
@@ -1653,7 +1647,7 @@ export function createQuestionnaireUI(
                 message:
                   options?.mode === "tweak"
                     ? "Confirm Swarm plan revision"
-                    : "Confirm Swarm mission plan",
+                    : "Confirm dynamic Swarm plan",
               },
             },
           );

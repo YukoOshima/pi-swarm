@@ -20,13 +20,7 @@ import {
   type SafeTeardownTarget,
   type TeardownEntryResult,
 } from "../types.js";
-import {
-  findScopeViolations,
-  isPathInScope,
-  normalizeRelativeRepoPath,
-} from "./swarm-store.js";
-
-export { findScopeViolations, isPathInScope };
+import { normalizeRelativeRepoPath } from "./swarm-store.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -411,7 +405,7 @@ export class WorktreeManager implements IWorktreeManager {
     const exists = await this.branchExists(options.branch);
     if (exists && !options.reuseExistingBranch) {
       throw new SwarmProtocolError(
-        "DUPLICATE_BRANCH",
+        "GIT_ERROR",
         `Branch "${options.branch}" already exists in repository.`,
         { branch: options.branch },
       );
@@ -549,7 +543,7 @@ export class WorktreeManager implements IWorktreeManager {
     }
 
     // When inspecting an explicit worktree directory at HEAD (or its checked-out branch),
-    // also include uncommitted modified/staged/untracked files so scope violations can't hide.
+    // also include uncommitted modified/staged/untracked files.
     if (cwd) {
       let includeWorkingTree = targetRef === "HEAD";
       if (!includeWorkingTree) {
@@ -851,18 +845,18 @@ export class WorktreeManager implements IWorktreeManager {
       try {
         if (target.hasActiveAgent) {
           skipped.push({
-            missionId: target.missionId,
+            memberName: target.memberName,
             worktreePath: resolvedPath,
             branch: target.branch,
             action: "skipped_active",
-            reason: "Mission has an active running agent.",
+            reason: "Member has an active running agent.",
           });
           continue;
         }
 
         if (!(await pathExists(resolvedPath))) {
           skipped.push({
-            missionId: target.missionId,
+            memberName: target.memberName,
             worktreePath: resolvedPath,
             branch: target.branch,
             action: "missing",
@@ -874,11 +868,12 @@ export class WorktreeManager implements IWorktreeManager {
         const dirty = await this.isWorktreeDirty(resolvedPath);
         if (dirty) {
           skipped.push({
-            missionId: target.missionId,
+            memberName: target.memberName,
             worktreePath: resolvedPath,
             branch: target.branch,
             action: "skipped_dirty",
-            reason: "Worktree has uncommitted changes; preserved to avoid data loss.",
+            reason:
+              "Worktree has uncommitted changes; preserved to avoid data loss.",
           });
           continue;
         }
@@ -893,14 +888,14 @@ export class WorktreeManager implements IWorktreeManager {
         }
 
         removed.push({
-          missionId: target.missionId,
+          memberName: target.memberName,
           worktreePath: resolvedPath,
           branch: target.branch,
           action: "removed",
         });
       } catch (err) {
         errors.push({
-          missionId: target.missionId,
+          memberName: target.memberName,
           worktreePath: resolvedPath,
           branch: target.branch,
           action: "error",

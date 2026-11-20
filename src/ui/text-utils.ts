@@ -6,17 +6,17 @@ import {
   visibleWidth,
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import { ORCHESTRATOR_NAME } from "../constants.js";
 import type {
+  BoardMessage,
   BoardMessageKind,
-  FinalAuditStatus,
-  FinalAuditVerdict,
-  MissionKind,
-  MissionRecord,
-  MissionStatus,
-  RosterAgentRole,
-  RosterAgentStatus,
-  RunStatus,
+  SwarmMemberRecord,
+  SwarmMemberRole,
+  SwarmMemberState,
   SwarmRoleModels,
+  SwarmRunState,
+  SwarmRunStatus,
+  SwarmWorkspaceMode,
 } from "../types.js";
 
 export { visibleWidth, stripTerminalSequences };
@@ -65,7 +65,13 @@ export interface RoleModelsLineOptions {
   includeThinking?: boolean;
 }
 
+export interface SwarmGraphOptions {
+  /** Optional Pi theme for ANSI styling inside TUI overlays. */
+  theme?: StyleTheme;
+}
+
 const ANSI_ESCAPE_RE = /\x1b\[[0-9;]*m/;
+/** Local control-character matcher for cross-version Pi TUI compatibility (Pi 1.3–1.6+). */
 const CONTROL_CHARS_RE = /[\u0000-\u001f\u007f-\u009f]/g;
 
 /**
@@ -493,159 +499,29 @@ export function formatRoleModelsLine(
 }
 
 // ============================================================================
-// Status, Kind & Review Badges
+// Dynamic Swarm v2 Status, Role, State, Workspace & Board Badges
 // ============================================================================
 
-export function missionStatusIcon(status: MissionStatus): string {
-  switch (status) {
-    case "planned":
-      return "○";
-    case "active":
-      return "●";
-    case "completed":
-      return "◐";
-    case "merged":
-      return "✓";
-    case "failed":
-      return "✗";
-    case "stopped":
-      return "■";
-    case "abandoned":
-      return "⊘";
-  }
-}
-
-export function formatMissionStatusBadge(
-  status: MissionStatus,
-  theme?: StyleTheme,
-): string {
-  const raw = `${missionStatusIcon(status)} ${status}`;
-  if (!theme) return raw;
-  switch (status) {
-    case "merged":
-      return theme.fg("success", raw);
-    case "active":
-      return theme.fg("accent", raw);
-    case "completed":
-      return theme.fg("warning", raw);
-    case "failed":
-      return theme.fg("error", raw);
-    case "stopped":
-      return theme.fg("warning", raw);
-    case "abandoned":
-      return theme.fg("dim", raw);
-    case "planned":
-      return theme.fg("muted", raw);
-  }
-}
-
 export function formatRunStatusBadge(
-  status: RunStatus,
+  status: SwarmRunStatus,
   theme?: StyleTheme,
 ): string {
-  const raw = status;
+  const raw = status === "active" ? "Live" : status;
   if (!theme) return raw;
   switch (status) {
     case "active":
       return theme.fg("accent", theme.bold(raw));
-    case "verifying":
-      return theme.fg("borderAccent", theme.bold(raw));
-    case "completed":
-      return theme.fg("success", theme.bold(raw));
     case "paused":
       return theme.fg("warning", theme.bold(raw));
-    case "failed":
-      return theme.fg("error", theme.bold(raw));
+    case "completed":
+      return theme.fg("success", theme.bold(raw));
     case "abandoned":
       return theme.fg("dim", raw);
   }
 }
 
-/**
- * Compute the 1-based Final Audit round number to display in UI surfaces.
- *
- * `completedRound` (`run.finalAuditRound`) tracks completed rounds (`0` while
- * Round 1 runs, `1` while Round 2 runs after Round 1 produced `latestAudit`).
- * While running, display `Math.max(completedRound, latestAudit.round) + 1`
- * when a prior audit verdict exists, or `Math.max(1, completedRound)` before
- * any audit has completed.
- */
-export function resolveFinalAuditDisplayRound(
-  status: FinalAuditStatus,
-  completedRound: number,
-  latestAudit?: Pick<FinalAuditVerdict, "round">,
-  isRunning = false,
-): number {
-  if (isRunning || status === "running") {
-    return latestAudit
-      ? Math.max(completedRound, latestAudit.round) + 1
-      : Math.max(1, completedRound);
-  }
-  return latestAudit?.round ?? completedRound;
-}
-
-/** Alias for `resolveFinalAuditDisplayRound`. */
-export const computeActiveFinalAuditRound = resolveFinalAuditDisplayRound;
-
-export function formatFinalAuditBadge(
-  status?: FinalAuditStatus,
-  round?: number,
-  maxRounds?: number,
-  theme?: StyleTheme,
-): string {
-  const effective: FinalAuditStatus = status ?? "idle";
-  const roundSuffix =
-    round !== undefined && round > 0
-      ? maxRounds !== undefined && maxRounds > 0
-        ? ` (${round}/${maxRounds})`
-        : ` (r${round})`
-      : "";
-
-  switch (effective) {
-    case "idle": {
-      const raw = "idle";
-      return theme ? theme.fg("dim", raw) : raw;
-    }
-    case "pending": {
-      const raw = `⏳ pending${roundSuffix}`;
-      return theme ? theme.fg("warning", raw) : raw;
-    }
-    case "running": {
-      const raw = `🔍 running${roundSuffix}`;
-      return theme ? theme.fg("borderAccent", theme.bold(raw)) : raw;
-    }
-    case "approved": {
-      const raw = `✓ approved${roundSuffix}`;
-      return theme ? theme.fg("success", raw) : raw;
-    }
-    case "disapproved": {
-      const raw = `⚠ disapproved${roundSuffix}`;
-      return theme ? theme.fg("error", theme.bold(raw)) : raw;
-    }
-    case "skipped": {
-      const raw = "⊘ skipped";
-      return theme ? theme.fg("muted", raw) : raw;
-    }
-  }
-}
-
-export function formatMissionKindBadge(
-  kind: MissionKind,
-  theme?: StyleTheme,
-): string {
-  if (!theme) return kind;
-  switch (kind) {
-    case "build":
-      return theme.fg("accent", kind);
-    case "artifact":
-      return theme.fg("warning", kind);
-    case "survey":
-      return theme.fg("muted", kind);
-  }
-}
-
-export function formatRosterRoleBadge(
-  role: RosterAgentRole,
+export function formatMemberRoleBadge(
+  role: SwarmMemberRole | "orchestrator" | "monitor",
   theme?: StyleTheme,
 ): string {
   if (!theme) return role;
@@ -654,28 +530,63 @@ export function formatRosterRoleBadge(
       return theme.fg("accent", role);
     case "validator":
       return theme.fg("warning", role);
-    case "final-validator":
-      return theme.fg("borderAccent", role);
+    case "orchestrator":
+      return theme.fg("borderAccent", theme.bold(role));
+    case "monitor":
+      return theme.fg("muted", role);
   }
 }
 
-export function formatRosterStatusBadge(
-  status: RosterAgentStatus,
+export function memberStateIcon(state: SwarmMemberState): string {
+  switch (state) {
+    case "working":
+      return "●";
+    case "waiting":
+      return "◌";
+    case "stopped":
+      return "■";
+    case "killed":
+      return "⊘";
+  }
+}
+
+export function formatMemberStateBadge(
+  state: SwarmMemberState,
   theme?: StyleTheme,
 ): string {
-  if (!theme) return status;
-  switch (status) {
+  if (!theme) return state;
+  switch (state) {
     case "working":
-      return theme.fg("accent", status);
+      return theme.fg("accent", state);
     case "waiting":
-      return theme.fg("muted", status);
+      return theme.fg("muted", state);
     case "stopped":
-      return theme.fg("warning", status);
+      return theme.fg("warning", state);
     case "killed":
-      return theme.fg("dim", status);
-    case "failed":
-    case "died":
-      return theme.fg("error", status);
+      return theme.fg("dim", state);
+  }
+}
+
+export function formatWorkspaceBadge(
+  workspace: SwarmWorkspaceMode,
+  branch?: string,
+  theme?: StyleTheme,
+): string {
+  const cleanBranch = branch ? sanitizePlainText(branch) : "";
+  const raw =
+    workspace === "inherit"
+      ? "inherit"
+      : cleanBranch
+        ? `${workspace}:${cleanBranch}`
+        : workspace;
+  if (!theme) return raw;
+  switch (workspace) {
+    case "inherit":
+      return theme.fg("dim", raw);
+    case "share":
+      return theme.fg("accent", raw);
+    case "branch":
+      return theme.fg("borderAccent", raw);
   }
 }
 
@@ -691,58 +602,17 @@ export function formatBoardKindBadge(
       return theme.fg("accent", raw);
     case "done":
       return theme.fg("success", raw);
+    case "update":
+      return theme.fg("muted", raw);
     case "review":
-    case "fix":
       return theme.fg("warning", raw);
-    case "handoff":
     case "model_switch":
       return theme.fg("borderAccent", raw);
     case "stall":
       return theme.fg("error", raw);
     case "chat":
-      return theme.fg("muted", raw);
+      return theme.fg("dim", raw);
   }
-}
-
-export function formatReviewBadge(
-  mission: Pick<
-    MissionRecord,
-    "kind" | "status" | "latestReview" | "humanApprovedSha" | "lastReviewedSha"
-  >,
-  validatorEnabled: boolean,
-  theme?: StyleTheme,
-): string {
-  if (mission.kind === "survey") {
-    return theme ? theme.fg("dim", "n/a") : "n/a";
-  }
-  if (mission.kind === "artifact") {
-    if (mission.humanApprovedSha) {
-      return theme ? theme.fg("success", "✓ approved") : "✓ approved";
-    }
-    if (mission.status === "completed") {
-      return theme ? theme.fg("warning", "⏳ human") : "⏳ human";
-    }
-    return theme ? theme.fg("muted", "human") : "human";
-  }
-
-  // build mission
-  if (!validatorEnabled) {
-    return theme ? theme.fg("dim", "off") : "off";
-  }
-  if (mission.latestReview) {
-    const verdict = mission.latestReview;
-    if (verdict.status === "clean" && verdict.merge === "merge") {
-      return theme ? theme.fg("success", "✓ clean") : "✓ clean";
-    }
-    const label = `! ${verdict.status}`;
-    return theme
-      ? theme.fg(verdict.status.startsWith("p1") ? "error" : "warning", label)
-      : label;
-  }
-  if (mission.status === "completed") {
-    return theme ? theme.fg("warning", "pending") : "pending";
-  }
-  return theme ? theme.fg("dim", "—") : "—";
 }
 
 // ============================================================================
@@ -909,10 +779,9 @@ export function renderTable<T>(
 
   const totalGap = gap * Math.max(0, activeCols.length - 1);
   const availableForCols = Math.max(1, targetWidth - totalGap);
-  let sumW = widths.reduce((a, b) => a + b, 0);
+  const sumW = widths.reduce((a, b) => a + b, 0);
 
   if (sumW > availableForCols) {
-    // Shrink flexibly down to minWidth first, then proportionally if still tight
     let excess = sumW - availableForCols;
     const shrinkOrder = activeCols
       .map((col, idx) => ({ idx, flex: col.flex ?? 0, minW: col.minWidth }))
@@ -927,7 +796,6 @@ export function renderTable<T>(
       excess -= drop;
     }
 
-    // Hard fallback if even minWidths exceed availableForCols
     while (excess > 0) {
       let reduced = false;
       for (let i = widths.length - 1; i >= 0 && excess > 0; i--) {
@@ -940,7 +808,6 @@ export function renderTable<T>(
       if (!reduced) break;
     }
   } else if (sumW < availableForCols) {
-    // Distribute spare width to flex columns up to maxWidth
     let spare = availableForCols - sumW;
     const flexCols = activeCols
       .map((col, idx) => ({ idx, flex: col.flex ?? 0, maxW: col.maxWidth }))
@@ -996,55 +863,313 @@ export function renderTable<T>(
 }
 
 // ============================================================================
-// Pure Topological Wave Helper for UI Display
+// Pure Swarm Collaboration Graph Builder (Spawn Tree + Peer @mentions)
 // ============================================================================
 
+function getOrderedRunMembers(run: SwarmRunState): SwarmMemberRecord[] {
+  const seen = new Set<string>();
+  const out: SwarmMemberRecord[] = [];
+  for (const name of run.memberOrder) {
+    const member = run.members[name];
+    if (member) {
+      seen.add(name);
+      out.push(member);
+    }
+  }
+  for (const member of Object.values(run.members)) {
+    if (!seen.has(member.name)) {
+      out.push(member);
+    }
+  }
+  return out;
+}
+
+function styleMemberStateIcon(
+  state: SwarmMemberState,
+  theme?: StyleTheme,
+): string {
+  const icon = memberStateIcon(state);
+  if (!theme) return icon;
+  switch (state) {
+    case "working":
+      return theme.fg("accent", icon);
+    case "waiting":
+      return theme.fg("muted", icon);
+    case "stopped":
+      return theme.fg("warning", icon);
+    case "killed":
+      return theme.fg("dim", icon);
+  }
+}
+
 /**
- * Group missions into topological execution waves for display.
- * Safe against missing dependencies or cycles (remaining missions placed in a final wave).
+ * Build a clean ASCII/Unicode Swarm collaboration graph showing:
+ * 1. **Spawn Tree** (`orchestrator` -> top-level members -> helper sub-members,
+ *    with live state icon, role, model snippet, and workspace badge).
+ * 2. **Peer `@mention` Interactions** (`a ⇄ b (N msgs)`, `a → b (N msg)` derived from `board`).
+ *
+ * Every output line is strictly guaranteed `visibleWidth(line) <= width`.
  */
-export function computeMissionWaves<T extends { id: string; deps: readonly string[] }>(
-  missions: readonly T[],
-): T[][] {
-  if (missions.length === 0) return [];
+export function buildSwarmGraphLines(
+  run: SwarmRunState,
+  board: readonly BoardMessage[],
+  width: number,
+  options?: SwarmGraphOptions,
+): string[] {
+  const targetWidth = Math.max(0, Math.floor(width));
+  if (targetWidth === 0) return [];
 
-  const byId = new Map<string, T>();
-  for (const m of missions) {
-    byId.set(m.id, m);
+  const theme = options?.theme;
+  const lines: string[] = [];
+
+  // --------------------------------------------------------------------------
+  // 1. Spawn Tree
+  // --------------------------------------------------------------------------
+  lines.push(
+    targetWidth >= 18
+      ? renderHorizontalRule(targetWidth, "Spawn Tree", theme)
+      : fitLine("Spawn Tree", targetWidth),
+  );
+
+  const orchModel = run.roleModels?.orchestrator?.model
+    ? shortenModelName(run.roleModels.orchestrator.model, targetWidth >= 60 ? 20 : 12)
+    : "";
+  const orchLabel = formatMemberRoleBadge(ORCHESTRATOR_NAME, theme);
+  const runBadge = formatRunStatusBadge(run.status, theme);
+  const orchModelPart = orchModel
+    ? ` ${theme ? theme.fg("dim", `[${orchModel}]`) : `[${orchModel}]`}`
+    : "";
+  const rootIcon = theme ? theme.fg("borderAccent", "◆") : "◆";
+  lines.push(
+    fitLine(`${rootIcon} ${orchLabel} [${runBadge}]${orchModelPart}`, targetWidth),
+  );
+
+  const ordered = getOrderedRunMembers(run);
+  const byName = new Map<string, SwarmMemberRecord>();
+  for (const m of ordered) {
+    byName.set(m.name, m);
   }
 
-  const remaining = new Set(missions.map((m) => m.id));
-  const placed = new Set<string>();
-  const waves: T[][] = [];
-
-  while (remaining.size > 0) {
-    const wave: T[] = [];
-    for (const m of missions) {
-      if (!remaining.has(m.id)) continue;
-      const depsReady = m.deps.every(
-        (depId) => !byId.has(depId) || placed.has(depId),
-      );
-      if (depsReady) {
-        wave.push(m);
-      }
-    }
-
-    if (wave.length === 0) {
-      // Defensive cycle breaker for display only
-      const rest: T[] = [];
-      for (const m of missions) {
-        if (remaining.has(m.id)) rest.push(m);
-      }
-      waves.push(rest);
-      break;
-    }
-
-    waves.push(wave);
-    for (const m of wave) {
-      remaining.delete(m.id);
-      placed.add(m.id);
+  const childrenOf = new Map<string, SwarmMemberRecord[]>();
+  const topLevel: SwarmMemberRecord[] = [];
+  for (const m of ordered) {
+    const parent = m.parentName?.trim();
+    if (
+      !parent ||
+      parent === ORCHESTRATOR_NAME ||
+      parent === "coordinator" ||
+      parent === m.name ||
+      !byName.has(parent)
+    ) {
+      topLevel.push(m);
+    } else {
+      const list = childrenOf.get(parent) ?? [];
+      list.push(m);
+      childrenOf.set(parent, list);
     }
   }
 
-  return waves;
+  const visited = new Set<string>();
+  const renderNode = (
+    member: SwarmMemberRecord,
+    prefix: string,
+    isLast: boolean,
+  ): void => {
+    if (visited.has(member.name)) return;
+    visited.add(member.name);
+
+    const connectorRaw = isLast ? "└── " : "├── ";
+    const connector = theme ? theme.fg("borderMuted", connectorRaw) : connectorRaw;
+    const icon = styleMemberStateIcon(member.state, theme);
+    const nameStr = theme
+      ? member.state === "killed"
+        ? theme.fg("dim", member.name)
+        : theme.bold(member.name)
+      : member.name;
+    const roleStr = formatMemberRoleBadge(member.role, theme);
+    const modelShort = member.model
+      ? shortenModelName(member.model, targetWidth >= 70 ? 20 : 12)
+      : "";
+    const modelPart = modelShort
+      ? ` ${theme ? theme.fg("dim", `[${modelShort}]`) : `[${modelShort}]`}`
+      : "";
+    const wsBadge = formatWorkspaceBadge(member.workspace, member.branch, theme);
+    const stateTag =
+      targetWidth >= 72
+        ? ` ${formatMemberStateBadge(member.state, theme)}`
+        : "";
+
+    const row = `${prefix}${connector}${icon} ${nameStr} (${roleStr})${stateTag}${modelPart} ${wsBadge}`;
+    lines.push(fitLine(row, targetWidth));
+
+    const kids = (childrenOf.get(member.name) ?? []).filter(
+      (k) => !visited.has(k.name),
+    );
+    const childPrefix =
+      prefix +
+      (isLast
+        ? "    "
+        : theme
+          ? theme.fg("borderMuted", "│   ")
+          : "│   ");
+    for (let i = 0; i < kids.length; i++) {
+      renderNode(kids[i]!, childPrefix, i === kids.length - 1);
+    }
+  };
+
+  if (ordered.length === 0) {
+    const empty = "└── (no members spawned yet)";
+    lines.push(fitLine(theme ? theme.fg("muted", empty) : empty, targetWidth));
+  } else {
+    // Identify any defensive cycle orphans up front so root tree connectors are exact
+    const reachable = new Set<string>();
+    const markReachable = (member: SwarmMemberRecord): void => {
+      if (reachable.has(member.name)) return;
+      reachable.add(member.name);
+      for (const kid of childrenOf.get(member.name) ?? []) {
+        markReachable(kid);
+      }
+    };
+    for (const root of topLevel) {
+      markReachable(root);
+    }
+    const orphans = ordered.filter((m) => !reachable.has(m.name));
+    const allRoots = [...topLevel, ...orphans];
+    for (let i = 0; i < allRoots.length; i++) {
+      const root = allRoots[i]!;
+      if (visited.has(root.name)) continue;
+      // Check if any later root in allRoots is still unvisited
+      const hasMoreRoots = allRoots.slice(i + 1).some((r) => !visited.has(r.name));
+      renderNode(root, "", !hasMoreRoots);
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // 2. Peer @mention Interactions
+  // --------------------------------------------------------------------------
+  lines.push("");
+  lines.push(
+    targetWidth >= 24
+      ? renderHorizontalRule(targetWidth, "Peer @mention Interactions", theme)
+      : targetWidth >= 14
+        ? renderHorizontalRule(targetWidth, "@mentions", theme)
+        : fitLine("@mentions", targetWidth),
+  );
+
+  const directedCounts = new Map<string, number>();
+  const channelCounts = new Map<string, number>();
+
+  for (const msg of board) {
+    const sender = sanitizePlainText(msg.from).replace(/^@+/, "");
+    if (!sender) continue;
+
+    for (const rawMention of msg.mentions) {
+      const target = sanitizePlainText(rawMention).replace(/^@+/, "");
+      if (!target || target === sender) continue;
+      const key = `${sender}\0${target}`;
+      directedCounts.set(key, (directedCounts.get(key) ?? 0) + 1);
+    }
+
+    for (const rawCh of msg.channelMentions ?? []) {
+      const ch = sanitizePlainText(rawCh).replace(/^@#?/, "");
+      if (!ch) continue;
+      const key = `${sender}\0#${ch}`;
+      channelCounts.set(key, (channelCounts.get(key) ?? 0) + 1);
+    }
+  }
+
+  interface InteractionEdge {
+    left: string;
+    right: string;
+    bidirectional: boolean;
+    total: number;
+    sortKey: string;
+  }
+
+  const edges: InteractionEdge[] = [];
+  const handledPairs = new Set<string>();
+
+  for (const [key, ab] of directedCounts.entries()) {
+    const sep = key.indexOf("\0");
+    if (sep < 0) continue;
+    const a = key.slice(0, sep);
+    const b = key.slice(sep + 1);
+    const pairKey = a < b ? `${a}\0${b}` : `${b}\0${a}`;
+    if (handledPairs.has(pairKey)) continue;
+    handledPairs.add(pairKey);
+
+    const ba = directedCounts.get(`${b}\0${a}`) ?? 0;
+    if (ab > 0 && ba > 0) {
+      const [first, second] =
+        ab > ba || (ab === ba && a <= b) ? [a, b] : [b, a];
+      const total = ab + ba;
+      edges.push({
+        left: first,
+        right: second,
+        bidirectional: true,
+        total,
+        sortKey: `${first}<->${second}`,
+      });
+    } else if (ab > 0) {
+      edges.push({
+        left: a,
+        right: b,
+        bidirectional: false,
+        total: ab,
+        sortKey: `${a}->${b}`,
+      });
+    }
+  }
+
+  for (const [key, count] of channelCounts.entries()) {
+    const sep = key.indexOf("\0");
+    if (sep < 0) continue;
+    const from = key.slice(0, sep);
+    const ch = key.slice(sep + 1);
+    edges.push({
+      left: from,
+      right: ch,
+      bidirectional: false,
+      total: count,
+      sortKey: `${from}->${ch}`,
+    });
+  }
+
+  edges.sort((x, y) => y.total - x.total || x.sortKey.localeCompare(y.sortKey));
+
+  if (edges.length === 0) {
+    const none = "  (no @mention interactions yet)";
+    lines.push(fitLine(theme ? theme.fg("muted", none) : none, targetWidth));
+  } else {
+    for (const edge of edges) {
+      const arrowRaw = edge.bidirectional ? "⇄" : "→";
+      const countText = `(${edge.total} ${edge.total === 1 ? "msg" : "msgs"})`;
+      if (theme) {
+        const leftStyled = theme.bold(edge.left);
+        const arrowStyled = theme.fg(
+          edge.bidirectional ? "accent" : "borderAccent",
+          arrowRaw,
+        );
+        const rightStyled = edge.right.startsWith("#")
+          ? theme.fg("accent", edge.right)
+          : theme.bold(edge.right);
+        const countStyled = theme.fg("muted", countText);
+        lines.push(
+          fitLine(
+            `  ${leftStyled} ${arrowStyled} ${rightStyled} ${countStyled}`,
+            targetWidth,
+          ),
+        );
+      } else {
+        lines.push(
+          fitLine(
+            `  ${edge.left} ${arrowRaw} ${edge.right} ${countText}`,
+            targetWidth,
+          ),
+        );
+      }
+    }
+  }
+
+  return lines.map((line) => fitLine(line, targetWidth));
 }

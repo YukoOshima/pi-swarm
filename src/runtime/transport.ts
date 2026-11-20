@@ -1,12 +1,11 @@
 import path from "node:path";
-import type { AgentMessage, AgentToolResult, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { type AssistantMessage, StringEnum } from "@earendil-works/pi-ai";
+import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import {
   type AgentSession,
   type AgentSessionEvent,
   createAgentSession,
   DefaultResourceLoader,
-  defineTool,
   type ExtensionContext,
   type ExtensionFactory,
   getAgentDir,
@@ -17,69 +16,34 @@ import {
   SettingsManager,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { type TSchema, Type } from "typebox";
 import {
-  FINAL_AUDIT_MISSION_ID,
-  ORCHESTRATOR_BOARD_NAME,
-  SWARM_BOARD_POST_TOOL,
-  SWARM_BOARD_READ_TOOL,
+  POST_MESSAGE_TOOL,
+  READ_BOARD_TOOL,
+  SWARM_CORE_TOOLS,
   SWARM_DIR,
-  SWARM_FINAL_VERDICT_TOOL,
-  SWARM_FINDING_TOOL,
-  SWARM_MISSION_TOOL,
-  SWARM_REVIEW_VERDICT_TOOL,
-  SWARM_STATUS_TOOL,
-  SWARM_WORKER_DONE_TOOL,
-  VALIDATOR_BOARD_TOOLS,
+  SWARM_TOOL,
+  SWARM_WAIT_TOOL,
   VALIDATOR_BUILTIN_TOOLS,
   WORKER_BUILTIN_TOOLS,
-  WORKER_SWARM_TOOLS,
 } from "../constants.js";
 import {
+  type AgentTelemetryEvent,
+  type AgentTurnOutcome,
   type AgentTurnResult,
-  type BoardMessage,
-  type BoardMessageKind,
-  type CallerRole,
-  computeReviewSeverityStatus,
-  type FinalAuditVerdict,
-  type FinalValidatorSpawnRequest,
-  type ISwarmBoard,
-  type ISwarmStore,
+  type AvailableModelInfo,
   type ISwarmTransport,
-  isSwarmProtocolError,
-  isValidReviewSeverityStatus,
-  type MissionReviewVerdict,
+  type MemberEngineBridge,
   type ModelSwitchResult,
   type PersistentAgentHandle,
-  type ReviewCheck,
-  type ReviewFinding,
-  type ReviewMergeDecision,
-  type RosterAgentRole,
-  type RosterAgentStatus,
-  type SuggestedFixMission,
+  type SpawnMemberRequest,
+  type SwarmMemberState,
   type SwarmModelRole,
   SwarmProtocolError,
   type SwarmSettings,
   type TokenUsage,
-  type ValidatorSpawnRequest,
-  type WorkerDonePayload,
-  type WorkerRunOutcome,
-  type WorkerSpawnRequest,
-  type WorkerTelemetryEvent,
 } from "../types.js";
 import { isRateLimitOrTransientError, parseRetryAfterMs } from "./rate-limit.js";
-import { formatBoardExcerptLine } from "./role-prompts.js";
-
-// ============================================================================
-// Typed StringEnum Helper (Google-compatible JSON schema + TypeBox Static)
-// ============================================================================
-
-function stringEnum<const T extends readonly string[]>(
-  values: T,
-  options?: { description?: string; default?: T[number] },
-) {
-  return Type.Unsafe<T[number]>(StringEnum(values, options) as unknown as TSchema);
-}
+import { createMemberScopedTools } from "./swarm-tools.js";
 
 // ============================================================================
 // 3-Role Model Resolution Helper
@@ -170,6 +134,11 @@ export function isProtectedSwarmPath(relPath: string): boolean {
   return PROTECTED_PREFIXES.some((prefix) => norm === prefix || norm.startsWith(`${prefix}/`));
 }
 
+function pathTargetsProtectedDir(rawPath: string): boolean {
+  const posix = rawPath.replace(/\\/g, "/").trim();
+  return /(?:^|\/)(?:\.pi\/swarm|\.swarm|\.git)(?:\/|$)/.test(posix);
+}
+
 function globToRegExp(pattern: string): RegExp {
   let regex = "^";
   let i = 0;
@@ -177,7 +146,6 @@ function globToRegExp(pattern: string): RegExp {
     const ch = pattern[i]!;
     if (ch === "*") {
       if (pattern[i + 1] === "*") {
-        // `**/` matches zero or more directories
         if (pattern[i + 2] === "/") {
           regex += "(?:.*/)?";
           i += 3;
@@ -300,7 +268,7 @@ const VALIDATOR_FORBIDDEN_PATTERNS: ReadonlyArray<{ pattern: RegExp; reason: str
 ];
 
 /**
- * Guard for bash commands executed by an independent read-only Validator or Final Validator.
+ * Guard for bash commands executed by an independent read-only Validator.
  * Rejects file writes, redirects, mutating git commands, and package mutations
  * while permitting inspection and verification commands (git diff/log/show, tests, typecheck, lint).
  */
@@ -318,30 +286,31 @@ export function isReadOnlyValidationCommand(command: string): CommandGuardResult
 }
 
 /**
- * Guard for bash commands executed by a build/artifact Worker.
- * Blocks direct mutation of `.pi/swarm/` / `.swarm/` internals and manual
- * `git merge` / `git push` / `git worktree` / base-branch checkout operations.
+ * Guard for bash commands executed by a Worker.
+ * Blocks direct mutation of `.pi/swarm/` / `.swarm/` / `.git/` internals and manual
+ * `git merge` / `git push` / `git worktree` (and switching to `baseBranch` when isolated).
  */
-export function isForbiddenWorkerBashCommand(command: string, baseBranch: string): CommandGuardResult {
+export function isForbiddenWorkerBashCommand(command: string, baseBranch = ""): CommandGuardResult {
   const trimmed = command.trim();
   if (!trimmed) {
     return { allowed: true };
   }
 
   if (
-    /(?:^|[\s"'`\/])(?:\.pi\/swarm|\.swarm)(?:\/|$|\s|["'`])/.test(trimmed) &&
+    /(?:^|[\s"'`\/])(?:\.pi\/swarm|\.swarm|\.git)(?:\/|$|\s|["'`])/.test(trimmed) &&
     /(?:>|>>|\b(?:rm|mv|cp|tee|touch|mkdir|chmod|truncate|sed\s+-i|perl\s+-i|cat\s+<<)\b)/.test(trimmed)
   ) {
     return {
       allowed: false,
-      reason: `Workers are forbidden from mutating \`${SWARM_DIR}/\` directly. Use Swarm tools instead.`,
+      reason: `Workers are forbidden from mutating \`${SWARM_DIR}/\` or \`.git/\` directly. Use Swarm tools instead.`,
     };
   }
 
   if (/\bgit\b(?:\s+-[^\s]+(?:\s+[^\s]+)?)*\s+(?:merge|push|worktree)\b/.test(trimmed)) {
     return {
       allowed: false,
-      reason: "Workers must not run `git merge`, `git push`, or `git worktree`. Only the Swarm Orchestrator merges.",
+      reason:
+        "Workers must not run `git merge`, `git push`, or `git worktree`. Only the Swarm Orchestrator merges.",
     };
   }
 
@@ -353,7 +322,7 @@ export function isForbiddenWorkerBashCommand(command: string, baseBranch: string
     if (checkoutBaseRe.test(trimmed)) {
       return {
         allowed: false,
-        reason: `Workers must stay on their mission branch and must not switch to base branch \`${baseBranch}\`.`,
+        reason: `Workers must stay on their worktree branch and must not switch to base branch \`${baseBranch}\`.`,
       };
     }
   }
@@ -362,768 +331,196 @@ export function isForbiddenWorkerBashCommand(command: string, baseBranch: string
 }
 
 // ============================================================================
-// Shared Board & Status Custom Tools (Workers, Validators & Final Validators)
+// TRUE Conversation Forking Helpers
 // ============================================================================
 
-function formatToolError(err: unknown): AgentToolResult<unknown> {
-  if (isSwarmProtocolError(err)) {
-    return {
-      isError: true,
-      content: [{ type: "text", text: `[SwarmProtocolError:${err.code}] ${err.message}` }],
-      details: { errorCode: err.code, details: err.details },
-    };
+function cloneAgentMessage(msg: AgentMessage): AgentMessage | null {
+  try {
+    return structuredClone(msg);
+  } catch {
+    try {
+      return JSON.parse(JSON.stringify(msg)) as AgentMessage;
+    } catch {
+      return null;
+    }
   }
-  const msg = err instanceof Error ? err.message : String(err);
-  return {
-    isError: true,
-    content: [{ type: "text", text: `Error: ${msg}` }],
-    details: { error: msg },
+}
+
+/**
+ * Extracts a safe cloned snapshot of `AgentMessage[]` from a Pi `SessionManager` or
+ * `ReadonlySessionManager` (`buildSessionContext` or `buildSessionProjection`).
+ */
+export function extractSessionMessages(sessionManager: unknown): AgentMessage[] {
+  if (!sessionManager || typeof sessionManager !== "object") {
+    return [];
+  }
+  const sm = sessionManager as {
+    buildSessionContext?: () => { messages?: AgentMessage[] };
+    buildSessionProjection?: () => { messages?: AgentMessage[] };
   };
+
+  let raw: AgentMessage[] | undefined;
+  try {
+    if (typeof sm.buildSessionContext === "function") {
+      raw = sm.buildSessionContext()?.messages;
+    } else if (typeof sm.buildSessionProjection === "function") {
+      raw = sm.buildSessionProjection()?.messages;
+    }
+  } catch {
+    raw = undefined;
+  }
+
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return [];
+  }
+  const cloned: AgentMessage[] = [];
+  for (const msg of raw) {
+    if (!msg || typeof msg !== "object") {
+      continue;
+    }
+    const copy = cloneAgentMessage(msg);
+    if (copy) {
+      cloned.push(copy);
+    }
+  }
+  return cloned;
 }
 
-interface BoardToolContext {
-  runId: string;
-  from: string;
-  fromRole: CallerRole;
-  missionId?: string;
-  store?: ISwarmStore;
-  board?: ISwarmBoard;
-  onBoardPost?: (msg: BoardMessage) => Promise<void> | void;
+/**
+ * Deep-clones and sanitizes forked conversation messages before seeding into a new
+ * `SessionManager.inMemory`, stripping any dangling unresolved `toolCall` blocks
+ * (e.g. when forking `"orchestrator"` mid-`swarm{action:"add"}` tool execution) and
+ * orphaned `toolResult` messages so downstream LLM providers never reject the fork.
+ */
+export function sanitizeForkSeedMessages(messages: readonly AgentMessage[]): AgentMessage[] {
+  const cloned: AgentMessage[] = [];
+  for (const raw of messages) {
+    if (!raw || typeof raw !== "object" || !("role" in raw)) {
+      continue;
+    }
+    const copy = cloneAgentMessage(raw);
+    if (copy) {
+      cloned.push(copy);
+    }
+  }
+  if (cloned.length === 0) {
+    return [];
+  }
+
+  // Collect all toolCallIds that actually have a matching toolResult message
+  const resolvedToolCallIds = new Set<string>();
+  for (const msg of cloned) {
+    const rec = msg as unknown as Record<string, unknown>;
+    if (rec.role === "toolResult" && typeof rec.toolCallId === "string" && rec.toolCallId) {
+      resolvedToolCallIds.add(rec.toolCallId);
+    }
+  }
+
+  // Collect kept toolCallIds emitted by assistant messages
+  const keptToolCallIds = new Set<string>();
+  const intermediate: AgentMessage[] = [];
+
+  for (const msg of cloned) {
+    if (isAssistantMessage(msg) && Array.isArray(msg.content)) {
+      const filteredContent = msg.content.filter((part) => {
+        if (part && typeof part === "object" && part.type === "toolCall") {
+          const id = typeof part.id === "string" ? part.id : "";
+          if (!id || !resolvedToolCallIds.has(id)) {
+            return false;
+          }
+          keptToolCallIds.add(id);
+          return true;
+        }
+        return true;
+      });
+      if (filteredContent.length === 0) {
+        continue;
+      }
+      intermediate.push({ ...msg, content: filteredContent });
+      continue;
+    }
+    intermediate.push(msg);
+  }
+
+  // Drop orphaned toolResults whose assistant toolCall was stripped or absent
+  return intermediate.filter((msg) => {
+    const rec = msg as unknown as Record<string, unknown>;
+    if (rec.role === "toolResult" && typeof rec.toolCallId === "string") {
+      return keptToolCallIds.has(rec.toolCallId);
+    }
+    return true;
+  });
 }
 
-const SUBAGENT_BOARD_KINDS = [
-  "chat",
-  "handoff",
-  "decision",
-  "fix",
-  "review",
-  "done",
-  "brief",
-  "stall",
-] as const;
-
-function buildBoardAndStatusTools(ctx: BoardToolContext): ToolDefinition[] {
-  const statusTool = defineTool({
-    name: SWARM_STATUS_TOOL,
-    label: "Swarm Status",
-    description: "Inspect current Swarm run status, missions, and roster (read-only).",
-    promptSnippet: "Inspect read-only Swarm run status and roster.",
-    parameters: Type.Object({}),
-    async execute() {
-      try {
-        if (!ctx.store) {
-          return {
-            content: [{ type: "text", text: `Swarm agent ${ctx.from} (${ctx.fromRole})` }],
-            details: { runId: ctx.runId, from: ctx.from },
-          };
+function seedMessagesIntoSessionManager(
+  sessionManager: SessionManager,
+  seedMessages: readonly AgentMessage[],
+): void {
+  const sanitized = sanitizeForkSeedMessages(seedMessages);
+  for (const msg of sanitized) {
+    try {
+      const rec = msg as unknown as Record<string, unknown>;
+      if (rec.role === "compactionSummary") {
+        const summary = typeof rec.summary === "string" ? rec.summary : "";
+        const tokensBefore = typeof rec.tokensBefore === "number" ? rec.tokensBefore : 0;
+        if (summary) {
+          sessionManager.appendCompaction(summary, null, tokensBefore);
         }
-        const run = await ctx.store.loadRun(ctx.runId);
-        const head = await ctx.store.getBoardHead(ctx.runId).catch(() => 0);
-        const lines = [
-          `Run ${run.id} (${run.status}) | base=${run.baseBranch} | board=#${head}`,
-          "Missions:",
-          ...run.missionOrder.map((id) => {
-            const m = run.missions[id];
-            return m ? `- ${m.id} (${m.kind}) [${m.status}] ${m.title}` : "";
-          }),
-          "Roster:",
-          ...Object.values(run.roster).map(
-            (r) => `- ${r.name} (${r.role}) [${r.status}]${r.model ? ` model=${r.model}` : ""}`,
-          ),
-        ].filter(Boolean);
-        return {
-          content: [{ type: "text", text: lines.join("\n") }],
-          details: { runId: run.id, status: run.status, boardHead: head },
-        };
-      } catch (err) {
-        return formatToolError(err);
+        continue;
       }
-    },
-  });
-
-  const boardPostTool = defineTool({
-    name: SWARM_BOARD_POST_TOOL,
-    label: "Swarm Board Post",
-    description:
-      "Post a short message to the shared Swarm message board. Use `@name` (e.g. `@M2`, `@validator-M1`, `@orchestrator`) only to wake peers who need to act; reference earlier posts by `#seq`.",
-    promptSnippet: "Post a message to the shared Swarm message board (with optional @mentions).",
-    promptGuidelines: [
-      `Use ${SWARM_BOARD_POST_TOOL} for short peer-to-peer handoffs, questions, or blockers. Reference prior posts as #seq instead of copy-pasting; use @name only as a wakeup doorbell.`,
-    ],
-    parameters: Type.Object({
-      text: Type.String({ description: "Concise board message text (include @name to wake specific peers)." }),
-      kind: Type.Optional(
-        stringEnum(SUBAGENT_BOARD_KINDS, {
-          description: 'Optional message kind (defaults to "chat").',
-          default: "chat",
-        }),
-      ),
-    }),
-    async execute(_toolCallId, params) {
-      try {
-        const text = params.text.trim();
-        if (!text) {
-          throw new SwarmProtocolError("INVALID_TRANSITION", "Board message text must be non-empty.");
+      if (rec.role === "branchSummary") {
+        const summary = typeof rec.summary === "string" ? rec.summary : "";
+        if (summary) {
+          sessionManager.appendCustomMessageEntry(
+            "pi-swarm-fork-branch-summary",
+            summary,
+            false,
+          );
         }
-        const kind: BoardMessageKind = params.kind ?? "chat";
-        const postInput = {
-          from: ctx.from,
-          fromRole: ctx.fromRole,
-          text,
-          kind,
-          missionId: ctx.missionId,
-        };
-
-        let msg: BoardMessage;
-        if (ctx.store) {
-          msg = await ctx.store.postBoardMessage(ctx.runId, postInput);
-        } else if (ctx.board) {
-          msg = await ctx.board.post(ctx.runId, postInput);
-        } else {
-          msg = {
-            seq: 0,
-            runId: ctx.runId,
-            from: ctx.from,
-            fromRole: ctx.fromRole,
-            text,
-            mentions: [],
-            kind,
-            missionId: ctx.missionId,
-            timestamp: new Date().toISOString(),
-          };
-        }
-
-        if (ctx.onBoardPost) {
-          await ctx.onBoardPost(msg);
-        }
-
-        const notified =
-          msg.mentions.length > 0 ? ` (notified: ${msg.mentions.map((m) => `@${m}`).join(", ")})` : "";
-        return {
-          content: [{ type: "text", text: `Posted #${msg.seq} to swarm board${notified}.` }],
-          details: msg,
-        };
-      } catch (err) {
-        return formatToolError(err);
+        continue;
       }
-    },
-  });
-
-  const boardReadTool = defineTool({
-    name: SWARM_BOARD_READ_TOOL,
-    label: "Swarm Board Read",
-    description:
-      "Read messages from the shared Swarm message board (oldest first). Pass `since` for unread messages, `seqs` to inspect specific `#seq` posts, or omit both for the latest messages.",
-    promptSnippet: "Read messages from the shared Swarm message board.",
-    parameters: Type.Object({
-      since: Type.Optional(Type.Number({ description: "Return messages with seq > since." })),
-      seqs: Type.Optional(
-        Type.Array(Type.Number(), { description: "Fetch specific message sequence numbers only." }),
-      ),
-      limit: Type.Optional(Type.Number({ description: "Maximum number of messages to return (default 20)." })),
-    }),
-    async execute(_toolCallId, params) {
-      try {
-        const opts = {
-          since: params.since,
-          seqs: params.seqs,
-          limit: params.limit,
-        };
-        const res = ctx.store
-          ? await ctx.store.readBoard(ctx.runId, opts)
-          : ctx.board
-            ? await ctx.board.read(ctx.runId, opts)
-            : { messages: [], head: 0 };
-
-        if (res.messages.length === 0) {
-          return {
-            content: [{ type: "text", text: `Board has no matching messages (head: #${res.head}).` }],
-            details: res,
-          };
-        }
-        const lines = res.messages.map((m) => formatBoardExcerptLine(m, 500));
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Swarm Board (head: #${res.head}, showing ${res.messages.length}):\n${lines.join("\n")}`,
-            },
-          ],
-          details: res,
-        };
-      } catch (err) {
-        return formatToolError(err);
-      }
-    },
-  });
-
-  return [statusTool, boardPostTool, boardReadTool];
+      sessionManager.appendMessage(
+        msg as Parameters<SessionManager["appendMessage"]>[0],
+      );
+    } catch {
+      // Skip malformed/incompatible seed entry safely so fork never crashes
+    }
+  }
 }
 
 // ============================================================================
-// Worker & Validator Custom Tools
+// Guard Extension Factories & Fallback Bridge
 // ============================================================================
 
-function buildWorkerCustomTools(
-  request: WorkerSpawnRequest,
-  onCaptureDone: (payload: WorkerDonePayload) => void,
-): ToolDefinition[] {
-  const tools: ToolDefinition[] = [];
-
-  // 1. swarm_worker_done (terminating current turn; parks warm if keepWarm)
-  tools.push(
-    defineTool({
-      name: SWARM_WORKER_DONE_TOOL,
-      label: "Swarm Worker Done",
-      description: request.keepWarm
-        ? "Signal that your mission work is complete (verified & cleanly committed for build/artifact, or findings recorded for survey). Posts [done] on the shared board and parks your session in warm waiting state with full memory intact."
-        : "Signal that your mission work is complete (verified & cleanly committed for build/artifact, or findings recorded for survey). Immediately ends this worker session.",
-      promptSnippet: "Call when your mission work is complete and verified.",
-      promptGuidelines: [
-        `Always finish your mission by calling ${SWARM_WORKER_DONE_TOOL} with a concise summary and verification report.`,
-      ],
-      parameters: Type.Object({
-        summary: Type.String({ description: "Concise summary of completed work or findings." }),
-        verificationRan: Type.Optional(
-          Type.String({ description: "Verification commands/checks executed and their results." }),
-        ),
-        notes: Type.Optional(
-          Type.String({ description: "Optional notes, caveats, or human sign-off guidance." }),
-        ),
-      }),
-      async execute(_toolCallId, params) {
-        const payload: WorkerDonePayload = {
-          missionId: request.mission.id,
-          summary: params.summary.trim(),
-          verificationRan: params.verificationRan?.trim() || undefined,
-          notes: params.notes?.trim() || undefined,
-        };
-        onCaptureDone(payload);
-        if (request.onWorkerDone) {
-          await request.onWorkerDone(payload);
-        }
-        return {
-          content: [
-            {
-              type: "text",
-              text: request.keepWarm
-                ? `Completion recorded for mission ${request.mission.id}. Parking warm in waiting state.`
-                : `Completion recorded for mission ${request.mission.id}. Ending worker session.`,
-            },
-          ],
-          details: payload,
-          terminate: true,
-        };
-      },
-    }),
-  );
-
-  // 2-4. swarm_status, swarm_board_post, swarm_board_read
-  tools.push(
-    ...buildBoardAndStatusTools({
-      runId: request.runId,
-      from: request.name,
-      fromRole: "worker",
-      missionId: request.mission.id,
-      store: request.store,
-      board: request.board,
-      onBoardPost: request.onBoardPost,
-    }),
-  );
-
-  // 5. swarm_mission (worker-scoped: get / progress / task_done only)
-  tools.push(
-    defineTool({
-      name: SWARM_MISSION_TOOL,
-      label: "Swarm Mission",
-      description:
-        "Inspect your mission or update progress/checklist items (actions: get, progress, task_done). Workers cannot abandon or patch scope directly.",
-      promptSnippet: "Read mission details or mark progress / checklist items done.",
-      promptGuidelines: [
-        `Use ${SWARM_MISSION_TOOL} with action="task_done" to check off completed checklist items and action="progress" to report progress.`,
-      ],
-      parameters: Type.Object({
-        action: stringEnum(["get", "progress", "task_done"] as const, {
-          description: "Mission action to perform.",
-        }),
-        missionId: Type.Optional(
-          Type.String({ description: "Mission ID (defaults to your assigned mission; writes restricted to own mission)." }),
-        ),
-        summary: Type.Optional(Type.String({ description: "Progress summary (for action=progress)." })),
-        taskIds: Type.Optional(
-          Type.Array(Type.String(), { description: "Checklist task IDs completed (for action=task_done)." }),
-        ),
-      }),
-      async execute(_toolCallId, params) {
-        try {
-          if (!request.store) {
-            return {
-              content: [{ type: "text", text: `Mission ${request.mission.id}: ${request.mission.status}` }],
-              details: { missionId: request.mission.id },
-            };
-          }
-          const targetId = params.missionId?.trim() || request.mission.id;
-          if (params.action === "get") {
-            const run = await request.store.loadRun(request.runId);
-            const m = run.missions[targetId];
-            if (!m) {
-              throw new SwarmProtocolError("NOT_FOUND", `Mission "${targetId}" not found.`);
-            }
-            return {
-              content: [{ type: "text", text: JSON.stringify(m, null, 2) }],
-              details: m,
-            };
-          }
-
-          if (targetId !== request.mission.id) {
-            throw new SwarmProtocolError(
-              "ROLE_FORBIDDEN",
-              `Worker ${request.name} (${request.agentId}) may only update its own mission (${request.mission.id}), not "${targetId}".`,
-            );
-          }
-
-          if (params.action === "progress") {
-            if (!params.summary?.trim()) {
-              throw new SwarmProtocolError("INVALID_TRANSITION", "summary is required for action=progress.");
-            }
-            const updated = await request.store.updateMission(request.runId, targetId, {
-              progressSummary: params.summary.trim(),
-              callerRole: "worker",
-              actor: request.name,
-            });
-            return {
-              content: [{ type: "text", text: `Updated progress for ${targetId}.` }],
-              details: updated.missions[targetId],
-            };
-          }
-
-          if (params.action === "task_done") {
-            const ids = params.taskIds ?? [];
-            if (ids.length === 0) {
-              throw new SwarmProtocolError("INVALID_TRANSITION", "taskIds must be non-empty for action=task_done.");
-            }
-            const updated = await request.store.updateMission(request.runId, targetId, {
-              taskDoneIds: ids,
-              callerRole: "worker",
-              actor: request.name,
-            });
-            return {
-              content: [{ type: "text", text: `Marked task(s) done on ${targetId}: ${ids.join(", ")}` }],
-              details: updated.missions[targetId],
-            };
-          }
-
-          throw new SwarmProtocolError("ROLE_FORBIDDEN", `Unsupported worker action: ${String(params.action)}`);
-        } catch (err) {
-          return formatToolError(err);
-        }
-      },
-    }),
-  );
-
-  // 6. swarm_finding (record or list findings)
-  tools.push(
-    defineTool({
-      name: SWARM_FINDING_TOOL,
-      label: "Swarm Finding",
-      description: "Record structured survey/diagnostic findings or list existing run findings.",
-      promptSnippet: "Record structured findings (especially for survey missions) or read upstream findings.",
-      promptGuidelines: [
-        `Use ${SWARM_FINDING_TOOL} to record structured research findings so downstream missions inherit them.`,
-      ],
-      parameters: Type.Object({
-        action: Type.Optional(
-          stringEnum(["record", "list"] as const, {
-            description: "Defaults to 'record'.",
-            default: "record",
-          }),
-        ),
-        title: Type.Optional(Type.String({ description: "Short finding title (required for record)." })),
-        summary: Type.Optional(Type.String({ description: "Concise takeaway (required for record)." })),
-        details: Type.Optional(
-          Type.String({ description: "Detailed evidence, file paths, constraints (required for record)." }),
-        ),
-        files: Type.Optional(Type.Array(Type.String(), { description: "Relevant file paths." })),
-        missionId: Type.Optional(Type.String({ description: "Optional filter for action=list." })),
-      }),
-      async execute(_toolCallId, params) {
-        try {
-          if (!request.store) {
-            return {
-              content: [{ type: "text", text: "Finding recorded (in-memory transport without store)." }],
-              details: params,
-            };
-          }
-          const action = params.action ?? "record";
-          if (action === "list") {
-            const run = await request.store.loadRun(request.runId);
-            const items = params.missionId
-              ? run.findings.filter((f) => f.missionId === params.missionId)
-              : run.findings;
-            const text =
-              items.length === 0
-                ? "No findings recorded yet."
-                : items.map((f) => `[${f.missionId}] ${f.title}: ${f.summary}\n${f.details}`).join("\n\n");
-            return {
-              content: [{ type: "text", text }],
-              details: { count: items.length, findings: items },
-            };
-          }
-          if (!params.title?.trim() || !params.summary?.trim() || !params.details?.trim()) {
-            throw new SwarmProtocolError(
-              "INVALID_TRANSITION",
-              "title, summary, and details are required when recording a finding.",
-            );
-          }
-          const record = await request.store.recordFinding(request.runId, {
-            missionId: request.mission.id,
-            author: request.name,
-            title: params.title.trim(),
-            summary: params.summary.trim(),
-            details: params.details.trim(),
-            files: params.files,
-          });
-          return {
-            content: [{ type: "text", text: `Recorded finding ${record.id}: "${record.title}"` }],
-            details: record,
-          };
-        } catch (err) {
-          return formatToolError(err);
-        }
-      },
-    }),
-  );
-
-  return tools;
-}
-
-function buildValidatorVerdictTool(
-  request: ValidatorSpawnRequest,
-  onCaptureVerdict: (verdict: MissionReviewVerdict) => void,
-): ToolDefinition {
-  const FindingSchema = Type.Object({
-    severity: stringEnum(["p1", "p2", "note"] as const, {
-      description: "p1 = blocking defect, p2 = should fix before merge, note = informational.",
-    }),
-    title: Type.String({ description: "Short finding title." }),
-    detail: Type.String({ description: "Concrete explanation of the defect and evidence." }),
-    file: Type.Optional(Type.String({ description: "Repo-relative file path if applicable." })),
-    line: Type.Optional(Type.Number({ description: "1-based line number if applicable." })),
-    suggestion: Type.Optional(Type.String({ description: "Concrete fix suggestion." })),
-  });
-
-  const CheckSchema = Type.Object({
-    name: Type.String({ description: "Check name (e.g., 'scope', 'typecheck', 'unit-tests', 'security')." }),
-    passed: Type.Boolean({ description: "Whether the check passed." }),
-    detail: Type.Optional(Type.String({ description: "Brief evidence or failure summary." })),
-  });
-
-  return defineTool({
-    name: SWARM_REVIEW_VERDICT_TOOL,
-    label: "Swarm Review Verdict",
-    description:
-      "Submit your structured independent validation verdict pinned to the audited commit SHA and finish this validation turn.",
-    promptSnippet: "Submit structured validation verdict (status, merge, findings, checks, decision).",
-    promptGuidelines: [
-      `Always finish your audit by calling ${SWARM_REVIEW_VERDICT_TOOL} with consistent status, merge decision, findings, checks, and rationale.`,
-    ],
-    parameters: Type.Object({
-      status: Type.String({
-        description: 'Severity status: "clean", "p1-Nitems", or "p2-Nitems" matching findings.',
-      }),
-      merge: stringEnum(["merge", "fix-then-merge", "hold"] as const, {
-        description: '"merge" only if status is "clean"; "fix-then-merge" for actionable fixes; "hold" for human/design hold.',
-      }),
-      findings: Type.Array(FindingSchema, {
-        description: "All findings discovered during validation (empty array if clean).",
-      }),
-      checks: Type.Array(CheckSchema, {
-        description: "Checklist of verification criteria audited.",
-      }),
-      decision: Type.String({
-        description: "Concise overall audit rationale.",
-      }),
-    }),
-    async execute(_toolCallId, params) {
-      try {
-        const findings: ReviewFinding[] = params.findings.map((f) => ({
-          severity: f.severity,
-          title: f.title.trim(),
-          detail: f.detail.trim(),
-          file: f.file?.trim() || undefined,
-          line: f.line,
-          suggestion: f.suggestion?.trim() || undefined,
-        }));
-        const checks: ReviewCheck[] = params.checks.map((c) => ({
-          name: c.name.trim(),
-          passed: c.passed,
-          detail: c.detail?.trim() || undefined,
-        }));
-
-        const expectedStatus = computeReviewSeverityStatus(findings);
-        const submittedStatus = params.status.trim();
-        if (!isValidReviewSeverityStatus(submittedStatus)) {
-          throw new SwarmProtocolError(
-            "INVALID_TRANSITION",
-            `Invalid validation status "${submittedStatus}". Expected "clean", "p1-Nitems", or "p2-Nitems" (computed from findings: "${expectedStatus}").`,
-          );
-        }
-        if (submittedStatus !== expectedStatus) {
-          throw new SwarmProtocolError(
-            "INVALID_TRANSITION",
-            `Validation status "${submittedStatus}" does not match findings (expected "${expectedStatus}"). Please align status with findings.`,
-          );
-        }
-
-        const merge: ReviewMergeDecision = params.merge;
-        if (merge === "merge" && submittedStatus !== "clean") {
-          throw new SwarmProtocolError(
-            "INVALID_TRANSITION",
-            `Cannot set merge="merge" when status is "${submittedStatus}". Use "fix-then-merge" or "hold".`,
-          );
-        }
-
-        const verdict: MissionReviewVerdict = {
-          commitSha: request.targetCommitSha ?? "",
-          missionId: request.mission.id,
-          branch: request.branch,
-          reviewedAt: new Date().toISOString(),
-          reviewerAgentId: request.agentId,
-          status: submittedStatus,
-          merge,
-          findings,
-          checks,
-          decision: params.decision.trim(),
-          round: request.mission.reviewRound + 1,
-        };
-
-        onCaptureVerdict(verdict);
-        if (request.onReviewVerdict) {
-          await request.onReviewVerdict(verdict);
-        }
-
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Validation verdict submitted for ${request.mission.id}@${verdict.commitSha.slice(0, 12)}: ${verdict.status} (${verdict.merge}).`,
-            },
-          ],
-          details: verdict,
-          terminate: true,
-        };
-      } catch (err) {
-        return formatToolError(err);
-      }
-    },
-  });
-}
-
-function buildFinalValidatorVerdictTool(
-  request: FinalValidatorSpawnRequest,
-  onCaptureVerdict: (verdict: FinalAuditVerdict) => void,
-): ToolDefinition {
-  const FindingSchema = Type.Object({
-    severity: stringEnum(["p1", "p2", "note"] as const, {
-      description: "p1 = blocking defect/missing goal requirement, p2 = important integration gap, note = informational.",
-    }),
-    title: Type.String({ description: "Short finding title." }),
-    detail: Type.String({ description: "Concrete explanation of the defect and evidence." }),
-    file: Type.Optional(Type.String({ description: "Repo-relative file path if applicable." })),
-    line: Type.Optional(Type.Number({ description: "1-based line number if applicable." })),
-    suggestion: Type.Optional(Type.String({ description: "Concrete fix suggestion." })),
-  });
-
-  const CheckSchema = Type.Object({
-    name: Type.String({ description: "Check name (e.g., 'typecheck', 'unit-tests', 'integration', 'contract')." }),
-    passed: Type.Boolean({ description: "Whether the check passed." }),
-    detail: Type.Optional(Type.String({ description: "Brief evidence or failure summary." })),
-  });
-
-  const RecommendedMissionSchema = Type.Object({
-    title: Type.String({
-      description: "Printable ASCII mission title containing letters/digits (used for unique feat/<slug> branch).",
-    }),
-    description: Type.String({ description: "Detailed fix specification for the follow-up mission." }),
-    scope: Type.Array(Type.String(), {
-      minItems: 1,
-      description: "Concrete repo-relative POSIX scope paths (pairwise-disjoint across recommended build missions; no globs or ..).",
-    }),
-    verification: Type.String({ description: "Concrete verification command or criteria for this fix mission." }),
-    kind: Type.Optional(
-      stringEnum(["build", "artifact"] as const, {
-        description: 'Mission kind ("build" default, or "artifact").',
-        default: "build",
-      }),
-    ),
-    tasks: Type.Optional(
-      Type.Array(Type.String(), { description: "Optional checklist item titles." }),
-    ),
-  });
-
-  return defineTool({
-    name: SWARM_FINAL_VERDICT_TOOL,
-    label: "Swarm Final Verdict",
-    description:
-      "Submit your structured Run-Level Final Validation verdict pinned to the audited base branch HEAD SHA and end this validation turn.",
-    promptSnippet:
-      "Submit structured final audit verdict (verdict, summary, checks, findings, optional recommended_missions).",
-    promptGuidelines: [
-      `Always conclude your final audit by calling ${SWARM_FINAL_VERDICT_TOOL} with verdict ("approved" | "disapproved"), summary, checks, findings, and optional recommended_missions when disapproved.`,
-    ],
-    parameters: Type.Object({
-      verdict: stringEnum(["approved", "disapproved"] as const, {
-        description: '"approved" only if the overall objective & verification contract are genuinely satisfied with zero p1 defects; otherwise "disapproved".',
-      }),
-      summary: Type.String({
-        description: "Concise, evidence-backed overall verification verdict summary.",
-      }),
-      checks: Type.Array(CheckSchema, {
-        description: "Checklist of verification contract items and integration checks executed.",
-      }),
-      findings: Type.Array(FindingSchema, {
-        description: "All findings discovered during final validation (empty array if clean).",
-      }),
-      recommended_missions: Type.Optional(
-        Type.Array(RecommendedMissionSchema, {
-          description:
-            'Optional concrete follow-up fix missions when verdict is "disapproved". Must use printable ASCII titles and pairwise-disjoint concrete scope paths.',
-        }),
-      ),
-    }),
-    async execute(_toolCallId, params) {
-      try {
-        const summary = params.summary.trim();
-        if (!summary) {
-          throw new SwarmProtocolError("INVALID_TRANSITION", "Final verdict summary must be non-empty.");
-        }
-
-        const findings: ReviewFinding[] = params.findings.map((f) => ({
-          severity: f.severity,
-          title: f.title.trim(),
-          detail: f.detail.trim(),
-          file: f.file?.trim() || undefined,
-          line: f.line,
-          suggestion: f.suggestion?.trim() || undefined,
-        }));
-        const checks: ReviewCheck[] = params.checks.map((c) => ({
-          name: c.name.trim(),
-          passed: c.passed,
-          detail: c.detail?.trim() || undefined,
-        }));
-
-        if (params.verdict === "approved" && findings.some((f) => f.severity === "p1")) {
-          throw new SwarmProtocolError(
-            "INVALID_TRANSITION",
-            'Cannot submit verdict="approved" while blocking p1 findings exist. Either resolve severity or submit verdict="disapproved".',
-          );
-        }
-
-        const recommendedMissions: SuggestedFixMission[] | undefined =
-          params.verdict === "disapproved" &&
-          params.recommended_missions &&
-          params.recommended_missions.length > 0
-            ? params.recommended_missions.map((m) => ({
-                title: m.title.trim(),
-                description: m.description.trim(),
-                scope: m.scope.map((s) => s.trim()).filter(Boolean),
-                verification: m.verification.trim(),
-                ...(m.kind ? { kind: m.kind } : {}),
-                ...(m.tasks && m.tasks.length > 0
-                  ? { tasks: m.tasks.map((t) => t.trim()).filter(Boolean) }
-                  : {}),
-              }))
-            : undefined;
-
-        const verdict: FinalAuditVerdict = {
-          commitSha: request.targetCommitSha,
-          baseBranch: request.baseBranch,
-          auditedAt: new Date().toISOString(),
-          verifierAgentId: request.agentId,
-          verdict: params.verdict,
-          summary,
-          checks,
-          findings,
-          ...(recommendedMissions && recommendedMissions.length > 0 ? { recommendedMissions } : {}),
-          round: request.round,
-        };
-
-        onCaptureVerdict(verdict);
-        if (request.onFinalVerdict) {
-          await request.onFinalVerdict(verdict);
-        }
-
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Final audit verdict submitted for ${request.baseBranch}@${verdict.commitSha.slice(0, 12)} (round ${verdict.round}): ${verdict.verdict}.`,
-            },
-          ],
-          details: verdict,
-          terminate: true,
-        };
-      } catch (err) {
-        return formatToolError(err);
-      }
-    },
-  });
-}
-
-// ============================================================================
-// Inline Guard Extension Factories (Enforced via Pi tool_call Hook)
-// ============================================================================
-
-function createWorkerGuardExtensionFactory(request: WorkerSpawnRequest): ExtensionFactory {
+function createWorkerGuardExtensionFactory(
+  request: SpawnMemberRequest,
+  baseBranch?: string,
+): ExtensionFactory {
   return (pi) => {
     pi.on("tool_call", (event) => {
-      if (request.mission.kind === "survey") {
-        if (
-          isToolCallEventType("write", event) ||
-          isToolCallEventType("edit", event) ||
-          isToolCallEventType("bash", event) ||
-          isToolCallEventType("powershell", event)
-        ) {
-          return {
-            block: true,
-            reason: `Survey mission ${request.mission.id} is strictly read-only. Tool "${event.toolName}" is disabled.`,
-          };
-        }
-        return undefined;
-      }
-
       if (isToolCallEventType("write", event) || isToolCallEventType("edit", event)) {
-        const rel = resolveWorktreeRelativePath(request.worktreePath, event.input.path);
-        if (rel === null) {
+        const rawPath = event.input.path;
+        const rel = resolveWorktreeRelativePath(request.cwd, rawPath);
+        if (request.workspace !== "inherit" && rel === null) {
           return {
             block: true,
-            reason: `Path "${event.input.path}" escapes worktree root "${request.worktreePath}".`,
+            reason: `Path "${rawPath}" escapes worktree root "${request.cwd}".`,
           };
         }
-        if (isProtectedSwarmPath(rel)) {
+        if ((rel !== null && isProtectedSwarmPath(rel)) || pathTargetsProtectedDir(rawPath)) {
           return {
             block: true,
-            reason: `Workers are forbidden from editing protected path "${rel}" (${SWARM_DIR}/ or .git/).`,
-          };
-        }
-        if (request.mission.scope.length > 0 && !isPathInScope(rel, request.mission.scope)) {
-          return {
-            block: true,
-            reason: `Path "${rel}" is outside mission ${request.mission.id} declared scope [${request.mission.scope.join(", ")}]. Post @${ORCHESTRATOR_BOARD_NAME} via ${SWARM_BOARD_POST_TOOL} to request a scope patch.`,
+            reason: `Workers are forbidden from editing protected path "${rel ?? rawPath}" (${SWARM_DIR}/, .swarm/, or .git/).`,
           };
         }
         return undefined;
       }
 
-      if (isToolCallEventType("bash", event)) {
-        const check = isForbiddenWorkerBashCommand(event.input.command, request.baseBranch);
-        if (!check.allowed) {
-          return { block: true, reason: check.reason };
-        }
-      }
-
-      if (isToolCallEventType("powershell", event)) {
-        const check = isForbiddenWorkerBashCommand(event.input.command, request.baseBranch);
+      if (isToolCallEventType("bash", event) || isToolCallEventType("powershell", event)) {
+        const check = isForbiddenWorkerBashCommand(
+          event.input.command,
+          request.workspace !== "inherit" ? (baseBranch ?? "") : "",
+        );
         if (!check.allowed) {
           return { block: true, reason: check.reason };
         }
@@ -1135,7 +532,7 @@ function createWorkerGuardExtensionFactory(request: WorkerSpawnRequest): Extensi
 }
 
 function createValidatorGuardExtensionFactory(
-  sessionLabel: string,
+  memberName: string,
   enforceReadOnlyBash: boolean,
 ): ExtensionFactory {
   return (pi) => {
@@ -1147,7 +544,7 @@ function createValidatorGuardExtensionFactory(
       ) {
         return {
           block: true,
-          reason: `${sessionLabel} is strictly read-only. Tool "${event.toolName}" is blocked.`,
+          reason: `Independent validator @${memberName} is strictly read-only. Tool "${event.toolName}" is blocked.`,
         };
       }
 
@@ -1158,13 +555,65 @@ function createValidatorGuardExtensionFactory(
             block: true,
             reason:
               check.reason ??
-              `Mutating bash commands are blocked in read-only ${sessionLabel.toLowerCase()} sessions.`,
+              `Mutating bash commands are blocked in read-only validator @${memberName} sessions.`,
           };
         }
       }
 
       return undefined;
     });
+  };
+}
+
+function createFallbackBridge(request: SpawnMemberRequest): MemberEngineBridge {
+  return {
+    async postMessage() {
+      throw new SwarmProtocolError(
+        "NOT_FOUND",
+        `No Swarm engine bridge attached to member "@${request.name}".`,
+      );
+    },
+    async readBoard() {
+      return { messages: [], head: 0 };
+    },
+    async getStatus() {
+      return {
+        runId: request.runId,
+        title: request.runId,
+        status: "active",
+        baseBranch: request.branch ?? "main",
+        boardHead: 0,
+        members: [],
+        channels: [],
+      };
+    },
+    async listModels() {
+      return [];
+    },
+    async addHelper() {
+      throw new SwarmProtocolError(
+        "PERMISSION_DENIED",
+        `No Swarm engine bridge attached to member "@${request.name}".`,
+      );
+    },
+    async killHelper() {
+      throw new SwarmProtocolError(
+        "PERMISSION_DENIED",
+        `No Swarm engine bridge attached to member "@${request.name}".`,
+      );
+    },
+    async switchModel() {
+      throw new SwarmProtocolError(
+        "PERMISSION_DENIED",
+        `No Swarm engine bridge attached to member "@${request.name}".`,
+      );
+    },
+    async manageChannel() {
+      throw new SwarmProtocolError(
+        "PERMISSION_DENIED",
+        `No Swarm engine bridge attached to member "@${request.name}".`,
+      );
+    },
   };
 }
 
@@ -1182,7 +631,7 @@ function formatToolActivity(toolName: string, args: unknown): string {
     (typeof record.command === "string" && record.command.slice(0, 60)) ||
     (typeof record.pattern === "string" && record.pattern.slice(0, 40)) ||
     (typeof record.action === "string" && record.action) ||
-    (typeof record.title === "string" && record.title.slice(0, 40)) ||
+    (typeof record.name === "string" && record.name) ||
     "";
   return target ? `${toolName}: ${target}` : toolName;
 }
@@ -1201,11 +650,16 @@ function extractAssistantText(message: AssistantMessage | undefined): string {
 }
 
 function isAssistantMessage(message: AgentMessage): message is AssistantMessage {
-  return typeof message === "object" && message !== null && "role" in message && message.role === "assistant";
+  return (
+    typeof message === "object" &&
+    message !== null &&
+    "role" in message &&
+    message.role === "assistant"
+  );
 }
 
 // ============================================================================
-// InProcessPiTransport (Pi 1.5.2 SDK — Warm Persistent AgentSessions)
+// InProcessPiTransport (Pi 1.3–1.6 SDK — Warm Persistent Sessions + Forking)
 // ============================================================================
 
 export interface InProcessPiTransportOptions {
@@ -1213,49 +667,22 @@ export interface InProcessPiTransportOptions {
   agentDir?: string;
   /** Enforce read-only bash guard inside validator sessions (default true). */
   validatorReadOnlyBash?: boolean;
-  /** Optional session factory override (defaults to Pi's `createAgentSession`, primarily for deterministic tests). */
+  /** Optional session factory override (defaults to Pi's `createAgentSession`, for deterministic tests). */
   createSession?: typeof createAgentSession;
 }
 
-interface InternalSessionLaunchSpec {
-  agentId: string;
-  name: string;
-  missionId: string;
-  role: RosterAgentRole;
-  cwd: string;
-  prompt: string;
-  systemPromptAppendix?: string;
-  keepWarm: boolean;
-  modelOverride?: string;
-  thinkingLevel?: ThinkingLevel;
-  hostContext?: ExtensionContext;
-  onTelemetry?: (event: WorkerTelemetryEvent) => void;
-  allowedTools: string[];
-  customTools: ToolDefinition[];
-  guardFactory: ExtensionFactory;
-  startActivity: string;
-  getNudgePrompt?: () => string | null;
-  resetCaptured: () => void;
-  getCapturedResult: () => {
-    workerDone?: WorkerDonePayload;
-    reviewVerdict?: MissionReviewVerdict;
-    finalAuditVerdict?: FinalAuditVerdict;
-    summaryOverride?: string;
-  };
-}
-
 /**
- * In-process multi-agent transport backed by Pi 1.5.2's `createAgentSession`.
+ * In-process multi-agent transport backed by Pi's `createAgentSession`.
  *
- * Supports Antigravity Swarm warm persistent sessions:
- * - When `keepWarm: true`, completed turns transition `"working"` -> `"waiting"` WITHOUT
- *   disposing `AgentSession`, preserving 100% conversation history across `wake(prompt)`
- *   and `switchModel(modelOverride, thinkingLevel)` calls!
- * - `kill()` permanently disposes the session (`"killed"` state).
- * - Respects all Pi 1.5.2 SDK invariants: shared `ModelRuntime`, `SettingsManager.create`,
- *   `SessionManager.inMemory`, `DefaultResourceLoader({ noExtensions: true })` + `reload()`
- *   + `bindExtensions({})`, custom tools explicitly included in `options.tools`, and
- *   `message_end` / `stopReason === "error"` / 429 inspection.
+ * Preserves all Pi 1.3–1.6 SDK invariants:
+ * - Shared host `ModelRuntime` (with lazy `ModelRuntime.create` fallback + provider copy)
+ * - `SettingsManager.create(cwd, agentDir)` + `SessionManager.inMemory(cwd)`
+ * - TRUE conversation forking (`seedMessages` appended before `createAgentSession`)
+ * - `DefaultResourceLoader({ noExtensions: true, appendSystemPrompt, extensionFactories })` + `reload()` + `bindExtensions({})`
+ * - Scoped 4-tool Antigravity Swarm toolset (`swarm`, `post_message`, `read_board`, `swarm_wait`) inside `options.tools`
+ * - `WeakSet<AgentSession>` leak-free disposal on early `kill()`
+ * - `switchingModel` lock + strict `state === "waiting"` + post-await session checks
+ * - Compaction-safe `message_end` tracking + `stopReason === "error"` / 429 detection
  */
 export class InProcessPiTransport implements ISwarmTransport {
   private readonly agentDirOverride?: string;
@@ -1269,73 +696,799 @@ export class InProcessPiTransport implements ISwarmTransport {
     this.createSessionFn = options.createSession ?? createAgentSession;
   }
 
-  async spawnWorker(request: WorkerSpawnRequest): Promise<PersistentAgentHandle> {
-    return this.spawnMissionAgent({ ...request, role: "worker" });
+  async listAvailableModels(
+    hostContext?: ExtensionContext,
+  ): Promise<AvailableModelInfo[]> {
+    try {
+      const agentDir = this.agentDirOverride ?? getAgentDir();
+      const runtime = await this.resolveModelRuntime(hostContext, agentDir);
+      let rawModels = runtime.getAvailableSnapshot();
+      if (rawModels.length === 0) {
+        rawModels = runtime.getModels();
+      }
+
+      const seen = new Set<string>();
+      const result: AvailableModelInfo[] = [];
+      for (const m of rawModels) {
+        if (!m?.id) {
+          continue;
+        }
+        const provider = m.provider ?? "";
+        const fullId = provider ? `${provider}/${m.id}` : m.id;
+        const key = fullId.toLowerCase();
+        if (seen.has(key)) {
+          continue;
+        }
+        seen.add(key);
+        result.push({
+          id: m.id,
+          provider,
+          fullId,
+          name: m.name,
+          reasoning: Boolean(m.reasoning),
+          contextWindow: m.contextWindow,
+        });
+      }
+      return result;
+    } catch {
+      // Fallback to host modelRegistry if ModelRuntime lookup fails
+      try {
+        const reg = hostContext?.modelRegistry;
+        const list = reg?.getAvailable?.() ?? reg?.getAll?.() ?? [];
+        return list
+          .filter((m) => Boolean(m?.id))
+          .map((m) => ({
+            id: m.id,
+            provider: m.provider ?? "",
+            fullId: m.provider ? `${m.provider}/${m.id}` : m.id,
+            name: m.name,
+            reasoning: Boolean(m.reasoning),
+            contextWindow: m.contextWindow,
+          }));
+      } catch {
+        return [];
+      }
+    }
   }
 
-  async spawnValidator(request: ValidatorSpawnRequest): Promise<PersistentAgentHandle> {
-    return this.spawnMissionAgent({ ...request, role: "validator" });
-  }
+  async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+    let session: AgentSession | undefined;
+    let modelRuntime: ModelRuntime | undefined;
+    let unsubscribe: (() => void) | undefined;
+    const disposedSessions = new WeakSet<AgentSession>();
 
-  async spawnFinalValidator(request: FinalValidatorSpawnRequest): Promise<PersistentAgentHandle> {
-    let capturedFinalVerdict: FinalAuditVerdict | undefined;
+    let state: SwarmMemberState = "working";
+    const getCurrentState = (): SwarmMemberState => state;
+    let currentModelId: string | undefined =
+      request.modelOverride?.trim() || formatModelId(request.hostContext?.model);
+    let currentThinkingLevel: ThinkingLevel | undefined = request.thinkingLevel;
+    let cachedMessages: AgentMessage[] = request.seedMessages
+      ? sanitizeForkSeedMessages(request.seedMessages)
+      : [];
 
-    const allowedTools = Array.from(
-      new Set<string>([
-        ...VALIDATOR_BUILTIN_TOOLS,
-        "bash",
-        ...VALIDATOR_BOARD_TOOLS,
-        SWARM_FINAL_VERDICT_TOOL,
-      ]),
-    );
-    const customTools: ToolDefinition[] = [
-      ...buildBoardAndStatusTools({
-        runId: request.runId,
-        from: request.name,
-        fromRole: "validator",
-        missionId: FINAL_AUDIT_MISSION_ID,
-        store: request.store,
-        board: request.board,
-        onBoardPost: request.onBoardPost,
-      }),
-      buildFinalValidatorVerdictTool(request, (verdict) => {
-        capturedFinalVerdict = verdict;
-      }),
-    ];
-    const guardFactory = createValidatorGuardExtensionFactory(
-      `Final Validator for run ${request.runId}`,
-      true,
-    );
+    let promptActive = false;
+    let switchingModel = false;
+    let killed = false;
+    const isKilled = (): boolean => killed;
+    let abortedByCaller = false;
+    const isAbortedByCaller = (): boolean => abortedByCaller;
+    let abortReason: string | undefined;
+    const assistantRef: { current: AssistantMessage | undefined } = { current: undefined };
+    const getLastAssistant = (): AssistantMessage | undefined => assistantRef.current;
+    let lastTextEmitAt = 0;
 
-    return this.runPersistentSession({
+    const pendingSteers: Array<{ text: string; mode: "steer" | "followUp" }> = [];
+
+    const emitTelemetry = (
+      partial: Omit<AgentTelemetryEvent, "agentId" | "name" | "role" | "runId" | "timestamp">,
+    ): void => {
+      if (!request.onTelemetry) {
+        return;
+      }
+      try {
+        request.onTelemetry({
+          agentId: request.agentId,
+          name: request.name,
+          role: request.role,
+          runId: request.runId,
+          timestamp: new Date().toISOString(),
+          model: currentModelId,
+          thinkingLevel: currentThinkingLevel,
+          ...partial,
+        });
+      } catch {
+        // telemetry errors must never crash agent execution
+      }
+    };
+
+    const allowedTools: string[] =
+      request.role === "validator"
+        ? Array.from(
+            new Set<string>([
+              ...VALIDATOR_BUILTIN_TOOLS,
+              "bash",
+              SWARM_TOOL,
+              POST_MESSAGE_TOOL,
+              READ_BOARD_TOOL,
+              SWARM_WAIT_TOOL,
+            ]),
+          )
+        : Array.from(new Set<string>([...WORKER_BUILTIN_TOOLS, ...SWARM_CORE_TOOLS]));
+
+    const bridge = request.engineApi ?? createFallbackBridge(request);
+    const customTools: ToolDefinition[] = createMemberScopedTools(bridge, {
+      name: request.name,
+      role: request.role,
+      runId: request.runId,
+      onWaitRecorded: ({ since, mentionsOnly }) => {
+        emitTelemetry({
+          type: "waiting",
+          activity: `waiting (since #${since})`,
+          logLine: `swarm_wait since=#${since} mentions_only=${mentionsOnly}`,
+        });
+      },
+    });
+
+    const guardFactory: ExtensionFactory =
+      request.role === "validator"
+        ? createValidatorGuardExtensionFactory(request.name, this.validatorReadOnlyBash)
+        : createWorkerGuardExtensionFactory(request);
+
+    const readStats = (
+      activeSession: AgentSession | undefined,
+    ): { tokens: number; breakdown?: TokenUsage; cost: number } => {
+      if (!activeSession) {
+        return { tokens: 0, cost: 0 };
+      }
+      try {
+        const stats = activeSession.getSessionStats();
+        return {
+          tokens: stats.tokens.total,
+          breakdown: {
+            input: stats.tokens.input,
+            output: stats.tokens.output,
+            cacheRead: stats.tokens.cacheRead,
+            cacheWrite: stats.tokens.cacheWrite,
+            total: stats.tokens.total,
+          },
+          cost: stats.cost,
+        };
+      } catch {
+        return { tokens: 0, cost: 0 };
+      }
+    };
+
+    const snapshotSessionMessages = (activeSession: AgentSession | undefined): void => {
+      if (!activeSession) {
+        return;
+      }
+      const extracted = extractSessionMessages(activeSession.sessionManager);
+      if (extracted.length > 0) {
+        cachedMessages = extracted;
+      }
+    };
+
+    const disposeSessionOnce = async (targetSession?: AgentSession): Promise<void> => {
+      const activeSession = targetSession ?? session;
+      if (!activeSession) {
+        unsubscribe?.();
+        unsubscribe = undefined;
+        return;
+      }
+      snapshotSessionMessages(activeSession);
+      if (session === activeSession) {
+        session = undefined;
+      }
+      unsubscribe?.();
+      unsubscribe = undefined;
+      if (disposedSessions.has(activeSession)) {
+        return;
+      }
+      disposedSessions.add(activeSession);
+      try {
+        if (activeSession.extensionRunner?.hasHandlers("session_shutdown")) {
+          await activeSession.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+        }
+      } catch {
+        // ignore shutdown hook errors
+      }
+      try {
+        activeSession.dispose();
+      } catch {
+        // ignore dispose error
+      }
+    };
+
+    const makeEarlyAbortResult = (): AgentTurnResult => {
+      const outcome: AgentTurnOutcome = killed ? "killed" : "stopped";
+      state = outcome;
+      const reason = abortReason ?? (killed ? "Killed before session start" : "Stopped before session start");
+      if (!killed) {
+        emitTelemetry({
+          type: "stopped",
+          model: currentModelId,
+          activity: "stopped",
+          logLine: `stopped: ${reason}`,
+          error: reason,
+        });
+      }
+      return {
+        agentId: request.agentId,
+        name: request.name,
+        role: request.role,
+        outcome,
+        summary: reason,
+        model: currentModelId,
+        thinkingLevel: currentThinkingLevel,
+        tokens: 0,
+        cost: 0,
+        error: reason,
+        stopReason: "aborted",
+      };
+    };
+
+    const runPromptTurn = async (
+      promptText: string,
+      options: { isInitialTurn: boolean },
+    ): Promise<AgentTurnResult> => {
+      let caughtError: unknown;
+      assistantRef.current = undefined;
+
+      try {
+        if (options.isInitialTurn) {
+          const agentDir = this.agentDirOverride ?? getAgentDir();
+          modelRuntime = await this.resolveModelRuntime(request.hostContext, agentDir);
+          const settingsManager = SettingsManager.create(request.cwd, agentDir);
+          const sessionManager = SessionManager.inMemory(request.cwd);
+
+          // TRUE Conversation Forking: seed parent messages BEFORE createAgentSession!
+          if (request.seedMessages && request.seedMessages.length > 0) {
+            seedMessagesIntoSessionManager(sessionManager, request.seedMessages);
+          }
+
+          let resolvedModel = request.hostContext?.model;
+          let resolvedThinking = request.thinkingLevel;
+
+          if (request.modelOverride?.trim()) {
+            const cliRes = resolveCliModel({
+              cliModel: request.modelOverride.trim(),
+              cliThinking: request.thinkingLevel,
+              modelRuntime,
+            });
+            if (cliRes.model) {
+              resolvedModel = cliRes.model;
+            }
+            if (cliRes.thinkingLevel && !resolvedThinking) {
+              resolvedThinking = cliRes.thinkingLevel;
+            }
+          }
+
+          if (killed || abortedByCaller) {
+            return makeEarlyAbortResult();
+          }
+
+          const resourceLoader = new DefaultResourceLoader({
+            cwd: request.cwd,
+            agentDir,
+            settingsManager,
+            noExtensions: true,
+            appendSystemPrompt: request.systemPrompt ? [request.systemPrompt] : [],
+            extensionFactories: [guardFactory],
+          });
+          await resourceLoader.reload();
+
+          if (killed || abortedByCaller) {
+            return makeEarlyAbortResult();
+          }
+
+          const created = await this.createSessionFn({
+            cwd: request.cwd,
+            agentDir,
+            modelRuntime,
+            model: resolvedModel,
+            thinkingLevel: resolvedThinking,
+            tools: allowedTools,
+            customTools,
+            resourceLoader,
+            sessionManager,
+            settingsManager,
+          });
+
+          if (killed || abortedByCaller) {
+            await disposeSessionOnce(created.session);
+            return makeEarlyAbortResult();
+          }
+
+          session = created.session;
+          await session.bindExtensions({});
+
+          if (killed || abortedByCaller) {
+            await disposeSessionOnce(created.session);
+            return makeEarlyAbortResult();
+          }
+
+          currentModelId = formatModelId(session.model ?? resolvedModel) ?? currentModelId;
+          currentThinkingLevel = resolvedThinking ?? currentThinkingLevel;
+
+          unsubscribe = session.subscribe((event: AgentSessionEvent) => {
+            switch (event.type) {
+              case "tool_execution_start": {
+                const activity = formatToolActivity(event.toolName, event.args);
+                emitTelemetry({
+                  type: "tool_start",
+                  toolName: event.toolName,
+                  activity,
+                  logLine: `> ${activity}`,
+                });
+                break;
+              }
+              case "tool_execution_end": {
+                emitTelemetry({
+                  type: "tool_end",
+                  toolName: event.toolName,
+                  activity: event.isError
+                    ? `${event.toolName} (error)`
+                    : `${event.toolName} (ok)`,
+                  logLine: `< ${event.toolName} (${event.isError ? "error" : "ok"})`,
+                });
+                break;
+              }
+              case "message_update": {
+                if (event.assistantMessageEvent.type === "text_delta") {
+                  const now = Date.now();
+                  if (now - lastTextEmitAt >= 250) {
+                    lastTextEmitAt = now;
+                    const snippet = event.assistantMessageEvent.delta.replace(/\s+/g, " ").trim();
+                    if (snippet) {
+                      emitTelemetry({
+                        type: "text_delta",
+                        activity: "generating response",
+                        logLine: snippet.slice(0, 120),
+                      });
+                    }
+                  }
+                }
+                break;
+              }
+              case "message_end": {
+                if (isAssistantMessage(event.message)) {
+                  assistantRef.current = event.message;
+                }
+                break;
+              }
+              case "thinking_level_changed": {
+                currentThinkingLevel = event.level;
+                break;
+              }
+              case "turn_end": {
+                if (session) {
+                  const usage = readStats(session);
+                  emitTelemetry({
+                    type: "turn_end",
+                    tokens: usage.tokens,
+                    tokenBreakdown: usage.breakdown,
+                    cost: usage.cost,
+                  });
+                }
+                break;
+              }
+              case "auto_retry_start": {
+                emitTelemetry({
+                  type: "rate_limit",
+                  activity: `retrying (${event.attempt}/${event.maxAttempts})`,
+                  logLine: `retry ${event.attempt}/${event.maxAttempts}: ${event.errorMessage}`,
+                  error: event.errorMessage,
+                });
+                break;
+              }
+              default:
+                break;
+            }
+          });
+
+          emitTelemetry({
+            type: "started",
+            model: currentModelId,
+            activity: request.role === "validator" ? "starting validation" : "starting assignment",
+            logLine: `spawned ${request.role} @${request.name} (${request.agentId}) in ${request.cwd}`,
+          });
+        }
+
+        if (!session) {
+          throw new SwarmProtocolError(
+            "MEMBER_KILLED",
+            `Member "@${request.name}" session is no longer active.`,
+          );
+        }
+
+        if (killed || abortedByCaller) {
+          await session.abort();
+        } else {
+          promptActive = true;
+          const promptPromise = session.prompt(promptText, { expandPromptTemplates: false });
+
+          // Drain any early steer/followUp calls buffered before session.prompt() started
+          if (pendingSteers.length > 0) {
+            for (const queued of pendingSteers.splice(0, pendingSteers.length)) {
+              if (killed || abortedByCaller) {
+                break;
+              }
+              if (queued.mode === "followUp") {
+                await session.followUp(queued.text).catch(() => {});
+              } else {
+                await session.steer(queued.text).catch(() => {});
+              }
+            }
+          }
+
+          await promptPromise;
+        }
+      } catch (err) {
+        caughtError = err;
+      } finally {
+        promptActive = false;
+        pendingSteers.length = 0;
+      }
+
+      // Snapshot stats & messages BEFORE potential disposal
+      const usage = readStats(session);
+      snapshotSessionMessages(session);
+
+      // Classify turn outcome (session.prompt() does NOT throw on provider/quota/429 errors!)
+      let outcome: AgentTurnOutcome = request.keepWarm && session ? "waiting" : "stopped";
+      let errorText: string | undefined;
+      let retryAfterMs: number | undefined;
+      const finalAssistant = getLastAssistant();
+      const stopReason = finalAssistant?.stopReason;
+
+      if (killed) {
+        outcome = "killed";
+        errorText = abortReason ?? "Killed";
+      } else if (abortedByCaller || stopReason === "aborted") {
+        outcome = "stopped";
+        errorText = abortReason ?? finalAssistant?.errorMessage ?? "Stopped";
+      } else if (caughtError !== undefined) {
+        errorText = caughtError instanceof Error ? caughtError.message : String(caughtError);
+        if (isRateLimitOrTransientError(caughtError)) {
+          outcome = "rate_limited";
+          retryAfterMs = parseRetryAfterMs(caughtError);
+        } else {
+          outcome = "failed";
+        }
+      } else if (stopReason === "error") {
+        errorText = finalAssistant?.errorMessage ?? "Provider returned stopReason=error";
+        if (isRateLimitOrTransientError(errorText)) {
+          outcome = "rate_limited";
+          retryAfterMs = parseRetryAfterMs(errorText);
+        } else {
+          outcome = "failed";
+        }
+      }
+
+      const summary = extractAssistantText(finalAssistant) || errorText || "";
+
+      // Transition handle state cleanly (keep warm in `waiting` when keepWarm && session alive!)
+      if (killed) {
+        state = "killed";
+        await disposeSessionOnce();
+      } else if (request.keepWarm && session) {
+        if (outcome === "waiting") {
+          state = "waiting";
+          emitTelemetry({
+            type: "waiting",
+            activity: "waiting (warm)",
+            logLine: `@${request.name} parked warm in waiting state`,
+            tokens: usage.tokens,
+            tokenBreakdown: usage.breakdown,
+            cost: usage.cost,
+          });
+        } else if (outcome === "stopped") {
+          state = "stopped";
+          emitTelemetry({
+            type: "stopped",
+            activity: "stopped",
+            logLine: `stopped: ${errorText ?? "aborted"}`,
+            tokens: usage.tokens,
+            tokenBreakdown: usage.breakdown,
+            cost: usage.cost,
+            error: errorText,
+          });
+        } else if (outcome === "rate_limited") {
+          // Keep warm in `waiting` so engine/orchestrator can hot-switch fallback model preserving history!
+          state = "waiting";
+          emitTelemetry({
+            type: "rate_limit",
+            activity: "rate limited (warm)",
+            logLine: `rate_limited: ${errorText ?? "429"}`,
+            tokens: usage.tokens,
+            tokenBreakdown: usage.breakdown,
+            cost: usage.cost,
+            error: errorText,
+          });
+        } else {
+          // Keep warm in `waiting` with error recorded so Orchestrator can switch model or retry!
+          state = "waiting";
+          emitTelemetry({
+            type: "error",
+            activity: "error (warm)",
+            logLine: `error: ${errorText ?? "turn failed"}`,
+            tokens: usage.tokens,
+            tokenBreakdown: usage.breakdown,
+            cost: usage.cost,
+            error: errorText,
+          });
+        }
+      } else {
+        state = "stopped";
+        await disposeSessionOnce();
+        emitTelemetry({
+          type:
+            outcome === "rate_limited"
+              ? "rate_limit"
+              : outcome === "failed"
+                ? "error"
+                : "stopped",
+          activity: outcome,
+          logLine: errorText ? `${outcome}: ${errorText}` : `${outcome}: ${summary.slice(0, 120)}`,
+          tokens: usage.tokens,
+          tokenBreakdown: usage.breakdown,
+          cost: usage.cost,
+          error: errorText,
+        });
+      }
+
+      return {
+        agentId: request.agentId,
+        name: request.name,
+        role: request.role,
+        outcome,
+        summary,
+        model: currentModelId,
+        thinkingLevel: currentThinkingLevel,
+        tokens: usage.tokens,
+        tokenBreakdown: usage.breakdown,
+        cost: usage.cost,
+        error: errorText,
+        stopReason,
+        retryAfterMs,
+      };
+    };
+
+    let currentTurnPromise: Promise<AgentTurnResult> = runPromptTurn(request.initialPrompt, {
+      isInitialTurn: true,
+    });
+
+    return {
       agentId: request.agentId,
       name: request.name,
-      missionId: FINAL_AUDIT_MISSION_ID,
-      role: "final-validator",
-      cwd: request.repoRoot,
-      prompt: request.prompt,
-      systemPromptAppendix: request.systemPromptAppendix,
-      keepWarm: request.keepWarm,
-      modelOverride: request.modelOverride,
-      thinkingLevel: request.thinkingLevel,
-      hostContext: request.hostContext,
-      onTelemetry: request.onTelemetry,
-      allowedTools,
-      customTools,
-      guardFactory,
-      startActivity: `starting final validation (r${request.round}/${request.maxRounds})`,
-      getNudgePrompt: () =>
-        capturedFinalVerdict
-          ? null
-          : `You have not yet submitted your structured final validation verdict. Call \`${SWARM_FINAL_VERDICT_TOOL}\` now with verdict ("approved" or "disapproved"), summary, checks, findings, and optional recommended_missions.`,
-      resetCaptured: () => {
-        capturedFinalVerdict = undefined;
+      role: request.role,
+
+      getState(): SwarmMemberState {
+        return state;
       },
-      getCapturedResult: () => ({
-        finalAuditVerdict: capturedFinalVerdict,
-        summaryOverride: capturedFinalVerdict?.summary,
-      }),
-    });
+
+      getModel(): string | undefined {
+        return currentModelId;
+      },
+
+      getThinkingLevel(): ThinkingLevel | undefined {
+        return currentThinkingLevel;
+      },
+
+      getConversationMessages(): AgentMessage[] {
+        if (session) {
+          const liveMessages = extractSessionMessages(session.sessionManager);
+          if (liveMessages.length > 0) {
+            cachedMessages = liveMessages;
+            return liveMessages;
+          }
+        }
+        return sanitizeForkSeedMessages(cachedMessages);
+      },
+
+      async wake(prompt: string): Promise<AgentTurnResult> {
+        if (killed || state === "killed") {
+          throw new SwarmProtocolError(
+            "MEMBER_KILLED",
+            `Member "@${request.name}" (${request.agentId}) has been killed and cannot be woken.`,
+          );
+        }
+        if (switchingModel) {
+          throw new SwarmProtocolError(
+            "MEMBER_NOT_WAITING",
+            `Member "@${request.name}" (${request.agentId}) is currently switching models; retry wake once model switch completes.`,
+          );
+        }
+        if (state !== "waiting" || promptActive) {
+          throw new SwarmProtocolError(
+            "MEMBER_NOT_WAITING",
+            `Member "@${request.name}" (${request.agentId}) is not waiting (currently "${state}"); cannot wake.`,
+          );
+        }
+        if (!session) {
+          throw new SwarmProtocolError(
+            "MEMBER_KILLED",
+            `Member "@${request.name}" (${request.agentId}) does not have an active persistent session.`,
+          );
+        }
+
+        // Preserve 100% conversation history on the exact same AgentSession!
+        abortedByCaller = false;
+        abortReason = undefined;
+        state = "working";
+
+        emitTelemetry({
+          type: "woken",
+          model: currentModelId,
+          activity: "woken by board",
+          logLine: `woken @${request.name}: ${prompt.replace(/\s+/g, " ").trim().slice(0, 100)}`,
+        });
+
+        currentTurnPromise = runPromptTurn(prompt, { isInitialTurn: false });
+        return currentTurnPromise;
+      },
+
+      async steer(message: string): Promise<void> {
+        if (killed || state === "killed" || abortedByCaller) {
+          return;
+        }
+        if (!session || !promptActive) {
+          if (state === "working") {
+            pendingSteers.push({ text: message, mode: "steer" });
+          }
+          return;
+        }
+        await session.steer(message);
+      },
+
+      async followUp(message: string): Promise<void> {
+        if (killed || state === "killed" || abortedByCaller) {
+          return;
+        }
+        if (!session || !promptActive) {
+          if (state === "working") {
+            pendingSteers.push({ text: message, mode: "followUp" });
+          }
+          return;
+        }
+        await session.followUp(message);
+      },
+
+      async switchModel(
+        modelOverride: string,
+        thinkingLevel?: ThinkingLevel,
+      ): Promise<ModelSwitchResult> {
+        if (killed || state === "killed") {
+          throw new SwarmProtocolError(
+            "MEMBER_KILLED",
+            `Member "@${request.name}" (${request.agentId}) has been killed and cannot switch models.`,
+          );
+        }
+        if (switchingModel || state !== "waiting" || promptActive) {
+          throw new SwarmProtocolError(
+            "MEMBER_NOT_WAITING",
+            `Member "@${request.name}" (${request.agentId}) is not in waiting state (currently "${switchingModel ? "switchingModel" : state}"). Wait until it parks in waiting state before switching models.`,
+          );
+        }
+        const activeSession = session;
+        const activeRuntime = modelRuntime;
+        if (!activeSession || !activeRuntime) {
+          throw new SwarmProtocolError(
+            "MEMBER_KILLED",
+            `Member "@${request.name}" (${request.agentId}) has no live session for model switching.`,
+          );
+        }
+
+        const trimmed = modelOverride.trim();
+        if (!trimmed) {
+          throw new SwarmProtocolError("MODEL_NOT_FOUND", "Model identifier must be non-empty.");
+        }
+
+        const cliRes = resolveCliModel({
+          cliModel: trimmed,
+          cliThinking: thinkingLevel,
+          modelRuntime: activeRuntime,
+        });
+        if (!cliRes.model) {
+          throw new SwarmProtocolError(
+            "MODEL_NOT_FOUND",
+            `Model "${trimmed}" could not be resolved in the active Pi model registry.`,
+            { modelOverride: trimmed },
+          );
+        }
+
+        switchingModel = true;
+        try {
+          await activeSession.setModel(cliRes.model, { persist: false });
+
+          const postSwitchState = getCurrentState();
+          if (isKilled() || postSwitchState === "killed" || !session || session !== activeSession) {
+            throw new SwarmProtocolError(
+              "MEMBER_KILLED",
+              `Member "@${request.name}" (${request.agentId}) was killed while switching models.`,
+            );
+          }
+          if (isAbortedByCaller() || postSwitchState !== "waiting") {
+            throw new SwarmProtocolError(
+              "MEMBER_NOT_WAITING",
+              `Member "@${request.name}" (${request.agentId}) stopped waiting (currently "${postSwitchState}") while switching models.`,
+            );
+          }
+
+          const effectiveThinking = thinkingLevel ?? cliRes.thinkingLevel;
+          if (effectiveThinking) {
+            activeSession.setThinkingLevel(effectiveThinking, { persist: false });
+          }
+
+          const resolvedId = formatModelId(cliRes.model) ?? trimmed;
+          currentModelId = resolvedId;
+          currentThinkingLevel = effectiveThinking ?? currentThinkingLevel;
+
+          emitTelemetry({
+            type: "model_switched",
+            model: resolvedId,
+            thinkingLevel: currentThinkingLevel,
+            activity: `switched model -> ${resolvedId}`,
+            logLine: `model switched -> ${resolvedId}${effectiveThinking ? ` (${effectiveThinking})` : ""}`,
+          });
+
+          return {
+            model: resolvedId,
+            thinkingLevel: effectiveThinking,
+          };
+        } finally {
+          switchingModel = false;
+        }
+      },
+
+      async abort(reason?: string): Promise<void> {
+        if (killed || state === "killed") {
+          return;
+        }
+        abortedByCaller = true;
+        abortReason = reason ?? "Stopped";
+        if (session && promptActive) {
+          try {
+            await session.abort();
+          } catch {
+            // ignore abort race
+          }
+        } else {
+          state = "stopped";
+        }
+      },
+
+      async kill(reason?: string): Promise<void> {
+        if (killed || state === "killed") {
+          return;
+        }
+        killed = true;
+        abortedByCaller = true;
+        abortReason = reason ?? "Killed";
+        state = "killed";
+        pendingSteers.length = 0;
+
+        if (session && promptActive) {
+          try {
+            await session.abort();
+          } catch {
+            // ignore abort race
+          }
+        }
+        await disposeSessionOnce();
+
+        emitTelemetry({
+          type: "killed",
+          model: currentModelId,
+          activity: reason ?? "killed",
+          logLine: `killed @${request.name}: ${reason ?? "session disposed"}`,
+        });
+      },
+
+      get currentTurn(): Promise<AgentTurnResult> {
+        return currentTurnPromise;
+      },
+    };
   }
 
   private async resolveModelRuntime(
@@ -1395,789 +1548,5 @@ export class InProcessPiTransport implements ISwarmTransport {
     }
 
     return runtime;
-  }
-
-  private async spawnMissionAgent(
-    request: WorkerSpawnRequest | ValidatorSpawnRequest,
-  ): Promise<PersistentAgentHandle> {
-    let capturedWorkerDone: WorkerDonePayload | undefined;
-    let capturedVerdict: MissionReviewVerdict | undefined;
-
-    let allowedTools: string[];
-    let customTools: ToolDefinition[];
-    let guardFactory: ExtensionFactory;
-
-    if (request.role === "validator") {
-      allowedTools = Array.from(
-        new Set<string>([
-          ...VALIDATOR_BUILTIN_TOOLS,
-          "bash",
-          ...VALIDATOR_BOARD_TOOLS,
-          SWARM_REVIEW_VERDICT_TOOL,
-        ]),
-      );
-      customTools = [
-        ...buildBoardAndStatusTools({
-          runId: request.runId,
-          from: request.name,
-          fromRole: "validator",
-          missionId: request.mission.id,
-          store: request.store,
-          board: request.board,
-          onBoardPost: request.onBoardPost,
-        }),
-        buildValidatorVerdictTool(request, (verdict) => {
-          capturedVerdict = verdict;
-        }),
-      ];
-      guardFactory = createValidatorGuardExtensionFactory(
-        `Validator ${request.name} for mission ${request.mission.id}`,
-        this.validatorReadOnlyBash,
-      );
-    } else {
-      customTools = buildWorkerCustomTools(request, (payload) => {
-        capturedWorkerDone = payload;
-      });
-      if (request.mission.kind === "survey") {
-        allowedTools = Array.from(
-          new Set<string>(["read", "grep", "find", "ls", ...WORKER_SWARM_TOOLS]),
-        );
-      } else {
-        allowedTools = Array.from(
-          new Set<string>([...WORKER_BUILTIN_TOOLS, ...WORKER_SWARM_TOOLS]),
-        );
-      }
-      guardFactory = createWorkerGuardExtensionFactory(request);
-    }
-
-    return this.runPersistentSession({
-      agentId: request.agentId,
-      name: request.name,
-      missionId: request.mission.id,
-      role: request.role,
-      cwd: request.worktreePath,
-      prompt: request.prompt,
-      systemPromptAppendix: request.systemPromptAppendix,
-      keepWarm: request.keepWarm,
-      modelOverride: request.modelOverride,
-      thinkingLevel: request.thinkingLevel,
-      hostContext: request.hostContext,
-      onTelemetry: request.onTelemetry,
-      allowedTools,
-      customTools,
-      guardFactory,
-      startActivity: request.role === "validator" ? "starting validation" : "starting mission",
-      getNudgePrompt:
-        request.role === "validator"
-          ? () =>
-              capturedVerdict
-                ? null
-                : `You have not yet submitted your structured verdict. Call \`${SWARM_REVIEW_VERDICT_TOOL}\` now with status, merge, findings, checks, and decision.`
-          : undefined,
-      resetCaptured: () => {
-        capturedWorkerDone = undefined;
-        capturedVerdict = undefined;
-      },
-      getCapturedResult: () => ({
-        workerDone: capturedWorkerDone,
-        reviewVerdict: capturedVerdict,
-        summaryOverride: capturedWorkerDone?.summary ?? capturedVerdict?.decision,
-      }),
-    });
-  }
-
-  private async runPersistentSession(spec: InternalSessionLaunchSpec): Promise<PersistentAgentHandle> {
-    let session: AgentSession | undefined;
-    let modelRuntime: ModelRuntime | undefined;
-    let unsubscribe: (() => void) | undefined;
-    const disposedSessions = new WeakSet<AgentSession>();
-
-    let state: RosterAgentStatus = "working";
-    const getCurrentState = (): RosterAgentStatus => state;
-    let currentModelId: string | undefined = spec.modelOverride?.trim() || formatModelId(spec.hostContext?.model);
-    let promptActive = false;
-    let switchingModel = false;
-    let killed = false;
-    const isKilled = (): boolean => killed;
-    let abortedByCaller = false;
-    const isAbortedByCaller = (): boolean => abortedByCaller;
-    let abortReason: string | undefined;
-    const assistantRef: { current: AssistantMessage | undefined } = { current: undefined };
-    const getLastAssistant = (): AssistantMessage | undefined => assistantRef.current;
-    let lastTextEmitAt = 0;
-
-    const pendingSteers: Array<{ text: string; mode: "steer" | "followUp" }> = [];
-
-    const emitTelemetry = (
-      partial: Omit<WorkerTelemetryEvent, "agentId" | "name" | "missionId" | "role" | "timestamp">,
-    ): void => {
-      if (!spec.onTelemetry) {
-        return;
-      }
-      try {
-        spec.onTelemetry({
-          agentId: spec.agentId,
-          name: spec.name,
-          missionId: spec.missionId,
-          role: spec.role,
-          timestamp: new Date().toISOString(),
-          model: currentModelId,
-          ...partial,
-        });
-      } catch {
-        // telemetry errors must never crash agent execution
-      }
-    };
-
-    const readStats = (
-      activeSession: AgentSession | undefined,
-    ): { tokens: number; breakdown?: TokenUsage; cost: number } => {
-      if (!activeSession) {
-        return { tokens: 0, cost: 0 };
-      }
-      try {
-        const stats = activeSession.getSessionStats();
-        return {
-          tokens: stats.tokens.total,
-          breakdown: {
-            input: stats.tokens.input,
-            output: stats.tokens.output,
-            cacheRead: stats.tokens.cacheRead,
-            cacheWrite: stats.tokens.cacheWrite,
-            total: stats.tokens.total,
-          },
-          cost: stats.cost,
-        };
-      } catch {
-        return { tokens: 0, cost: 0 };
-      }
-    };
-
-    const disposeSessionOnce = async (targetSession?: AgentSession): Promise<void> => {
-      const activeSession = targetSession ?? session;
-      if (!activeSession) {
-        unsubscribe?.();
-        unsubscribe = undefined;
-        return;
-      }
-      if (session === activeSession) {
-        session = undefined;
-      }
-      unsubscribe?.();
-      unsubscribe = undefined;
-      if (disposedSessions.has(activeSession)) {
-        return;
-      }
-      disposedSessions.add(activeSession);
-      try {
-        if (activeSession.extensionRunner?.hasHandlers("session_shutdown")) {
-          await activeSession.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
-        }
-      } catch {
-        // ignore shutdown hook errors
-      }
-      try {
-        activeSession.dispose();
-      } catch {
-        // ignore dispose error
-      }
-    };
-
-    const makeEarlyAbortResult = (): AgentTurnResult => {
-      state = killed ? "killed" : "stopped";
-      const reason = abortReason ?? "Aborted before session start";
-      if (!killed) {
-        emitTelemetry({
-          type: "aborted",
-          model: currentModelId,
-          activity: "stopped",
-          logLine: `aborted: ${reason}`,
-          error: reason,
-        });
-      }
-      return {
-        agentId: spec.agentId,
-        name: spec.name,
-        missionId: spec.missionId,
-        role: spec.role,
-        outcome: "aborted",
-        summary: reason,
-        model: currentModelId,
-        tokens: 0,
-        cost: 0,
-        error: reason,
-        stopReason: "aborted",
-      };
-    };
-
-    const runPromptTurn = async (
-      promptText: string,
-      options: { isInitialTurn: boolean },
-    ): Promise<AgentTurnResult> => {
-      let caughtError: unknown;
-      assistantRef.current = undefined;
-
-      try {
-        if (options.isInitialTurn) {
-          const agentDir = this.agentDirOverride ?? getAgentDir();
-          modelRuntime = await this.resolveModelRuntime(spec.hostContext, agentDir);
-          const settingsManager = SettingsManager.create(spec.cwd, agentDir);
-          const sessionManager = SessionManager.inMemory(spec.cwd);
-
-          let resolvedModel = spec.hostContext?.model;
-          let resolvedThinking = spec.thinkingLevel;
-
-          if (spec.modelOverride?.trim()) {
-            const cliRes = resolveCliModel({
-              cliModel: spec.modelOverride.trim(),
-              cliThinking: spec.thinkingLevel,
-              modelRuntime,
-            });
-            if (cliRes.model) {
-              resolvedModel = cliRes.model;
-            }
-            if (cliRes.thinkingLevel && !resolvedThinking) {
-              resolvedThinking = cliRes.thinkingLevel;
-            }
-          }
-
-          if (killed || abortedByCaller) {
-            return makeEarlyAbortResult();
-          }
-
-          const resourceLoader = new DefaultResourceLoader({
-            cwd: spec.cwd,
-            agentDir,
-            settingsManager,
-            noExtensions: true,
-            appendSystemPrompt: spec.systemPromptAppendix ? [spec.systemPromptAppendix] : [],
-            extensionFactories: [spec.guardFactory],
-          });
-          await resourceLoader.reload();
-
-          if (killed || abortedByCaller) {
-            return makeEarlyAbortResult();
-          }
-
-          const created = await this.createSessionFn({
-            cwd: spec.cwd,
-            agentDir,
-            modelRuntime,
-            model: resolvedModel,
-            thinkingLevel: resolvedThinking,
-            tools: spec.allowedTools,
-            customTools: spec.customTools,
-            resourceLoader,
-            sessionManager,
-            settingsManager,
-          });
-
-          if (killed || abortedByCaller) {
-            await disposeSessionOnce(created.session);
-            return makeEarlyAbortResult();
-          }
-
-          session = created.session;
-          await session.bindExtensions({});
-
-          if (killed || abortedByCaller) {
-            await disposeSessionOnce(created.session);
-            return makeEarlyAbortResult();
-          }
-
-          currentModelId =
-            formatModelId(session.model ?? resolvedModel) ?? currentModelId;
-
-          // Persistent telemetry + assistant message subscription kept alive across warm turns!
-          unsubscribe = session.subscribe((event: AgentSessionEvent) => {
-            switch (event.type) {
-              case "tool_execution_start": {
-                const activity = formatToolActivity(event.toolName, event.args);
-                emitTelemetry({
-                  type: "tool_start",
-                  toolName: event.toolName,
-                  activity,
-                  logLine: `> ${activity}`,
-                });
-                break;
-              }
-              case "tool_execution_end": {
-                emitTelemetry({
-                  type: "tool_end",
-                  toolName: event.toolName,
-                  activity: event.isError ? `${event.toolName} (error)` : `${event.toolName} (ok)`,
-                  logLine: `< ${event.toolName} (${event.isError ? "error" : "ok"})`,
-                });
-                break;
-              }
-              case "message_update": {
-                if (event.assistantMessageEvent.type === "text_delta") {
-                  const now = Date.now();
-                  if (now - lastTextEmitAt >= 250) {
-                    lastTextEmitAt = now;
-                    const snippet = event.assistantMessageEvent.delta.replace(/\s+/g, " ").trim();
-                    if (snippet) {
-                      emitTelemetry({
-                        type: "text_delta",
-                        activity: "generating response",
-                        logLine: snippet.slice(0, 120),
-                      });
-                    }
-                  }
-                }
-                break;
-              }
-              case "message_end": {
-                if (isAssistantMessage(event.message)) {
-                  assistantRef.current = event.message;
-                }
-                break;
-              }
-              case "turn_end": {
-                if (session) {
-                  const usage = readStats(session);
-                  emitTelemetry({
-                    type: "turn_end",
-                    tokens: usage.tokens,
-                    tokenBreakdown: usage.breakdown,
-                    cost: usage.cost,
-                  });
-                }
-                break;
-              }
-              case "auto_retry_start": {
-                emitTelemetry({
-                  type: "rate_limit",
-                  activity: `retrying (${event.attempt}/${event.maxAttempts})`,
-                  logLine: `retry ${event.attempt}/${event.maxAttempts}: ${event.errorMessage}`,
-                  error: event.errorMessage,
-                });
-                break;
-              }
-              default:
-                break;
-            }
-          });
-
-          emitTelemetry({
-            type: "started",
-            model: currentModelId,
-            activity: spec.startActivity,
-            logLine: `spawned ${spec.role} ${spec.name} (${spec.agentId}) in ${spec.cwd}`,
-          });
-        }
-
-        if (!session) {
-          throw new SwarmProtocolError(
-            "AGENT_KILLED",
-            `Agent "${spec.name}" session is no longer active.`,
-          );
-        }
-
-        if (killed || abortedByCaller) {
-          await session.abort();
-        } else {
-          promptActive = true;
-          const promptPromise = session.prompt(promptText, { expandPromptTemplates: false });
-
-          // Drain any early steer/followUp calls buffered before session.prompt() started
-          if (pendingSteers.length > 0) {
-            for (const queued of pendingSteers.splice(0, pendingSteers.length)) {
-              if (killed || abortedByCaller) {
-                break;
-              }
-              if (queued.mode === "followUp") {
-                await session.followUp(queued.text).catch(() => {});
-              } else {
-                await session.steer(queued.text).catch(() => {});
-              }
-            }
-          }
-
-          await promptPromise;
-
-          // If a validator or final validator ended its initial audit turn without submitting a verdict, nudge once!
-          if (options.isInitialTurn) {
-            const nudgePrompt = spec.getNudgePrompt?.();
-            const currentAssistant = getLastAssistant();
-            if (
-              nudgePrompt &&
-              !killed &&
-              !abortedByCaller &&
-              currentAssistant?.stopReason !== "error" &&
-              currentAssistant?.stopReason !== "aborted"
-            ) {
-              await session.prompt(nudgePrompt, { expandPromptTemplates: false });
-            }
-          }
-        }
-      } catch (err) {
-        caughtError = err;
-      } finally {
-        promptActive = false;
-        pendingSteers.length = 0;
-      }
-
-      // Read stats BEFORE potential disposal
-      const usage = readStats(session);
-
-      // Classify turn outcome (session.prompt() does NOT throw on provider/quota/429 errors!)
-      let outcome: WorkerRunOutcome = "completed";
-      let errorText: string | undefined;
-      let retryAfterMs: number | undefined;
-      const finalAssistant = getLastAssistant();
-      const stopReason = finalAssistant?.stopReason;
-
-      if (killed || abortedByCaller || stopReason === "aborted") {
-        outcome = "aborted";
-        errorText = abortReason ?? finalAssistant?.errorMessage ?? "Aborted";
-      } else if (caughtError !== undefined) {
-        errorText = caughtError instanceof Error ? caughtError.message : String(caughtError);
-        if (isRateLimitOrTransientError(caughtError)) {
-          outcome = "rate_limited";
-          retryAfterMs = parseRetryAfterMs(caughtError);
-        } else {
-          outcome = "failed";
-        }
-      } else if (stopReason === "error") {
-        errorText = finalAssistant?.errorMessage ?? "Provider returned stopReason=error";
-        if (isRateLimitOrTransientError(errorText)) {
-          outcome = "rate_limited";
-          retryAfterMs = parseRetryAfterMs(errorText);
-        } else {
-          outcome = "failed";
-        }
-      }
-
-      const captured = spec.getCapturedResult();
-      const summary =
-        captured.summaryOverride ||
-        extractAssistantText(finalAssistant) ||
-        errorText ||
-        "";
-
-      // Transition handle state cleanly: keep warm in `waiting` when keepWarm && alive!
-      if (killed) {
-        state = "killed";
-        await disposeSessionOnce();
-      } else if (spec.keepWarm && session) {
-        if (outcome === "completed") {
-          state = "waiting";
-          emitTelemetry({
-            type: "completed",
-            activity: "completed turn",
-            logLine: `completed: ${summary.slice(0, 120)}`,
-            tokens: usage.tokens,
-            tokenBreakdown: usage.breakdown,
-            cost: usage.cost,
-          });
-          emitTelemetry({
-            type: "waiting",
-            activity: "waiting (warm)",
-            logLine: `${spec.name} parked warm in waiting state`,
-            tokens: usage.tokens,
-            tokenBreakdown: usage.breakdown,
-            cost: usage.cost,
-          });
-        } else if (outcome === "aborted") {
-          state = "stopped";
-          emitTelemetry({
-            type: "aborted",
-            activity: "stopped",
-            logLine: `aborted: ${errorText ?? "stopped"}`,
-            tokens: usage.tokens,
-            tokenBreakdown: usage.breakdown,
-            cost: usage.cost,
-            error: errorText,
-          });
-        } else if (outcome === "rate_limited") {
-          // Keep warm session alive in `waiting` so orchestrator can hot-switch to a fallback model!
-          state = "waiting";
-          emitTelemetry({
-            type: "rate_limit",
-            activity: "rate limited (warm)",
-            logLine: `rate_limited: ${errorText ?? "429"}`,
-            tokens: usage.tokens,
-            tokenBreakdown: usage.breakdown,
-            cost: usage.cost,
-            error: errorText,
-          });
-        } else {
-          state = "failed";
-          emitTelemetry({
-            type: "error",
-            activity: "failed",
-            logLine: `failed: ${errorText ?? "error"}`,
-            tokens: usage.tokens,
-            tokenBreakdown: usage.breakdown,
-            cost: usage.cost,
-            error: errorText,
-          });
-        }
-      } else {
-        // Non-warm session or session failed before creation -> dispose cleanly
-        state =
-          outcome === "completed" || outcome === "aborted"
-            ? "stopped"
-            : "failed";
-        await disposeSessionOnce();
-        emitTelemetry({
-          type:
-            outcome === "completed"
-              ? "completed"
-              : outcome === "aborted"
-                ? "aborted"
-                : outcome === "rate_limited"
-                  ? "rate_limit"
-                  : "error",
-          activity: outcome,
-          logLine: errorText ? `${outcome}: ${errorText}` : `${outcome}: ${summary.slice(0, 120)}`,
-          tokens: usage.tokens,
-          tokenBreakdown: usage.breakdown,
-          cost: usage.cost,
-          error: errorText,
-        });
-      }
-
-      return {
-        agentId: spec.agentId,
-        name: spec.name,
-        missionId: spec.missionId,
-        role: spec.role,
-        outcome,
-        summary,
-        workerDone: captured.workerDone,
-        reviewVerdict: captured.reviewVerdict,
-        finalAuditVerdict: captured.finalAuditVerdict,
-        model: currentModelId,
-        tokens: usage.tokens,
-        tokenBreakdown: usage.breakdown,
-        cost: usage.cost,
-        error: errorText,
-        stopReason,
-        retryAfterMs,
-      };
-    };
-
-    let currentTurnPromise: Promise<AgentTurnResult> = runPromptTurn(spec.prompt, {
-      isInitialTurn: true,
-    });
-
-    return {
-      agentId: spec.agentId,
-      name: spec.name,
-      missionId: spec.missionId,
-      role: spec.role,
-
-      getState(): RosterAgentStatus {
-        return state;
-      },
-
-      getModel(): string | undefined {
-        return currentModelId;
-      },
-
-      async wake(prompt: string): Promise<AgentTurnResult> {
-        if (killed || state === "killed") {
-          throw new SwarmProtocolError(
-            "AGENT_KILLED",
-            `Agent "${spec.name}" (${spec.agentId}) has been killed and cannot be woken.`,
-          );
-        }
-        if (switchingModel) {
-          throw new SwarmProtocolError(
-            "AGENT_NOT_WAITING",
-            `Agent "${spec.name}" (${spec.agentId}) is currently switching models; retry wake once model switch completes.`,
-          );
-        }
-        if (state !== "waiting" || promptActive) {
-          throw new SwarmProtocolError(
-            "AGENT_NOT_WAITING",
-            `Agent "${spec.name}" (${spec.agentId}) is not waiting (currently "${state}"); cannot wake.`,
-          );
-        }
-        if (!session) {
-          throw new SwarmProtocolError(
-            "AGENT_KILLED",
-            `Agent "${spec.name}" (${spec.agentId}) does not have an active persistent session.`,
-          );
-        }
-
-        // Preserve 100% conversation history on the exact same AgentSession!
-        spec.resetCaptured();
-        abortedByCaller = false;
-        abortReason = undefined;
-        state = "working";
-
-        emitTelemetry({
-          type: "woken",
-          model: currentModelId,
-          activity: "woken by board",
-          logLine: `woken ${spec.name}: ${prompt.replace(/\s+/g, " ").trim().slice(0, 100)}`,
-        });
-
-        currentTurnPromise = runPromptTurn(prompt, { isInitialTurn: false });
-        return currentTurnPromise;
-      },
-
-      async steer(message: string): Promise<void> {
-        if (killed || state === "killed" || abortedByCaller) {
-          return;
-        }
-        if (!session || !promptActive) {
-          if (state === "working") {
-            pendingSteers.push({ text: message, mode: "steer" });
-          }
-          return;
-        }
-        await session.steer(message);
-      },
-
-      async followUp(message: string): Promise<void> {
-        if (killed || state === "killed" || abortedByCaller) {
-          return;
-        }
-        if (!session || !promptActive) {
-          if (state === "working") {
-            pendingSteers.push({ text: message, mode: "followUp" });
-          }
-          return;
-        }
-        await session.followUp(message);
-      },
-
-      async switchModel(
-        modelOverride: string,
-        thinkingLevel?: ThinkingLevel,
-      ): Promise<ModelSwitchResult> {
-        if (killed || state === "killed") {
-          throw new SwarmProtocolError(
-            "AGENT_KILLED",
-            `Agent "${spec.name}" (${spec.agentId}) has been killed and cannot switch models.`,
-          );
-        }
-        if (switchingModel || state !== "waiting" || promptActive) {
-          throw new SwarmProtocolError(
-            "AGENT_NOT_WAITING",
-            `Agent "${spec.name}" (${spec.agentId}) is not in waiting state (currently "${switchingModel ? "switchingModel" : state}"). Wait until it parks in waiting state before switching models.`,
-          );
-        }
-        const activeSession = session;
-        const activeRuntime = modelRuntime;
-        if (!activeSession || !activeRuntime) {
-          throw new SwarmProtocolError(
-            "AGENT_KILLED",
-            `Agent "${spec.name}" (${spec.agentId}) has no live session for model switching.`,
-          );
-        }
-
-        const trimmed = modelOverride.trim();
-        if (!trimmed) {
-          throw new SwarmProtocolError("MODEL_NOT_FOUND", "Model identifier must be non-empty.");
-        }
-
-        const cliRes = resolveCliModel({
-          cliModel: trimmed,
-          cliThinking: thinkingLevel,
-          modelRuntime: activeRuntime,
-        });
-        if (!cliRes.model) {
-          throw new SwarmProtocolError(
-            "MODEL_NOT_FOUND",
-            `Model "${trimmed}" could not be resolved in the active Pi model registry.`,
-            { modelOverride: trimmed },
-          );
-        }
-
-        switchingModel = true;
-        try {
-          await activeSession.setModel(cliRes.model, { persist: false });
-
-          const postSwitchState = getCurrentState();
-          if (isKilled() || postSwitchState === "killed" || !session || session !== activeSession) {
-            throw new SwarmProtocolError(
-              "AGENT_KILLED",
-              `Agent "${spec.name}" (${spec.agentId}) was killed while switching models.`,
-            );
-          }
-          if (isAbortedByCaller() || postSwitchState !== "waiting") {
-            throw new SwarmProtocolError(
-              "AGENT_NOT_WAITING",
-              `Agent "${spec.name}" (${spec.agentId}) stopped waiting (currently "${postSwitchState}") while switching models.`,
-            );
-          }
-
-          const effectiveThinking = thinkingLevel ?? cliRes.thinkingLevel;
-          if (effectiveThinking) {
-            activeSession.setThinkingLevel(effectiveThinking, { persist: false });
-          }
-
-          const resolvedId = formatModelId(cliRes.model) ?? trimmed;
-          currentModelId = resolvedId;
-
-          emitTelemetry({
-            type: "model_switched",
-            model: resolvedId,
-            activity: `switched model -> ${resolvedId}`,
-            logLine: `model switched -> ${resolvedId}${effectiveThinking ? ` (${effectiveThinking})` : ""}`,
-          });
-
-          return {
-            model: resolvedId,
-            thinkingLevel: effectiveThinking,
-          };
-        } finally {
-          switchingModel = false;
-        }
-      },
-
-      async abort(reason?: string): Promise<void> {
-        if (killed || state === "killed") {
-          return;
-        }
-        abortedByCaller = true;
-        abortReason = reason ?? "Aborted";
-        if (session && promptActive) {
-          try {
-            await session.abort();
-          } catch {
-            // ignore abort race
-          }
-        } else {
-          state = "stopped";
-        }
-      },
-
-      async kill(reason?: string): Promise<void> {
-        if (killed || state === "killed") {
-          return;
-        }
-        killed = true;
-        abortedByCaller = true;
-        abortReason = reason ?? "Killed";
-        state = "killed";
-        pendingSteers.length = 0;
-
-        if (session && promptActive) {
-          try {
-            await session.abort();
-          } catch {
-            // ignore abort race
-          }
-        }
-        await disposeSessionOnce();
-
-        emitTelemetry({
-          type: "killed",
-          model: currentModelId,
-          activity: reason ?? "killed",
-          logLine: `killed ${spec.name}: ${reason ?? "session disposed"}`,
-        });
-      },
-
-      get currentTurn(): Promise<AgentTurnResult> {
-        return currentTurnPromise;
-      },
-    };
   }
 }

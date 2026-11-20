@@ -5,15 +5,14 @@ import {
   matchesKey,
   type TUI,
 } from "@earendil-works/pi-tui";
-import { FINAL_AUDIT_MISSION_ID } from "../constants.js";
 import type {
   BoardMessage,
-  FinalAuditStatus,
-  FinalAuditVerdict,
-  MissionRecord,
-  RosterEntry,
+  SwarmChannelRecord,
   SwarmDraftMode,
   SwarmEvent,
+  SwarmMemberRecord,
+  SwarmMemberRole,
+  SwarmMemberState,
   SwarmModelRole,
   SwarmRoleModels,
   SwarmRunState,
@@ -21,23 +20,20 @@ import type {
   SwarmSnapshot,
 } from "../types.js";
 import {
-  computeActiveFinalAuditRound,
-  computeMissionWaves,
+  buildSwarmGraphLines,
   fitLine,
   formatBoardKindBadge,
   formatCost,
   formatDuration,
   formatElapsedSince,
-  formatFinalAuditBadge,
-  formatMissionKindBadge,
-  formatMissionStatusBadge,
-  formatReviewBadge,
+  formatMemberRoleBadge,
+  formatMemberStateBadge,
   formatRoleModelsLine,
-  formatRosterRoleBadge,
-  formatRosterStatusBadge,
   formatRunStatusBadge,
   formatTokens,
+  formatWorkspaceBadge,
   joinColumns,
+  memberStateIcon,
   renderBox,
   renderHorizontalRule,
   renderTable,
@@ -60,11 +56,9 @@ export interface SwarmWidgetState {
 export interface SwarmWidgetOptions {
   /** Spinner animation interval in milliseconds (default: 100ms). */
   spinnerIntervalMs?: number;
-  /** Maximum working agents shown in compact mode before "+N more" (default: 3). */
+  /** Maximum working members shown in compact mode before "+N more" (default: 4). */
   maxCompactWorkers?: number;
-  /** Maximum recent ledger events shown in expanded mode (default: 5). */
-  maxRecentEvents?: number;
-  /** Maximum recent board messages shown in expanded mode (default: 3). */
+  /** Maximum recent board messages shown in expanded mode (default: 5). */
   maxRecentBoard?: number;
   /** Optional host session model fallback for 3-role display. */
   hostModel?: string;
@@ -88,6 +82,14 @@ export interface StatusDashboardOptions {
 
 export interface BoardViewOptions {
   runId?: string;
+  channel?: string;
+}
+
+export interface GraphViewOptions {
+  /** Render width for the ASCII/Unicode graph block (default: 88). */
+  width?: number;
+  /** Optional full board override (defaults to `snapshot.recentBoard`). */
+  board?: readonly BoardMessage[];
 }
 
 export function createSwarmWidgetState(
@@ -106,43 +108,96 @@ export function isModalOpen(state: Pick<SwarmWidgetState, "modalDepth">): boolea
   return state.modalDepth > 0;
 }
 
-function getOrderedMissions(run: SwarmRunState): MissionRecord[] {
+// ============================================================================
+// Internal Snapshot & Formatting Helpers
+// ============================================================================
+
+function getOrderedMembers(run: SwarmRunState): SwarmMemberRecord[] {
   const seen = new Set<string>();
-  const out: MissionRecord[] = [];
-  for (const id of run.missionOrder) {
-    const m = run.missions[id];
-    if (m) {
-      seen.add(id);
-      out.push(m);
+  const out: SwarmMemberRecord[] = [];
+  for (const name of run.memberOrder) {
+    const member = run.members[name];
+    if (member) {
+      seen.add(name);
+      out.push(member);
     }
   }
-  for (const m of Object.values(run.missions)) {
-    if (!seen.has(m.id)) {
-      out.push(m);
+  for (const member of Object.values(run.members)) {
+    if (!seen.has(member.name)) {
+      out.push(member);
     }
   }
   return out;
 }
 
-function getEffectiveFinalAuditStatus(
-  snapshot: SwarmSnapshot,
-  run: SwarmRunState,
-): FinalAuditStatus {
-  return snapshot.finalAuditStatus ?? run.finalAuditStatus ?? "idle";
+function memberStateRank(state: SwarmMemberState): number {
+  switch (state) {
+    case "working":
+      return 0;
+    case "waiting":
+      return 1;
+    case "stopped":
+      return 2;
+    case "killed":
+      return 3;
+  }
 }
 
-function getEffectiveLatestFinalAudit(
-  snapshot: SwarmSnapshot,
-  run: SwarmRunState,
-): FinalAuditVerdict | undefined {
-  return snapshot.latestFinalAudit ?? run.latestFinalAudit;
+function getSortedMembers(run: SwarmRunState): SwarmMemberRecord[] {
+  const ordered = getOrderedMembers(run);
+  const orderIdx = new Map<string, number>();
+  ordered.forEach((m, idx) => orderIdx.set(m.name, idx));
+  return [...ordered].sort((a, b) => {
+    const rDiff = memberStateRank(a.state) - memberStateRank(b.state);
+    if (rDiff !== 0) return rDiff;
+    return (orderIdx.get(a.name) ?? 0) - (orderIdx.get(b.name) ?? 0);
+  });
 }
 
-function isFinalAuditRunning(
+function getWorkingMembers(
   snapshot: SwarmSnapshot,
   run: SwarmRunState,
-): boolean {
-  return run.status === "verifying" || Boolean(snapshot.finalAuditRunningAgentId);
+): SwarmMemberRecord[] {
+  const workingNames = new Set(snapshot.workingMemberNames);
+  return getOrderedMembers(run).filter(
+    (m) =>
+      m.state === "working" ||
+      (workingNames.has(m.name) &&
+        m.state !== "waiting" &&
+        m.state !== "stopped" &&
+        m.state !== "killed"),
+  );
+}
+
+function getWaitingMembers(
+  snapshot: SwarmSnapshot,
+  run: SwarmRunState,
+): SwarmMemberRecord[] {
+  const waitingNames = new Set(snapshot.waitingMemberNames);
+  const workingNames = new Set(snapshot.workingMemberNames);
+  return getOrderedMembers(run).filter(
+    (m) =>
+      m.state === "waiting" ||
+      (waitingNames.has(m.name) &&
+        !workingNames.has(m.name) &&
+        m.state !== "working" &&
+        m.state !== "stopped" &&
+        m.state !== "killed"),
+  );
+}
+
+function getWorkingCount(
+  snapshot: SwarmSnapshot,
+  workingMembers: readonly SwarmMemberRecord[],
+): number {
+  return Math.max(workingMembers.length, snapshot.workingMemberNames.length);
+}
+
+function getWaitingCount(
+  snapshot: SwarmSnapshot,
+  waitingMembers: readonly SwarmMemberRecord[],
+): number {
+  return Math.max(waitingMembers.length, snapshot.waitingMemberNames.length);
 }
 
 function resolveEffectiveRoleModels(
@@ -159,119 +214,7 @@ function resolveEffectiveRoleModels(
   };
 }
 
-function buildWorkingIdSet(snapshot: SwarmSnapshot): Set<string> {
-  const set = new Set<string>(snapshot.workingAgentIds);
-  if (snapshot.finalAuditRunningAgentId) {
-    set.add(snapshot.finalAuditRunningAgentId);
-  }
-  return set;
-}
-
-function findRunningFinalValidatorEntry(
-  snapshot: SwarmSnapshot,
-  run: SwarmRunState,
-): RosterEntry | undefined {
-  if (snapshot.finalAuditRunningAgentId) {
-    const byId = run.roster[snapshot.finalAuditRunningAgentId];
-    if (byId) return byId;
-  }
-  const workingIds = buildWorkingIdSet(snapshot);
-  const entries = Object.values(run.roster)
-    .filter(
-      (entry) =>
-        entry.role === "final-validator" || entry.missionId === FINAL_AUDIT_MISSION_ID,
-    )
-    .sort((a, b) => b.startedAt.localeCompare(a.startedAt));
-  return entries.find(
-    (entry) => entry.status === "working" || workingIds.has(entry.agentId),
-  );
-}
-
-function getWorkingRosterEntries(snapshot: SwarmSnapshot): RosterEntry[] {
-  const run = snapshot.run;
-  if (!run) return [];
-  const workingIds = buildWorkingIdSet(snapshot);
-  return Object.values(run.roster)
-    .filter(
-      (entry) =>
-        entry.status === "working" ||
-        (workingIds.has(entry.agentId) &&
-          entry.status !== "waiting" &&
-          entry.status !== "killed" &&
-          entry.status !== "stopped"),
-    )
-    .sort((a, b) => a.startedAt.localeCompare(b.startedAt));
-}
-
-function getWaitingRosterEntries(snapshot: SwarmSnapshot): RosterEntry[] {
-  const run = snapshot.run;
-  if (!run) return [];
-  const waitingIds = new Set(snapshot.waitingAgentIds);
-  const workingIds = buildWorkingIdSet(snapshot);
-  return Object.values(run.roster)
-    .filter(
-      (entry) =>
-        entry.status === "waiting" ||
-        (waitingIds.has(entry.agentId) &&
-          !workingIds.has(entry.agentId) &&
-          entry.status !== "working"),
-    )
-    .sort((a, b) => a.startedAt.localeCompare(b.startedAt));
-}
-
-function getWorkingCount(
-  snapshot: SwarmSnapshot,
-  workingRoster: readonly RosterEntry[],
-): number {
-  return Math.max(workingRoster.length, snapshot.workingAgentIds.length);
-}
-
-function getWaitingCount(
-  snapshot: SwarmSnapshot,
-  waitingRoster: readonly RosterEntry[],
-): number {
-  return Math.max(waitingRoster.length, snapshot.waitingAgentIds.length);
-}
-
-function rosterStatusRank(
-  entry: RosterEntry,
-  workingIds: ReadonlySet<string>,
-  waitingIds: ReadonlySet<string>,
-): number {
-  if (entry.status === "working" || workingIds.has(entry.agentId)) return 0;
-  if (entry.status === "waiting" || waitingIds.has(entry.agentId)) return 1;
-  if (entry.status === "stopped") return 2;
-  if (entry.status === "failed" || entry.status === "died") return 3;
-  return 4; // killed
-}
-
-function getAllRosterEntries(
-  snapshot: SwarmSnapshot,
-  run: SwarmRunState,
-): RosterEntry[] {
-  const workingIds = buildWorkingIdSet(snapshot);
-  const waitingIds = new Set(snapshot.waitingAgentIds);
-  return Object.values(run.roster).sort((a, b) => {
-    const rankA = rosterStatusRank(a, workingIds, waitingIds);
-    const rankB = rosterStatusRank(b, workingIds, waitingIds);
-    if (rankA !== rankB) return rankA - rankB;
-    const aFinal = a.role === "final-validator" ? 0 : 1;
-    const bFinal = b.role === "final-validator" ? 0 : 1;
-    if (rankA === 0 && aFinal !== bFinal) return aFinal - bFinal;
-    return b.startedAt.localeCompare(a.startedAt);
-  });
-}
-
-function countMergedMissions(missions: readonly MissionRecord[]): number {
-  let count = 0;
-  for (const m of missions) {
-    if (m.status === "merged") count++;
-  }
-  return count;
-}
-
 function formatEventClock(timestamp: string): string {
-  // ISO 8601: 2026-11-20T17:45:00.000Z -> 17:45:00
   const tIndex = timestamp.indexOf("T");
   if (tIndex >= 0 && timestamp.length >= tIndex + 9) {
     return timestamp.slice(tIndex + 1, tIndex + 9);
@@ -279,18 +222,54 @@ function formatEventClock(timestamp: string): string {
   return timestamp.slice(0, 8);
 }
 
-function formatScopeCompact(scope: readonly string[]): string {
-  if (scope.length === 0) return "—";
-  if (scope.length === 1) return scope[0]!;
-  return `${scope[0]} +${scope.length - 1}`;
+function formatBoardTargets(msg: Pick<BoardMessage, "mentions" | "channelMentions">): string {
+  const targets: string[] = [];
+  for (const m of msg.mentions) {
+    const clean = sanitizePlainText(m);
+    if (clean) targets.push(clean.startsWith("@") ? clean : `@${clean}`);
+  }
+  for (const ch of msg.channelMentions ?? []) {
+    const clean = sanitizePlainText(ch).replace(/^@#?/, "");
+    if (clean) targets.push(`@#${clean}`);
+  }
+  if (targets.length === 0) return "";
+  return ` -> ${targets.join(", ")}`;
 }
 
-function formatBoardMentionsSuffix(mentions: readonly string[]): string {
-  if (mentions.length === 0) return "";
-  const formatted = mentions
-    .map((m) => (m.startsWith("@") ? m : `@${m}`))
-    .join(", ");
-  return ` -> ${formatted}`;
+function formatRoleShortBadge(role: SwarmMemberRole, theme?: Theme): string {
+  const raw = role === "validator" ? "V" : "W";
+  if (!theme) return `[${raw}]`;
+  return role === "validator"
+    ? theme.fg("warning", `[${raw}]`)
+    : theme.fg("accent", `[${raw}]`);
+}
+
+function getOrderedChannels(run: SwarmRunState): SwarmChannelRecord[] {
+  const list = Object.values(run.channels);
+  return list.sort((a, b) => {
+    if (a.name === "main" && b.name !== "main") return -1;
+    if (b.name === "main" && a.name !== "main") return 1;
+    if (a.archived !== b.archived) return a.archived ? 1 : -1;
+    return a.name.localeCompare(b.name);
+  });
+}
+
+function formatChannelsSummaryInline(
+  run: SwarmRunState,
+  theme?: Theme,
+): string {
+  const channels = getOrderedChannels(run);
+  if (channels.length === 0) {
+    return theme ? theme.fg("dim", "#main") : "#main";
+  }
+  return channels
+    .map((ch) => {
+      const count = ch.subscribers.length;
+      const base = `#${ch.name}(${count})${ch.archived ? "[archived]" : ""}`;
+      if (!theme) return base;
+      return ch.archived ? theme.fg("dim", base) : theme.fg("accent", base);
+    })
+    .join(theme ? theme.fg("dim", " · ") : " · ");
 }
 
 // ============================================================================
@@ -304,7 +283,6 @@ class SwarmDashboardComponent implements Component {
 
   private readonly spinnerIntervalMs: number;
   private readonly maxCompactWorkers: number;
-  private readonly maxRecentEvents: number;
   private readonly maxRecentBoard: number;
   private readonly hostModel?: string;
   private readonly now: () => number;
@@ -317,19 +295,18 @@ class SwarmDashboardComponent implements Component {
     options?: SwarmWidgetOptions,
   ) {
     this.spinnerIntervalMs = Math.max(40, options?.spinnerIntervalMs ?? 100);
-    this.maxCompactWorkers = Math.max(1, options?.maxCompactWorkers ?? 3);
-    this.maxRecentEvents = Math.max(1, options?.maxRecentEvents ?? 5);
-    this.maxRecentBoard = Math.max(1, options?.maxRecentBoard ?? 3);
+    this.maxCompactWorkers = Math.max(1, options?.maxCompactWorkers ?? 4);
+    this.maxRecentBoard = Math.max(1, options?.maxRecentBoard ?? 5);
     this.hostModel = options?.hostModel;
     this.now = options?.now ?? (() => Date.now());
   }
 
-  private syncSpinnerTimer(hasWorkingAgents: boolean): void {
+  private syncSpinnerTimer(hasWorkingMembers: boolean): void {
     if (this.disposed) {
       this.stopTimer();
       return;
     }
-    if (hasWorkingAgents && !this.spinnerTimer) {
+    if (hasWorkingMembers && !this.spinnerTimer) {
       this.spinnerTimer = setInterval(() => {
         if (this.disposed) {
           this.stopTimer();
@@ -341,7 +318,7 @@ class SwarmDashboardComponent implements Component {
       if (typeof this.spinnerTimer.unref === "function") {
         this.spinnerTimer.unref();
       }
-    } else if (!hasWorkingAgents && this.spinnerTimer) {
+    } else if (!hasWorkingMembers && this.spinnerTimer) {
       this.stopTimer();
     }
   }
@@ -365,264 +342,63 @@ class SwarmDashboardComponent implements Component {
   private renderDraftBanner(width: number): string[] {
     const modeLabel =
       this.state.draftMode === "tweak" ? "Swarm Plan Revision" : "Swarm Draft";
-    const seedPart = this.state.draftSeed
-      ? ` — ${sanitizePlainText(this.state.draftSeed)}`
-      : " — answering questions / refining plan";
-    const left = `${this.theme.fg("accent", this.theme.bold(`🐝 ${modeLabel}`))}${this.theme.fg("muted", seedPart)}`;
+    const seedSuffix = this.state.draftSeed
+      ? `: ${sanitizePlainText(this.state.draftSeed)}`
+      : "";
+    const desc = ` — clarifying requirements & strategy${seedSuffix}`;
+    const left = `${this.theme.fg("accent", this.theme.bold(`🐝 ${modeLabel}`))}${this.theme.fg("muted", desc)}`;
     const right = this.theme.fg("dim", "/swarm cancel");
     const line =
-      width >= 56
+      width >= 60
         ? joinColumns(left, right, width)
         : fitLine(`${left} · ${right}`, width);
     return [fitLine(line, width)];
   }
 
-  private renderAgentLine(
-    entry: RosterEntry,
+  private renderWorkingMemberLine(
+    member: SwarmMemberRecord,
     width: number,
     nowMs: number,
-    options?: { showStatus?: boolean },
   ): string {
-    const spinColor = entry.role === "final-validator" ? "borderAccent" : "accent";
-    const glyph =
-      entry.status === "working"
-        ? this.theme.fg(spinColor, SPINNER_FRAMES[this.spinnerFrame]!)
-        : entry.status === "waiting"
-          ? this.theme.fg("muted", "◌")
-          : entry.status === "killed"
-            ? this.theme.fg("dim", "⊘")
-            : entry.status === "failed" || entry.status === "died"
-              ? this.theme.fg("error", "✗")
-              : this.theme.fg("warning", "■");
-
-    const missionLabel =
-      entry.missionId === FINAL_AUDIT_MISSION_ID ? "FINAL" : entry.missionId;
-    const roleLabel = formatRosterRoleBadge(entry.role, this.theme);
-    const idAndRole = `${this.theme.bold(missionLabel)} (${roleLabel})`;
-    const statusPart = options?.showStatus
-      ? ` ${formatRosterStatusBadge(entry.status, this.theme)}`
-      : "";
-    const modelShort = entry.model ? shortenModelName(entry.model, 18) : "";
-    const modelPart =
-      modelShort && width >= 66
-        ? ` ${this.theme.fg("dim", `[${modelShort}]`)}`
-        : "";
+    const spinColor = member.role === "validator" ? "warning" : "accent";
+    const glyph = this.theme.fg(spinColor, SPINNER_FRAMES[this.spinnerFrame]!);
+    const rolePill = formatRoleShortBadge(member.role, this.theme);
+    const nameStr = this.theme.bold(sanitizePlainText(member.name));
     const activityRaw =
-      entry.status === "waiting"
-        ? entry.currentActivity || `waiting warm (turns:${entry.turns})`
-        : entry.currentActivity ||
-          (entry.lastTool ? `tool:${entry.lastTool}` : entry.status);
+      member.currentActivity ||
+      (member.lastTool ? `tool:${member.lastTool}` : "working");
     const activity = this.theme.fg("muted", sanitizePlainText(activityRaw));
     const elapsed = this.theme.fg(
       "dim",
-      entry.endedAt
-        ? formatDuration(
-            Math.max(0, Date.parse(entry.endedAt) - Date.parse(entry.startedAt)),
-          )
-        : formatElapsedSince(entry.startedAt, nowMs),
+      formatElapsedSince(member.createdAt, nowMs),
     );
 
-    if (width < 52) {
-      return fitLine(`  ${glyph} ${idAndRole}${statusPart} ${elapsed}`, width);
+    if (width < 48) {
+      return fitLine(`  ${glyph} ${rolePill} ${nameStr} ${elapsed}`, width);
     }
 
-    return fitLine(
-      joinColumns(
-        `  ${glyph} ${idAndRole}${statusPart}${modelPart} ${activity}`,
-        elapsed,
-        width,
-      ),
-      width,
-    );
-  }
-
-  private renderVerifyingSpinnerLine(
-    snapshot: SwarmSnapshot,
-    run: SwarmRunState,
-    width: number,
-    nowMs: number,
-  ): string {
-    const validator = findRunningFinalValidatorEntry(snapshot, run);
-    const auditStatus = getEffectiveFinalAuditStatus(snapshot, run);
-    const latestAudit = getEffectiveLatestFinalAudit(snapshot, run);
-    const round = computeActiveFinalAuditRound(
-      auditStatus,
-      run.finalAuditRound,
-      latestAudit,
-      true,
-    );
-    const maxRounds = Math.max(1, run.maxFinalAuditRounds || 1);
-    const spin = this.theme.fg(
-      "borderAccent",
-      SPINNER_FRAMES[this.spinnerFrame]!,
-    );
-    const activityRaw =
-      validator?.currentActivity ||
-      (validator?.lastTool
-        ? `tool:${validator.lastTool}`
-        : "auditing final integration");
-    const header = `${this.theme.fg("borderAccent", this.theme.bold(`🔍 Final Validator (round ${round}/${maxRounds})`))} · base:${this.theme.fg("accent", run.baseBranch)} · ${this.theme.fg("muted", sanitizePlainText(activityRaw))}`;
-
-    if (validator && width >= 72) {
-      const elapsed = this.theme.fg(
-        "dim",
-        formatElapsedSince(validator.startedAt, nowMs),
-      );
-      return fitLine(joinColumns(`  ${spin} ${header}`, elapsed, width), width);
-    }
-
-    return fitLine(`  ${spin} ${header}`, width);
-  }
-
-  private renderFinalValidationLine(
-    snapshot: SwarmSnapshot,
-    run: SwarmRunState,
-    width: number,
-  ): string {
-    const enabledPill = run.finalValidatorEnabled
-      ? this.theme.fg("success", "ON")
-      : this.theme.fg("muted", "OFF");
-    const auditStatus = getEffectiveFinalAuditStatus(snapshot, run);
-    const latestAudit = getEffectiveLatestFinalAudit(snapshot, run);
-    const maxRounds = Math.max(1, run.maxFinalAuditRounds || 1);
-    const round = computeActiveFinalAuditRound(
-      auditStatus,
-      run.finalAuditRound,
-      latestAudit,
-      auditStatus === "running",
-    );
-    const badge = formatFinalAuditBadge(auditStatus, round, maxRounds, this.theme);
-
-    const parts: string[] = [
-      `${this.theme.fg("muted", "Final Validation:")} ${enabledPill}`,
-      badge,
-    ];
-    if (round === 0 && run.finalValidatorEnabled) {
-      parts.push(this.theme.fg("dim", `round 0/${maxRounds}`));
-    }
-    if (latestAudit) {
-      const totalChecks = latestAudit.checks.length;
-      const passedChecks = latestAudit.checks.filter((c) => c.passed).length;
-      const findingsCount = latestAudit.findings.length;
-      if (totalChecks > 0) {
-        const checksColor = passedChecks === totalChecks ? "success" : "warning";
-        parts.push(
-          this.theme.fg(checksColor, `checks ${passedChecks}/${totalChecks}`),
-        );
-      }
-      const findingsColor = findingsCount > 0 ? "error" : "success";
-      parts.push(
-        this.theme.fg(
-          findingsColor,
-          `${findingsCount} finding${findingsCount === 1 ? "" : "s"}`,
-        ),
-      );
-    } else if (auditStatus === "skipped" && run.finalAuditSkipReason) {
-      parts.push(this.theme.fg("dim", sanitizePlainText(run.finalAuditSkipReason)));
-    }
-
-    return fitLine(parts.join(" · "), width);
+    const left = `  ${glyph} ${rolePill} ${nameStr} ${activity}`;
+    return fitLine(joinColumns(left, elapsed, width), width);
   }
 
   private renderBoardPreviewLine(msg: BoardMessage, width: number): string {
     const seqStr = this.theme.fg("accent", `#${msg.seq}`);
+    const chStr = this.theme.fg("dim", `[#${sanitizePlainText(msg.channel || "main")}]`);
     const fromStr = this.theme.bold(sanitizePlainText(msg.from));
+    const targets = formatBoardTargets(msg);
+    const targetsStyled = targets ? this.theme.fg("accent", targets) : "";
     const textStr = this.theme.fg("muted", sanitizePlainText(msg.text));
-    return fitLine(`  💬 ${seqStr} ${fromStr}: ${textStr}`, width);
-  }
-
-  private renderAttentionLines(
-    snapshot: SwarmSnapshot,
-    run: SwarmRunState,
-    missions: readonly MissionRecord[],
-    width: number,
-    nowMs: number,
-  ): string[] {
-    const out: string[] = [];
-
-    const auditStatus = getEffectiveFinalAuditStatus(snapshot, run);
-    if (auditStatus === "disapproved") {
-      const latestAudit = getEffectiveLatestFinalAudit(snapshot, run);
-      const findingsCount = latestAudit?.findings.length ?? 0;
-      const findingsText = `${findingsCount} finding${findingsCount === 1 ? "" : "s"}`;
-      out.push(
-        fitLine(
-          this.theme.fg(
-            "error",
-            `  ⚠ Final Validator disapproved (${findingsText}) — /swarm verify | /swarm verify --skip | add fix mission`,
-          ),
-          width,
-        ),
-      );
-    }
-
-    if (snapshot.rateLimitUntil && snapshot.rateLimitUntil > nowMs) {
-      const rem = formatDuration(snapshot.rateLimitUntil - nowMs);
-      const reason = snapshot.rateLimitReason
-        ? ` — ${sanitizePlainText(snapshot.rateLimitReason)}`
-        : "";
-      out.push(
-        fitLine(
-          this.theme.fg("warning", `  ⏳ Rate-limit backoff (${rem})${reason}`),
-          width,
-        ),
-      );
-    }
-
-    if (snapshot.pendingArtifactApprovals.length > 0) {
-      const ids = snapshot.pendingArtifactApprovals.join(", ");
-      const hint =
-        snapshot.pendingArtifactApprovals.length === 1
-          ? `/swarm approve ${snapshot.pendingArtifactApprovals[0]}`
-          : "/swarm approve <id>";
-      out.push(
-        fitLine(
-          this.theme.fg(
-            "warning",
-            `  ⚠ Awaiting sign-off: ${ids} · run ${hint}`,
-          ),
-          width,
-        ),
-      );
-    }
-
-    const failedOrStopped = missions
-      .filter((m) => m.status === "failed" || (m.status === "stopped" && m.humanStopped))
-      .map((m) => m.id);
-    if (failedOrStopped.length > 0) {
-      out.push(
-        fitLine(
-          this.theme.fg(
-            "error",
-            `  ⚠ Needs attention: ${failedOrStopped.join(", ")} · /swarm tasks`,
-          ),
-          width,
-        ),
-      );
-    } else if (
-      snapshot.readyToMerge.length > 0 &&
-      snapshot.pendingArtifactApprovals.length === 0
-    ) {
-      out.push(
-        fitLine(
-          this.theme.fg(
-            "success",
-            `  ✓ Ready to merge: ${snapshot.readyToMerge.join(", ")}`,
-          ),
-          width,
-        ),
-      );
-    }
-
-    return out;
+    return fitLine(
+      `  ${seqStr} ${chStr} ${fromStr}${targetsStyled}: ${textStr}`,
+      width,
+    );
   }
 
   private renderCompact(
     snapshot: SwarmSnapshot,
     run: SwarmRunState,
-    missions: readonly MissionRecord[],
-    workingRoster: readonly RosterEntry[],
-    waitingRoster: readonly RosterEntry[],
+    workingMembers: readonly SwarmMemberRecord[],
+    waitingMembers: readonly SwarmMemberRecord[],
     width: number,
     nowMs: number,
   ): string[] {
@@ -632,101 +408,98 @@ class SwarmDashboardComponent implements Component {
       lines.push(...this.renderDraftBanner(width));
     }
 
-    const merged = countMergedMissions(missions);
-    const total = missions.length;
-    const workingCount = getWorkingCount(snapshot, workingRoster);
-    const waitingCount = getWaitingCount(snapshot, waitingRoster);
+    const titleText = sanitizePlainText(run.title || run.objective) || run.id;
     const statusBadge = formatRunStatusBadge(run.status, this.theme);
-    const objSnippet = sanitizePlainText(run.objective);
-    const boardTag = this.theme.fg("accent", `board:#${snapshot.boardHead}`);
+    const workingCount = getWorkingCount(snapshot, workingMembers);
+    const waitingCount = getWaitingCount(snapshot, waitingMembers);
+    const boardTag = this.theme.fg("accent", `Board:#${snapshot.boardHead}`);
+    const fleetTag = `${this.theme.fg("accent", `${workingCount}w`)}/${this.theme.fg("muted", `${waitingCount}wait`)}`;
     const roleModels = resolveEffectiveRoleModels(snapshot, run);
-
-    const valPill = run.validatorEnabled
-      ? this.theme.fg("success", "val:ON")
-      : this.theme.fg("muted", "val:OFF");
-    const slotsPill = this.theme.fg(
-      "accent",
-      `${workingCount}/${snapshot.maxConcurrency}`,
-    );
-    const usagePill = this.theme.fg(
-      "muted",
-      `${formatTokens(snapshot.totalTokens)} · ${formatCost(snapshot.totalCost)}`,
-    );
+    const shortcutTag = this.theme.fg("dim", "[Ctrl+Shift+T · /swarm tasks]");
 
     if (width < 58) {
-      const compactHeader = `${this.theme.fg("accent", this.theme.bold("🐝 Swarm"))} [${statusBadge}] ${merged}/${total} · ${boardTag}`;
-      lines.push(fitLine(compactHeader, width));
-      const modelsPill = formatRoleModelsLine(roleModels, this.hostModel ?? "default", {
-        maxWidth: Math.max(1, width - 2),
-        theme: this.theme,
-        includeThinking: false,
-      });
-      lines.push(fitLine(`  ${modelsPill}`, width));
-    } else if (width < 100) {
-      const left = `${this.theme.fg("accent", this.theme.bold("🐝 Swarm"))} [${statusBadge}] ${objSnippet}`;
-      const right = `${merged}/${total} merged · ${boardTag}`;
+      const left = this.theme.fg("accent", this.theme.bold(`🐝 ${titleText}`));
+      const right = `${statusBadge} · ${boardTag} · ${fleetTag}`;
       lines.push(fitLine(joinColumns(left, right, width), width));
-
-      const rightMeta = `${slotsPill} · ${valPill} · ${usagePill}`;
-      const modelsBudget = Math.max(12, width - visibleWidth(rightMeta) - 4);
-      const modelsPill = formatRoleModelsLine(roleModels, this.hostModel ?? "default", {
-        maxWidth: modelsBudget,
-        theme: this.theme,
-        includeThinking: false,
-      });
-      lines.push(fitLine(joinColumns(`  ${modelsPill}`, rightMeta, width), width));
-    } else {
-      const left = `${this.theme.fg("accent", this.theme.bold("🐝 Swarm"))} [${statusBadge}] ${objSnippet}`;
-      const right = `base:${this.theme.fg("accent", run.baseBranch)} · ${merged}/${total} merged · ${boardTag} · ${slotsPill} · ${valPill} · ${this.theme.fg("muted", `${formatTokens(snapshot.totalTokens)} ${formatCost(snapshot.totalCost)}`)}`;
-      lines.push(fitLine(joinColumns(left, right, width), width));
-
-      const shortcuts = this.theme.fg(
-        "dim",
-        "[Ctrl+Shift+T expand · /swarm tasks · /swarm board]",
+      const modelsPill = formatRoleModelsLine(
+        roleModels,
+        this.hostModel ?? "default",
+        {
+          maxWidth: Math.max(1, width - 2),
+          theme: this.theme,
+          includeThinking: false,
+        },
       );
-      const modelsBudget = Math.max(16, width - visibleWidth(shortcuts) - 4);
-      const modelsPill = formatRoleModelsLine(roleModels, this.hostModel ?? "default", {
-        maxWidth: modelsBudget,
-        theme: this.theme,
-        includeThinking: false,
-      });
-      lines.push(fitLine(joinColumns(`  ${modelsPill}`, shortcuts, width), width));
+      lines.push(fitLine(`  ${modelsPill}`, width));
+    } else if (width < 112) {
+      const left = `${this.theme.fg("accent", this.theme.bold(`🐝 ${titleText}`))} · ${statusBadge}`;
+      const right = `${boardTag} · ${fleetTag}`;
+      lines.push(fitLine(joinColumns(left, right, width), width));
+
+      const modelsBudget = Math.max(12, width - visibleWidth("[Ctrl+Shift+T · /swarm tasks]") - 4);
+      const modelsPill = formatRoleModelsLine(
+        roleModels,
+        this.hostModel ?? "default",
+        {
+          maxWidth: modelsBudget,
+          theme: this.theme,
+          includeThinking: false,
+        },
+      );
+      lines.push(fitLine(joinColumns(`  ${modelsPill}`, shortcutTag, width), width));
+    } else {
+      const lead = `${this.theme.fg("accent", this.theme.bold(`🐝 ${titleText}`))} · ${statusBadge} · ${boardTag} · ${fleetTag}`;
+      const modelsBudget = Math.max(
+        16,
+        width - visibleWidth(lead) - visibleWidth("[Ctrl+Shift+T · /swarm tasks]") - 8,
+      );
+      if (modelsBudget >= 24) {
+        const modelsPill = formatRoleModelsLine(
+          roleModels,
+          this.hostModel ?? "default",
+          {
+            maxWidth: modelsBudget,
+            theme: this.theme,
+            includeThinking: false,
+          },
+        );
+        lines.push(
+          fitLine(
+            joinColumns(`${lead} · ${modelsPill}`, shortcutTag, width),
+            width,
+          ),
+        );
+      } else {
+        lines.push(fitLine(joinColumns(lead, shortcutTag, width), width));
+        const modelsPill = formatRoleModelsLine(
+          roleModels,
+          this.hostModel ?? "default",
+          {
+            maxWidth: Math.max(1, width - 2),
+            theme: this.theme,
+            includeThinking: false,
+          },
+        );
+        lines.push(fitLine(`  ${modelsPill}`, width));
+      }
     }
 
-    // Active Final Validator spinner line
-    const verifying = isFinalAuditRunning(snapshot, run);
-    const runningFinalValidator = verifying
-      ? findRunningFinalValidatorEntry(snapshot, run)
-      : undefined;
-    if (verifying) {
-      lines.push(this.renderVerifyingSpinnerLine(snapshot, run, width, nowMs));
+    // Active working members (up to 4 + "+N more")
+    const visibleWorking = workingMembers.slice(0, this.maxCompactWorkers);
+    for (const member of visibleWorking) {
+      lines.push(this.renderWorkingMemberLine(member, width, nowMs));
     }
-
-    // Working agents (max 3 + "+N more"), excluding final-validator already shown above
-    const remainingWorking = runningFinalValidator
-      ? workingRoster.filter((entry) => entry.agentId !== runningFinalValidator.agentId)
-      : workingRoster;
-    const visibleWorkers = remainingWorking.slice(0, this.maxCompactWorkers);
-    for (const entry of visibleWorkers) {
-      lines.push(this.renderAgentLine(entry, width, nowMs));
-    }
-    if (remainingWorking.length > visibleWorkers.length) {
-      const extra = remainingWorking.length - visibleWorkers.length;
+    if (workingMembers.length > visibleWorking.length) {
+      const extra = workingMembers.length - visibleWorking.length;
       lines.push(
         fitLine(
           this.theme.fg(
             "dim",
-            `  +${extra} more working agent${extra === 1 ? "" : "s"} · /swarm tasks`,
+            `  +${extra} more working · /swarm tasks`,
           ),
           width,
         ),
       );
-    }
-
-    // Warm waiting fleet summary line when any warm sessions are parked
-    if (waitingCount > 0) {
-      const fleetSummary = `  ${this.theme.fg("accent", `${workingCount} working`)} · ${this.theme.fg("muted", `${waitingCount} waiting warm`)}`;
-      lines.push(fitLine(fleetSummary, width));
     }
 
     // Latest board post preview
@@ -735,30 +508,18 @@ class SwarmDashboardComponent implements Component {
       lines.push(this.renderBoardPreviewLine(latest, width));
     }
 
-    // Attention / gate banner (max 2 lines so compact stays tight)
-    const attention = this.renderAttentionLines(
-      snapshot,
-      run,
-      missions,
-      width,
-      nowMs,
-    );
-    for (const line of attention.slice(0, 2)) {
-      lines.push(line);
-    }
-
-    // Subtle hint line when completely idle with no active/waiting agents and width < 100
-    if (
-      !verifying &&
-      workingRoster.length === 0 &&
-      waitingCount === 0 &&
-      snapshot.recentBoard.length === 0 &&
-      attention.length === 0 &&
-      width >= 44 &&
-      width < 100
-    ) {
-      const hint = `  base:${run.baseBranch} · [Ctrl+Shift+T expand · /swarm tasks · /swarm board]`;
-      lines.push(fitLine(this.theme.fg("dim", hint), width));
+    // Rate-limit backoff notice (when active)
+    if (snapshot.rateLimitUntil && snapshot.rateLimitUntil > nowMs) {
+      const rem = formatDuration(snapshot.rateLimitUntil - nowMs);
+      const reason = snapshot.rateLimitReason
+        ? ` — ${sanitizePlainText(snapshot.rateLimitReason)}`
+        : "";
+      lines.push(
+        fitLine(
+          this.theme.fg("warning", `  ⏳ Rate-limit backoff (${rem})${reason}`),
+          width,
+        ),
+      );
     }
 
     return lines.map((l) => fitLine(l, width));
@@ -767,17 +528,16 @@ class SwarmDashboardComponent implements Component {
   private renderExpanded(
     snapshot: SwarmSnapshot,
     run: SwarmRunState,
-    missions: readonly MissionRecord[],
-    workingRoster: readonly RosterEntry[],
-    waitingRoster: readonly RosterEntry[],
+    workingMembers: readonly SwarmMemberRecord[],
+    waitingMembers: readonly SwarmMemberRecord[],
     width: number,
     nowMs: number,
   ): string[] {
-    const termRows = this.tui.terminal?.rows ?? 30;
-    const maxTotalLines = Math.max(14, Math.min(36, Math.floor(termRows * 0.78)));
+    const termRows = this.tui.terminal?.rows ?? 32;
+    const maxTotalLines = Math.max(16, Math.min(36, Math.floor(termRows * 0.82)));
     const innerWidth =
       width < 12 ? Math.max(1, width) : Math.max(1, width - (width < 24 ? 2 : 4));
-    const maxInner = Math.max(10, maxTotalLines - 2);
+    const maxInner = Math.max(12, maxTotalLines - 2);
 
     const body: string[] = [];
 
@@ -785,18 +545,14 @@ class SwarmDashboardComponent implements Component {
       body.push(...this.renderDraftBanner(innerWidth));
     }
 
-    const merged = countMergedMissions(missions);
-    const total = missions.length;
-    const workingCount = getWorkingCount(snapshot, workingRoster);
-    const waitingCount = getWaitingCount(snapshot, waitingRoster);
+    const titleText = sanitizePlainText(run.title || run.objective) || run.id;
     const statusBadge = formatRunStatusBadge(run.status, this.theme);
-    const valStr = run.validatorEnabled
-      ? this.theme.fg("success", "val:ON")
-      : this.theme.fg("muted", "val:OFF");
+    const workingCount = getWorkingCount(snapshot, workingMembers);
+    const waitingCount = getWaitingCount(snapshot, waitingMembers);
     const roleModels = resolveEffectiveRoleModels(snapshot, run);
 
-    const summaryLeft = `[${statusBadge}] ${sanitizePlainText(run.objective)}`;
-    const summaryRight = `base:${run.baseBranch} · ${merged}/${total} merged · board:#${snapshot.boardHead} · ${workingCount}w/${waitingCount}wait · ${valStr} · ${formatTokens(snapshot.totalTokens)} ${formatCost(snapshot.totalCost)}`;
+    const summaryLeft = `[${statusBadge}] ${sanitizePlainText(run.objective || titleText)}`;
+    const summaryRight = `base:${run.baseBranch} · Board:#${snapshot.boardHead} · ${workingCount}w/${waitingCount}wait · ${formatTokens(snapshot.totalTokens)} ${formatCost(snapshot.totalCost)}`;
     body.push(
       innerWidth >= 72
         ? joinColumns(summaryLeft, summaryRight, innerWidth)
@@ -809,145 +565,146 @@ class SwarmDashboardComponent implements Component {
     // 3-Role Models bar
     const modelsPrefix = this.theme.fg("muted", "Models: ");
     const modelsBudget = Math.max(1, innerWidth - visibleWidth("Models: "));
-    const modelsLine = formatRoleModelsLine(roleModels, this.hostModel ?? "default", {
-      maxWidth: modelsBudget,
-      theme: this.theme,
-    });
+    const modelsLine = formatRoleModelsLine(
+      roleModels,
+      this.hostModel ?? "default",
+      {
+        maxWidth: modelsBudget,
+        theme: this.theme,
+      },
+    );
     body.push(fitLine(`${modelsPrefix}${modelsLine}`, innerWidth));
 
-    // Final Validation status line
-    body.push(this.renderFinalValidationLine(snapshot, run, innerWidth));
-
-    // Mission DAG table
-    body.push(renderHorizontalRule(innerWidth, "Missions", this.theme));
-    const columns: TableColumn<MissionRecord>[] = [
-      {
-        key: "id",
-        header: "ID",
-        minWidth: 4,
-        maxWidth: 10,
-        priority: 100,
-        render: (m) => this.theme.bold(m.id),
-      },
-      {
-        key: "status",
-        header: "Status",
-        minWidth: 10,
-        maxWidth: 14,
-        priority: 95,
-        render: (m) => formatMissionStatusBadge(m.status, this.theme),
-      },
-      {
-        key: "kind",
-        header: "Kind",
-        minWidth: 6,
-        maxWidth: 10,
-        priority: 85,
-        render: (m) => formatMissionKindBadge(m.kind, this.theme),
-      },
-      {
-        key: "validation",
-        header: "Valid",
-        minWidth: 7,
-        maxWidth: 14,
-        priority: 80,
-        render: (m) => formatReviewBadge(m, run.validatorEnabled, this.theme),
-      },
-      {
-        key: "branch",
-        header: "Branch",
-        minWidth: 12,
-        maxWidth: 28,
-        flex: 2,
-        priority: 65,
-        render: (m) => this.theme.fg("muted", m.branch),
-      },
-      {
-        key: "scope",
-        header: "Scope",
-        minWidth: 10,
-        maxWidth: 26,
-        flex: 2,
-        priority: 50,
-        render: (m) => this.theme.fg("dim", formatScopeCompact(m.scope)),
-      },
-      {
-        key: "retries",
-        header: "Try",
-        minWidth: 3,
-        maxWidth: 5,
-        align: "right",
-        priority: 40,
-        render: (m) =>
-          m.retryCount > 0
-            ? this.theme.fg("warning", String(m.retryCount))
-            : this.theme.fg("dim", "0"),
-      },
-    ];
-
-    const maxMissionRows = Math.max(
-      2,
-      Math.min(missions.length, Math.floor(maxInner * 0.35)),
+    // Channels summary
+    const channelsText = formatChannelsSummaryInline(run, this.theme);
+    body.push(
+      fitLine(`${this.theme.fg("muted", "Channels: ")}${channelsText}`, innerWidth),
     );
-    const tableLines = renderTable(missions, columns, innerWidth, {
-      header: true,
-      theme: this.theme,
-      maxRows: maxMissionRows,
-      columnGap: innerWidth < 60 ? 1 : 2,
-    });
-    body.push(...tableLines);
 
-    // Attention lines
-    const attention = this.renderAttentionLines(
-      snapshot,
-      run,
-      missions,
-      innerWidth,
-      nowMs,
-    );
-    for (const line of attention) {
-      if (body.length < maxInner - 5) {
-        body.push(line);
-      }
-    }
-
-    // Live Roster section (working / waiting / stopped / killed + live model)
-    const roster = getAllRosterEntries(snapshot, run);
-    if (roster.length > 0 && body.length < maxInner - 3) {
-      const rosterLabel =
-        waitingCount > 0
-          ? `Roster (${workingCount} working · ${waitingCount} waiting / ${roster.length} total)`
-          : `Roster (${workingCount} working / ${roster.length} total)`;
-      body.push(renderHorizontalRule(innerWidth, rosterLabel, this.theme));
-      const reserveForBoardAndActivity =
-        (snapshot.recentBoard.length > 0 ? 3 : 0) +
-        (snapshot.recentEvents.length > 0 ? 2 : 0);
-      const rosterBudget = Math.max(
-        1,
-        Math.min(4, maxInner - body.length - reserveForBoardAndActivity),
+    // Rate-limit notice if active
+    if (snapshot.rateLimitUntil && snapshot.rateLimitUntil > nowMs) {
+      const rem = formatDuration(snapshot.rateLimitUntil - nowMs);
+      const reason = snapshot.rateLimitReason
+        ? ` — ${sanitizePlainText(snapshot.rateLimitReason)}`
+        : "";
+      body.push(
+        fitLine(
+          this.theme.fg("warning", `⏳ Rate-limit backoff (${rem})${reason}`),
+          innerWidth,
+        ),
       );
-      const shownRoster = roster.slice(0, rosterBudget);
-      for (const entry of shownRoster) {
-        body.push(
-          this.renderAgentLine(entry, innerWidth, nowMs, { showStatus: true }),
-        );
-      }
-      if (roster.length > shownRoster.length && body.length < maxInner - 3) {
-        body.push(
-          fitLine(
-            this.theme.fg(
-              "dim",
-              `  … +${roster.length - shownRoster.length} more roster entries`,
-            ),
-            innerWidth,
-          ),
-        );
-      }
     }
 
-    // Recent Board section (#seq)
+    // Full Roster table (Name | Role | State | Model | Workspace | Turns | Activity)
+    const members = getSortedMembers(run);
+    body.push(
+      renderHorizontalRule(
+        innerWidth,
+        `Roster (${workingCount}w / ${waitingCount}wait · ${members.length} total)`,
+        this.theme,
+      ),
+    );
+
+    if (members.length === 0) {
+      body.push(
+        fitLine(this.theme.fg("dim", "  (no members spawned yet)"), innerWidth),
+      );
+    } else {
+      const columns: TableColumn<SwarmMemberRecord>[] = [
+        {
+          key: "name",
+          header: "Name",
+          minWidth: 8,
+          maxWidth: 18,
+          priority: 100,
+          render: (m) => {
+            const icon =
+              m.state === "working"
+                ? this.theme.fg("accent", SPINNER_FRAMES[this.spinnerFrame]!)
+                : memberStateIcon(m.state);
+            return `${icon} ${this.theme.bold(sanitizePlainText(m.name))}`;
+          },
+        },
+        {
+          key: "role",
+          header: "Role",
+          minWidth: 6,
+          maxWidth: 10,
+          priority: 90,
+          render: (m) => formatMemberRoleBadge(m.role, this.theme),
+        },
+        {
+          key: "state",
+          header: "State",
+          minWidth: 7,
+          maxWidth: 10,
+          priority: 95,
+          render: (m) => formatMemberStateBadge(m.state, this.theme),
+        },
+        {
+          key: "model",
+          header: "Model",
+          minWidth: 10,
+          maxWidth: 20,
+          flex: 1,
+          priority: 75,
+          render: (m) =>
+            m.model
+              ? this.theme.fg("muted", shortenModelName(m.model, 18))
+              : this.theme.fg("dim", "default"),
+        },
+        {
+          key: "workspace",
+          header: "Workspace",
+          minWidth: 9,
+          maxWidth: 22,
+          flex: 1,
+          priority: 65,
+          render: (m) => formatWorkspaceBadge(m.workspace, m.branch, this.theme),
+        },
+        {
+          key: "turns",
+          header: "Turns",
+          minWidth: 5,
+          maxWidth: 6,
+          align: "right",
+          priority: 55,
+          render: (m) => this.theme.fg("muted", String(m.turns)),
+        },
+        {
+          key: "activity",
+          header: "Activity",
+          minWidth: 12,
+          maxWidth: 32,
+          flex: 2,
+          priority: 45,
+          render: (m) => {
+            const text =
+              m.currentActivity ||
+              m.parkedOn ||
+              (m.lastTool ? `tool:${m.lastTool}` : m.state);
+            return this.theme.fg("dim", sanitizePlainText(text));
+          },
+        },
+      ];
+
+      const recentBoardReserve = snapshot.recentBoard.length > 0 ? 7 : 0;
+      const maxRosterRows = Math.max(
+        2,
+        Math.min(members.length, maxInner - body.length - recentBoardReserve - 2),
+      );
+      const tableLines = renderTable(members, columns, innerWidth, {
+        header: true,
+        theme: this.theme,
+        maxRows: maxRosterRows,
+        columnGap: innerWidth < 60 ? 1 : 2,
+      });
+      body.push(...tableLines);
+    }
+
+    // Recent 5 Board messages (#seq)
     const recentBoard = snapshot.recentBoard.slice(-this.maxRecentBoard);
-    if (recentBoard.length > 0 && body.length < maxInner - 2) {
+    if (recentBoard.length > 0 && body.length < maxInner - 1) {
       body.push(
         renderHorizontalRule(
           innerWidth,
@@ -955,43 +712,19 @@ class SwarmDashboardComponent implements Component {
           this.theme,
         ),
       );
-      const boardReserveForActivity = snapshot.recentEvents.length > 0 ? 2 : 0;
-      const boardBudget = Math.max(
-        1,
-        Math.min(
-          recentBoard.length,
-          maxInner - body.length - boardReserveForActivity,
-        ),
-      );
-      for (const msg of recentBoard.slice(-boardBudget)) {
-        body.push(this.renderBoardPreviewLine(msg, innerWidth));
-      }
-    }
-
-    // Recent Ledger Activity
-    const events = snapshot.recentEvents.slice(-this.maxRecentEvents);
-    if (events.length > 0 && body.length < maxInner - 1) {
-      body.push(renderHorizontalRule(innerWidth, "Recent Activity", this.theme));
       const remaining = Math.max(1, maxInner - body.length);
-      const shownEvents = events.slice(-remaining);
-      for (const ev of shownEvents) {
-        const ts = this.theme.fg("dim", formatEventClock(ev.timestamp));
-        const tag = ev.missionId
-          ? this.theme.fg("accent", `[${ev.missionId}] `)
-          : "";
-        body.push(
-          fitLine(`  ${ts} ${tag}${sanitizePlainText(ev.summary)}`, innerWidth),
-        );
+      for (const msg of recentBoard.slice(-remaining)) {
+        body.push(this.renderBoardPreviewLine(msg, innerWidth));
       }
     }
 
     const title = this.theme.fg(
       "accent",
-      this.theme.bold(`🐝 Swarm Dashboard · ${run.id}`),
+      this.theme.bold(`🐝 ${titleText} · ${run.id}`),
     );
     const footer = this.theme.fg(
       "dim",
-      "Ctrl+Shift+T / Esc collapse · /swarm tasks · /swarm board · /swarm models",
+      "Ctrl+Shift+T / Esc collapse · /swarm tasks · /swarm board · /swarm graph",
     );
 
     return renderBox(body.slice(0, maxInner), width, {
@@ -1016,12 +749,9 @@ class SwarmDashboardComponent implements Component {
       return this.renderDraftBanner(targetWidth);
     }
 
-    const missions = getOrderedMissions(run);
-    const workingRoster = getWorkingRosterEntries(snapshot);
-    const waitingRoster = getWaitingRosterEntries(snapshot);
-    this.syncSpinnerTimer(
-      workingRoster.length > 0 || isFinalAuditRunning(snapshot, run),
-    );
+    const workingMembers = getWorkingMembers(snapshot, run);
+    const waitingMembers = getWaitingMembers(snapshot, run);
+    this.syncSpinnerTimer(workingMembers.length > 0);
 
     const nowMs = this.now();
 
@@ -1029,9 +759,8 @@ class SwarmDashboardComponent implements Component {
       return this.renderExpanded(
         snapshot,
         run,
-        missions,
-        workingRoster,
-        waitingRoster,
+        workingMembers,
+        waitingMembers,
         targetWidth,
         nowMs,
       );
@@ -1039,9 +768,8 @@ class SwarmDashboardComponent implements Component {
     return this.renderCompact(
       snapshot,
       run,
-      missions,
-      workingRoster,
-      waitingRoster,
+      workingMembers,
+      waitingMembers,
       targetWidth,
       nowMs,
     );
@@ -1070,55 +798,21 @@ export function formatStatusLine(
     return draftActive ? "🐝 swarm:draft" : undefined;
   }
 
-  const missions = getOrderedMissions(run);
-  const merged = countMergedMissions(missions);
-  const workingRoster = getWorkingRosterEntries(snapshot);
-  const waitingRoster = getWaitingRosterEntries(snapshot);
-  const workingCount = getWorkingCount(snapshot, workingRoster);
-  const waitingCount = getWaitingCount(snapshot, waitingRoster);
+  const workingMembers = getWorkingMembers(snapshot, run);
+  const waitingMembers = getWaitingMembers(snapshot, run);
+  const workingCount = getWorkingCount(snapshot, workingMembers);
+  const waitingCount = getWaitingCount(snapshot, waitingMembers);
 
-  const auditStatus = getEffectiveFinalAuditStatus(snapshot, run);
-  const latestAudit = getEffectiveLatestFinalAudit(snapshot, run);
-  const verifying = isFinalAuditRunning(snapshot, run);
-
-  const leadTokens: string[] = [`🐝 swarm:${run.status}`];
-  if (verifying) {
-    const round = computeActiveFinalAuditRound(
-      auditStatus,
-      run.finalAuditRound,
-      latestAudit,
-      true,
-    );
-    const maxRounds = Math.max(1, run.maxFinalAuditRounds || 1);
-    leadTokens.push(`r${round}/${maxRounds}`);
-  } else if (workingCount > 0 || waitingCount > 0) {
-    leadTokens.push(`${workingCount}w/${waitingCount}wait`);
-  }
+  const statusLabel = formatRunStatusBadge(run.status);
+  const leadTokens: string[] = [
+    `🐝 swarm:${statusLabel}`,
+    `${workingCount}w/${waitingCount}wait`,
+  ];
   if (snapshot.boardHead > 0) {
     leadTokens.push(`#${snapshot.boardHead}`);
   }
 
   const parts: string[] = [leadTokens.join(" ")];
-  parts.push(`${merged}/${missions.length} merged`);
-
-  if (!verifying) {
-    if (auditStatus === "disapproved") {
-      const findingsCount = latestAudit?.findings.length ?? 0;
-      parts.push(
-        findingsCount > 0
-          ? `⚠ audit:disapproved (${findingsCount})`
-          : "⚠ audit:disapproved",
-      );
-    } else if (auditStatus === "approved") {
-      parts.push("✓ audit:approved");
-    } else if (auditStatus === "skipped") {
-      parts.push("audit:skipped");
-    }
-  }
-
-  if (snapshot.pendingArtifactApprovals.length > 0) {
-    parts.push(`${snapshot.pendingArtifactApprovals.length} approval`);
-  }
   if (snapshot.totalTokens > 0) {
     parts.push(`${formatTokens(snapshot.totalTokens)} tok`);
   }
@@ -1130,7 +824,8 @@ export function formatStatusLine(
 }
 
 // ============================================================================
-// Zero-LLM-Turn Markdown Formatters (`/swarm status`, `/swarm board`, `/swarm models`)
+// Zero-LLM-Turn Markdown Formatters
+// (`/swarm status`, `/swarm board`, `/swarm models`, `/swarm graph`)
 // ============================================================================
 
 function escapeMdCell(text: string): string {
@@ -1152,40 +847,44 @@ export function formatZeroTurnStatusDashboard(
       return [
         "### 🐝 Swarm Draft Active",
         "",
-        `An interactive planning interview is in progress.${seedLine}`,
+        `Clarifying requirements & strategy.${seedLine}`,
         "- Continue answering questions in chat or run `/swarm cancel` to discard.",
       ].join("\n");
     }
     return "No active Swarm run. Start one with `/swarm <idea>` or `/swarm direct <objective>`.";
   }
 
-  const missions = getOrderedMissions(run);
-  const merged = countMergedMissions(missions);
-  const waves = computeMissionWaves(missions);
-  const roster = getAllRosterEntries(snapshot, run);
-  const workingRoster = getWorkingRosterEntries(snapshot);
-  const waitingRoster = getWaitingRosterEntries(snapshot);
-  const workingCount = getWorkingCount(snapshot, workingRoster);
-  const waitingCount = getWaitingCount(snapshot, waitingRoster);
+  const members = getSortedMembers(run);
+  const workingMembers = getWorkingMembers(snapshot, run);
+  const waitingMembers = getWaitingMembers(snapshot, run);
+  const workingCount = getWorkingCount(snapshot, workingMembers);
+  const waitingCount = getWaitingCount(snapshot, waitingMembers);
   const roleModels = resolveEffectiveRoleModels(snapshot, run);
   const hostFallback = options?.hostModel ?? "host default";
+  const channels = getOrderedChannels(run);
 
   const out: string[] = [];
-  out.push(`### 🐝 Swarm Status — \`${run.id}\` (${run.status})`);
+  const titleStr = sanitizePlainText(run.title || run.objective) || run.id;
+  out.push(
+    `### 🐝 ${titleStr} — \`${run.id}\` (${formatRunStatusBadge(run.status)})`,
+  );
   out.push("");
   out.push(`- **Objective:** ${sanitizePlainText(run.objective)}`);
-  out.push(
-    `- **Base Branch:** \`${run.baseBranch}\` · **Progress:** ${merged}/${missions.length} merged · **Fleet:** ${workingCount} working · ${waitingCount} waiting warm (max ${snapshot.maxConcurrency}) · **Board:** #${snapshot.boardHead}`,
-  );
-  out.push(
-    `- **Validator:** ${run.validatorEnabled ? `ON (max ${run.maxValidationRounds} rounds)` : "OFF"} · **Keep Warm:** ${run.keepWorkersWarm ? "ON" : "OFF"} · **Usage:** ${formatTokens(snapshot.totalTokens)} tokens (${formatCost(snapshot.totalCost)})`,
-  );
-
-  if (snapshot.unreadOrchestratorMessages > 0) {
+  if (run.strategy) {
+    out.push(`- **Strategy:** ${sanitizePlainText(run.strategy)}`);
+  }
+  if (run.acceptanceCriteria) {
     out.push(
-      `- **Unread Orchestrator Messages:** ${snapshot.unreadOrchestratorMessages} message(s)`,
+      `- **Acceptance Criteria:** ${sanitizePlainText(run.acceptanceCriteria)}`,
     );
   }
+  out.push(
+    `- **Base Branch:** \`${run.baseBranch}\` · **Roster:** ${workingCount} working · ${waitingCount} waiting / ${members.length} total (max ${run.maxConcurrency}) · **Board:** #${snapshot.boardHead}`,
+  );
+  out.push(
+    `- **Validator Policy:** ${run.validatorEnabled ? "ON" : "OFF"} · **Keep Warm:** ${run.keepWorkersWarm ? "ON" : "OFF"} · **Usage:** ${formatTokens(snapshot.totalTokens)} tokens (${formatCost(snapshot.totalCost)})`,
+  );
+
   if (snapshot.rateLimitUntil && snapshot.rateLimitUntil > nowMs) {
     const rem = formatDuration(snapshot.rateLimitUntil - nowMs);
     const reason = snapshot.rateLimitReason
@@ -1194,7 +893,7 @@ export function formatZeroTurnStatusDashboard(
     out.push(`- **Rate-Limit Backoff:** ${rem} remaining${reason}`);
   }
 
-  // 3-Role Models section
+  // 3-Role Models
   out.push("");
   out.push("#### 3-Role Models");
   out.push(`- **Summary:** ${formatRoleModelsLine(roleModels, hostFallback)}`);
@@ -1207,7 +906,9 @@ export function formatZeroTurnStatusDashboard(
   ];
   for (const r of roleRows) {
     const cfg = roleModels[r.role];
-    const modelStr = cfg?.model ? `\`${escapeMdCell(cfg.model)}\`` : `_${escapeMdCell(hostFallback)}_`;
+    const modelStr = cfg?.model
+      ? `\`${escapeMdCell(cfg.model)}\``
+      : `_${escapeMdCell(hostFallback)}_`;
     const thinkingStr = cfg?.thinkingLevel ? `\`${cfg.thinkingLevel}\`` : "default";
     out.push(`| ${r.label} | ${modelStr} | ${thinkingStr} |`);
   }
@@ -1217,187 +918,69 @@ export function formatZeroTurnStatusDashboard(
     );
   }
 
-  // Wave-grouped missions table
+  // Channels
   out.push("");
-  out.push("#### Missions by Wave");
-  out.push(
-    "| Wave | ID | Kind | Status | Deps | Branch | Scope | Validation | Retries |",
-  );
-  out.push("| --- | --- | --- | --- | --- | --- | --- | --- | ---: |");
-
-  for (let w = 0; w < waves.length; w++) {
-    const wave = waves[w] ?? [];
-    for (const m of wave) {
-      const depsStr = m.deps.length > 0 ? m.deps.join(", ") : "—";
-      const scopeStr = m.scope.length > 0 ? m.scope.join(", ") : "—";
-      const reviewStr = formatReviewBadge(m, run.validatorEnabled);
-      const statusStr = m.humanStopped
-        ? `${formatMissionStatusBadge(m.status)} (human)`
-        : formatMissionStatusBadge(m.status);
-      out.push(
-        `| W${w + 1} | \`${escapeMdCell(m.id)}\` | ${m.kind} | ${escapeMdCell(statusStr)} | ${escapeMdCell(depsStr)} | \`${escapeMdCell(m.branch)}\` | ${escapeMdCell(scopeStr)} | ${escapeMdCell(reviewStr)} | ${m.retryCount} |`,
-      );
+  out.push(`#### Channels (${channels.length})`);
+  if (channels.length === 0) {
+    out.push("_No channels configured._");
+  } else {
+    out.push("| Channel | Topic | Subscribers | Status |");
+    out.push("| --- | --- | --- | --- |");
+    for (const ch of channels) {
+      const topic = ch.topic ? escapeMdCell(ch.topic) : "—";
+      const subs =
+        ch.subscribers.length > 0
+          ? ch.subscribers.map((s) => `\`${escapeMdCell(s)}\``).join(", ")
+          : "_none_";
+      const status = ch.archived ? "archived" : "active";
+      out.push(`| \`#${escapeMdCell(ch.name)}\` | ${topic} | ${subs} | ${status} |`);
     }
   }
 
-  // Final Verification section
-  const auditStatus = getEffectiveFinalAuditStatus(snapshot, run);
-  const latestAudit = getEffectiveLatestFinalAudit(snapshot, run);
-  const maxAuditRounds = Math.max(1, run.maxFinalAuditRounds || 1);
-  const displayAuditRound = computeActiveFinalAuditRound(
-    auditStatus,
-    run.finalAuditRound,
-    latestAudit,
-    auditStatus === "running",
-  );
-  const auditBadge = formatFinalAuditBadge(
-    auditStatus,
-    displayAuditRound,
-    maxAuditRounds,
-  );
-
-  out.push("");
-  out.push("### Final Verification");
-  out.push(
-    `- **Enabled:** ${run.finalValidatorEnabled ? `ON (max ${maxAuditRounds} round${maxAuditRounds === 1 ? "" : "s"}, auto-fix: ${run.autoFixOnAuditFail ? "ON" : "OFF"})` : "OFF"} · **Status:** ${auditBadge} · **Round:** ${displayAuditRound}/${maxAuditRounds}`,
-  );
-  const pinnedSha = latestAudit?.commitSha || run.lastAuditedSha;
-  if (pinnedSha) {
-    out.push(
-      `- **Pinned SHA:** \`${pinnedSha.slice(0, 12)}\` (\`${run.baseBranch}\`)`,
-    );
-  }
-  if (auditStatus === "skipped") {
-    const by = run.finalAuditSkippedBy
-      ? ` by ${sanitizePlainText(run.finalAuditSkippedBy)}`
-      : "";
-    const reason = run.finalAuditSkipReason
-      ? ` — ${sanitizePlainText(run.finalAuditSkipReason)}`
-      : "";
-    out.push(`- **Skipped:**${by}${reason || " (manual bypass)"}`);
-  }
-  if (latestAudit) {
-    const totalChecks = latestAudit.checks.length;
-    const passedChecks = latestAudit.checks.filter((c) => c.passed).length;
-    out.push(
-      `- **Checks:** ${passedChecks}/${totalChecks} passed · **Findings:** ${latestAudit.findings.length}`,
-    );
-    if (latestAudit.summary) {
-      out.push(`- **Summary:** ${sanitizePlainText(latestAudit.summary)}`);
-    }
-    if (latestAudit.findings.length > 0) {
-      for (const f of latestAudit.findings.slice(0, 5)) {
-        const loc = f.file
-          ? ` (\`${f.file}${f.line !== undefined ? `:${f.line}` : ""}\`)`
-          : "";
-        out.push(
-          `  - **[${f.severity}]** ${sanitizePlainText(f.title)}${loc} — ${sanitizePlainText(f.detail)}`,
-        );
-      }
-      if (latestAudit.findings.length > 5) {
-        out.push(`  - _… +${latestAudit.findings.length - 5} more finding(s)_`);
-      }
-    }
-    if (
-      latestAudit.recommendedMissions &&
-      latestAudit.recommendedMissions.length > 0
-    ) {
-      out.push(
-        `- **Recommended Fix Missions:** ${latestAudit.recommendedMissions.map((m) => sanitizePlainText(m.title)).join("; ")}`,
-      );
-    }
-  }
-  if (auditStatus === "disapproved") {
-    out.push(
-      "- **Hints:** Run `/swarm verify` to re-verify after fixes, add a fix mission, or `/swarm verify --skip` to bypass.",
-    );
-  }
-
-  // Pending gates / human attention
-  const failedOrStopped = missions.filter(
-    (m) => m.status === "failed" || (m.status === "stopped" && m.humanStopped),
-  );
-  const hasGates =
-    snapshot.pendingReviews.length > 0 ||
-    snapshot.pendingArtifactApprovals.length > 0 ||
-    snapshot.readyToMerge.length > 0 ||
-    failedOrStopped.length > 0;
-
-  if (hasGates) {
-    out.push("");
-    out.push("#### Pending Gates & Attention");
-    if (snapshot.pendingReviews.length > 0) {
-      out.push(
-        `- **Pending Validations:** ${snapshot.pendingReviews.map((id) => `\`${id}\``).join(", ")}`,
-      );
-    }
-    if (snapshot.pendingArtifactApprovals.length > 0) {
-      out.push(
-        `- **Pending Artifact Sign-Off:** ${snapshot.pendingArtifactApprovals.map((id) => `\`${id}\``).join(", ")} — run \`/swarm approve <id>\``,
-      );
-    }
-    if (snapshot.readyToMerge.length > 0) {
-      out.push(
-        `- **Ready to Merge:** ${snapshot.readyToMerge.map((id) => `\`${id}\``).join(", ")}`,
-      );
-    }
-    for (const m of failedOrStopped) {
-      const detail = m.error
-        ? `: ${sanitizePlainText(m.error)}`
-        : m.humanStopped
-          ? " (stopped by human — will not auto-restart)"
-          : "";
-      out.push(`- **${m.status.toUpperCase()} \`${m.id}\`**${detail}`);
-    }
-  }
-
-  // Live Roster
+  // Full Roster Table
   out.push("");
   out.push(
-    `#### Live Roster (${workingCount} working · ${waitingCount} waiting / ${roster.length} total)`,
+    `#### Roster (${workingCount} working · ${waitingCount} waiting / ${members.length} total)`,
   );
-  if (roster.length === 0) {
-    out.push("_No workers, validators, or final validators spawned yet._");
+  if (members.length === 0) {
+    out.push("_No members spawned yet._");
   } else {
     out.push(
-      "| Agent | Role | Mission | Status | Model | Turns | Board | Activity | Usage | Elapsed |",
+      "| Name | Role | State | Model | Workspace | Parent | Turns | Last Read/Post |",
     );
-    out.push(
-      "| --- | --- | --- | --- | --- | ---: | ---: | --- | ---: | ---: |",
-    );
-    for (const entry of roster) {
-      const activity = entry.currentActivity || entry.lastTool || "—";
-      const usage = `${formatTokens(entry.tokens)} / ${formatCost(entry.cost)}`;
-      const elapsed = entry.endedAt
-        ? formatDuration(
-            Math.max(0, Date.parse(entry.endedAt) - Date.parse(entry.startedAt)),
-          )
-        : formatElapsedSince(entry.startedAt, nowMs);
-      const statusText = entry.humanStopped
-        ? `${formatRosterStatusBadge(entry.status)} (human)`
-        : formatRosterStatusBadge(entry.status);
-      const missionCol =
-        entry.missionId === FINAL_AUDIT_MISSION_ID ? "FINAL" : entry.missionId;
-      const modelCol = entry.model ? `\`${escapeMdCell(entry.model)}\`` : "_default_";
+    out.push("| --- | --- | --- | --- | --- | --- | ---: | --- |");
+    for (const m of members) {
+      const stateText = m.humanStopped
+        ? `${formatMemberStateBadge(m.state)} (human)`
+        : formatMemberStateBadge(m.state);
+      const modelCol = m.model
+        ? `\`${escapeMdCell(m.model)}\``
+        : `_${escapeMdCell(hostFallback)}_`;
+      const wsCol = `\`${escapeMdCell(formatWorkspaceBadge(m.workspace, m.branch))}\``;
+      const parentCol = `\`${escapeMdCell(m.parentName)}\``;
+      const seqCol = `read #${m.lastReadSeq} / post ${m.lastPostSeq !== undefined ? `#${m.lastPostSeq}` : "—"}`;
       out.push(
-        `| \`${escapeMdCell(entry.name || entry.agentId)}\` | ${entry.role} | \`${escapeMdCell(missionCol)}\` | ${escapeMdCell(statusText)} | ${modelCol} | ${entry.turns} | #${entry.lastReadBoardSeq} | ${escapeMdCell(activity)} | ${escapeMdCell(usage)} | ${elapsed} |`,
+        `| \`${escapeMdCell(m.name)}\` | ${formatMemberRoleBadge(m.role)} | ${escapeMdCell(stateText)} | ${modelCol} | ${wsCol} | ${parentCol} | ${m.turns} | ${seqCol} |`,
       );
     }
   }
 
-  // Recent Board preview
+  // Recent Board (#seq)
   const recentBoard = snapshot.recentBoard.slice(-8);
   if (recentBoard.length > 0 || snapshot.boardHead > 0) {
     out.push("");
     out.push(`#### Recent Board (#${snapshot.boardHead})`);
     if (recentBoard.length === 0) {
-      out.push(`_Board head is #${snapshot.boardHead}; run \`/swarm board\` to inspect._`);
+      out.push(
+        `_Board head is #${snapshot.boardHead}; run \`/swarm board\` to inspect._`,
+      );
     } else {
       for (const msg of recentBoard) {
         const clock = formatEventClock(msg.timestamp);
-        const mentions = formatBoardMentionsSuffix(msg.mentions);
+        const ch = sanitizePlainText(msg.channel || "main");
+        const targets = formatBoardTargets(msg);
         out.push(
-          `- **#${msg.seq}** \`${clock}\` \`${formatBoardKindBadge(msg.kind)}\` **${sanitizePlainText(msg.from)}**${mentions}: ${sanitizePlainText(msg.text)}`,
+          `- **#${msg.seq}** \`${clock}\` [${ch}] \`${formatBoardKindBadge(msg.kind)}\` **@${sanitizePlainText(msg.from)}**${targets}: ${sanitizePlainText(msg.text)}`,
         );
       }
     }
@@ -1410,9 +993,10 @@ export function formatZeroTurnStatusDashboard(
     out.push("#### Recent Activity");
     for (const ev of recent) {
       const clock = formatEventClock(ev.timestamp);
-      const mTag = ev.missionId ? ` [\`${ev.missionId}\`]` : "";
+      const memberTag = ev.memberName ? ` [\`${ev.memberName}\`]` : "";
+      const chTag = ev.channel ? ` [#${ev.channel}]` : "";
       out.push(
-        `- \`${clock}\`${mTag} **${ev.type}**: ${sanitizePlainText(ev.summary)}`,
+        `- \`${clock}\`${memberTag}${chTag} **${ev.type}**: ${sanitizePlainText(ev.summary)}`,
       );
     }
   }
@@ -1421,7 +1005,8 @@ export function formatZeroTurnStatusDashboard(
 }
 
 /**
- * Zero-LLM-turn formatter for `/swarm board [N]`.
+ * Zero-LLM-turn formatter for `/swarm board [N]` — Antigravity-Swarm-style
+ * `#seq [ch] @from -> @mentions` feed.
  */
 export function formatZeroTurnBoardView(
   messages: readonly BoardMessage[],
@@ -1429,8 +1014,12 @@ export function formatZeroTurnBoardView(
   options?: BoardViewOptions,
 ): string {
   const runSuffix = options?.runId ? ` — \`${sanitizePlainText(options.runId)}\`` : "";
+  const chSuffix =
+    options?.channel && options.channel !== "*"
+      ? ` [#${sanitizePlainText(options.channel)}]`
+      : "";
   const out: string[] = [
-    `### 🐝 Swarm Board${runSuffix} (head: #${head})`,
+    `### 🐝 Swarm Board${runSuffix}${chSuffix} (head: #${head})`,
     "",
   ];
 
@@ -1448,13 +1037,13 @@ export function formatZeroTurnBoardView(
 
   for (const msg of messages) {
     const clock = formatEventClock(msg.timestamp);
+    const ch = sanitizePlainText(msg.channel || "main");
     const kindBadge = formatBoardKindBadge(msg.kind);
     const sender = sanitizePlainText(msg.from);
-    const mentions = formatBoardMentionsSuffix(msg.mentions);
-    const missionTag = msg.missionId ? ` [\`${sanitizePlainText(msg.missionId)}\`]` : "";
+    const targets = formatBoardTargets(msg);
     const body = sanitizePlainText(msg.text);
     out.push(
-      `- **#${msg.seq}** \`${clock}\` \`${kindBadge}\` **${sender}**${mentions}${missionTag}: ${body}`,
+      `- **#${msg.seq}** \`${clock}\` [${ch}] \`${kindBadge}\` **@${sender}**${targets}: ${body}`,
     );
   }
 
@@ -1463,8 +1052,8 @@ export function formatZeroTurnBoardView(
 
 /**
  * Zero-LLM-turn formatter for `/swarm models`.
- * Shows configured 3-role models (`orchestrator`, `worker`, `validator`, thinking levels,
- * `fallbackModels`) AND every live/roster agent's actual model & state.
+ * Shows configured 3-role models (`orchestrator`/`worker`/`validator` + `fallbackModels`)
+ * and every member's live model & state.
  */
 export function formatZeroTurnModelsView(
   settings: SwarmSettings,
@@ -1520,7 +1109,9 @@ export function formatZeroTurnModelsView(
       ? `\`${escapeMdCell(activeModel)}\``
       : `_${escapeMdCell(hostDisplay)}_`;
     const thinking = runCfg?.thinkingLevel ?? r.settingsThinking ?? "default";
-    out.push(`| ${r.label} | ${settingsCell} | ${activeCell} | \`${escapeMdCell(thinking)}\` |`);
+    out.push(
+      `| ${r.label} | ${settingsCell} | ${activeCell} | \`${escapeMdCell(thinking)}\` |`,
+    );
   }
 
   const fallbacks = Array.from(
@@ -1534,26 +1125,25 @@ export function formatZeroTurnModelsView(
     `- **Fallback Models:** ${fallbacks.length > 0 ? fallbacks.map((m) => `\`${sanitizePlainText(m)}\``).join(", ") : "_none_"}`,
   );
 
-  // Live Roster Models
+  // Live Member Models
   out.push("");
-  out.push("#### Live Roster Models");
+  out.push("#### Live Member Models");
   const run = snapshot.run;
   if (!run) {
     out.push("_No active Swarm run._");
   } else {
-    const roster = getAllRosterEntries(snapshot, run);
-    if (roster.length === 0) {
-      out.push("_No active or waiting agents in the current run._");
+    const members = getSortedMembers(run);
+    if (members.length === 0) {
+      out.push("_No members spawned in the current run._");
     } else {
-      out.push("| Agent | Role | Mission | State | Live Model | Thinking | Turns |");
+      out.push("| Name | Role | State | Live Model | Thinking | Workspace | Turns |");
       out.push("| --- | --- | --- | --- | --- | --- | ---: |");
-      for (const entry of roster) {
-        const missionCol =
-          entry.missionId === FINAL_AUDIT_MISSION_ID ? "FINAL" : entry.missionId;
-        const liveModel = entry.model ?? hostDisplay;
-        const thinking = entry.thinkingLevel ?? "default";
+      for (const m of members) {
+        const liveModel = m.model ?? hostDisplay;
+        const thinking = m.thinkingLevel ?? "default";
+        const ws = formatWorkspaceBadge(m.workspace, m.branch);
         out.push(
-          `| \`${escapeMdCell(entry.name || entry.agentId)}\` | ${entry.role} | \`${escapeMdCell(missionCol)}\` | ${escapeMdCell(formatRosterStatusBadge(entry.status))} | \`${escapeMdCell(liveModel)}\` | \`${escapeMdCell(thinking)}\` | ${entry.turns} |`,
+          `| \`${escapeMdCell(m.name)}\` | ${formatMemberRoleBadge(m.role)} | ${escapeMdCell(formatMemberStateBadge(m.state))} | \`${escapeMdCell(liveModel)}\` | \`${escapeMdCell(thinking)}\` | \`${escapeMdCell(ws)}\` | ${m.turns} |`,
         );
       }
     }
@@ -1561,10 +1151,37 @@ export function formatZeroTurnModelsView(
 
   out.push("");
   out.push(
-    "_Tip: Hot-switch any `waiting` agent's model with `/swarm model <agent> <model>` or press `[m]` in `/swarm tasks`._",
+    "_Tip: Hot-switch any `waiting` member's model with `/swarm model <member> <model>` or press `[m]` in `/swarm tasks`._",
   );
 
   return out.join("\n");
+}
+
+/**
+ * Zero-LLM-turn formatter for `/swarm graph`.
+ * Renders Markdown/ASCII Spawn Tree + Peer `@mention` Interaction Graph using `buildSwarmGraphLines`.
+ */
+export function formatZeroTurnGraphView(
+  snapshot: SwarmSnapshot,
+  options?: GraphViewOptions,
+): string {
+  const run = snapshot.run;
+  if (!run) {
+    return "No active Swarm run. Start one with `/swarm <idea>` or `/swarm direct <objective>`.";
+  }
+
+  const width = Math.max(40, Math.floor(options?.width ?? 88));
+  const board = options?.board ?? snapshot.recentBoard;
+  const graphLines = buildSwarmGraphLines(run, board, width);
+  const titleStr = sanitizePlainText(run.title || run.objective) || run.id;
+
+  return [
+    `### 🐝 Swarm Graph — ${titleStr} (\`${run.id}\`)`,
+    "",
+    "```text",
+    ...graphLines,
+    "```",
+  ].join("\n");
 }
 
 // ============================================================================

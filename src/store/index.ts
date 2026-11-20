@@ -2,6 +2,7 @@ export {
   SwarmBoard,
   formatBoardMessage,
   formatBoardMessages,
+  parseChannelMentions,
   parseMentions,
 } from "./board.js";
 
@@ -32,16 +33,11 @@ export {
 export {
   SwarmStore,
   assertOwnerSession,
-  deriveMissionBranch,
-  findScopeViolations,
-  isPathInScope,
-  isPrintableAsciiTitle,
+  deriveMemberBranch,
   isProcessAlive,
-  isValidMissionTransition,
   normalizeRelativeRepoPath,
-  normalizeScopePath,
-  scopesOverlap,
-  slugifyMissionTitle,
+  validateChannelName,
+  validateMemberName,
   type SwarmStoreOptions,
 } from "./swarm-store.js";
 

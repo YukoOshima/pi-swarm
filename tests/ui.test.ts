@@ -1,64 +1,69 @@
 import assert from "node:assert/strict";
+import { readdirSync, readFileSync } from "node:fs";
+import path from "node:path";
 import { describe, it } from "node:test";
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import {
   type Component,
   CURSOR_MARKER,
-  type Focusable,
   isFocusable,
   stripTerminalSequences,
   type TUI,
   visibleWidth,
 } from "@earendil-works/pi-tui";
-import {
-  DEFAULT_SWARM_SETTINGS,
-  FINAL_AUDIT_MISSION_ID,
-} from "../src/constants.js";
+import { DEFAULT_SWARM_SETTINGS, ORCHESTRATOR_NAME } from "../src/constants.js";
 import type {
   BoardMessage,
   DiffSummary,
-  FinalAuditStatus,
-  FinalAuditVerdict,
-  ISwarmOrchestrator,
+  ISwarmEngine,
   IWorktreeManager,
-  MissionRecord,
+  KillMemberOptions,
+  MergeMemberOptions,
   PostBoardMessageInput,
   ProposedSwarmPlan,
   QuestionSpec,
-  RosterEntry,
-  SwarmOrchestratorEvent,
+  ReadBoardOptions,
+  StopMemberOptions,
+  SwarmEngineEvent,
+  SwarmMemberRecord,
   SwarmRoleModels,
   SwarmRunState,
   SwarmSettings,
   SwarmSnapshot,
+  SwitchModelOptions,
 } from "../src/types.js";
 import {
   bindSwarmShortcuts,
-  computeActiveFinalAuditRound,
-  computeMissionWaves,
+  buildInitialMembersSummaryLines,
+  buildSwarmGraphLines,
   createQuestionnaireUI,
   createSwarmWidget,
   createSwarmWidgetState,
   fitLine,
+  fitLines,
   formatBoardKindBadge,
   formatCost,
   formatDuration,
-  formatFinalAuditBadge,
+  formatElapsedSince,
+  formatMemberRoleBadge,
+  formatMemberStateBadge,
   formatRoleModelsLine,
-  formatRosterRoleBadge,
-  formatRosterStatusBadge,
   formatRunStatusBadge,
   formatStatusLine,
   formatTokens,
+  formatWorkspaceBadge,
   formatZeroTurnBoardView,
+  formatZeroTurnGraphView,
   formatZeroTurnModelsView,
   formatZeroTurnStatusDashboard,
   isModalOpen,
   joinColumns,
-  openTasksOverlay,
+  memberStateIcon,
+  openSwarmOverlay,
   renderBox,
+  renderHorizontalRule,
   renderTable,
-  resolveFinalAuditDisplayRound,
+  sanitizePlainText,
   shortenModelName,
   wrapLines,
 } from "../src/ui/index.js";
@@ -160,65 +165,117 @@ function assertAllLinesFit(
   }
 }
 
-function makeSampleBoard(runId = "run-20261120-abc"): BoardMessage[] {
+function flushAsync(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 10));
+}
+
+function makeSampleBoard(runId = "run-20261120-dyn"): BoardMessage[] {
   return [
     {
       seq: 1,
       runId,
+      channel: "main",
       from: "orchestrator",
       fromRole: "orchestrator",
-      text: "@M1 Implement core parser & lexer with full EOF coverage",
-      mentions: ["M1"],
+      text: "@worker-1 Build the streaming parser module with full EOF guards",
+      mentions: ["worker-1"],
+      channelMentions: [],
       kind: "brief",
-      missionId: "M1",
       timestamp: "2026-11-20T17:31:00.000Z",
     },
     {
       seq: 2,
       runId,
-      from: "M1",
+      channel: "backend",
+      from: "worker-1",
       fromRole: "worker",
-      text: "@validator-M1 [done] Implemented lexer and parser tests; ready for validation",
-      mentions: ["validator-M1"],
+      text: "@validator [done] Implemented lexer + parser tests; ready for audit",
+      mentions: ["validator"],
+      channelMentions: [],
       kind: "done",
-      missionId: "M1",
-      timestamp: "2026-11-20T17:41:00.000Z",
+      timestamp: "2026-11-20T17:38:00.000Z",
     },
     {
       seq: 3,
       runId,
-      from: "validator-M1",
+      channel: "backend",
+      from: "validator",
       fromRole: "validator",
-      text: "@M1 Found p2 EOF guard edge case in src/parser/lexer.ts:42",
-      mentions: ["M1"],
+      text: "@worker-1 Found edge case on empty buffer in src/parser.ts:42",
+      mentions: ["worker-1"],
+      channelMentions: [],
       kind: "review",
-      missionId: "M1",
+      timestamp: "2026-11-20T17:40:00.000Z",
+    },
+    {
+      seq: 4,
+      runId,
+      channel: "backend",
+      from: "worker-1",
+      fromRole: "worker",
+      text: "@validator Fixed EOF edge case and re-ran tests",
+      mentions: ["validator"],
+      channelMentions: [],
+      kind: "update",
       timestamp: "2026-11-20T17:42:00.000Z",
+    },
+    {
+      seq: 5,
+      runId,
+      channel: "main",
+      from: "worker-2",
+      fromRole: "worker",
+      text: "@worker-1 Sharing shared AST type definitions on @#backend",
+      mentions: ["worker-1"],
+      channelMentions: ["backend"],
+      kind: "chat",
+      timestamp: "2026-11-20T17:44:00.000Z",
     },
   ];
 }
 
+function makeSampleMember(
+  overrides: Partial<SwarmMemberRecord> & { name: string },
+): SwarmMemberRecord {
+  const { name, ...rest } = overrides;
+  return {
+    name,
+    agentId: `agent-${name}`,
+    role: "worker",
+    state: "working",
+    parentName: ORCHESTRATOR_NAME,
+    brief: `Own ${name} slice and verify tests pass`,
+    workspace: "share",
+    cwd: `/tmp/wt-${name}`,
+    branch: `swarm/dyn/${name}`,
+    channels: ["main"],
+    model: "openai/gpt-5.4-codex",
+    thinkingLevel: "medium",
+    lastReadSeq: 5,
+    lastPostSeq: 4,
+    lastPostTime: "2026-11-20T17:42:00.000Z",
+    parkedOn: undefined,
+    turns: 3,
+    tokens: 12_400,
+    cost: 0.14,
+    humanStopped: false,
+    currentActivity: `Editing src/${name}.ts`,
+    lastTool: "edit",
+    logTail: [`Reading src/${name}.ts`, `Running unit tests for ${name}`],
+    createdAt: "2026-11-20T17:35:00.000Z",
+    updatedAt: "2026-11-20T17:44:00.000Z",
+    ...rest,
+  };
+}
+
 function makeSampleSnapshot(overrides?: {
   status?: SwarmRunState["status"];
-  workingAgents?: number;
-  waitingAgents?: number;
-  extraRoster?: RosterEntry[];
-  withRateLimit?: boolean;
   empty?: boolean;
+  members?: SwarmMemberRecord[];
   roleModels?: SwarmRoleModels;
   boardHead?: number;
   recentBoard?: BoardMessage[];
-  finalValidatorEnabled?: boolean;
-  maxFinalAuditRounds?: number;
-  autoFixOnAuditFail?: boolean;
-  finalAuditStatus?: FinalAuditStatus;
-  finalAuditRound?: number;
-  lastAuditedSha?: string;
-  latestFinalAudit?: FinalAuditVerdict;
-  finalAuditSkippedBy?: string;
-  finalAuditSkipReason?: string;
-  finalValidatorRosterEntry?: RosterEntry;
-  finalAuditRunningAgentId?: string;
+  withRateLimit?: boolean;
 }): SwarmSnapshot {
   const defaultRoleModels: SwarmRoleModels = overrides?.roleModels ?? {
     orchestrator: { model: "anthropic/claude-opus-4-6", thinkingLevel: "high" },
@@ -231,249 +288,123 @@ function makeSampleSnapshot(overrides?: {
     return {
       run: null,
       activeRunId: null,
-      runningAgentIds: [],
-      workingAgentIds: [],
-      waitingAgentIds: [],
-      runningCount: 0,
-      maxConcurrency: 3,
+      workingMemberNames: [],
+      waitingMemberNames: [],
       boardHead: 0,
       recentBoard: [],
       recentEvents: [],
-      unreadOrchestratorMessages: 0,
       roleModels: defaultRoleModels,
       totalTokens: 0,
       totalCost: 0,
-      pendingReviews: [],
-      pendingArtifactApprovals: [],
-      readyToMerge: [],
       updatedAt: "2026-11-20T17:45:00.000Z",
     };
   }
 
-  const missions: Record<string, MissionRecord> = {
-    M1: {
-      id: "M1",
-      title: "Build core parser & tokenizer",
-      kind: "build",
-      description: "Implement parser module",
-      scope: ["src/parser/", "tests/parser.test.ts"],
-      deps: [],
-      verification: "npm test -- tests/parser.test.ts",
-      tasks: [{ id: "t1", title: "Write lexer", done: true }],
-      branch: "feat/build-core-parser",
-      worktreePath: "/tmp/wt-M1",
-      status: "active",
-      reviewRound: 1,
-      retryCount: 0,
-      latestReview: {
-        commitSha: "abcdef1234567890",
-        missionId: "M1",
-        branch: "feat/build-core-parser",
-        reviewedAt: "2026-11-20T17:42:00.000Z",
-        reviewerAgentId: "val-M1-1",
-        status: "p2-1items",
-        merge: "fix-then-merge",
-        findings: [
-          {
-            severity: "p2",
-            title: "Handle empty EOF cleanly",
-            detail: "Guard against zero-length buffer",
-            file: "src/parser/lexer.ts",
-            line: 42,
-          },
-        ],
-        checks: [{ name: "unit tests", passed: true }],
-        decision: "Fix edge case then merge",
-      },
-      humanStopped: false,
-      createdAt: "2026-11-20T17:30:00.000Z",
-      updatedAt: "2026-11-20T17:44:00.000Z",
-    },
-    M2: {
-      id: "M2",
-      title: "Architecture design spec",
-      kind: "artifact",
-      description: "Produce architecture report",
-      scope: ["docs/architecture.md"],
-      deps: [],
-      verification: "Human review of docs/architecture.md",
-      tasks: [],
-      branch: "feat/architecture-design-spec",
-      worktreePath: "/tmp/wt-M2",
-      status: "completed",
-      reviewRound: 0,
-      retryCount: 0,
-      humanStopped: false,
-      createdAt: "2026-11-20T17:30:00.000Z",
-      updatedAt: "2026-11-20T17:44:00.000Z",
-    },
-    M3: {
-      id: "M3",
-      title: "Integration wiring",
-      kind: "build",
-      description: "Wire parser into CLI",
-      scope: ["src/cli/"],
-      deps: ["M1"],
-      verification: "npm test",
-      tasks: [],
-      branch: "feat/integration-wiring",
-      worktreePath: "/tmp/wt-M3",
-      status: "failed",
-      reviewRound: 0,
-      retryCount: 2,
-      humanStopped: false,
-      error: "Test suite exited with code 1",
-      createdAt: "2026-11-20T17:30:00.000Z",
-      updatedAt: "2026-11-20T17:44:00.000Z",
-    },
-    M4: {
-      id: "M4",
-      title: "Dependency survey",
-      kind: "survey",
-      description: "Audit third-party deps",
-      scope: ["package.json"],
-      deps: [],
-      verification: "Record findings",
-      tasks: [],
-      branch: "feat/dependency-survey",
-      worktreePath: "/tmp/wt-M4",
-      status: "merged",
-      reviewRound: 0,
-      retryCount: 0,
-      mergedCommitSha: "11223344",
-      mergedAt: "2026-11-20T17:35:00.000Z",
-      humanStopped: false,
-      createdAt: "2026-11-20T17:30:00.000Z",
-      updatedAt: "2026-11-20T17:35:00.000Z",
-    },
-  };
-
-  const workingCount = overrides?.workingAgents ?? 2;
-  const waitingCount = overrides?.waitingAgents ?? 1;
-  const roster: Record<string, RosterEntry> = {};
-  const workingAgentIds: string[] = [];
-  const waitingAgentIds: string[] = [];
-
-  for (let i = 0; i < workingCount; i++) {
-    const id = `worker-${i + 1}`;
-    const missionId = i === 0 ? "M1" : i === 1 ? "M2" : "M3";
-    const role = i === 1 ? "validator" : "worker";
-    roster[id] = {
-      agentId: id,
-      name: role === "validator" ? `validator-${missionId}` : missionId,
-      role,
-      missionId,
-      worktreePath: `/tmp/wt-${missionId}`,
-      branch: missions[missionId]?.branch ?? "feat/extra",
-      status: "working",
-      model:
-        role === "validator"
-          ? "google/gemini-2.5-pro"
-          : "openai/gpt-5.4-codex",
-      thinkingLevel: role === "validator" ? "high" : "medium",
-      lastReadBoardSeq: 3,
-      lastPostBoardSeq: 2,
-      turns: 2 + i,
-      startedAt: "2026-11-20T17:40:00.000Z",
-      humanStopped: false,
-      currentActivity: `Running edit on src/${missionId.toLowerCase()}.ts`,
-      lastTool: "edit",
-      tokens: 12_400 + i * 3_100,
-      cost: 0.145 + i * 0.04,
-      logTail: [
-        "Reading src/parser/lexer.ts",
-        "Applying EOF guard patch",
-        "Running npm test -- tests/parser.test.ts",
-      ],
-    };
-    workingAgentIds.push(id);
-  }
-
-  for (let i = 0; i < waitingCount; i++) {
-    const id = `warm-${i + 1}`;
-    const missionId = i === 0 ? "M2" : "M4";
-    roster[id] = {
-      agentId: id,
-      name: `warm-${missionId}`,
+  const runId = "run-20261120-dyn";
+  const memberList: SwarmMemberRecord[] = overrides?.members ?? [
+    makeSampleMember({
+      name: "worker-1",
       role: "worker",
-      missionId,
-      worktreePath: `/tmp/wt-${missionId}`,
-      branch: missions[missionId]?.branch ?? "feat/extra",
-      status: "waiting",
-      model: "openai/gpt-5.4-codex",
-      thinkingLevel: "medium",
-      lastReadBoardSeq: 3,
+      state: "working",
+      workspace: "share",
+      branch: "swarm/dyn/worker-1",
+      channels: ["main", "backend"],
+      currentActivity: "Running npm test -- tests/parser.test.ts",
       turns: 4,
-      startedAt: "2026-11-20T17:33:00.000Z",
-      humanStopped: false,
-      currentActivity: "Warm session parked on board #3",
-      tokens: 5_200,
-      cost: 0.06,
-      logTail: ["Completed draft, parked waiting on board"],
-    };
-    waitingAgentIds.push(id);
+    }),
+    makeSampleMember({
+      name: "helper-lex",
+      role: "worker",
+      state: "waiting",
+      parentName: "worker-1",
+      workspace: "inherit",
+      cwd: "/tmp/repo",
+      branch: undefined,
+      channels: ["main", "backend"],
+      parkedOn: "Waiting on @worker-1 feedback",
+      currentActivity: undefined,
+      turns: 2,
+    }),
+    makeSampleMember({
+      name: "validator",
+      role: "validator",
+      state: "waiting",
+      workspace: "inherit",
+      cwd: "/tmp/repo",
+      branch: undefined,
+      model: "google/gemini-2.5-pro",
+      thinkingLevel: "high",
+      channels: ["main", "backend"],
+      parkedOn: "Parked after review #3",
+      currentActivity: undefined,
+      turns: 2,
+    }),
+    makeSampleMember({
+      name: "worker-2",
+      role: "worker",
+      state: "working",
+      workspace: "branch",
+      branch: "swarm/dyn/worker-2",
+      channels: ["main"],
+      currentActivity: "Wiring CLI integration",
+      turns: 1,
+    }),
+  ];
+
+  const members: Record<string, SwarmMemberRecord> = {};
+  const memberOrder: string[] = [];
+  const workingMemberNames: string[] = [];
+  const waitingMemberNames: string[] = [];
+
+  for (const m of memberList) {
+    members[m.name] = m;
+    memberOrder.push(m.name);
+    if (m.state === "working") workingMemberNames.push(m.name);
+    if (m.state === "waiting") waitingMemberNames.push(m.name);
   }
 
-  if (overrides?.extraRoster) {
-    for (const entry of overrides.extraRoster) {
-      roster[entry.agentId] = entry;
-      if (entry.status === "working" && !workingAgentIds.includes(entry.agentId)) {
-        workingAgentIds.push(entry.agentId);
-      } else if (
-        entry.status === "waiting" &&
-        !waitingAgentIds.includes(entry.agentId)
-      ) {
-        waitingAgentIds.push(entry.agentId);
-      }
-    }
-  }
-
-  if (overrides?.finalValidatorRosterEntry) {
-    const v = overrides.finalValidatorRosterEntry;
-    roster[v.agentId] = v;
-    if (v.status === "working" && !workingAgentIds.includes(v.agentId)) {
-      workingAgentIds.push(v.agentId);
-    } else if (v.status === "waiting" && !waitingAgentIds.includes(v.agentId)) {
-      waitingAgentIds.push(v.agentId);
-    }
-  }
-
-  const finalAuditStatus: FinalAuditStatus =
-    overrides?.finalAuditStatus ?? "idle";
-  const recentBoard = overrides?.recentBoard ?? makeSampleBoard();
+  const recentBoard = overrides?.recentBoard ?? makeSampleBoard(runId);
   const boardHead =
     overrides?.boardHead ??
     (recentBoard.length > 0 ? recentBoard[recentBoard.length - 1]!.seq : 0);
 
   const run: SwarmRunState = {
-    version: 1,
-    id: "run-20261120-abc",
-    objective: "Implement parallel parser pipeline with independent validation",
-    verificationContract: "All tests pass and tsc --noEmit reports 0 errors",
+    version: 2,
+    id: runId,
+    title: "Dynamic Parser Swarm",
+    objective: "Build and verify streaming parser pipeline with peer review",
+    strategy: "Parallel worktrees for parser + CLI, independent validator audit on board",
+    acceptanceCriteria: "All unit tests pass and strict tsc reports 0 errors",
     baseBranch: "main",
     ownerSessionId: "sess-1",
     ownerPid: process.pid,
     status: overrides?.status ?? "active",
-    maxConcurrency: 3,
+    maxConcurrency: 6,
     validatorEnabled: true,
-    maxValidationRounds: 3,
-    finalValidatorEnabled: overrides?.finalValidatorEnabled ?? true,
-    maxFinalAuditRounds: overrides?.maxFinalAuditRounds ?? 2,
-    autoFixOnAuditFail: overrides?.autoFixOnAuditFail ?? true,
     keepWorkersWarm: true,
-    finalAuditStatus,
-    finalAuditRound: overrides?.finalAuditRound ?? 0,
-    lastAuditedSha:
-      overrides?.lastAuditedSha ?? overrides?.latestFinalAudit?.commitSha,
-    latestFinalAudit: overrides?.latestFinalAudit,
-    finalAuditSkippedBy: overrides?.finalAuditSkippedBy,
-    finalAuditSkipReason: overrides?.finalAuditSkipReason,
     roleModels: defaultRoleModels,
-    revision: 5,
-    missions,
-    missionOrder: ["M1", "M2", "M3", "M4"],
-    roster,
-    findings: [],
+    revision: 7,
+    members,
+    memberOrder,
+    channels: {
+      main: {
+        name: "main",
+        topic: "Swarm coordination",
+        createdBy: ORCHESTRATOR_NAME,
+        createdAt: "2026-11-20T17:30:00.000Z",
+        archived: false,
+        subscribers: memberOrder,
+      },
+      backend: {
+        name: "backend",
+        topic: "Parser & validator handoffs",
+        createdBy: ORCHESTRATOR_NAME,
+        createdAt: "2026-11-20T17:32:00.000Z",
+        archived: false,
+        subscribers: ["worker-1", "helper-lex", "validator"],
+      },
+    },
+    boardHead,
     createdAt: "2026-11-20T17:30:00.000Z",
     updatedAt: "2026-11-20T17:45:00.000Z",
   };
@@ -481,173 +412,149 @@ function makeSampleSnapshot(overrides?: {
   return {
     run,
     activeRunId: run.id,
-    runningAgentIds: workingAgentIds,
-    workingAgentIds,
-    waitingAgentIds,
-    runningCount: workingAgentIds.length,
-    maxConcurrency: 3,
-    rateLimitUntil: overrides?.withRateLimit
-      ? Date.parse("2026-11-20T17:45:30.000Z")
-      : undefined,
-    rateLimitReason: overrides?.withRateLimit ? "HTTP 429 rate limit" : undefined,
+    workingMemberNames,
+    waitingMemberNames,
     boardHead,
     recentBoard,
     recentEvents: [
       {
         id: "ev-1",
-        runId: run.id,
+        runId,
         type: "run_created",
         timestamp: "2026-11-20T17:30:00.000Z",
-        summary: "Created run with 4 missions",
+        summary: "Created Dynamic Parser Swarm",
       },
       {
         id: "ev-2",
-        runId: run.id,
-        type: "worker_spawned",
-        timestamp: "2026-11-20T17:40:00.000Z",
-        missionId: "M1",
-        summary: "Spawned M1 on feat/build-core-parser",
+        runId,
+        type: "member_added",
+        memberName: "worker-1",
+        timestamp: "2026-11-20T17:31:00.000Z",
+        summary: "Spawned worker-1 (share:swarm/dyn/worker-1)",
       },
       {
         id: "ev-3",
-        runId: run.id,
-        type: "validation_submitted",
-        timestamp: "2026-11-20T17:42:00.000Z",
-        missionId: "M1",
-        summary: "Validation p2-1items (fix-then-merge)",
-      },
-      {
-        id: "ev-4",
-        runId: run.id,
-        type: "merge_succeeded",
-        timestamp: "2026-11-20T17:43:00.000Z",
-        missionId: "M4",
-        summary: "Closed survey mission M4",
-      },
-      {
-        id: "ev-5",
-        runId: run.id,
-        type: "mission_failed",
-        timestamp: "2026-11-20T17:44:00.000Z",
-        missionId: "M3",
-        summary: "Worker failed verification",
+        runId,
+        type: "board_posted",
+        memberName: "validator",
+        channel: "backend",
+        timestamp: "2026-11-20T17:40:00.000Z",
+        summary: "Posted review #3 to @worker-1",
       },
     ],
-    unreadOrchestratorMessages: 1,
     roleModels: defaultRoleModels,
-    totalTokens: 28_900,
-    totalCost: 0.33,
-    pendingReviews: [],
-    pendingArtifactApprovals: ["M2"],
-    readyToMerge: ["M2"],
-    finalAuditStatus,
-    latestFinalAudit: overrides?.latestFinalAudit,
-    finalAuditRunningAgentId: overrides?.finalAuditRunningAgentId,
+    totalTokens: 32_500,
+    totalCost: 0.41,
+    rateLimitUntil: overrides?.withRateLimit
+      ? Date.parse("2026-11-20T17:45:30.000Z")
+      : undefined,
+    rateLimitReason: overrides?.withRateLimit ? "HTTP 429 rate limit" : undefined,
     updatedAt: "2026-11-20T17:45:00.000Z",
   };
 }
 
 // ============================================================================
-// 1. text-utils Tests
+// 0. Static Compatibility & Hygiene Audit
+// ============================================================================
+
+describe("src/ui compatibility & hygiene audit", () => {
+  it("contains zero replaceControlCharacters imports/references and zero tower strings across src/ui/*", () => {
+    const uiDir = path.resolve(process.cwd(), "src/ui");
+    const files = readdirSync(uiDir).filter((f) => f.endsWith(".ts"));
+    assert.ok(files.includes("text-utils.ts"));
+    assert.ok(files.includes("questionnaire.ts"));
+    assert.ok(files.includes("dashboard-widget.ts"));
+    assert.ok(files.includes("swarm-overlay.ts"));
+    assert.ok(files.includes("index.ts"));
+    assert.ok(
+      !files.includes("tasks-overlay.ts"),
+      "Obsolete tasks-overlay.ts must be deleted",
+    );
+
+    for (const file of files) {
+      const content = readFileSync(path.join(uiDir, file), "utf8");
+      assert.doesNotMatch(
+        content,
+        /replaceControlCharacters/,
+        `${file} must not reference replaceControlCharacters`,
+      );
+      assert.doesNotMatch(
+        content,
+        /tower/i,
+        `${file} must not contain any 'tower' strings`,
+      );
+    }
+  });
+});
+
+// ============================================================================
+// 1. text-utils & Collaboration Graph Tests
 // ============================================================================
 
 describe("text-utils", () => {
-  it("fitLine guarantees visibleWidth <= width for ANSI, CJK, emoji, and narrow widths", () => {
+  it("fitLine, fitLines, wrapLines, joinColumns, renderBox, and renderTable obey strict width bounds (40/80/120)", () => {
+    const theme = createMockTheme();
     const samples = [
       "Simple ASCII line that is moderately long for narrow viewports",
-      "\x1b[36m\x1b[1m🐝 Swarm [active]\x1b[0m \x1b[32m中文并行任务编排测试字符串\x1b[0m — extra detail",
-      "Line with\nembedded\r\nnewlines\tand tabs",
+      "\x1b[36m\x1b[1m🐝 Dynamic Swarm [Live]\x1b[0m \x1b[32m中文并行多智能体协作测试\x1b[0m — extra detail",
+      "Line with\nembedded\r\nnewlines\tand\u0007control chars",
       "漢字テスト漢字テスト漢字テスト漢字テスト",
-      "🚀✨🔥🐝⚠️✓✗●○◐■",
+      "🚀✨🔥🐝⚠️✓✗●◌■⊘⇄→",
     ];
-    const widths = [1, 2, 5, 10, 20, 40, 80, 120];
-
     for (const sample of samples) {
-      for (const w of widths) {
+      for (const w of [1, 2, 10, 40, 80, 120]) {
         const fitted = fitLine(sample, w);
-        assert.ok(
-          visibleWidth(fitted) <= w,
-          `fitLine width ${w} exceeded: got ${visibleWidth(fitted)} for ${JSON.stringify(sample)}`,
-        );
+        assert.ok(visibleWidth(fitted) <= w);
         assert.ok(!fitted.includes("\n") && !fitted.includes("\r"));
-
         const padded = fitLine(sample, w, { pad: true });
-        assert.ok(
-          visibleWidth(padded) <= w,
-          `fitLine(pad) width ${w} exceeded: got ${visibleWidth(padded)}`,
-        );
+        assert.ok(visibleWidth(padded) <= w);
       }
     }
     assert.equal(fitLine("anything", 0), "");
-  });
+    assert.equal(sanitizePlainText("\x1b[31mhi\u0007\tthere\n\x1b[0m"), "hi there");
 
-  it("wrapLines, joinColumns, renderBox, and renderTable obey width bounds on 40/80/120", () => {
-    const theme = createMockTheme();
     const longText =
-      theme.fg("accent", "Parallel Swarm Orchestrator: ") +
-      "中文字符宽度与ANSI颜色混合换行测试 ".repeat(4) +
-      "plus verylongunbreakableidentifier_1234567890_abcdefghijklmnopqrstuvwxyz";
+      theme.fg("accent", "Dynamic Antigravity Swarm: ") +
+      "中文字符宽度与ANSI颜色混合换行测试 ".repeat(3) +
+      "verylongunbreakableidentifier_1234567890_abcdefghijklmnopqrstuvwxyz";
 
     for (const width of [40, 80, 120]) {
       const wrapped = wrapLines(longText, width, 4);
       assert.ok(wrapped.length <= 4);
       assertAllLinesFit(wrapped, width, `wrapLines@${width}`);
 
+      const capped = fitLines(["a", "b", "c", "d", "e"], width, { maxLines: 3 });
+      assert.equal(capped.length, 3);
+      assertAllLinesFit(capped, width, `fitLines@${width}`);
+
       const joined = joinColumns(
-        theme.bold("🐝 Swarm [active] Very long objective title here"),
-        theme.fg("success", "12/15 merged · 45.2k tok · $1.23"),
+        theme.bold("🐝 Dynamic Parser Swarm · Live"),
+        theme.fg("success", "Board:#18 · 2w/3wait"),
         width,
       );
       assert.ok(visibleWidth(joined) <= width);
 
+      const rule = renderHorizontalRule(width, "Section Header", theme);
+      assert.ok(visibleWidth(rule) <= width);
+
       const boxed = renderBox(wrapped, width, {
-        title: theme.fg("accent", "🐝 Swarm Box Title"),
+        title: theme.fg("accent", "🐝 Swarm Box"),
         footer: theme.fg("dim", "[Esc] close"),
         borderColor: (s) => theme.fg("border", s),
       });
       assertAllLinesFit(boxed, width, `renderBox@${width}`);
 
       const rows = [
-        {
-          id: "M1",
-          status: "● active",
-          branch: "feat/very-long-branch-name-here",
-          scope: "src/core/parser/",
-        },
-        {
-          id: "M2",
-          status: "✓ merged",
-          branch: "feat/中文-branch",
-          scope: "docs/spec.md",
-        },
+        { name: "worker-1", role: "worker", state: "working", ws: "share:swarm/r1/worker-1" },
+        { name: "validator", role: "validator", state: "waiting", ws: "inherit" },
       ];
       const table = renderTable(
         rows,
         [
-          { key: "id", header: "ID", minWidth: 4, priority: 100, render: (r) => r.id },
-          {
-            key: "status",
-            header: "Status",
-            minWidth: 10,
-            priority: 90,
-            render: (r) => r.status,
-          },
-          {
-            key: "branch",
-            header: "Branch",
-            minWidth: 16,
-            flex: 2,
-            priority: 60,
-            render: (r) => r.branch,
-          },
-          {
-            key: "scope",
-            header: "Scope",
-            minWidth: 14,
-            flex: 1,
-            priority: 40,
-            render: (r) => r.scope,
-          },
+          { key: "name", header: "Name", minWidth: 8, priority: 100, render: (r) => r.name },
+          { key: "role", header: "Role", minWidth: 6, priority: 90, render: (r) => r.role },
+          { key: "state", header: "State", minWidth: 7, priority: 85, render: (r) => r.state },
+          { key: "ws", header: "Workspace", minWidth: 12, flex: 2, priority: 60, render: (r) => r.ws },
         ],
         width,
         { theme },
@@ -656,619 +563,130 @@ describe("text-utils", () => {
     }
   });
 
-  it("formatDuration, formatTokens, formatCost, and computeMissionWaves format cleanly", () => {
-    assert.equal(formatDuration(0), "0s");
-    assert.equal(formatDuration(-5), "0s");
-    assert.equal(formatDuration(450), "450ms");
-    assert.equal(formatDuration(15_000), "15s");
-    assert.equal(formatDuration(125_000), "2m05s");
-    assert.equal(formatDuration(180_000), "3m");
-    assert.equal(formatDuration(3_900_000), "1h05m");
-
-    assert.equal(formatTokens(0), "0");
-    assert.equal(formatTokens(842), "842");
-    assert.equal(formatTokens(1_500), "1.5k");
-    assert.equal(formatTokens(12_000), "12k");
-    assert.equal(formatTokens(145_600), "146k");
-    assert.equal(formatTokens(1_250_000), "1.25M");
-
-    assert.equal(formatCost(0), "$0.00");
-    assert.equal(formatCost(0.0025), "$0.0025");
-    assert.equal(formatCost(0.42), "$0.42");
-    assert.equal(formatCost(12.5), "$12.50");
-
-    const waves = computeMissionWaves([
-      { id: "M1", deps: [] },
-      { id: "M2", deps: ["M1"] },
-      { id: "M3", deps: [] },
-      { id: "M4", deps: ["M2", "M3"] },
-    ]);
-    assert.deepEqual(
-      waves.map((w) => w.map((m) => m.id)),
-      [["M1", "M3"], ["M2"], ["M4"]],
-    );
-
-    // Cycle safety for UI display
-    const cyclic = computeMissionWaves([
-      { id: "A", deps: ["B"] },
-      { id: "B", deps: ["A"] },
-    ]);
-    assert.equal(cyclic.flat().length, 2);
-  });
-
-  it("formats 3-role model pills cleanly across unbounded and tight widths", () => {
+  it("formats durations, elapsed time, tokens, costs, 3-role models, and clean v2 badges", () => {
     const theme = createMockTheme();
+
+    assert.equal(formatDuration(0), "0s");
+    assert.equal(formatDuration(450), "450ms");
+    assert.equal(formatDuration(125_000), "2m05s");
+    assert.equal(formatDuration(3_900_000), "1h05m");
+    assert.equal(
+      formatElapsedSince("2026-11-20T17:40:00.000Z", Date.parse("2026-11-20T17:42:05.000Z")),
+      "2m05s",
+    );
+    assert.equal(formatTokens(1_500), "1.5k");
+    assert.equal(formatTokens(1_250_000), "1.25M");
+    assert.equal(formatCost(0.0025), "$0.0025");
+    assert.equal(formatCost(1.5), "$1.50");
+
+    // 3-role model pills
     const roleModels: SwarmRoleModels = {
       orchestrator: { model: "anthropic/claude-opus-4-6-20260201", thinkingLevel: "high" },
       worker: { model: "openai/gpt-5.4-codex", thinkingLevel: "medium" },
       validator: { model: "google/gemini-2.5-pro", thinkingLevel: "high" },
     };
-
     assert.equal(shortenModelName("anthropic/claude-opus-4-6"), "claude-opus-4-6");
     assert.ok(visibleWidth(shortenModelName("anthropic/claude-opus-4-6-20260201", 15)) <= 15);
-
-    const plainFull = formatRoleModelsLine(roleModels);
-    assert.match(plainFull, /^O:anthropic\/claude-opus-4-6-20260201\(high\) · W:openai\/gpt-5\.4-codex\(medium\) · V:google\/gemini-2\.5-pro\(high\)$/);
-
-    const fallbackLine = formatRoleModelsLine(undefined, "host default");
-    assert.equal(fallbackLine, "O:host default · W:host default · V:host default");
-
-    for (const width of [20, 40, 60, 80, 120]) {
-      const fitted = formatRoleModelsLine(roleModels, "default", {
-        maxWidth: width,
-        theme,
-      });
-      assert.ok(
-        visibleWidth(fitted) <= width,
-        `formatRoleModelsLine exceeded width ${width}: got ${visibleWidth(fitted)}`,
-      );
-      const stripped = stripTerminalSequences(fitted);
-      if (width >= 40) {
-        assert.match(stripped, /O:/);
-        assert.match(stripped, /W:/);
-        assert.match(stripped, /V:/);
-      }
-    }
-  });
-
-  it("formats verifying run status, final audit badges, roster roles/statuses, and board kind badges", () => {
-    const theme = createMockTheme();
-
-    assert.equal(formatRunStatusBadge("verifying"), "verifying");
-    const themedVerifying = formatRunStatusBadge("verifying", theme);
-    assert.equal(stripTerminalSequences(themedVerifying), "verifying");
-    assert.ok(themedVerifying.includes("\x1b["));
-
-    assert.equal(formatFinalAuditBadge(undefined), "idle");
-    assert.equal(formatFinalAuditBadge("idle"), "idle");
-    assert.match(formatFinalAuditBadge("pending"), /pending/);
-    assert.match(formatFinalAuditBadge("running", 1, 2), /running \(1\/2\)/);
-    assert.match(formatFinalAuditBadge("approved", 2, 2), /approved \(2\/2\)/);
-    assert.match(formatFinalAuditBadge("disapproved", 1, 2), /disapproved \(1\/2\)/);
-    assert.match(formatFinalAuditBadge("skipped"), /skipped/);
-
-    for (const role of ["worker", "validator", "final-validator"] as const) {
-      assert.equal(formatRosterRoleBadge(role), role);
-      assert.equal(stripTerminalSequences(formatRosterRoleBadge(role, theme)), role);
+    assert.match(
+      formatRoleModelsLine(roleModels),
+      /^O:anthropic\/claude-opus-4-6-20260201\(high\) · W:openai\/gpt-5\.4-codex\(medium\) · V:google\/gemini-2\.5-pro\(high\)$/,
+    );
+    for (const width of [20, 40, 80, 120]) {
+      const fitted = formatRoleModelsLine(roleModels, "default", { maxWidth: width, theme });
+      assert.ok(visibleWidth(fitted) <= width);
     }
 
-    for (const status of [
-      "working",
-      "waiting",
-      "stopped",
-      "killed",
-      "failed",
-      "died",
-    ] as const) {
-      assert.equal(formatRosterStatusBadge(status), status);
-      assert.equal(
-        stripTerminalSequences(formatRosterStatusBadge(status, theme)),
-        status,
-      );
+    // Run status badges (active -> Live)
+    assert.equal(formatRunStatusBadge("active"), "Live");
+    assert.equal(stripTerminalSequences(formatRunStatusBadge("active", theme)), "Live");
+    assert.equal(formatRunStatusBadge("paused"), "paused");
+    assert.equal(formatRunStatusBadge("completed"), "completed");
+    assert.equal(formatRunStatusBadge("abandoned"), "abandoned");
+
+    // Member role badges
+    for (const role of ["worker", "validator", "orchestrator", "monitor"] as const) {
+      assert.equal(formatMemberRoleBadge(role), role);
+      assert.equal(stripTerminalSequences(formatMemberRoleBadge(role, theme)), role);
     }
 
+    // Member state badges & icons
+    for (const state of ["working", "waiting", "stopped", "killed"] as const) {
+      assert.equal(formatMemberStateBadge(state), state);
+      assert.equal(stripTerminalSequences(formatMemberStateBadge(state, theme)), state);
+      assert.ok(memberStateIcon(state).length > 0);
+    }
+
+    // Workspace badges
+    assert.equal(formatWorkspaceBadge("inherit"), "inherit");
+    assert.equal(formatWorkspaceBadge("share", "swarm/r1/parser"), "share:swarm/r1/parser");
+    assert.equal(formatWorkspaceBadge("branch", "swarm/r1/cli"), "branch:swarm/r1/cli");
+    assert.equal(
+      stripTerminalSequences(formatWorkspaceBadge("share", "swarm/r1/parser", theme)),
+      "share:swarm/r1/parser",
+    );
+
+    // Board kind badges
     for (const kind of [
       "brief",
       "done",
+      "update",
       "review",
-      "fix",
-      "handoff",
       "decision",
       "model_switch",
       "stall",
       "chat",
     ] as const) {
       assert.equal(formatBoardKindBadge(kind), `[${kind}]`);
-      assert.equal(
-        stripTerminalSequences(formatBoardKindBadge(kind, theme)),
-        `[${kind}]`,
-      );
+      assert.equal(stripTerminalSequences(formatBoardKindBadge(kind, theme)), `[${kind}]`);
+    }
+  });
+
+  it("buildSwarmGraphLines renders nested Spawn Tree + Peer @mention Interactions strictly within width 40/80/120", () => {
+    const theme = createMockTheme();
+    const snap = makeSampleSnapshot();
+    const run = snap.run!;
+    const board = snap.recentBoard;
+
+    for (const width of [40, 80, 120]) {
+      const plainLines = buildSwarmGraphLines(run, board, width);
+      assertAllLinesFit(plainLines, width, `graph-plain@${width}`);
+      const themedLines = buildSwarmGraphLines(run, board, width, { theme });
+      assertAllLinesFit(themedLines, width, `graph-themed@${width}`);
     }
 
-    assert.equal(computeActiveFinalAuditRound("running", 0, undefined, true), 1);
-    assert.equal(resolveFinalAuditDisplayRound("running", 1, { round: 1 }, true), 2);
-    assert.equal(computeActiveFinalAuditRound("disapproved", 1, { round: 1 }, false), 1);
+    const lines80 = buildSwarmGraphLines(run, board, 80);
+    const joined = lines80.join("\n");
+    assert.match(joined, /orchestrator \[Live\]/);
+    assert.match(joined, /├── ● worker-1 \(worker\).*share:swarm\/dyn\/worker-1/);
+    assert.match(joined, /│\s+└── ◌ helper-lex \(worker\).*inherit/);
+    assert.match(joined, /├── ◌ validator \(validator\).*inherit/);
+    assert.match(joined, /└── ● worker-2 \(worker\).*branch:swarm\/dyn\/worker-2/);
+    // Bidirectional edge between worker-1 and validator (2 + 1 = 3 msgs)
+    assert.match(joined, /worker-1 ⇄ validator \(3 msgs\)/);
+    // Unidirectional edge worker-2 -> worker-1 (1 msg)
+    assert.match(joined, /worker-2 → worker-1 \(1 msg\)/);
+    // Channel mention edge worker-2 -> #backend (1 msg)
+    assert.match(joined, /worker-2 → #backend \(1 msg\)/);
+
+    // Defensive cycle safety in parentName
+    const cyclicRun: SwarmRunState = {
+      ...run,
+      members: {
+        a: makeSampleMember({ name: "a", parentName: "b" }),
+        b: makeSampleMember({ name: "b", parentName: "a" }),
+      },
+      memberOrder: ["a", "b"],
+    };
+    const cyclicLines = buildSwarmGraphLines(cyclicRun, [], 80);
+    assertAllLinesFit(cyclicLines, 80, "graph-cyclic@80");
+    assert.match(cyclicLines.join("\n"), /\ba\b/);
+    assert.match(cyclicLines.join("\n"), /\bb\b/);
+    assert.match(cyclicLines.join("\n"), /no @mention interactions yet/);
   });
 });
 
 // ============================================================================
-// 2. dashboard-widget Tests
-// ============================================================================
-
-describe("dashboard-widget", () => {
-  it("renders empty, drafting, compact (warm waiting + board preview + 3-role pills), and expanded states within widths 40, 80, 120", () => {
-    const theme = createMockTheme();
-    const fixedNow = () => Date.parse("2026-11-20T17:45:00.000Z");
-
-    // Empty state
-    {
-      const mock = createMockTUI();
-      const state = createSwarmWidgetState();
-      const factory = createSwarmWidget(
-        () => makeSampleSnapshot({ empty: true }),
-        state,
-        { now: fixedNow },
-      );
-      const comp = factory(mock.tui, theme);
-      assert.deepEqual(comp.render(80), []);
-      comp.dispose();
-    }
-
-    // Drafting state (no run)
-    {
-      const mock = createMockTUI();
-      const state = createSwarmWidgetState({
-        draftActive: true,
-        draftSeed: "Build a parallel web crawler with rate limiting",
-      });
-      const factory = createSwarmWidget(
-        () => makeSampleSnapshot({ empty: true }),
-        state,
-        { now: fixedNow },
-      );
-      const comp = factory(mock.tui, theme);
-      for (const width of [40, 80, 120]) {
-        const lines = comp.render(width);
-        assert.ok(lines.length >= 1);
-        assertAllLinesFit(lines, width, `draft@${width}`);
-        const plain = stripTerminalSequences(lines.join("\n"));
-        assert.match(plain, /Swarm Draft/);
-        assert.doesNotMatch(plain, /tower/i);
-      }
-      comp.dispose();
-    }
-
-    // Compact mode (5 working, 2 waiting warm, board preview, 3-role pill, rate-limit)
-    {
-      const mock = createMockTUI();
-      const state = createSwarmWidgetState({ expanded: false });
-      const snap = makeSampleSnapshot({
-        workingAgents: 5,
-        waitingAgents: 2,
-        boardHead: 12,
-        withRateLimit: true,
-      });
-      const factory = createSwarmWidget(() => snap, state, {
-        now: fixedNow,
-        maxCompactWorkers: 3,
-      });
-      const comp = factory(mock.tui, theme);
-      for (const width of [40, 80, 120]) {
-        const lines = comp.render(width);
-        assert.ok(lines.length >= 6);
-        assertAllLinesFit(lines, width, `compact@${width}`);
-        const plain = stripTerminalSequences(lines.join("\n"));
-        assert.match(plain, /Swarm/);
-        assert.match(plain, /board:#12/);
-        assert.match(plain, /O:/);
-        assert.match(plain, /5 working · 2 waiting warm/);
-        assert.match(plain, /\+2 more working agents/);
-        assert.match(plain, /#3 validator-M1:/);
-        assert.doesNotMatch(plain, /tower/i);
-        if (width >= 100) {
-          assert.match(plain, /\/swarm board/);
-        }
-      }
-      comp.dispose();
-    }
-
-    // Expanded mode (3-role models bar + Missions + Live Roster + Final Validation + Recent Board + Recent Activity)
-    {
-      const mock = createMockTUI(36, 120);
-      const state = createSwarmWidgetState({ expanded: true });
-      const snap = makeSampleSnapshot({
-        workingAgents: 1,
-        waitingAgents: 1,
-        extraRoster: [
-          {
-            agentId: "killed-1",
-            name: "old-M3",
-            role: "worker",
-            missionId: "M3",
-            worktreePath: "/tmp/wt-M3",
-            branch: "feat/integration-wiring",
-            status: "killed",
-            model: "openai/gpt-5.4-codex",
-            lastReadBoardSeq: 2,
-            turns: 1,
-            startedAt: "2026-11-20T17:32:00.000Z",
-            endedAt: "2026-11-20T17:36:00.000Z",
-            humanStopped: false,
-            tokens: 1_200,
-            cost: 0.01,
-            logTail: [],
-          },
-        ],
-      });
-      const factory = createSwarmWidget(() => snap, state, { now: fixedNow });
-      const comp = factory(mock.tui, theme);
-      for (const width of [40, 80, 120]) {
-        const lines = comp.render(width);
-        assert.ok(lines.length >= 10);
-        assertAllLinesFit(lines, width, `expanded@${width}`);
-        const plain = stripTerminalSequences(lines.join("\n"));
-        assert.match(plain, /Swarm Dashboard/);
-        assert.match(plain, /Models:/);
-        assert.match(plain, /Final Validation:/);
-        assert.match(plain, /Missions/);
-        assert.match(plain, /M1/);
-        assert.match(plain, /Roster/);
-        assert.match(plain, /Recent Board/);
-        assert.doesNotMatch(plain, /tower/i);
-      }
-      comp.dispose();
-    }
-  });
-
-  it("animates spinner timer while working, stays idle when only warm-waiting, and clears timer on dispose()", async () => {
-    const theme = createMockTheme();
-
-    // Only warm waiting agents -> no spinner ticks!
-    {
-      const mock = createMockTUI();
-      const state = createSwarmWidgetState();
-      const waitingOnlySnap = makeSampleSnapshot({
-        workingAgents: 0,
-        waitingAgents: 2,
-      });
-      const comp = createSwarmWidget(() => waitingOnlySnap, state, {
-        spinnerIntervalMs: 40,
-      })(mock.tui, theme);
-      comp.render(80);
-      await new Promise((r) => setTimeout(r, 110));
-      assert.equal(mock.renderCount(), 0, "Warm waiting-only swarm should not spin timer");
-      comp.dispose();
-    }
-
-    // Working agents -> spinner ticks until dispose()
-    {
-      const mock = createMockTUI();
-      const state = createSwarmWidgetState();
-      const snap = makeSampleSnapshot({ workingAgents: 1, waitingAgents: 0 });
-      const comp = createSwarmWidget(() => snap, state, {
-        spinnerIntervalMs: 40,
-      })(mock.tui, theme);
-
-      comp.render(80);
-      await new Promise((r) => setTimeout(r, 110));
-      const countBeforeDispose = mock.renderCount();
-      assert.ok(
-        countBeforeDispose >= 1,
-        `Expected spinner timer to trigger requestRender, got ${countBeforeDispose}`,
-      );
-
-      comp.dispose();
-      await new Promise((r) => setTimeout(r, 110));
-      assert.equal(
-        mock.renderCount(),
-        countBeforeDispose,
-        "Spinner timer must not tick after dispose()",
-      );
-    }
-  });
-
-  it("bindSwarmShortcuts guards on isModalOpen and handles Ctrl+Shift+T and Esc", () => {
-    let listener:
-      | ((data: string) => { consume?: boolean; data?: string } | undefined)
-      | undefined;
-    let unsubscribed = false;
-
-    const ctx = {
-      mode: "tui",
-      hasUI: true,
-      ui: {
-        onTerminalInput(fn: NonNullable<typeof listener>) {
-          listener = fn;
-          return () => {
-            unsubscribed = true;
-          };
-        },
-      },
-    } as unknown as ExtensionContext;
-
-    const state = createSwarmWidgetState();
-    let toggleCalls = 0;
-    let collapseCalls = 0;
-
-    const unbind = bindSwarmShortcuts(ctx, {
-      isModalOpen: () => isModalOpen(state),
-      isExpanded: () => state.expanded,
-      onToggleExpand: () => {
-        toggleCalls++;
-        state.expanded = !state.expanded;
-      },
-      onCollapse: () => {
-        collapseCalls++;
-        state.expanded = false;
-      },
-    });
-
-    assert.ok(listener);
-    assert.equal(listener("\x1b"), undefined);
-    assert.equal(collapseCalls, 0);
-
-    const toggleRes = listener("\x1b[116;6u");
-    assert.deepEqual(toggleRes, { consume: true });
-    assert.equal(state.expanded, true);
-    assert.equal(toggleCalls, 1);
-
-    // Modal open -> ignore both
-    state.modalDepth = 1;
-    assert.equal(listener("\x1b[116;6u"), undefined);
-    assert.equal(listener("\x1b"), undefined);
-    assert.equal(state.expanded, true);
-
-    // Modal closed -> Esc collapses
-    state.modalDepth = 0;
-    const escRes = listener("\x1b");
-    assert.deepEqual(escRes, { consume: true });
-    assert.equal(state.expanded, false);
-    assert.equal(collapseCalls, 1);
-
-    unbind();
-    assert.equal(unsubscribed, true);
-  });
-
-  it("formats status line, zero-turn status dashboard, board view, and 3-role models view cleanly", () => {
-    const empty = makeSampleSnapshot({ empty: true });
-    assert.equal(formatStatusLine(empty, false), undefined);
-    assert.equal(formatStatusLine(empty, true), "🐝 swarm:draft");
-    assert.match(formatZeroTurnStatusDashboard(empty), /No active Swarm run/);
-    assert.match(
-      formatZeroTurnStatusDashboard(empty, {
-        draftActive: true,
-        draftSeed: "Refactor auth",
-      }),
-      /Swarm Draft Active/,
-    );
-
-    const active = makeSampleSnapshot({
-      workingAgents: 2,
-      waitingAgents: 1,
-      boardHead: 12,
-      withRateLimit: true,
-    });
-    const statusLine = formatStatusLine(active, false);
-    assert.ok(statusLine);
-    assert.match(statusLine, /swarm:active 2w\/1wait #12/);
-    assert.match(statusLine, /1\/4 merged/);
-    assert.match(statusLine, /1 approval/);
-    assert.doesNotMatch(statusLine, /tower/i);
-
-    const md = formatZeroTurnStatusDashboard(active, {
-      now: () => Date.parse("2026-11-20T17:45:00.000Z"),
-    });
-    assert.match(md, /Swarm Status/);
-    assert.match(md, /run-20261120-abc/);
-    assert.match(md, /#### 3-Role Models/);
-    assert.match(md, /anthropic\/claude-opus-4-6/);
-    assert.match(md, /openai\/gpt-5\.4-codex/);
-    assert.match(md, /google\/gemini-2\.5-pro/);
-    assert.match(md, /Base Branch.*`main`/);
-    assert.match(md, /Missions by Wave/);
-    assert.match(md, /\| W1 \| `M1`/);
-    assert.match(md, /\| W2 \| `M3`/);
-    assert.match(md, /### Final Verification/);
-    assert.match(md, /Pending Artifact Sign-Off.*`M2`/);
-    assert.match(md, /Rate-Limit Backoff/);
-    assert.match(md, /#### Live Roster/);
-    assert.match(md, /waiting/);
-    assert.match(md, /#### Recent Board \(#12\)/);
-    assert.match(md, /#3/);
-    assert.match(md, /Recent Activity/);
-    assert.doesNotMatch(md, /tower/i);
-
-    // formatZeroTurnBoardView
-    const emptyBoard = formatZeroTurnBoardView([], 0);
-    assert.match(emptyBoard, /Swarm Board \(head: #0\)/);
-    assert.match(emptyBoard, /No board messages posted yet/);
-
-    const boardMd = formatZeroTurnBoardView(active.recentBoard, 12, {
-      runId: active.activeRunId ?? undefined,
-    });
-    assert.match(boardMd, /Swarm Board — `run-20261120-abc` \(head: #12\)/);
-    assert.match(boardMd, /\*\*#1\*\*.*`\[brief\]`.*\*\*orchestrator\*\* -> @M1/);
-    assert.match(boardMd, /\*\*#2\*\*.*`\[done\]`.*\*\*M1\*\* -> @validator-M1/);
-    assert.match(boardMd, /\*\*#3\*\*.*`\[review\]`.*\*\*validator-M1\*\* -> @M1/);
-    assert.doesNotMatch(boardMd, /tower/i);
-
-    // formatZeroTurnModelsView
-    const settings: SwarmSettings = {
-      ...DEFAULT_SWARM_SETTINGS,
-      orchestratorModel: "anthropic/claude-opus-4-6",
-      orchestratorThinkingLevel: "high",
-      workerModel: "openai/gpt-5.4-codex",
-      workerThinkingLevel: "medium",
-      validatorModel: "google/gemini-2.5-pro",
-      validatorThinkingLevel: "high",
-      fallbackModels: ["anthropic/claude-sonnet-4-5", "openai/gpt-4.1"],
-    };
-    const modelsMd = formatZeroTurnModelsView(
-      settings,
-      active,
-      "anthropic/claude-sonnet-4-5",
-    );
-    assert.match(modelsMd, /### 🐝 Swarm 3-Role Models/);
-    assert.match(modelsMd, /Host Default Model.*`anthropic\/claude-sonnet-4-5`/);
-    assert.match(modelsMd, /\| orchestrator \| `anthropic\/claude-opus-4-6`/);
-    assert.match(modelsMd, /\| worker \| `openai\/gpt-5\.4-codex`/);
-    assert.match(modelsMd, /\| validator \| `google\/gemini-2\.5-pro`/);
-    assert.match(modelsMd, /Fallback Models.*`anthropic\/claude-sonnet-4-5`, `openai\/gpt-4\.1`/);
-    assert.match(modelsMd, /#### Live Roster Models/);
-    assert.match(modelsMd, /`warm-M2`.*waiting.*`openai\/gpt-5\.4-codex`/);
-    assert.match(modelsMd, /`validator-M2`.*working.*`google\/gemini-2\.5-pro`/);
-    assert.doesNotMatch(modelsMd, /tower/i);
-  });
-
-  it("renders Final Validator verifying (round 1/2 & 2/2) and disapproved states within width bounds", () => {
-    const theme = createMockTheme();
-    const fixedNow = () => Date.parse("2026-11-20T17:45:00.000Z");
-
-    const validatorEntry: RosterEntry = {
-      agentId: "final-val-1",
-      name: "final-validator",
-      role: "final-validator",
-      missionId: FINAL_AUDIT_MISSION_ID,
-      worktreePath: "/tmp/repo",
-      branch: "main",
-      status: "working",
-      model: "google/gemini-2.5-pro",
-      lastReadBoardSeq: 5,
-      turns: 1,
-      startedAt: "2026-11-20T17:44:10.000Z",
-      humanStopped: false,
-      currentActivity: "Running full integration suite on main",
-      lastTool: "read",
-      tokens: 6_200,
-      cost: 0.08,
-      logTail: [
-        "Inspecting merged diff against verification contract",
-        "Checking src/cli/index.ts wiring",
-      ],
-    };
-
-    const verifyingSnap = makeSampleSnapshot({
-      status: "verifying",
-      workingAgents: 0,
-      waitingAgents: 1,
-      finalValidatorEnabled: true,
-      maxFinalAuditRounds: 2,
-      finalAuditStatus: "running",
-      finalAuditRound: 0,
-      finalValidatorRosterEntry: validatorEntry,
-      finalAuditRunningAgentId: validatorEntry.agentId,
-    });
-
-    // Compact widget during verifying round 1/2
-    {
-      const mock = createMockTUI();
-      const state = createSwarmWidgetState({ expanded: false });
-      const comp = createSwarmWidget(() => verifyingSnap, state, { now: fixedNow })(
-        mock.tui,
-        theme,
-      );
-      for (const width of [40, 80, 120]) {
-        const lines = comp.render(width);
-        assertAllLinesFit(lines, width, `compact-verifying@${width}`);
-        const plain = stripTerminalSequences(lines.join("\n"));
-        assert.match(plain, /verifying/);
-        assert.match(plain, /Final Validator \(round 1\/2\)/);
-      }
-      comp.dispose();
-    }
-
-    const verifyingLine = formatStatusLine(verifyingSnap, false);
-    assert.ok(verifyingLine);
-    assert.match(verifyingLine, /swarm:verifying r1\/2/);
-
-    // Disapproved state + Round 2/2 verifying
-    const disapprovedVerdict: FinalAuditVerdict = {
-      commitSha: "deadbeef1234567890",
-      baseBranch: "main",
-      auditedAt: "2026-11-20T17:44:50.000Z",
-      verifierAgentId: "final-val-1",
-      verdict: "disapproved",
-      summary: "CLI wiring misses error exit code on parser failure",
-      checks: [
-        { name: "typecheck", passed: true },
-        { name: "integration tests", passed: false, detail: "1 failing test" },
-      ],
-      findings: [
-        {
-          severity: "p1",
-          title: "Missing non-zero exit code",
-          detail: "CLI exits 0 when parser throws",
-          file: "src/cli/main.ts",
-          line: 88,
-        },
-        {
-          severity: "p2",
-          title: "Missing README usage section",
-          detail: "Document --strict flag",
-        },
-      ],
-      recommendedMissions: [
-        {
-          title: "Fix CLI exit code propagation",
-          description: "Return exit code 1 on parse failure",
-          scope: ["src/cli/main.ts"],
-          verification: "npm test",
-          kind: "build",
-        },
-      ],
-      round: 1,
-    };
-
-    const disapprovedSnap = makeSampleSnapshot({
-      status: "active",
-      workingAgents: 0,
-      waitingAgents: 1,
-      finalValidatorEnabled: true,
-      maxFinalAuditRounds: 2,
-      finalAuditStatus: "disapproved",
-      finalAuditRound: 1,
-      lastAuditedSha: disapprovedVerdict.commitSha,
-      latestFinalAudit: disapprovedVerdict,
-    });
-
-    {
-      const mock = createMockTUI();
-      const state = createSwarmWidgetState({ expanded: false });
-      const comp = createSwarmWidget(() => disapprovedSnap, state, { now: fixedNow })(
-        mock.tui,
-        theme,
-      );
-      for (const width of [40, 80, 120]) {
-        const lines = comp.render(width);
-        assertAllLinesFit(lines, width, `compact-disapproved@${width}`);
-        const plain = stripTerminalSequences(lines.join("\n"));
-        assert.match(plain, /Final Validator disapproved/);
-      }
-      comp.dispose();
-    }
-
-    const round2Snap = makeSampleSnapshot({
-      status: "verifying",
-      workingAgents: 0,
-      waitingAgents: 0,
-      finalValidatorEnabled: true,
-      maxFinalAuditRounds: 2,
-      finalAuditStatus: "running",
-      finalAuditRound: 1,
-      latestFinalAudit: disapprovedVerdict,
-      finalValidatorRosterEntry: validatorEntry,
-      finalAuditRunningAgentId: validatorEntry.agentId,
-    });
-    assert.match(formatStatusLine(round2Snap, false) ?? "", /swarm:verifying r2\/2/);
-    assert.match(
-      formatZeroTurnStatusDashboard(round2Snap, { now: fixedNow }),
-      /Round:\*\* 2\/2/,
-    );
-  });
-});
-
-// ============================================================================
-// 3. questionnaire Tests (TUI + RPC + Non-Interactive)
+// 2. questionnaire Tests (Flexible Dynamic Swarm Plan + IME Focusable + RPC)
 // ============================================================================
 
 describe("questionnaire", () => {
@@ -1314,13 +732,11 @@ describe("questionnaire", () => {
     return { ctx, blockedArg: () => lastBlocked };
   }
 
-  it("askQuestion & askQuestionnaire TUI navigate options, support IME custom Input, and use Swarm titles", async () => {
+  it("askQuestion & askQuestionnaire support IME custom Input, CURSOR_MARKER, hardware cursor restoration, and tabs", async () => {
     let modalDepth = 0;
-    let maxModalDepth = 0;
     const ui = createQuestionnaireUI({
       onModalEnter: () => {
         modalDepth++;
-        maxModalDepth = Math.max(maxModalDepth, modalDepth);
       },
       onModalExit: () => {
         modalDepth--;
@@ -1328,125 +744,112 @@ describe("questionnaire", () => {
     });
 
     const spec: QuestionSpec = {
-      id: "scope",
+      id: "runner",
       question: "Which test runner should workers use?",
-      context: "Used in mission verification contracts",
+      context: "Used by workers and independent validator",
       options: [
-        { label: "Node test runner", value: "node:test", description: "Zero extra deps" },
+        { label: "Node test runner", value: "node:test", description: "Built-in" },
         { label: "Vitest", value: "vitest", description: "Fast TS runner" },
       ],
       recommended: "node:test",
       allowCustom: true,
     };
 
-    // Custom input with CURSOR_MARKER & hardware cursor restoration
-    {
-      let sawCursorMarker = false;
-      let sawHardwareCursorEnabled = false;
-      let hardwareCursorAfterSubmit = true;
-      let sawSwarmTitle = false;
-      const { ctx } = createTuiCustomHarness((comp, mockTui) => {
-        for (const w of [40, 80, 120]) {
-          assertAllLinesFit(comp.render(w), w, `askQuestion@${w}`);
-        }
-        const initialPlain = stripTerminalSequences(comp.render(80).join("\n"));
-        sawSwarmTitle = initialPlain.includes("Swarm Question");
-        assert.doesNotMatch(initialPlain, /tower/i);
+    let sawCursorMarker = false;
+    let sawHardwareCursorOn = false;
+    let hardwareCursorAfter = true;
+    const { ctx } = createTuiCustomHarness((comp, mockTui) => {
+      for (const w of [40, 80, 120]) {
+        assertAllLinesFit(comp.render(w), w, `askQuestion@${w}`);
+      }
+      // Move down twice to "Custom answer…"
+      comp.handleInput?.("\x1b[B");
+      comp.handleInput?.("\x1b[B");
+      comp.handleInput?.("\r");
+      sawHardwareCursorOn = mockTui.getHardwareCursor();
+      for (const ch of "bun test") {
+        comp.handleInput?.(ch);
+      }
+      const rendered = comp.render(80);
+      assertAllLinesFit(rendered, 80, "askQuestion-custom@80");
+      sawCursorMarker = rendered.some((l) => l.includes(CURSOR_MARKER));
+      comp.handleInput?.("\r");
+      hardwareCursorAfter = mockTui.getHardwareCursor();
+    });
 
-        comp.handleInput?.("\x1b[B");
-        comp.handleInput?.("\x1b[B");
-        comp.handleInput?.("\r");
-        sawHardwareCursorEnabled = mockTui.getHardwareCursor();
-        for (const ch of "bun test") {
-          comp.handleInput?.(ch);
-        }
-        const rendered = comp.render(80);
-        assertAllLinesFit(rendered, 80, "askQuestion-custom@80");
-        sawCursorMarker = rendered.some((line) => line.includes(CURSOR_MARKER));
-        comp.handleInput?.("\r");
-        hardwareCursorAfterSubmit = mockTui.getHardwareCursor();
-      });
+    const res = await ui.askQuestion(ctx, spec);
+    assert.deepEqual(res, { cancelled: false, answer: "bun test", isCustom: true });
+    assert.equal(sawCursorMarker, true);
+    assert.equal(sawHardwareCursorOn, true);
+    assert.equal(hardwareCursorAfter, false);
+    assert.equal(modalDepth, 0);
 
-      const res = await ui.askQuestion(ctx, spec);
-      assert.deepEqual(res, { cancelled: false, answer: "bun test", isCustom: true });
-      assert.equal(sawSwarmTitle, true);
-      assert.equal(sawCursorMarker, true);
-      assert.equal(sawHardwareCursorEnabled, true);
-      assert.equal(hardwareCursorAfterSubmit, false);
-      assert.equal(modalDepth, 0);
-      assert.equal(maxModalDepth, 1);
-    }
-
-    // Multi-question tabs
-    {
-      const questions: QuestionSpec[] = [
-        {
-          id: "arch",
-          question: "Pick storage backend",
-          options: [
-            { label: "JSONL + state.json", value: "jsonl" },
-            { label: "SQLite", value: "sqlite" },
-          ],
-          recommended: "jsonl",
-        },
-        {
-          id: "branch",
-          question: "Target base branch?",
-          options: [{ label: "main", value: "main" }],
-          allowCustom: true,
-        },
-      ];
-      const { ctx } = createTuiCustomHarness((comp) => {
-        const plain = stripTerminalSequences(comp.render(80).join("\n"));
-        assert.match(plain, /Swarm Questionnaire/);
-        assert.doesNotMatch(plain, /tower/i);
-        comp.handleInput?.("\r"); // Tab 1 -> jsonl
-        comp.handleInput?.("\r"); // Tab 2 -> main
-        comp.handleInput?.("\r"); // Submit
-      });
-      const result = await ui.askQuestionnaire(ctx, questions);
-      assert.equal(result.cancelled, false);
-      assert.deepEqual(result.answers, { arch: "jsonl", branch: "main" });
-    }
+    // Multi-question questionnaire
+    const questions: QuestionSpec[] = [
+      {
+        id: "workspace",
+        question: "Default workspace mode?",
+        options: [
+          { label: "share", value: "share" },
+          { label: "inherit", value: "inherit" },
+        ],
+        recommended: "share",
+      },
+      {
+        id: "branch",
+        question: "Base branch?",
+        options: [{ label: "main", value: "main" }],
+      },
+    ];
+    const { ctx: multiCtx } = createTuiCustomHarness((comp) => {
+      for (const w of [40, 80, 120]) {
+        assertAllLinesFit(comp.render(w), w, `askQuestionnaire@${w}`);
+      }
+      comp.handleInput?.("\r");
+      comp.handleInput?.("\r");
+      comp.handleInput?.("\r");
+    });
+    const multiRes = await ui.askQuestionnaire(multiCtx, questions);
+    assert.equal(multiRes.cancelled, false);
+    assert.deepEqual(multiRes.answers, { workspace: "share", branch: "main" });
   });
 
-  it("confirmProposal TUI shows Swarm Plan Confirmation, 3-role models, [r] Validator, [v] Final Validator, and returns updated outcome", async () => {
+  it("confirmProposal TUI displays Flexible Dynamic Swarm Plan, [v] validator toggle, [+/-] concurrency, initialMembers, and Esc -> continue", async () => {
     const ui = createQuestionnaireUI();
     const plan: ProposedSwarmPlan = {
-      objective: "Ship parallel Swarm UI and runtime with strict verification",
+      title: "Dynamic Antigravity Swarm",
+      objective: "Refactor orchestration to flexible shared board and warm sessions",
+      strategy: "Spawn contract first, then parallel subsystem workers and verifier",
+      acceptanceCriteria: "All tests pass and strict tsc reports 0 errors",
       baseBranch: "main",
-      maxConcurrency: 3,
+      maxConcurrency: 6,
       validatorEnabled: true,
-      finalValidatorEnabled: true,
-      verificationContract: "npm test && npm run typecheck",
+      initialMembers: [
+        {
+          name: "store-author",
+          role: "worker",
+          brief: "Implement v2 store & board channels",
+          workspace: "share",
+        },
+        {
+          name: "verifier",
+          role: "validator",
+          brief: "Independent code review and test verification",
+          workspace: "inherit",
+        },
+      ],
       roleModels: {
         orchestrator: { model: "anthropic/claude-opus-4-6" },
         worker: { model: "openai/gpt-5.4-codex" },
         validator: { model: "google/gemini-2.5-pro" },
       },
-      missions: [
-        {
-          id: "M1",
-          title: "Store layer",
-          kind: "build",
-          description: "State store",
-          scope: ["src/store/"],
-          deps: [],
-          verification: "npm test",
-        },
-        {
-          id: "M2",
-          title: "UI layer",
-          kind: "build",
-          description: "TUI components",
-          scope: ["src/ui/"],
-          deps: ["M1"],
-          verification: "npm test",
-        },
-      ],
     };
 
-    // Toggle [r] Validator, [v] Final Validator, [+] Concurrency -> Confirm
+    const previewLines = buildInitialMembersSummaryLines(plan.initialMembers, 60);
+    assert.equal(previewLines.length, 2);
+    assertAllLinesFit(previewLines, 60, "initialMembersSummary@60");
+
+    // Toggle [v] Validator Policy + [+] Max Concurrency -> Confirm
     {
       const { ctx } = createTuiCustomHarness((comp) => {
         for (const w of [40, 80, 120]) {
@@ -1454,22 +857,24 @@ describe("questionnaire", () => {
         }
         const initialPlain = stripTerminalSequences(comp.render(100).join("\n"));
         assert.match(initialPlain, /Swarm Plan Confirmation/);
-        assert.match(initialPlain, /Models:/);
+        assert.match(initialPlain, /Dynamic Antigravity Swarm/);
+        assert.match(initialPlain, /base:main/);
+        assert.match(initialPlain, /2 initial members/);
         assert.match(initialPlain, /claude-opus-4-6/);
         assert.match(initialPlain, /gpt-5\.4-codex/);
         assert.match(initialPlain, /gemini-2\.5-pro/);
-        assert.match(initialPlain, /\[r\] Validator: ON/);
-        assert.match(initialPlain, /\[v\] Final Validator: ON/);
-        assert.match(initialPlain, /Concurrency: 3/);
-        assert.doesNotMatch(initialPlain, /tower/i);
+        assert.match(initialPlain, /\[v\] Independent Validator Policy: ON/);
+        assert.match(initialPlain, /\[(\+\/-)\] Max Concurrency: 6/);
+        assert.match(initialPlain, /Confirm — launch dynamic Swarm/);
+        assert.match(initialPlain, /Continue refining/);
+        assert.match(initialPlain, /Cancel — discard draft/);
 
-        comp.handleInput?.("r");
         comp.handleInput?.("v");
         comp.handleInput?.("+");
         const afterPlain = stripTerminalSequences(comp.render(100).join("\n"));
-        assert.match(afterPlain, /\[r\] Validator: OFF/);
-        assert.match(afterPlain, /\[v\] Final Validator: OFF/);
-        assert.match(afterPlain, /Concurrency: 4/);
+        assert.match(afterPlain, /\[v\] Independent Validator Policy: OFF/);
+        assert.match(afterPlain, /Max Concurrency: 7/);
+
         comp.handleInput?.("\r");
       });
 
@@ -1477,32 +882,25 @@ describe("questionnaire", () => {
       assert.deepEqual(out, {
         action: "confirm",
         validatorEnabled: false,
-        finalValidatorEnabled: false,
-        maxConcurrency: 4,
+        maxConcurrency: 7,
       });
     }
 
-    // Defaulting to "host default" when plan.roleModels is omitted + Esc -> continue
+    // Esc maps to "continue" and decrements concurrency with "-"
     {
       const { ctx } = createTuiCustomHarness((comp) => {
-        const plain = stripTerminalSequences(comp.render(100).join("\n"));
-        assert.match(plain, /host default/);
-        comp.handleInput?.("r");
+        comp.handleInput?.("-");
         comp.handleInput?.("\x1b");
       });
-      const out = await ui.confirmProposal(ctx, {
-        ...plan,
-        roleModels: undefined,
-      });
+      const out = await ui.confirmProposal(ctx, { ...plan, roleModels: undefined });
       assert.deepEqual(out, {
         action: "continue",
-        validatorEnabled: false,
-        finalValidatorEnabled: true,
-        maxConcurrency: 3,
+        validatorEnabled: true,
+        maxConcurrency: 5,
       });
     }
 
-    // Short terminal (16 rows) stays height-bounded and shows all 3 choices
+    // Short terminal (16 rows) stays height-bounded and preserves all 3 choices
     {
       const theme = createMockTheme();
       const shortTui = createMockTUI(16, 60);
@@ -1523,28 +921,29 @@ describe("questionnaire", () => {
               const comp = factory(shortTui.tui, theme, {}, resolve);
               const lines = comp.render(60);
               assertAllLinesFit(lines, 60, "confirmProposal-short@60");
-              assert.ok(lines.length <= 16, `Expected <= 16 lines, got ${lines.length}`);
+              assert.ok(lines.length <= 16);
               const plain = stripTerminalSequences(lines.join("\n"));
-              assert.match(plain, /Confirm — launch Swarm fleet now/);
+              assert.match(plain, /Confirm — launch dynamic Swarm/);
               assert.match(plain, /Continue refining/);
-              assert.match(plain, /Cancel — discard/);
-              comp.handleInput?.("\x1b");
+              assert.match(plain, /Cancel — discard draft/);
+              comp.handleInput?.("3");
+              comp.handleInput?.("\r");
             });
           },
         },
       } as unknown as ExtensionContext;
       const out = await ui.confirmProposal(shortCtx, plan);
-      assert.equal(out.action, "continue");
+      assert.equal(out.action, "cancel");
     }
   });
 
-  it("confirmProposal RPC fallback and non-UI mode display 3-role models and return validatorEnabled + finalValidatorEnabled", async () => {
+  it("confirmProposal RPC fallback and non-UI mode handle [v] toggle, concurrency, dismissal, and headless cancel", async () => {
     const ui = createQuestionnaireUI();
     const seenTitles: string[] = [];
-    const selectReplies: (string | undefined)[] = [
-      "Toggle Validator (currently ON)",
-      "Toggle Final Validator (currently ON)",
-      "Confirm — launch Swarm fleet now (recommended)",
+    const replies: (string | undefined)[] = [
+      "Toggle Independent Validator Policy (currently ON)",
+      "Increase Max Concurrency (currently 4)",
+      "Confirm — launch dynamic Swarm (recommended)",
       undefined,
     ];
 
@@ -1552,9 +951,9 @@ describe("questionnaire", () => {
       mode: "rpc",
       hasUI: true,
       ui: {
-        async select(title: string, _opts: string[]) {
+        async select(title: string) {
           seenTitles.push(title);
-          return selectReplies.shift();
+          return replies.shift();
         },
         async input() {
           return undefined;
@@ -1563,265 +962,487 @@ describe("questionnaire", () => {
     } as unknown as ExtensionContext;
 
     const plan: ProposedSwarmPlan = {
-      objective: "RPC test plan",
+      title: "RPC Swarm",
+      objective: "Verify RPC fallback",
+      strategy: "Dynamic",
+      acceptanceCriteria: "Tests pass",
       baseBranch: "main",
-      maxConcurrency: 2,
+      maxConcurrency: 4,
       validatorEnabled: true,
-      finalValidatorEnabled: true,
-      verificationContract: "npm test",
-      roleModels: {
-        orchestrator: { model: "anthropic/claude-opus-4-6" },
-      },
-      missions: [],
+      roleModels: { orchestrator: { model: "anthropic/claude-opus-4-6" } },
     };
 
-    const confirmRes = await ui.confirmProposal(rpcCtx, plan);
-    assert.deepEqual(confirmRes, {
+    const confirmed = await ui.confirmProposal(rpcCtx, plan);
+    assert.deepEqual(confirmed, {
       action: "confirm",
       validatorEnabled: false,
-      finalValidatorEnabled: false,
-      maxConcurrency: 2,
+      maxConcurrency: 5,
     });
     assert.ok(seenTitles[0]?.includes("Swarm Plan Confirmation"));
     assert.ok(seenTitles[0]?.includes("claude-opus-4-6"));
-    assert.ok(seenTitles[0]?.includes("host default"));
-    assert.doesNotMatch(seenTitles.join("\n"), /tower/i);
 
-    const dismissedRes = await ui.confirmProposal(rpcCtx, plan);
-    assert.deepEqual(dismissedRes, {
+    const dismissed = await ui.confirmProposal(rpcCtx, plan);
+    assert.deepEqual(dismissed, {
       action: "continue",
       validatorEnabled: true,
-      finalValidatorEnabled: true,
-      maxConcurrency: 2,
+      maxConcurrency: 4,
     });
 
-    const headlessCtx = {
-      mode: "print",
-      hasUI: false,
-    } as unknown as ExtensionContext;
-    assert.deepEqual(await ui.confirmProposal(headlessCtx, plan), {
-      action: "cancel",
-      validatorEnabled: true,
-      finalValidatorEnabled: true,
-      maxConcurrency: 2,
-    });
+    const headlessCtx = { mode: "print", hasUI: false } as unknown as ExtensionContext;
+    const headlessRes = await ui.confirmProposal(headlessCtx, plan);
+    assert.equal(headlessRes.action, "cancel");
   });
 });
 
 // ============================================================================
-// 4. tasks-overlay Tests
+// 3. dashboard-widget & Zero-Turn Formatter Tests
 // ============================================================================
 
-describe("tasks-overlay", () => {
-  function createMockOrchestrator(initial: SwarmSnapshot) {
-    let snap = initial;
-    let nextSeq = initial.boardHead + 1;
-    const listeners = new Set<(ev: SwarmOrchestratorEvent) => void>();
-    const calls = {
-      postToBoard: [] as PostBoardMessageInput[],
-      switchAgentModel: [] as { agentNameOrId: string; modelOverride: string }[],
-      steer: [] as { agentId: string; message: string; mode?: string }[],
-      stop: [] as {
-        agentId: string;
-        options?: { humanStopped?: boolean; reason?: string };
-      }[],
-      kill: [] as { agentNameOrId: string; reason?: string }[],
-      approve: [] as { missionId: string; options?: Record<string, unknown> }[],
-      retry: [] as { missionId: string; options?: Record<string, unknown> }[],
-      merge: [] as { missionId: string; options?: Record<string, unknown> }[],
-      runFinalAudit: [] as {
-        runId?: string;
-        force?: boolean;
-        hostContext?: unknown;
-      }[],
-      skipFinalAudit: [] as {
-        runId?: string;
-        reason?: string;
-        skippedBy?: string;
-      }[],
+describe("dashboard-widget", () => {
+  const fixedNow = () => Date.parse("2026-11-20T17:45:00.000Z");
+
+  it("renders empty, drafting, compact (4 working + overflow + board preview + 3-role pills), and expanded modes within widths 40/80/120", () => {
+    const theme = createMockTheme();
+    const mockTui = createMockTUI(34, 120);
+
+    // 1. Empty idle
+    {
+      const emptySnap = makeSampleSnapshot({ empty: true });
+      const state = createSwarmWidgetState({ expanded: false, draftActive: false });
+      const widget = createSwarmWidget(() => emptySnap, state, { now: fixedNow })(
+        mockTui.tui,
+        theme,
+      );
+      assert.deepEqual(widget.render(80), []);
+      assert.equal(formatStatusLine(emptySnap, false), undefined);
+      widget.dispose();
+    }
+
+    // 2. Drafting mode
+    {
+      const emptySnap = makeSampleSnapshot({ empty: true });
+      const state = createSwarmWidgetState({ draftActive: true });
+      const widget = createSwarmWidget(() => emptySnap, state, { now: fixedNow })(
+        mockTui.tui,
+        theme,
+      );
+      for (const width of [40, 80, 120]) {
+        const lines = widget.render(width);
+        assertAllLinesFit(lines, width, `widget-draft@${width}`);
+        const plain = stripTerminalSequences(lines.join("\n"));
+        assert.match(plain, /Swarm Draft/);
+        if (width >= 80) {
+          assert.match(plain, /clarifying requirements & strategy/);
+          assert.match(plain, /\/swarm cancel/);
+        }
+      }
+      assert.equal(formatStatusLine(emptySnap, true), "🐝 swarm:draft");
+      widget.dispose();
+    }
+
+    // 3. Compact mode with 5 working members -> shows up to 4 + "+1 more" + latest board post + 3-role pills
+    {
+      const manyWorking = [
+        makeSampleMember({ name: "w1", role: "worker", state: "working", currentActivity: "Step 1" }),
+        makeSampleMember({ name: "w2", role: "worker", state: "working", currentActivity: "Step 2" }),
+        makeSampleMember({ name: "v1", role: "validator", state: "working", currentActivity: "Auditing" }),
+        makeSampleMember({ name: "w3", role: "worker", state: "working", currentActivity: "Step 3" }),
+        makeSampleMember({ name: "w4", role: "worker", state: "working", currentActivity: "Step 4" }),
+        makeSampleMember({ name: "wait1", role: "worker", state: "waiting" }),
+      ];
+      const snap = makeSampleSnapshot({
+        members: manyWorking,
+        boardHead: 18,
+        withRateLimit: true,
+      });
+      const state = createSwarmWidgetState({ expanded: false });
+      const widget = createSwarmWidget(() => snap, state, { now: fixedNow })(
+        mockTui.tui,
+        theme,
+      );
+
+      for (const width of [40, 80, 120]) {
+        const lines = widget.render(width);
+        assertAllLinesFit(lines, width, `widget-compact@${width}`);
+        const plain = stripTerminalSequences(lines.join("\n"));
+        assert.match(plain, /Live/);
+        assert.match(plain, /Board:#18/);
+        assert.match(plain, /5w\/1wait/);
+        assert.match(plain, /\+1 more working/);
+        assert.match(plain, /#5/);
+      }
+
+      const statusLine = formatStatusLine(snap, false) ?? "";
+      assert.match(statusLine, /swarm:Live 5w\/1wait #18/);
+
+      widget.dispose();
+    }
+
+    // 4. Expanded mode: 3-role models + channels + roster table + recent 5 board messages
+    {
+      const snap = makeSampleSnapshot();
+      const state = createSwarmWidgetState({ expanded: true });
+      const widget = createSwarmWidget(() => snap, state, { now: fixedNow })(
+        mockTui.tui,
+        theme,
+      );
+
+      for (const width of [40, 80, 120]) {
+        const lines = widget.render(width);
+        assertAllLinesFit(lines, width, `widget-expanded@${width}`);
+      }
+      const plain120 = stripTerminalSequences(widget.render(120).join("\n"));
+      assert.match(plain120, /Models:/);
+      assert.match(plain120, /Channels:/);
+      assert.match(plain120, /#main/);
+      assert.match(plain120, /#backend/);
+      assert.match(plain120, /worker-1/);
+      assert.match(plain120, /validator/);
+      assert.match(plain120, /Recent Board \(#5\)/);
+      assert.match(plain120, /#1/);
+      assert.match(plain120, /#5/);
+
+      widget.dispose();
+    }
+  });
+
+  it("manages Braille spinner timer cleanly (starts while working, stops when idle and on dispose)", async () => {
+    const theme = createMockTheme();
+    const mockTui = createMockTUI();
+    let activeSnap = makeSampleSnapshot();
+    const state = createSwarmWidgetState({ expanded: false });
+    const widget = createSwarmWidget(() => activeSnap, state, {
+      spinnerIntervalMs: 40,
+      now: fixedNow,
+    })(mockTui.tui, theme);
+
+    widget.render(80);
+    await new Promise((r) => setTimeout(r, 110));
+    const afterWorking = mockTui.renderCount();
+    assert.ok(afterWorking >= 1, `Expected spinner ticks while working, got ${afterWorking}`);
+
+    // Transition to idle (all waiting) -> spinner stops
+    activeSnap = makeSampleSnapshot({
+      members: [makeSampleMember({ name: "idle-1", state: "waiting" })],
+    });
+    widget.render(80);
+    const countAfterIdle = mockTui.renderCount();
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(
+      mockTui.renderCount(),
+      countAfterIdle,
+      "Spinner timer must stop when no working members remain",
+    );
+
+    // Re-start working, then dispose -> timer must stop immediately
+    activeSnap = makeSampleSnapshot();
+    widget.render(80);
+    widget.dispose();
+    const countAfterDispose = mockTui.renderCount();
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(
+      mockTui.renderCount(),
+      countAfterDispose,
+      "Spinner timer must stop after dispose()",
+    );
+  });
+
+  it("formats zero-turn /swarm status, /swarm board, /swarm models, and /swarm graph dashboards cleanly", () => {
+    const snap = makeSampleSnapshot();
+    const settings: SwarmSettings = {
+      ...DEFAULT_SWARM_SETTINGS,
+      orchestratorModel: "anthropic/claude-opus-4-6",
+      workerModel: "openai/gpt-5.4-codex",
+      validatorModel: "google/gemini-2.5-pro",
+      fallbackModels: ["anthropic/claude-sonnet-4-5"],
     };
 
-    const orchestrator: ISwarmOrchestrator = {
+    const statusMd = formatZeroTurnStatusDashboard(snap, {
+      hostModel: "anthropic/claude-sonnet-4-5",
+      now: fixedNow,
+    });
+    assert.match(statusMd, /Dynamic Parser Swarm/);
+    assert.match(statusMd, /\(Live\)/);
+    assert.match(statusMd, /#### 3-Role Models/);
+    assert.match(statusMd, /#### Channels \(2\)/);
+    assert.match(
+      statusMd,
+      /\| Name \| Role \| State \| Model \| Workspace \| Parent \| Turns \| Last Read\/Post \|/,
+    );
+    assert.match(statusMd, /worker-1/);
+    assert.match(statusMd, /helper-lex/);
+    assert.match(statusMd, /#### Recent Board \(#5\)/);
+    assert.match(statusMd, /#### Recent Activity/);
+
+    const boardMd = formatZeroTurnBoardView(snap.recentBoard, snap.boardHead, {
+      runId: snap.run!.id,
+    });
+    assert.match(boardMd, /#1.*\[main\].*@orchestrator\*\* -> @worker-1/);
+    assert.match(boardMd, /#3.*\[backend\].*@validator\*\* -> @worker-1/);
+    assert.match(boardMd, /#5.*\[main\].*@worker-2\*\* -> @worker-1, @#backend/);
+
+    const modelsMd = formatZeroTurnModelsView(
+      settings,
+      snap,
+      "anthropic/claude-sonnet-4-5",
+    );
+    assert.match(modelsMd, /Swarm 3-Role Models/);
+    assert.match(modelsMd, /anthropic\/claude-opus-4-6/);
+    assert.match(modelsMd, /openai\/gpt-5\.4-codex/);
+    assert.match(modelsMd, /google\/gemini-2\.5-pro/);
+    assert.match(modelsMd, /anthropic\/claude-sonnet-4-5/);
+    assert.match(modelsMd, /worker-1/);
+    assert.match(modelsMd, /validator/);
+
+    const graphMd = formatZeroTurnGraphView(snap, { width: 80 });
+    assert.match(graphMd, /Swarm Graph — Dynamic Parser Swarm/);
+    assert.match(graphMd, /```text/);
+    assert.match(graphMd, /worker-1 ⇄ validator \(3 msgs\)/);
+    assert.match(graphMd, /worker-2 → worker-1 \(1 msg\)/);
+
+    // Empty snapshot handling
+    const emptySnap = makeSampleSnapshot({ empty: true });
+    assert.match(formatZeroTurnGraphView(emptySnap), /No active Swarm run/);
+    assert.match(
+      formatZeroTurnStatusDashboard(emptySnap, { draftActive: true }),
+      /Swarm Draft Active/,
+    );
+  });
+
+  it("bindSwarmShortcuts handles Ctrl+Shift+T & Esc and strictly respects isModalOpen()", () => {
+    let listener: ((data: string) => { consume?: boolean } | undefined) | undefined;
+    const ctx = {
+      mode: "tui",
+      ui: {
+        onTerminalInput(fn: (data: string) => { consume?: boolean } | undefined) {
+          listener = fn;
+          return () => {
+            listener = undefined;
+          };
+        },
+      },
+    } as unknown as ExtensionContext;
+
+    const state = createSwarmWidgetState({ expanded: false, modalDepth: 0 });
+    let toggles = 0;
+    let collapses = 0;
+
+    const unbind = bindSwarmShortcuts(ctx, {
+      isModalOpen: () => isModalOpen(state),
+      isExpanded: () => state.expanded,
+      onToggleExpand: () => {
+        toggles++;
+        state.expanded = !state.expanded;
+      },
+      onCollapse: () => {
+        collapses++;
+        state.expanded = false;
+      },
+    });
+
+    assert.ok(listener);
+    // Kitty Ctrl+Shift+T (\x1b[84;6u) toggles expand
+    const r1 = listener!("\x1b[84;6u");
+    assert.equal(r1?.consume, true);
+    assert.equal(state.expanded, true);
+    assert.equal(toggles, 1);
+
+    // Modal open -> MUST NOT consume Esc or Ctrl+Shift+T
+    state.modalDepth = 1;
+    assert.equal(listener!("\x1b"), undefined);
+    assert.equal(listener!("\x1b[84;6u"), undefined);
+    assert.equal(state.expanded, true);
+    assert.equal(collapses, 0);
+
+    // Modal closed -> Esc collapses when expanded
+    state.modalDepth = 0;
+    const r2 = listener!("\x1b");
+    assert.equal(r2?.consume, true);
+    assert.equal(state.expanded, false);
+    assert.equal(collapses, 1);
+
+    // Already collapsed -> Esc not consumed
+    assert.equal(listener!("\x1b"), undefined);
+
+    unbind();
+    assert.equal(listener, undefined);
+  });
+});
+
+// ============================================================================
+// 4. swarm-overlay Tests (All 4 Tabs + Actions + Live Subscribe + RPC)
+// ============================================================================
+
+describe("swarm-overlay", () => {
+  interface MockEngineRecord {
+    engine: ISwarmEngine;
+    posted: PostBoardMessageInput[];
+    switched: SwitchModelOptions[];
+    stopped: { name: string; options?: StopMemberOptions }[];
+    killed: { name: string; options?: KillMemberOptions }[];
+    merged: { name: string; options?: MergeMemberOptions }[];
+    subscriberCount: () => number;
+    emit: (ev: SwarmEngineEvent) => void;
+    setSnapshot: (snap: SwarmSnapshot) => void;
+  }
+
+  function createMockEngine(initialSnap: SwarmSnapshot): MockEngineRecord {
+    let snap = initialSnap;
+    let nextSeq =
+      (initialSnap.recentBoard.length > 0
+        ? initialSnap.recentBoard[initialSnap.recentBoard.length - 1]!.seq
+        : 0) + 1;
+    const allBoard: BoardMessage[] = [...initialSnap.recentBoard];
+    const listeners = new Set<(ev: SwarmEngineEvent) => void>();
+
+    const posted: PostBoardMessageInput[] = [];
+    const switched: SwitchModelOptions[] = [];
+    const stopped: { name: string; options?: StopMemberOptions }[] = [];
+    const killed: { name: string; options?: KillMemberOptions }[] = [];
+    const merged: { name: string; options?: MergeMemberOptions }[] = [];
+
+    const engine = {
       getSnapshot: () => snap,
-      subscribe(fn) {
+      subscribe(fn: (ev: SwarmEngineEvent) => void) {
         listeners.add(fn);
         return () => {
           listeners.delete(fn);
         };
       },
-      async postToBoard(input) {
-        calls.postToBoard.push(input);
+      async postMessage(input: PostBoardMessageInput): Promise<BoardMessage> {
+        posted.push(input);
         const msg: BoardMessage = {
           seq: nextSeq++,
-          runId: snap.activeRunId ?? "run-1",
+          runId: snap.run?.id ?? "run-1",
+          channel: input.channel ?? "main",
           from: input.from,
           fromRole: input.fromRole,
           text: input.text,
           mentions: input.mentions ?? [],
+          channelMentions: input.channelMentions ?? [],
           kind: input.kind ?? "chat",
-          missionId: input.missionId,
-          timestamp: "2026-11-20T17:45:05.000Z",
+          timestamp: "2026-11-20T17:46:00.000Z",
         };
+        allBoard.push(msg);
         snap = {
           ...snap,
           boardHead: msg.seq,
-          recentBoard: [...snap.recentBoard, msg],
+          recentBoard: [...allBoard],
         };
         return msg;
       },
-      async readBoard() {
-        return { messages: snap.recentBoard, head: snap.boardHead };
-      },
-      async switchAgentModel(agentNameOrId, modelOverride) {
-        calls.switchAgentModel.push({ agentNameOrId, modelOverride });
-        const existing = Object.values(snap.run?.roster ?? {}).find(
-          (e) => e.name === agentNameOrId || e.agentId === agentNameOrId,
-        );
-        const updated: RosterEntry = existing
-          ? { ...existing, model: modelOverride }
-          : {
-              agentId: agentNameOrId,
-              name: agentNameOrId,
-              role: "worker",
-              missionId: "M1",
-              worktreePath: "/tmp/wt-M1",
-              branch: "feat/m1",
-              status: "waiting",
-              model: modelOverride,
-              lastReadBoardSeq: snap.boardHead,
-              turns: 1,
-              startedAt: "2026-11-20T17:40:00.000Z",
-              humanStopped: false,
-              tokens: 0,
-              cost: 0,
-              logTail: [],
-            };
-        if (snap.run) {
-          snap = {
-            ...snap,
-            run: {
-              ...snap.run,
-              roster: {
-                ...snap.run.roster,
-                [updated.agentId]: updated,
-              },
-            },
-          };
+      async readBoard(options?: ReadBoardOptions) {
+        let msgs = [...allBoard];
+        if (options?.channel && options.channel !== "*") {
+          msgs = msgs.filter((m) => m.channel === options.channel);
         }
-        return updated;
-      },
-      async steerAgent(agentId, message, mode) {
-        calls.steer.push({ agentId, message, mode });
-      },
-      async stopAgent(agentId, options) {
-        calls.stop.push({ agentId, options });
-      },
-      async killAgent(agentNameOrId, reason) {
-        calls.kill.push({ agentNameOrId, reason });
-      },
-      async approveArtifact(missionId, options) {
-        calls.approve.push({
-          missionId,
-          options: options as Record<string, unknown>,
-        });
-        return snap.run!;
-      },
-      async retryMission(missionId, options) {
-        calls.retry.push({
-          missionId,
-          options: options as Record<string, unknown>,
-        });
-        return snap.run!;
-      },
-      async mergeMission(missionId, options) {
-        calls.merge.push({
-          missionId,
-          options: options as Record<string, unknown>,
-        });
+        if (options?.search) {
+          const needle = options.search.toLowerCase();
+          msgs = msgs.filter(
+            (m) =>
+              m.text.toLowerCase().includes(needle) ||
+              m.from.toLowerCase().includes(needle) ||
+              m.channel.toLowerCase().includes(needle),
+          );
+        }
         return {
-          mergedCommitSha: "deadbeef",
-          strategy: "merge",
-          changedFiles: [],
+          messages: msgs,
+          head: allBoard.length > 0 ? allBoard[allBoard.length - 1]!.seq : 0,
         };
       },
-      async runFinalAudit(options) {
-        calls.runFinalAudit.push({
-          runId: options?.runId,
-          force: options?.force,
-          hostContext: options?.hostContext,
-        });
-        return snap.run!;
+      async switchModel(options: SwitchModelOptions) {
+        switched.push(options);
+        if (snap.run && options.targetName && snap.run.members[options.targetName]) {
+          snap.run.members[options.targetName] = {
+            ...snap.run.members[options.targetName]!,
+            model: options.model,
+            thinkingLevel: options.thinkingLevel,
+          };
+        }
+        return {
+          targetName: options.targetName ?? ORCHESTRATOR_NAME,
+          model: options.model ?? "openai/gpt-5.4",
+          thinkingLevel: options.thinkingLevel,
+        };
       },
-      async skipFinalAudit(options) {
-        calls.skipFinalAudit.push({
-          runId: options?.runId,
-          reason: options?.reason,
-          skippedBy: options?.skippedBy,
-        });
-        return snap.run!;
+      async stopMember(name: string, options?: StopMemberOptions) {
+        stopped.push({ name, options });
+        if (snap.run?.members[name]) {
+          snap.run.members[name] = {
+            ...snap.run.members[name]!,
+            state: "stopped",
+            humanStopped: options?.humanStopped ?? false,
+          };
+        }
       },
-      startRun: async () => snap.run!,
-      attachRun: async () => snap,
-      pause: async () => snap.run!,
-      resume: async () => snap.run!,
-      tick: async () => {},
-      spawnForMission: async () => {
-        throw new Error("not implemented");
+      async killMember(name: string, options?: KillMemberOptions) {
+        killed.push({ name, options });
+        if (snap.run?.members[name]) {
+          snap.run.members[name] = {
+            ...snap.run.members[name]!,
+            state: "killed",
+          };
+        }
       },
-      teardown: async () => ({ removed: [], skipped: [], errors: [] }),
-      dispose: async () => {},
-    };
+      async mergeMember(name: string, options?: MergeMemberOptions) {
+        merged.push({ name, options });
+        return {
+          mergedCommitSha: "deadbeef12345678",
+          strategy: "merge" as const,
+          changedFiles: ["src/parser.ts"],
+        };
+      },
+    } as unknown as ISwarmEngine;
 
     return {
-      orchestrator,
-      calls,
-      listenerCount: () => listeners.size,
-      emit(nextSnap: SwarmSnapshot) {
-        snap = nextSnap;
-        for (const l of listeners) {
-          l({
-            type: "snapshot_changed",
-            runId: nextSnap.activeRunId,
-            summary: "updated",
-            snapshot: nextSnap,
-          });
-        }
+      engine,
+      posted,
+      switched,
+      stopped,
+      killed,
+      merged,
+      subscriberCount: () => listeners.size,
+      emit(ev: SwarmEngineEvent) {
+        snap = ev.snapshot;
+        for (const fn of listeners) fn(ev);
+      },
+      setSnapshot(next: SwarmSnapshot) {
+        snap = next;
       },
     };
   }
 
-  it("supports Fleet actions ([s], [m] hot-switch model, [x] stop, [k] kill, [a], [r], [g] merge, [d] diff) AND [b] Board view toggle + posting within widths 40, 80, 120", async () => {
-    // M1 has working worker-1; M2 has warm waiting warm-1 (no working agent on M2)
-    const snap = makeSampleSnapshot({
-      workingAgents: 1,
-      waitingAgents: 1,
-    });
-    const mockOrch = createMockOrchestrator(snap);
-    const diffCalls: { baseBranch: string; targetRef: string }[] = [];
-
-    const mockWorktree = {
-      async getDiffSummary(
-        baseBranch: string,
-        targetRef: string,
-      ): Promise<DiffSummary> {
-        diffCalls.push({ baseBranch, targetRef });
+  function createMockWorktree(): {
+    worktree: IWorktreeManager;
+    diffCalls: { base: string; ref: string }[];
+  } {
+    const diffCalls: { base: string; ref: string }[] = [];
+    const worktree = {
+      async getDiffSummary(baseBranch: string, targetRef: string): Promise<DiffSummary> {
+        diffCalls.push({ base: baseBranch, ref: targetRef });
         return {
           baseBranch,
           branch: targetRef,
-          headSha: "abcdef1234567890",
+          headSha: "abc123456789",
           commitsAhead: 2,
-          changedFiles: ["src/parser/lexer.ts"],
-          stat: " src/parser/lexer.ts | 12 +++++++++---\n 1 file changed, 9 insertions(+), 3 deletions(-)",
-          diff: "@@ -10,2 +10,5 @@\n+if (buf.length === 0) return [];\n-return null;",
+          changedFiles: ["src/parser.ts", "tests/parser.test.ts"],
+          stat: " src/parser.ts | 18 ++++++++++++++++--",
+          diff: "@@ -1,3 +1,5 @@\n+export function parse() {}\n-export function old() {}",
         };
       },
     } as unknown as IWorktreeManager;
+    return { worktree, diffCalls };
+  }
 
+  it("exercises all 4 tabs (Board [p]/[c], Members [w]/[m]/[x]/[k]/[g]/[d], Graph, Search), live updates, width bounds (40/80/120), and clean unsubscribe", async () => {
+    const snap = makeSampleSnapshot();
+    const mockEngine = createMockEngine(snap);
+    const { worktree, diffCalls } = createMockWorktree();
     const theme = createMockTheme();
-    const mockTui = createMockTUI(34, 110);
-    let overlayOptUsed = false;
-    let modalEnterCount = 0;
-    let modalExitCount = 0;
+    const mockTui = createMockTUI(32, 120);
+
+    let modalDepth = 0;
+    let overlayOptsSeen: unknown;
 
     const ctx = {
       mode: "tui",
@@ -1835,429 +1456,351 @@ describe("tasks-overlay", () => {
             th: Theme,
             kb: unknown,
             done: (res: T) => void,
-          ) => Component & Focusable & { dispose?(): void },
-          opts?: { overlay?: boolean },
+          ) => Component & { dispose?(): void },
+          opts?: { overlay?: boolean; overlayOptions?: unknown },
         ): Promise<T> {
-          overlayOptUsed = Boolean(opts?.overlay);
+          overlayOptsSeen = opts;
           return new Promise<T>((resolve) => {
-            const comp = factory(mockTui.tui, theme, {}, (res) => {
-              resolve(res);
-            });
-            comp.focused = true;
+            const comp = factory(mockTui.tui, theme, {}, resolve);
+            if (isFocusable(comp)) comp.focused = true;
 
             void (async () => {
-              assert.equal(mockOrch.listenerCount(), 1);
+              await flushAsync();
 
-              // Width bounds across 40, 80, 120 in Fleet view
+              // Verify active subscription
+              assert.equal(mockEngine.subscriberCount(), 1);
+
+              // --- TAB 1: BOARD ---
               for (const w of [40, 80, 120]) {
-                const rendered = comp.render(w);
-                assertAllLinesFit(rendered, w, `tasks-overlay-fleet@${w}`);
-                assert.doesNotMatch(
-                  stripTerminalSequences(rendered.join("\n")),
-                  /tower/i,
-                );
+                assertAllLinesFit(comp.render(w), w, `overlay-board@${w}`);
               }
+              const boardPlain = stripTerminalSequences(comp.render(100).join("\n"));
+              assert.match(boardPlain, /\[1\] Board \(#5\)/);
+              assert.match(boardPlain, /\[2\] Members \(2\/4\)/);
+              assert.match(boardPlain, /\[3\] Graph/);
+              assert.match(boardPlain, /\[4\] Search/);
+              assert.match(boardPlain, /Channel: \* \(all\)/);
 
-              // Detail pane on M1 shows model, working state, turns, board cursor
-              const m1Plain = stripTerminalSequences(comp.render(110).join("\n"));
-              assert.match(m1Plain, /Swarm Tasks & Board/);
-              assert.match(m1Plain, /model:openai\/gpt-5\.4-codex/);
-              assert.match(m1Plain, /turns:2/);
-              assert.match(m1Plain, /board:#3/);
-
-              // [m] on working M1 warns cleanly instead of switching mid-turn
-              comp.handleInput?.("m");
-              assert.match(
-                stripTerminalSequences(comp.render(110).join("\n")),
-                /hot-switch requires waiting state/,
-              );
-
-              // [s] steer on working M1
-              comp.handleInput?.("s");
-              const steerLines = comp.render(90);
-              assert.ok(steerLines.some((l) => l.includes(CURSOR_MARKER)));
-              for (const ch of "Focus on EOF test") {
-                comp.handleInput?.(ch);
-              }
-              comp.handleInput?.("\r");
-              await Promise.resolve();
-
-              // [x] stop M1's working agent
-              comp.handleInput?.("x");
-              await Promise.resolve();
-
-              // [k] kill M1's agent permanently
-              comp.handleInput?.("k");
-              await Promise.resolve();
-
-              // [d] diff on M1
-              comp.handleInput?.("d");
-              await new Promise((r) => setTimeout(r, 10));
-              for (const w of [40, 80, 120]) {
-                assertAllLinesFit(comp.render(w), w, `tasks-overlay-diff@${w}`);
-              }
+              // Cycle channel filter [c]: * -> main -> backend
+              comp.handleInput?.("c");
               assert.match(
                 stripTerminalSequences(comp.render(100).join("\n")),
-                /2 commit\(s\) ahead/,
+                /Channel: #main/,
               );
-
-              // Down to M2 (warm waiting agent `warm-M2`, artifact mission)
-              comp.handleInput?.("\x1b[B");
-
-              // [s] on waiting warm-M2 wakes via shared board with @warm-M2 mention
-              comp.handleInput?.("s");
-              const wakeLines = comp.render(100);
-              assert.ok(wakeLines.some((l) => l.includes(CURSOR_MARKER)));
-              for (const ch of "Please refresh architecture spec") {
-                comp.handleInput?.(ch);
-              }
-              comp.handleInput?.("\r");
-              await Promise.resolve();
-
-              // [m] hot-switch model on waiting agent warm-M2
-              comp.handleInput?.("m");
-              const modelInputLines = comp.render(100);
-              assertAllLinesFit(modelInputLines, 100, "tasks-overlay-model-input@100");
-              assert.ok(
-                modelInputLines.some((l) => l.includes(CURSOR_MARKER)),
-                "Model switch input must emit CURSOR_MARKER",
-              );
-              for (const ch of "anthropic/claude-opus-4-6") {
-                comp.handleInput?.(ch);
-              }
-              comp.handleInput?.("\r");
-              await Promise.resolve();
-
-              // [a] approve artifact M2 and [g] manual merge M2
-              comp.handleInput?.("a");
-              comp.handleInput?.("g");
-              await Promise.resolve();
-
-              // Down to M3 (failed) -> [r] retry
-              comp.handleInput?.("\x1b[B");
-              comp.handleInput?.("r");
-              await Promise.resolve();
-
-              // [b] toggle to Shared Board view
-              comp.handleInput?.("b");
-              for (const w of [40, 80, 120]) {
-                const boardLines = comp.render(w);
-                assertAllLinesFit(boardLines, w, `tasks-overlay-board@${w}`);
-              }
-              const boardPlain = stripTerminalSequences(comp.render(110).join("\n"));
-              assert.match(boardPlain, /\[BOARD\]/);
-              assert.match(boardPlain, /#1.*\[orchestrator -> @M1\]/);
-              assert.match(boardPlain, /#3.*\[validator-M1 -> @M1\]/);
-
-              // Scroll board up/down cleanly
-              comp.handleInput?.("\x1b[A");
-              comp.handleInput?.("\x1b[B");
-
-              // [s] in Board view posts directly to shared board
-              comp.handleInput?.("s");
-              const postInputLines = comp.render(100);
-              assert.ok(postInputLines.some((l) => l.includes(CURSOR_MARKER)));
-              for (const ch of "@warm-M2 please update architecture diagram") {
-                comp.handleInput?.(ch);
-              }
-              comp.handleInput?.("\r");
-              await Promise.resolve();
-
-              // [b] toggle back to Fleet view
-              comp.handleInput?.("b");
+              comp.handleInput?.("c");
               assert.match(
-                stripTerminalSequences(comp.render(110).join("\n")),
-                /\[FLEET\]/,
+                stripTerminalSequences(comp.render(100).join("\n")),
+                /Channel: #backend/,
               );
 
-              // [Esc] closes overlay & unsubscribes
+              // Post message [p] to #backend as orchestrator with IME CURSOR_MARKER
+              comp.handleInput?.("p");
+              assert.equal(mockTui.getHardwareCursor(), true);
+              for (const ch of "@worker-1 ship it") {
+                comp.handleInput?.(ch);
+              }
+              const postRender = comp.render(100);
+              assertAllLinesFit(postRender, 100, "overlay-board-post@100");
+              assert.ok(
+                postRender.some((l) => l.includes(CURSOR_MARKER)),
+                "Inline board post input must include CURSOR_MARKER",
+              );
+              comp.handleInput?.("\r");
+              await flushAsync();
+
+              assert.equal(mockEngine.posted.length, 1);
+              assert.equal(mockEngine.posted[0]!.from, ORCHESTRATOR_NAME);
+              assert.equal(mockEngine.posted[0]!.fromRole, "orchestrator");
+              assert.equal(mockEngine.posted[0]!.channel, "backend");
+              assert.equal(mockEngine.posted[0]!.text, "@worker-1 ship it");
+
+              // --- TAB 2: MEMBERS ---
+              comp.handleInput?.("2");
+              for (const w of [40, 80, 120]) {
+                assertAllLinesFit(comp.render(w), w, `overlay-members@${w}`);
+              }
+              const membersPlain = stripTerminalSequences(comp.render(100).join("\n"));
+              assert.match(membersPlain, /worker-1/);
+              assert.match(membersPlain, /Brief:/);
+              assert.match(membersPlain, /Channels:/);
+
+              // [d] Git diff on worker-1 (share worktree)
+              comp.handleInput?.("d");
+              await flushAsync();
+              assert.equal(diffCalls.length, 1);
+              assert.equal(diffCalls[0]!.ref, "swarm/dyn/worker-1");
+              const diffPlain = stripTerminalSequences(comp.render(100).join("\n"));
+              assert.match(diffPlain, /2 commit\(s\) ahead/);
+              assert.match(diffPlain, /export function parse/);
+              assertAllLinesFit(comp.render(40), 40, "overlay-diff@40");
+              // Toggle [d] back to info
+              comp.handleInput?.("d");
+
+              // [w] Wake/message worker-1
+              comp.handleInput?.("w");
+              for (const ch of "please check EOF") {
+                comp.handleInput?.(ch);
+              }
+              comp.handleInput?.("\r");
+              await flushAsync();
+              assert.equal(mockEngine.posted.length, 2);
+              assert.equal(mockEngine.posted[1]!.text, "@worker-1 please check EOF");
+
+              // [m] on working member worker-1 -> warns (does not call switchModel)
+              comp.handleInput?.("m");
+              assert.match(
+                stripTerminalSequences(comp.render(100).join("\n")),
+                /must be waiting/,
+              );
+              assert.equal(mockEngine.switched.length, 0);
+
+              // [g] Merge worktree on worker-1
+              comp.handleInput?.("g");
+              await flushAsync();
+              assert.equal(mockEngine.merged.length, 1);
+              assert.equal(mockEngine.merged[0]!.name, "worker-1");
+
+              // [x] Stop worker-1 (humanStopped: true)
+              comp.handleInput?.("x");
+              await flushAsync();
+              assert.equal(mockEngine.stopped.length, 1);
+              assert.equal(mockEngine.stopped[0]!.name, "worker-1");
+              assert.equal(mockEngine.stopped[0]!.options?.humanStopped, true);
+
+              // Move Down to helper-lex (index 1, state: waiting)
+              comp.handleInput?.("\x1b[B");
+              const helperPlain = stripTerminalSequences(comp.render(100).join("\n"));
+              assert.match(helperPlain, /Parked on: Waiting on @worker-1 feedback/);
+
+              // [m] Hot-switch model on waiting helper-lex
+              comp.handleInput?.("m");
+              for (const ch of "anthropic/claude-opus-4-6 high") {
+                comp.handleInput?.(ch);
+              }
+              comp.handleInput?.("\r");
+              await flushAsync();
+              assert.equal(mockEngine.switched.length, 1);
+              assert.equal(mockEngine.switched[0]!.targetName, "helper-lex");
+              assert.equal(mockEngine.switched[0]!.model, "anthropic/claude-opus-4-6");
+              assert.equal(mockEngine.switched[0]!.thinkingLevel, "high");
+
+              // [k] Kill helper-lex
+              comp.handleInput?.("k");
+              await flushAsync();
+              assert.equal(mockEngine.killed.length, 1);
+              assert.equal(mockEngine.killed[0]!.name, "helper-lex");
+              assert.equal(mockEngine.killed[0]!.options?.reason, "Killed by user");
+
+              // --- TAB 3: GRAPH (via Tab key from Members) ---
+              comp.handleInput?.("\t");
+              for (const w of [40, 80, 120]) {
+                assertAllLinesFit(comp.render(w), w, `overlay-graph@${w}`);
+              }
+              const graphPlain = stripTerminalSequences(comp.render(100).join("\n"));
+              assert.match(graphPlain, /Spawn Tree/);
+              assert.match(graphPlain, /orchestrator/);
+              assert.match(graphPlain, /worker-1 ⇄ validator \(3 msgs\)/);
+
+              // --- TAB 4: SEARCH (via Tab key from Graph) ---
+              comp.handleInput?.("\t");
+              assert.equal(mockTui.getHardwareCursor(), true);
+              for (const ch of "EOF") {
+                comp.handleInput?.(ch);
+              }
+              for (const w of [40, 80, 120]) {
+                assertAllLinesFit(comp.render(w), w, `overlay-search@${w}`);
+              }
+              const searchRender = comp.render(100);
+              assert.ok(
+                searchRender.some((l) => l.includes(CURSOR_MARKER)),
+                "Search tab IME input must emit CURSOR_MARKER",
+              );
+              const searchPlain = stripTerminalSequences(searchRender.join("\n"));
+              assert.match(searchPlain, /Matches: 3 \/ 7/);
+              assert.match(searchPlain, /#1/);
+              assert.match(searchPlain, /#4/);
+
+              // Live engine subscription re-render check
+              const rendersBeforeEvent = mockTui.renderCount();
+              mockEngine.emit({
+                type: "snapshot_changed",
+                runId: snap.run!.id,
+                summary: "Live tick",
+                snapshot: mockEngine.engine.getSnapshot(),
+              });
+              assert.ok(mockTui.renderCount() > rendersBeforeEvent);
+
+              // Exit search focus with Esc, then close overlay with q
               comp.handleInput?.("\x1b");
+              assert.equal(mockTui.getHardwareCursor(), false);
+              comp.handleInput?.("q");
             })();
           });
         },
       },
     } as unknown as ExtensionContext;
 
-    await openTasksOverlay(ctx, mockOrch.orchestrator, mockWorktree, {
-      onModalEnter: () => modalEnterCount++,
-      onModalExit: () => modalExitCount++,
-      now: () => Date.parse("2026-11-20T17:45:00.000Z"),
+    await openSwarmOverlay(ctx, mockEngine.engine, worktree, {
+      onModalEnter: () => {
+        modalDepth++;
+      },
+      onModalExit: () => {
+        modalDepth--;
+      },
     });
 
-    assert.equal(overlayOptUsed, true);
-    assert.equal(modalEnterCount, 1);
-    assert.equal(modalExitCount, 1);
-    assert.equal(mockOrch.listenerCount(), 0);
-
-    assert.deepEqual(mockOrch.calls.steer, [
-      { agentId: "worker-1", message: "Focus on EOF test", mode: "steer" },
-    ]);
-    assert.equal(mockOrch.calls.stop.length, 1);
-    assert.equal(mockOrch.calls.stop[0]?.agentId, "worker-1");
-    assert.equal(mockOrch.calls.stop[0]?.options?.humanStopped, true);
-
-    assert.deepEqual(mockOrch.calls.kill, [
-      { agentNameOrId: "M1", reason: "Killed by user" },
-    ]);
-
-    assert.deepEqual(mockOrch.calls.switchAgentModel, [
-      { agentNameOrId: "warm-M2", modelOverride: "anthropic/claude-opus-4-6" },
-    ]);
-
-    assert.equal(mockOrch.calls.approve.length, 1);
-    assert.equal(mockOrch.calls.approve[0]?.missionId, "M2");
-
-    assert.equal(mockOrch.calls.merge.length, 1);
-    assert.equal(mockOrch.calls.merge[0]?.missionId, "M2");
-
-    assert.equal(mockOrch.calls.retry.length, 1);
-    assert.equal(mockOrch.calls.retry[0]?.missionId, "M3");
-
-    assert.equal(mockOrch.calls.postToBoard.length, 2);
-    assert.equal(mockOrch.calls.postToBoard[0]?.from, "human");
-    assert.equal(mockOrch.calls.postToBoard[0]?.fromRole, "human");
-    assert.equal(
-      mockOrch.calls.postToBoard[0]?.text,
-      "@warm-M2 Please refresh architecture spec",
-    );
-    assert.equal(mockOrch.calls.postToBoard[0]?.missionId, "M2");
-    assert.equal(mockOrch.calls.postToBoard[1]?.from, "human");
-    assert.equal(mockOrch.calls.postToBoard[1]?.fromRole, "human");
-    assert.equal(
-      mockOrch.calls.postToBoard[1]?.text,
-      "@warm-M2 please update architecture diagram",
-    );
-
-    assert.equal(diffCalls.length, 1);
+    assert.equal(modalDepth, 0);
+    assert.equal(mockEngine.subscriberCount(), 0, "Overlay must unsubscribe on close");
+    assert.equal(mockTui.getHardwareCursor(), false);
+    assert.equal((overlayOptsSeen as { overlay?: boolean })?.overlay, true);
   });
 
-  it("renders selectable [FINAL] Final Validator row, supports [x] stop, [r] re-verify, and exposes [FINAL] skip pane", async () => {
-    const finalValidatorEntry: RosterEntry = {
-      agentId: "final-val-r1",
-      name: "final-validator",
-      role: "final-validator",
-      missionId: FINAL_AUDIT_MISSION_ID,
-      worktreePath: "/tmp/repo",
-      branch: "main",
-      status: "working",
-      model: "google/gemini-2.5-pro",
-      lastReadBoardSeq: 6,
-      turns: 2,
-      startedAt: "2026-11-20T17:44:00.000Z",
-      humanStopped: false,
-      currentActivity: "Auditing merged commits on main",
-      lastTool: "read",
-      tokens: 8_400,
-      cost: 0.11,
-      logTail: [
-        "Auditing commit deadbeef against verification contract",
-        "Found missing error code check in src/cli/main.ts:88",
-      ],
-    };
-
-    const latestFinalAudit: FinalAuditVerdict = {
-      commitSha: "deadbeef1234567890",
-      baseBranch: "main",
-      auditedAt: "2026-11-20T17:44:45.000Z",
-      verifierAgentId: "final-val-r1",
-      verdict: "disapproved",
-      summary: "CLI error handling does not exit non-zero on parse error",
-      checks: [
-        { name: "typecheck", passed: true },
-        { name: "e2e cli", passed: false, detail: "exit code 0" },
-      ],
-      findings: [
-        {
-          severity: "p1",
-          title: "CLI returns 0 on error",
-          detail: "Must exit 1 when parser fails",
-          file: "src/cli/main.ts",
-          line: 88,
-        },
-      ],
-      recommendedMissions: [
-        {
-          title: "Propagate CLI exit code on parse error",
-          description: "Set process.exitCode = 1 on error",
-          scope: ["src/cli/main.ts"],
-          verification: "npm test",
-          kind: "build",
-        },
-      ],
-      round: 1,
-    };
-
-    // Part A: Active Final Validator with checks/findings/logTail + [x] stop + [r] re-verify
-    {
-      const snap = makeSampleSnapshot({
-        status: "verifying",
-        workingAgents: 1,
-        waitingAgents: 0,
-        finalValidatorEnabled: true,
-        maxFinalAuditRounds: 2,
-        finalAuditStatus: "disapproved",
-        finalAuditRound: 1,
-        latestFinalAudit,
-        finalValidatorRosterEntry: finalValidatorEntry,
-        finalAuditRunningAgentId: finalValidatorEntry.agentId,
-      });
-      const mockOrch = createMockOrchestrator(snap);
-      const theme = createMockTheme();
-      const mockTui = createMockTUI(34, 120);
-
-      const ctx = {
-        mode: "tui",
-        hasUI: true,
-        ui: {
-          theme,
-          notify() {},
-          async custom<T>(
-            factory: (
-              tui: TUI,
-              th: Theme,
-              kb: unknown,
-              done: (res: T) => void,
-            ) => Component & Focusable & { dispose?(): void },
-          ): Promise<T> {
-            return new Promise<T>((resolve) => {
-              const comp = factory(mockTui.tui, theme, {}, resolve);
-              comp.focused = true;
-              void (async () => {
-                // Up once wraps from M1 to [FINAL] Final Validator
-                comp.handleInput?.("\x1b[A");
-                for (const w of [40, 80, 120]) {
-                  assertAllLinesFit(comp.render(w), w, `tasks-overlay-final@${w}`);
-                }
-                const plain = stripTerminalSequences(comp.render(110).join("\n"));
-                assert.match(plain, /\[FINAL\] Final Validator \(base:main\)/);
-                assert.match(plain, /Checks \(1\/2\):/);
-                assert.match(plain, /CLI returns 0 on error/);
-                assert.match(plain, /Propagate CLI exit code on parse error/);
-                assert.match(plain, /Auditing commit deadbeef against verification contract/);
-                assert.match(plain, /\[x\] stop/);
-                assert.match(plain, /\[r\] re-verify/);
-
-                comp.handleInput?.("x");
-                await Promise.resolve();
-                comp.handleInput?.("r");
-                await Promise.resolve();
-                comp.handleInput?.("\x1b");
-              })();
-            });
-          },
-        },
-      } as unknown as ExtensionContext;
-
-      await openTasksOverlay(ctx, mockOrch.orchestrator, undefined, {
-        now: () => Date.parse("2026-11-20T17:45:00.000Z"),
-      });
-
-      assert.equal(mockOrch.calls.stop.length, 1);
-      assert.equal(mockOrch.calls.stop[0]?.agentId, "final-val-r1");
-      assert.equal(mockOrch.calls.stop[0]?.options?.humanStopped, true);
-      assert.equal(mockOrch.calls.runFinalAudit.length, 1);
-      assert.equal(mockOrch.calls.runFinalAudit[0]?.force, true);
-    }
-
-    // Part B: [FINAL] skipped pane before first audit
-    {
-      const skippedSnap = makeSampleSnapshot({
-        status: "completed",
-        workingAgents: 0,
-        waitingAgents: 0,
-        finalValidatorEnabled: true,
-        maxFinalAuditRounds: 2,
-        finalAuditStatus: "skipped",
-        finalAuditRound: 0,
-        finalAuditSkippedBy: "human",
-        finalAuditSkipReason: "accepted known gap",
-      });
-      const mockOrch = createMockOrchestrator(skippedSnap);
-      const theme = createMockTheme();
-      const mockTui = createMockTUI(34, 120);
-
-      let plain = "";
-      const ctx = {
-        mode: "tui",
-        hasUI: true,
-        ui: {
-          theme,
-          notify() {},
-          async custom<T>(
-            factory: (
-              tui: TUI,
-              th: Theme,
-              kb: unknown,
-              done: (res: T) => void,
-            ) => Component & Focusable & { dispose?(): void },
-          ): Promise<T> {
-            return new Promise<T>((resolve) => {
-              const comp = factory(mockTui.tui, theme, {}, resolve);
-              comp.focused = true;
-              void (async () => {
-                for (const w of [40, 80, 120]) {
-                  assertAllLinesFit(comp.render(w), w, `tasks-overlay-skipped@${w}`);
-                }
-                plain = stripTerminalSequences(comp.render(110).join("\n"));
-                comp.handleInput?.("r");
-                await Promise.resolve();
-                comp.handleInput?.("\x1b");
-              })();
-            });
-          },
-        },
-      } as unknown as ExtensionContext;
-
-      await openTasksOverlay(ctx, mockOrch.orchestrator, undefined, {
-        initialMissionId: FINAL_AUDIT_MISSION_ID,
-        now: () => Date.parse("2026-11-20T17:45:00.000Z"),
-      });
-
-      assert.match(plain, /\[FINAL\] Final Validator \(base:main\)/);
-      assert.match(plain, /skipped/);
-      assert.match(plain, /Skip reason: accepted known gap/);
-      assert.match(plain, /\[r\] re-verify/);
-      assert.equal(mockOrch.calls.runFinalAudit.length, 1);
-      assert.equal(mockOrch.calls.runFinalAudit[0]?.force, true);
-    }
-  });
-
-  it("RPC fallback supports hot-switching model, killing agent, and posting to board", async () => {
-    const snap = makeSampleSnapshot({ workingAgents: 0, waitingAgents: 1 });
-    const mockOrch = createMockOrchestrator(snap);
+  it("supports RPC fallback menu via ctx.ui.select and ctx.ui.input", async () => {
+    const snap = makeSampleSnapshot();
+    const mockEngine = createMockEngine(snap);
+    const { worktree } = createMockWorktree();
     const notifications: string[] = [];
 
-    let step = 0;
+    const selectQueue: (string | undefined)[] = [
+      "Board (#5) — Post message",
+      "● worker-1 (worker · working [gpt-5.4-codex] · share:swarm/dyn/worker-1)",
+      "Stop worker-1 (human-stopped)",
+      "Swarm Graph — Spawn tree & @mentions",
+      "Close",
+    ];
+    const inputQueue: (string | undefined)[] = ["@validator please review #5"];
+
     const rpcCtx = {
       mode: "rpc",
       hasUI: true,
       ui: {
-        notify(msg: string) {
-          notifications.push(msg);
-        },
-        async select(_title: string, opts: string[]) {
-          step++;
-          if (step === 1) return opts.find((o) => o.includes("M2"));
-          if (step === 2) return opts.find((o) => o.startsWith("Hot-switch model on "));
-          if (step === 3) return opts.find((o) => o.includes("M2"));
-          if (step === 4) return opts.find((o) => o.startsWith("Kill "));
-          return "Close";
+        async select() {
+          return selectQueue.shift();
         },
         async input() {
-          return "google/gemini-2.5-pro";
+          return inputQueue.shift();
+        },
+        notify(msg: string) {
+          notifications.push(msg);
         },
       },
     } as unknown as ExtensionContext;
 
-    await openTasksOverlay(rpcCtx, mockOrch.orchestrator);
+    await openSwarmOverlay(rpcCtx, mockEngine.engine, worktree);
+    assert.equal(mockEngine.posted.length, 1);
+    assert.equal(mockEngine.posted[0]!.text, "@validator please review #5");
+    assert.equal(mockEngine.stopped.length, 1);
+    assert.equal(mockEngine.stopped[0]!.name, "worker-1");
+    assert.equal(mockEngine.stopped[0]!.options?.humanStopped, true);
+    assert.ok(notifications.some((n) => n.includes("Spawn Tree")));
+  });
 
-    assert.deepEqual(mockOrch.calls.switchAgentModel, [
-      { agentNameOrId: "warm-M2", modelOverride: "google/gemini-2.5-pro" },
-    ]);
-    assert.deepEqual(mockOrch.calls.kill, [
-      { agentNameOrId: "warm-M2", reason: "Killed by user" },
-    ]);
-    assert.ok(notifications.some((n) => n.includes("Switched warm-M2")));
-    assert.ok(notifications.some((n) => n.includes("Killed warm-M2")));
+  it("parses 'max' thinkingLevel in [m] model switch and disposes component in finally on external custom() exit", async () => {
+    // 1. Hot-switch with trailing 'max' thinking level
+    {
+      const snap = makeSampleSnapshot();
+      const mockEngine = createMockEngine(snap);
+      const theme = createMockTheme();
+      const mockTui = createMockTUI(32, 100);
+
+      const ctx = {
+        mode: "tui",
+        hasUI: true,
+        ui: {
+          theme,
+          notify() {},
+          async custom<T>(
+            factory: (
+              tui: TUI,
+              th: Theme,
+              kb: unknown,
+              done: (res: T) => void,
+            ) => Component & { dispose?(): void },
+          ): Promise<T> {
+            return new Promise<T>((resolve) => {
+              const comp = factory(mockTui.tui, theme, {}, resolve);
+              if (isFocusable(comp)) comp.focused = true;
+              void (async () => {
+                await flushAsync();
+                comp.handleInput?.("m");
+                for (const ch of "anthropic/claude-opus-4-6 max") {
+                  comp.handleInput?.(ch);
+                }
+                comp.handleInput?.("\r");
+                await flushAsync();
+                comp.handleInput?.("q");
+              })();
+            });
+          },
+        },
+      } as unknown as ExtensionContext;
+
+      await openSwarmOverlay(ctx, mockEngine.engine, null, {
+        initialTab: "members",
+        initialMemberName: "helper-lex",
+      });
+
+      assert.equal(mockEngine.switched.length, 1);
+      assert.equal(mockEngine.switched[0]!.targetName, "helper-lex");
+      assert.equal(mockEngine.switched[0]!.model, "anthropic/claude-opus-4-6");
+      assert.equal(mockEngine.switched[0]!.thinkingLevel, "max");
+      assert.equal(mockEngine.subscriberCount(), 0);
+    }
+
+    // 2. External custom() exit (without calling component.close) still disposes & restores hardware cursor
+    {
+      const snap = makeSampleSnapshot();
+      const mockEngine = createMockEngine(snap);
+      const theme = createMockTheme();
+      const mockTui = createMockTUI(32, 100);
+      let modalDepth = 0;
+
+      const ctx = {
+        mode: "tui",
+        hasUI: true,
+        ui: {
+          theme,
+          notify() {},
+          async custom<T>(
+            factory: (
+              tui: TUI,
+              th: Theme,
+              kb: unknown,
+              done: (res: T) => void,
+            ) => Component & { dispose?(): void },
+          ): Promise<T> {
+            const comp = factory(mockTui.tui, theme, {}, () => {});
+            if (isFocusable(comp)) comp.focused = true;
+            // Search tab activates hardware cursor & engine subscription
+            assert.equal(mockEngine.subscriberCount(), 1);
+            assert.equal(mockTui.getHardwareCursor(), true);
+            // Resolve externally without sending Esc/q to component
+            return undefined as T;
+          },
+        },
+      } as unknown as ExtensionContext;
+
+      await openSwarmOverlay(ctx, mockEngine.engine, null, {
+        initialTab: "search",
+        onModalEnter: () => {
+          modalDepth++;
+        },
+        onModalExit: () => {
+          modalDepth--;
+        },
+      });
+
+      assert.equal(modalDepth, 0);
+      assert.equal(
+        mockEngine.subscriberCount(),
+        0,
+        "finally must unsubscribe engine listener on external custom() exit",
+      );
+      assert.equal(
+        mockTui.getHardwareCursor(),
+        false,
+        "finally must restore hardware cursor on external custom() exit",
+      );
+    }
   });
 });

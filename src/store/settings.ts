@@ -18,8 +18,7 @@ const VALID_THINKING_LEVELS: ReadonlySet<ThinkingLevel> = new Set<ThinkingLevel>
 
 export const SWARM_SETTINGS_BOUNDS = Object.freeze({
   maxConcurrency: { min: 1, max: 64 },
-  maxValidationRounds: { min: 1, max: 10 },
-  maxFinalAuditRounds: { min: 1, max: 10 },
+  stallTimeoutMs: { min: 1_000, max: 3_600_000 },
   maxRetries: { min: 0, max: 20 },
   rateLimitBaseBackoffMs: { min: 250, max: 600_000 },
   rateLimitMaxBackoffMs: { min: 250, max: 3_600_000 },
@@ -161,7 +160,7 @@ function sanitizeFallbackModels(
 
 /**
  * Sanitize and clamp raw settings against valid bounds, falling back to `base`
- * (which defaults to `DEFAULT_SWARM_SETTINGS`).
+ * (which defaults to `DEFAULT_SWARM_SETTINGS`). Unknown legacy keys are ignored cleanly.
  */
 export function sanitizeSwarmSettings(
   raw: Record<string, unknown> | Partial<SwarmSettings> | undefined,
@@ -189,64 +188,6 @@ export function sanitizeSwarmSettings(
   const rateLimitMaxBackoffMs = Math.max(rateLimitBaseBackoffMs, rawMaxBackoff);
 
   return {
-    maxConcurrency: clampInt(
-      input.maxConcurrency,
-      SWARM_SETTINGS_BOUNDS.maxConcurrency.min,
-      SWARM_SETTINGS_BOUNDS.maxConcurrency.max,
-      base.maxConcurrency,
-    ),
-    validatorEnabled:
-      typeof input.validatorEnabled === "boolean"
-        ? input.validatorEnabled
-        : base.validatorEnabled,
-    finalValidatorEnabled:
-      typeof input.finalValidatorEnabled === "boolean"
-        ? input.finalValidatorEnabled
-        : base.finalValidatorEnabled,
-    maxValidationRounds: clampInt(
-      input.maxValidationRounds,
-      SWARM_SETTINGS_BOUNDS.maxValidationRounds.min,
-      SWARM_SETTINGS_BOUNDS.maxValidationRounds.max,
-      base.maxValidationRounds,
-    ),
-    maxFinalAuditRounds: clampInt(
-      input.maxFinalAuditRounds,
-      SWARM_SETTINGS_BOUNDS.maxFinalAuditRounds.min,
-      SWARM_SETTINGS_BOUNDS.maxFinalAuditRounds.max,
-      base.maxFinalAuditRounds,
-    ),
-    autoFixOnAuditFail:
-      typeof input.autoFixOnAuditFail === "boolean"
-        ? input.autoFixOnAuditFail
-        : base.autoFixOnAuditFail,
-    keepWorkersWarm:
-      typeof input.keepWorkersWarm === "boolean"
-        ? input.keepWorkersWarm
-        : base.keepWorkersWarm,
-    maxRetries: clampInt(
-      input.maxRetries,
-      SWARM_SETTINGS_BOUNDS.maxRetries.min,
-      SWARM_SETTINGS_BOUNDS.maxRetries.max,
-      base.maxRetries,
-    ),
-    rateLimitBaseBackoffMs,
-    rateLimitMaxBackoffMs,
-    gitTimeoutMs: clampInt(
-      input.gitTimeoutMs,
-      SWARM_SETTINGS_BOUNDS.gitTimeoutMs.min,
-      SWARM_SETTINGS_BOUNDS.gitTimeoutMs.max,
-      base.gitTimeoutMs,
-    ),
-    autoMergeClean:
-      typeof input.autoMergeClean === "boolean"
-        ? input.autoMergeClean
-        : base.autoMergeClean,
-    autoRebase:
-      typeof input.autoRebase === "boolean" ? input.autoRebase : base.autoRebase,
-    autoTeardownOnComplete:
-      typeof input.autoTeardownOnComplete === "boolean"
-        ? input.autoTeardownOnComplete
-        : base.autoTeardownOnComplete,
     orchestratorModel: sanitizeOptionalModel(
       input,
       "orchestratorModel",
@@ -274,6 +215,50 @@ export function sanitizeSwarmSettings(
       base.validatorThinkingLevel,
     ),
     fallbackModels: sanitizeFallbackModels(input, base.fallbackModels),
+    maxConcurrency: clampInt(
+      input.maxConcurrency,
+      SWARM_SETTINGS_BOUNDS.maxConcurrency.min,
+      SWARM_SETTINGS_BOUNDS.maxConcurrency.max,
+      base.maxConcurrency,
+    ),
+    validatorEnabled:
+      typeof input.validatorEnabled === "boolean"
+        ? input.validatorEnabled
+        : base.validatorEnabled,
+    keepWorkersWarm:
+      typeof input.keepWorkersWarm === "boolean"
+        ? input.keepWorkersWarm
+        : base.keepWorkersWarm,
+    stallWatchdogEnabled:
+      typeof input.stallWatchdogEnabled === "boolean"
+        ? input.stallWatchdogEnabled
+        : base.stallWatchdogEnabled,
+    stallTimeoutMs: clampInt(
+      input.stallTimeoutMs,
+      SWARM_SETTINGS_BOUNDS.stallTimeoutMs.min,
+      SWARM_SETTINGS_BOUNDS.stallTimeoutMs.max,
+      base.stallTimeoutMs,
+    ),
+    maxRetries: clampInt(
+      input.maxRetries,
+      SWARM_SETTINGS_BOUNDS.maxRetries.min,
+      SWARM_SETTINGS_BOUNDS.maxRetries.max,
+      base.maxRetries,
+    ),
+    rateLimitBaseBackoffMs,
+    rateLimitMaxBackoffMs,
+    gitTimeoutMs: clampInt(
+      input.gitTimeoutMs,
+      SWARM_SETTINGS_BOUNDS.gitTimeoutMs.min,
+      SWARM_SETTINGS_BOUNDS.gitTimeoutMs.max,
+      base.gitTimeoutMs,
+    ),
+    autoRebase:
+      typeof input.autoRebase === "boolean" ? input.autoRebase : base.autoRebase,
+    autoTeardownOnComplete:
+      typeof input.autoTeardownOnComplete === "boolean"
+        ? input.autoTeardownOnComplete
+        : base.autoTeardownOnComplete,
   };
 }
 
@@ -299,44 +284,26 @@ export function sanitizeSettingsPatch(
   if ("validatorEnabled" in input && typeof input.validatorEnabled === "boolean") {
     patch.validatorEnabled = input.validatorEnabled;
   }
-  if (
-    "finalValidatorEnabled" in input &&
-    typeof input.finalValidatorEnabled === "boolean"
-  ) {
-    patch.finalValidatorEnabled = input.finalValidatorEnabled;
-  }
-  if (
-    "maxValidationRounds" in input &&
-    typeof input.maxValidationRounds === "number" &&
-    Number.isFinite(input.maxValidationRounds)
-  ) {
-    patch.maxValidationRounds = clampInt(
-      input.maxValidationRounds,
-      SWARM_SETTINGS_BOUNDS.maxValidationRounds.min,
-      SWARM_SETTINGS_BOUNDS.maxValidationRounds.max,
-      DEFAULT_SWARM_SETTINGS.maxValidationRounds,
-    );
-  }
-  if (
-    "maxFinalAuditRounds" in input &&
-    typeof input.maxFinalAuditRounds === "number" &&
-    Number.isFinite(input.maxFinalAuditRounds)
-  ) {
-    patch.maxFinalAuditRounds = clampInt(
-      input.maxFinalAuditRounds,
-      SWARM_SETTINGS_BOUNDS.maxFinalAuditRounds.min,
-      SWARM_SETTINGS_BOUNDS.maxFinalAuditRounds.max,
-      DEFAULT_SWARM_SETTINGS.maxFinalAuditRounds,
-    );
-  }
-  if (
-    "autoFixOnAuditFail" in input &&
-    typeof input.autoFixOnAuditFail === "boolean"
-  ) {
-    patch.autoFixOnAuditFail = input.autoFixOnAuditFail;
-  }
   if ("keepWorkersWarm" in input && typeof input.keepWorkersWarm === "boolean") {
     patch.keepWorkersWarm = input.keepWorkersWarm;
+  }
+  if (
+    "stallWatchdogEnabled" in input &&
+    typeof input.stallWatchdogEnabled === "boolean"
+  ) {
+    patch.stallWatchdogEnabled = input.stallWatchdogEnabled;
+  }
+  if (
+    "stallTimeoutMs" in input &&
+    typeof input.stallTimeoutMs === "number" &&
+    Number.isFinite(input.stallTimeoutMs)
+  ) {
+    patch.stallTimeoutMs = clampInt(
+      input.stallTimeoutMs,
+      SWARM_SETTINGS_BOUNDS.stallTimeoutMs.min,
+      SWARM_SETTINGS_BOUNDS.stallTimeoutMs.max,
+      DEFAULT_SWARM_SETTINGS.stallTimeoutMs,
+    );
   }
   if (
     "maxRetries" in input &&
@@ -392,9 +359,6 @@ export function sanitizeSettingsPatch(
       SWARM_SETTINGS_BOUNDS.gitTimeoutMs.max,
       DEFAULT_SWARM_SETTINGS.gitTimeoutMs,
     );
-  }
-  if ("autoMergeClean" in input && typeof input.autoMergeClean === "boolean") {
-    patch.autoMergeClean = input.autoMergeClean;
   }
   if ("autoRebase" in input && typeof input.autoRebase === "boolean") {
     patch.autoRebase = input.autoRebase;
@@ -500,7 +464,7 @@ async function writeSettingsFileAtomic(
     const st = await lstat(filePath);
     if (st.isSymbolicLink()) {
       throw new SwarmProtocolError(
-        "SCOPE_VIOLATION",
+        "PERMISSION_DENIED",
         `Refusing to write symlinked settings file: ${filePath}`,
         { path: filePath },
       );

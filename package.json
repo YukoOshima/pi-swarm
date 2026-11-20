@@ -1,7 +1,7 @@
 {
   "name": "pi-swarm",
-  "version": "0.1.0",
-  "description": "Antigravity Swarm-style multi-agent collaboration with interactive upfront Q&A planning, isolated Git worktrees, shared message board, warm persistent sessions, and 3-role Orchestrator/Worker/Validator models for Pi.",
+  "version": "0.2.0",
+  "description": "Dynamic Antigravity Swarm multi-agent orchestration for Pi with pi-goal-x upfront Q&A planning, 3-role Orchestrator/Worker/Validator models, shared Message Board & channels, warm persistent sessions with context forking, hot model switching, and optional isolated Git worktrees.",
   "type": "module",
   "license": "MIT",
   "keywords": [

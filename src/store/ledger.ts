@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { appendFile, lstat, mkdir, readFile } from "node:fs/promises";
 import path from "node:path";
-import { FINAL_AUDIT_MISSION_ID } from "../constants.js";
 import {
   SwarmProtocolError,
   type SwarmEvent,
@@ -36,7 +35,7 @@ async function assertPathNotSymlink(filePath: string): Promise<void> {
     const st = await lstat(filePath);
     if (st.isSymbolicLink()) {
       throw new SwarmProtocolError(
-        "SCOPE_VIOLATION",
+        "PERMISSION_DENIED",
         `Refusing to access symlinked ledger path: ${filePath}`,
         { path: filePath },
       );
@@ -112,8 +111,9 @@ export async function appendLedgerEvent(
       timestamp: input.timestamp ?? new Date().toISOString(),
       summary: input.summary,
       ...(input.actor !== undefined ? { actor: input.actor } : {}),
-      ...(input.missionId !== undefined ? { missionId: input.missionId } : {}),
+      ...(input.memberName !== undefined ? { memberName: input.memberName } : {}),
       ...(input.agentId !== undefined ? { agentId: input.agentId } : {}),
+      ...(input.channel !== undefined ? { channel: input.channel } : {}),
       ...(input.data !== undefined ? { data: input.data } : {}),
     };
 
@@ -165,8 +165,30 @@ function formatShortTime(isoTimestamp: string): string {
   return `${hh}:${mm}:${ss}Z`;
 }
 
-function formatMissionTag(missionId: string): string {
-  return missionId === FINAL_AUDIT_MISSION_ID ? "final-audit" : missionId;
+function formatLine(
+  time: string,
+  eventType: string,
+  meta: readonly string[],
+  actorPart: string | undefined,
+  summary: string,
+): string {
+  const parts = [time, eventType];
+  if (meta.length > 0) {
+    parts.push(`[${meta.join(" · ")}]`);
+  }
+  if (actorPart) {
+    parts.push(actorPart);
+  }
+  if (summary) {
+    parts.push(summary);
+  }
+  return parts.join(" ");
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0
+    ? value.trim()
+    : undefined;
 }
 
 /** Format a single ledger event into a concise single-line human-readable activity string. */
@@ -178,232 +200,324 @@ export function formatLedgerEvent(event: SwarmEvent): string {
   const data = event.data;
 
   switch (event.type) {
-    case "board_posted": {
+    case "run_created": {
       const meta: string[] = [];
-      if (typeof data?.seq === "number" && !summary.includes(`#${data.seq}`)) {
-        meta.push(`#${data.seq}`);
+      const baseBranch = nonEmptyString(data?.baseBranch);
+      if (baseBranch && !summary.includes(baseBranch)) {
+        meta.push(baseBranch);
       }
-      if (
-        typeof data?.kind === "string" &&
-        data.kind.trim() &&
-        data.kind !== "chat" &&
-        !summary.toLowerCase().includes(`[${data.kind.toLowerCase()}]`)
-      ) {
-        meta.push(data.kind.trim());
-      }
-      const parts = [time, "board_posted"];
-      if (meta.length > 0) parts.push(`[${meta.join(" · ")}]`);
-      if (actorPart) parts.push(actorPart);
-      parts.push(summary || "Posted to shared board.");
-      return parts.join(" ");
+      return formatLine(
+        time,
+        event.type,
+        meta,
+        actorPart,
+        summary || "Created swarm run.",
+      );
     }
 
-    case "agent_woken": {
+    case "run_titled": {
+      const title = nonEmptyString(data?.title);
+      return formatLine(
+        time,
+        event.type,
+        [],
+        actorPart,
+        summary || (title ? `Renamed swarm to "${title}".` : "Updated swarm title."),
+      );
+    }
+
+    case "run_paused":
+      return formatLine(
+        time,
+        event.type,
+        [],
+        actorPart,
+        summary || "Paused swarm run.",
+      );
+
+    case "run_resumed":
+      return formatLine(
+        time,
+        event.type,
+        [],
+        actorPart,
+        summary || "Resumed swarm run.",
+      );
+
+    case "run_completed":
+      return formatLine(
+        time,
+        event.type,
+        [],
+        actorPart,
+        summary || "Completed swarm run.",
+      );
+
+    case "run_abandoned":
+      return formatLine(
+        time,
+        event.type,
+        [],
+        actorPart,
+        summary || "Abandoned swarm run.",
+      );
+
+    case "member_added": {
       const meta: string[] = [];
-      if (event.missionId) {
-        meta.push(formatMissionTag(event.missionId));
+      if (event.memberName) meta.push(event.memberName);
+      const role = nonEmptyString(data?.role);
+      if (role && !summary.toLowerCase().includes(role.toLowerCase())) {
+        meta.push(role);
       }
+      const workspace = nonEmptyString(data?.workspace);
+      if (workspace && !summary.includes(workspace)) {
+        meta.push(workspace);
+      }
+      const model = nonEmptyString(data?.model);
+      if (model && !summary.includes(model)) {
+        meta.push(model);
+      }
+      return formatLine(
+        time,
+        event.type,
+        meta,
+        actorPart,
+        summary || "Added swarm member.",
+      );
+    }
+
+    case "member_woken": {
+      const meta: string[] = [];
+      if (event.memberName) meta.push(event.memberName);
       if (
         typeof data?.boardSeq === "number" &&
         !summary.includes(`#${data.boardSeq}`)
       ) {
         meta.push(`#${data.boardSeq}`);
       }
-      const parts = [time, "agent_woken"];
-      if (meta.length > 0) parts.push(`[${meta.join(" · ")}]`);
-      if (actorPart) parts.push(actorPart);
-      parts.push(summary || "Agent woken.");
-      return parts.join(" ");
+      return formatLine(
+        time,
+        event.type,
+        meta,
+        actorPart,
+        summary || "Member woken.",
+      );
     }
 
-    case "agent_model_switched": {
+    case "member_waiting": {
       const meta: string[] = [];
-      if (event.missionId) {
-        meta.push(formatMissionTag(event.missionId));
-      }
-      const nextModel =
-        typeof data?.model === "string" && data.model.trim()
-          ? data.model.trim()
-          : undefined;
-      const prevModel =
-        typeof data?.previousModel === "string" && data.previousModel.trim()
-          ? data.previousModel.trim()
-          : undefined;
+      if (event.memberName) meta.push(event.memberName);
+      return formatLine(
+        time,
+        event.type,
+        meta,
+        actorPart,
+        summary || "Member waiting on board.",
+      );
+    }
+
+    case "member_stopped": {
+      const meta: string[] = [];
+      if (event.memberName) meta.push(event.memberName);
+      return formatLine(
+        time,
+        event.type,
+        meta,
+        actorPart,
+        summary || "Member stopped.",
+      );
+    }
+
+    case "member_killed": {
+      const meta: string[] = [];
+      if (event.memberName) meta.push(event.memberName);
+      return formatLine(
+        time,
+        event.type,
+        meta,
+        actorPart,
+        summary || "Member killed.",
+      );
+    }
+
+    case "member_model_switched": {
+      const meta: string[] = [];
+      if (event.memberName) meta.push(event.memberName);
+      const nextModel = nonEmptyString(data?.model);
+      const prevModel = nonEmptyString(data?.previousModel);
       if (nextModel && !summary.includes(nextModel)) {
         meta.push(prevModel ? `${prevModel} -> ${nextModel}` : nextModel);
       }
-      const parts = [time, "agent_model_switched"];
-      if (meta.length > 0) parts.push(`[${meta.join(" · ")}]`);
-      if (actorPart) parts.push(actorPart);
-      parts.push(summary || "Switched agent model.");
-      return parts.join(" ");
+      return formatLine(
+        time,
+        event.type,
+        meta,
+        actorPart,
+        summary || "Switched member model.",
+      );
     }
 
-    case "agent_killed": {
-      const parts = [time, "agent_killed"];
-      if (event.missionId) {
-        parts.push(`[${formatMissionTag(event.missionId)}]`);
-      }
-      if (actorPart) parts.push(actorPart);
-      parts.push(summary || "Agent killed.");
-      return parts.join(" ");
-    }
-
-    case "validator_spawned": {
+    case "member_merged": {
       const meta: string[] = [];
-      if (event.missionId) {
-        meta.push(formatMissionTag(event.missionId));
-      }
-      if (
-        typeof data?.model === "string" &&
-        data.model.trim() &&
-        !summary.includes(data.model.trim())
-      ) {
-        meta.push(data.model.trim());
-      }
-      const parts = [time, "validator_spawned"];
-      if (meta.length > 0) parts.push(`[${meta.join(" · ")}]`);
-      if (actorPart) parts.push(actorPart);
-      parts.push(summary || "Validator spawned.");
-      return parts.join(" ");
-    }
-
-    case "validation_submitted": {
-      const meta: string[] = [];
-      if (event.missionId) {
-        meta.push(formatMissionTag(event.missionId));
-      }
-      if (
-        typeof data?.status === "string" &&
-        data.status.trim() &&
-        !summary.includes(data.status.trim())
-      ) {
-        meta.push(data.status.trim());
-      }
-      if (
-        typeof data?.merge === "string" &&
-        data.merge.trim() &&
-        !summary.includes(data.merge.trim())
-      ) {
-        meta.push(data.merge.trim());
-      }
-      const parts = [time, "validation_submitted"];
-      if (meta.length > 0) parts.push(`[${meta.join(" · ")}]`);
-      if (actorPart) parts.push(actorPart);
-      parts.push(summary || "Validation submitted.");
-      return parts.join(" ");
-    }
-
-    case "final_audit_started": {
-      const meta: string[] = [];
-      if (
-        typeof data?.round === "number" &&
-        !new RegExp(`\\bround\\s+${data.round}\\b`, "i").test(summary)
-      ) {
-        meta.push(`r${data.round}`);
-      }
-      const branch =
-        typeof data?.baseBranch === "string" && data.baseBranch.trim()
-          ? data.baseBranch.trim()
-          : typeof data?.branch === "string" && data.branch.trim()
-            ? data.branch.trim()
-            : undefined;
-      if (branch && !summary.includes(branch)) {
-        meta.push(branch);
-      }
-      if (typeof data?.commitSha === "string" && data.commitSha.trim()) {
-        const shortSha = data.commitSha.trim().slice(0, 7);
+      if (event.memberName) meta.push(event.memberName);
+      const commitSha = nonEmptyString(data?.commitSha);
+      if (commitSha) {
+        const shortSha = commitSha.slice(0, 7);
         if (!summary.includes(shortSha)) {
           meta.push(`@${shortSha}`);
         }
       }
-      const parts = [time, "final_audit_started"];
-      if (meta.length > 0) parts.push(`[${meta.join(" · ")}]`);
-      if (actorPart) parts.push(actorPart);
-      parts.push(summary || "Final verification started.");
-      return parts.join(" ");
+      return formatLine(
+        time,
+        event.type,
+        meta,
+        actorPart,
+        summary || "Merged member branch.",
+      );
     }
 
-    case "final_audit_result": {
+    case "member_error": {
       const meta: string[] = [];
-      if (typeof data?.verdict === "string" && data.verdict.trim()) {
-        meta.push(data.verdict.trim().toUpperCase());
-      }
-      if (
-        typeof data?.round === "number" &&
-        !new RegExp(`\\bround\\s+${data.round}\\b`, "i").test(summary)
-      ) {
-        meta.push(`r${data.round}`);
-      }
-      if (typeof data?.commitSha === "string" && data.commitSha.trim()) {
-        const shortSha = data.commitSha.trim().slice(0, 7);
-        if (!summary.includes(shortSha)) {
-          meta.push(`@${shortSha}`);
-        }
-      }
-      if (
-        typeof data?.checksPassed === "number" &&
-        typeof data?.checksTotal === "number"
-      ) {
-        meta.push(`checks ${data.checksPassed}/${data.checksTotal}`);
-      }
-      if (typeof data?.findingsCount === "number") {
-        meta.push(
-          `${data.findingsCount} finding${data.findingsCount === 1 ? "" : "s"}`,
-        );
-      }
-      const parts = [time, "final_audit_result"];
-      if (meta.length > 0) parts.push(`[${meta.join(" · ")}]`);
-      if (actorPart) parts.push(actorPart);
-      parts.push(summary || "Final verification completed.");
-      return parts.join(" ");
+      if (event.memberName) meta.push(event.memberName);
+      return formatLine(
+        time,
+        event.type,
+        meta,
+        actorPart,
+        summary || "Member encountered an error.",
+      );
     }
 
-    case "final_audit_skipped": {
-      const skippedBy =
-        typeof data?.skippedBy === "string" && data.skippedBy.trim()
-          ? data.skippedBy.trim()
-          : actor ?? "human";
-      const reason =
-        typeof data?.reason === "string" && data.reason.trim()
-          ? data.reason.trim()
-          : undefined;
-      const parts = [time, "final_audit_skipped", `(${skippedBy})`];
-      if (summary) {
-        parts.push(summary);
-      } else if (reason) {
-        parts.push(`Final verification skipped: ${reason}`);
-      } else {
-        parts.push("Final verification skipped.");
+    case "board_posted": {
+      const meta: string[] = [];
+      if (typeof data?.seq === "number" && !summary.includes(`#${data.seq}`)) {
+        meta.push(`#${data.seq}`);
       }
-      return parts.join(" ");
+      const channel = event.channel ?? nonEmptyString(data?.channel);
+      if (
+        channel &&
+        !summary.includes(`[${channel}]`) &&
+        !summary.includes(`#${channel}`)
+      ) {
+        meta.push(`#${channel}`);
+      }
+      const kind = nonEmptyString(data?.kind);
+      if (
+        kind &&
+        kind !== "chat" &&
+        !summary.toLowerCase().includes(`[${kind.toLowerCase()}]`)
+      ) {
+        meta.push(kind);
+      }
+      return formatLine(
+        time,
+        event.type,
+        meta,
+        actorPart,
+        summary || "Posted to shared board.",
+      );
     }
 
-    case "final_audit_autofix_planned": {
-      const missionIds = Array.isArray(data?.missionIds)
-        ? data.missionIds.filter(
-            (id): id is string => typeof id === "string" && id.trim().length > 0,
-          )
-        : [];
-      const parts = [time, "final_audit_autofix_planned"];
-      if (missionIds.length > 0) {
-        parts.push(`[${missionIds.join(", ")}]`);
+    case "channel_created": {
+      const meta: string[] = [];
+      const channel = event.channel ?? nonEmptyString(data?.channel);
+      if (channel) meta.push(`#${channel}`);
+      return formatLine(
+        time,
+        event.type,
+        meta,
+        actorPart,
+        summary || "Created channel.",
+      );
+    }
+
+    case "channel_updated": {
+      const meta: string[] = [];
+      const channel = event.channel ?? nonEmptyString(data?.channel);
+      if (channel) meta.push(`#${channel}`);
+      if (event.memberName && !summary.includes(event.memberName)) {
+        meta.push(event.memberName);
       }
-      if (actorPart) parts.push(actorPart);
-      parts.push(summary || "Planned auto-fix missions from final verification.");
-      return parts.join(" ");
+      return formatLine(
+        time,
+        event.type,
+        meta,
+        actorPart,
+        summary || "Updated channel.",
+      );
+    }
+
+    case "channel_archived": {
+      const meta: string[] = [];
+      const channel = event.channel ?? nonEmptyString(data?.channel);
+      if (channel) meta.push(`#${channel}`);
+      return formatLine(
+        time,
+        event.type,
+        meta,
+        actorPart,
+        summary || "Archived channel.",
+      );
+    }
+
+    case "stall_detected": {
+      const meta: string[] = [];
+      if (event.memberName) meta.push(event.memberName);
+      if (
+        typeof data?.boardHead === "number" &&
+        !summary.includes(`#${data.boardHead}`)
+      ) {
+        meta.push(`head #${data.boardHead}`);
+      }
+      return formatLine(
+        time,
+        event.type,
+        meta,
+        actorPart,
+        summary || "Swarm stall detected.",
+      );
+    }
+
+    case "rate_limit_backoff": {
+      const meta: string[] = [];
+      if (event.memberName) meta.push(event.memberName);
+      if (typeof data?.backoffMs === "number" && Number.isFinite(data.backoffMs)) {
+        meta.push(`${Math.round(data.backoffMs)}ms`);
+      }
+      return formatLine(
+        time,
+        event.type,
+        meta,
+        actorPart,
+        summary || "Rate-limit backoff active.",
+      );
+    }
+
+    case "teardown_completed": {
+      const meta: string[] = [];
+      if (typeof data?.removed === "number") {
+        meta.push(`removed ${data.removed}`);
+      }
+      if (typeof data?.skipped === "number" && data.skipped > 0) {
+        meta.push(`skipped ${data.skipped}`);
+      }
+      if (typeof data?.errors === "number" && data.errors > 0) {
+        meta.push(`errors ${data.errors}`);
+      }
+      return formatLine(
+        time,
+        event.type,
+        meta,
+        actorPart,
+        summary || "Teardown completed.",
+      );
     }
 
     default: {
-      const parts: string[] = [time, event.type];
-      if (event.missionId) {
-        parts.push(`[${formatMissionTag(event.missionId)}]`);
-      }
-      if (actorPart) {
-        parts.push(actorPart);
-      }
-      parts.push(summary);
-      return parts.join(" ");
+      const meta: string[] = [];
+      if (event.memberName) meta.push(event.memberName);
+      if (event.channel) meta.push(`#${event.channel}`);
+      return formatLine(time, String(event.type), meta, actorPart, summary);
     }
   }
 }

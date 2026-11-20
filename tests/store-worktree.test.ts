@@ -15,28 +15,29 @@ import path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { promisify } from "node:util";
 import {
+  DEFAULT_CHANNEL,
   DEFAULT_SWARM_SETTINGS,
-  FINAL_AUDIT_MISSION_ID,
-  FINAL_VALIDATOR_BOARD_NAME,
-  ORCHESTRATOR_BOARD_NAME,
-  SWARM_AUDITS_DIR,
+  RESERVED_MEMBER_NAMES,
   SWARM_BOARD_FILE,
+  SWARM_DEFAULT_STALL_TIMEOUT_MS,
   SWARM_DIR,
+  SWARM_EVENTS_FILE,
   SWARM_LOCKS_DIR,
   SWARM_LOG_TAIL_LIMIT,
-  SWARM_MISSIONS_FILE,
-  SWARM_REVIEWS_DIR,
+  SWARM_ROSTER_FILE,
   SWARM_RUNS_DIR,
   SWARM_SETTINGS_FILE,
   SWARM_STATE_FILE,
+  SWARM_STATE_VERSION,
 } from "../src/constants.js";
 import {
+  SWARM_SETTINGS_BOUNDS,
   SwarmBoard,
   SwarmLedger,
   SwarmStore,
   WorktreeManager,
   assertOwnerSession,
-  findScopeViolations,
+  deriveMemberBranch,
   formatBoardMessage,
   formatBoardMessages,
   formatLedgerActivity,
@@ -45,22 +46,22 @@ import {
   getProjectSettingsPath,
   loadLayeredSwarmSettings,
   loadSwarmSettings,
-  normalizeScopePath,
+  parseChannelMentions,
   parseMentions,
   sanitizeSwarmSettings,
   saveSwarmSettings,
-  scopesOverlap,
+  validateChannelName,
+  validateMemberName,
 } from "../src/store/index.js";
 import {
   isSwarmProtocolError,
-  type FinalAuditVerdict,
-  type MissionPlanInput,
-  type MissionReviewVerdict,
+  type BoardMessage,
+  type SwarmErrorCode,
   type SwarmEvent,
+  type SwarmEventType,
 } from "../src/types.js";
 
 const execFileAsync = promisify(execFile);
-
 const tempDirs: string[] = [];
 
 async function makeTempDir(prefix: string): Promise<string> {
@@ -108,20 +109,7 @@ async function exists(p: string): Promise<boolean> {
   }
 }
 
-function makeMission(
-  overrides: Partial<MissionPlanInput> & { id: string; title: string },
-): MissionPlanInput {
-  return {
-    kind: "build",
-    description: `Description for ${overrides.id}`,
-    scope: [`src/${overrides.id.toLowerCase()}`],
-    deps: [],
-    verification: "npm test",
-    ...overrides,
-  };
-}
-
-function assertProtocolCode(err: unknown, expectedCode: string): boolean {
+function assertProtocolCode(err: unknown, expectedCode: SwarmErrorCode): boolean {
   assert.ok(
     isSwarmProtocolError(err),
     `Expected SwarmProtocolError(${expectedCode}), got ${String(err)}`,
@@ -142,414 +130,167 @@ afterEach(async () => {
 });
 
 // ============================================================================
-// 1. Plan Validation & Protocol Invariants
-// ============================================================================
-
-describe("SwarmStore.validatePlan & protocol invariants", () => {
-  it("computes multi-wave topological DAG and deterministic feat/<slug> branches", async () => {
-    const root = await makeTempDir("pi-swarm-plan-");
-    const store = new SwarmStore(root);
-
-    const missions: MissionPlanInput[] = [
-      makeMission({ id: "M1", title: "Build Auth Core", scope: ["src/auth"] }),
-      makeMission({
-        id: "M2",
-        title: "Add Storage Layer",
-        scope: ["src/storage"],
-      }),
-      makeMission({
-        id: "M3",
-        title: "Wire HTTP API",
-        scope: ["src/api"],
-        deps: ["M1", "M2"],
-      }),
-      makeMission({
-        id: "M4",
-        title: "Write Integration Report",
-        kind: "artifact",
-        scope: ["docs/report.md"],
-        deps: ["M3"],
-      }),
-    ];
-
-    const result = store.validatePlan(missions, {
-      baseBranch: "main",
-      existingBranches: ["main", "feat/unrelated"],
-    });
-
-    assert.equal(result.valid, true);
-    assert.deepEqual(result.errors, []);
-    assert.deepEqual(result.waves, [["M1", "M2"], ["M3"], ["M4"]]);
-    assert.deepEqual(result.branches, {
-      M1: "feat/build-auth-core",
-      M2: "feat/add-storage-layer",
-      M3: "feat/wire-http-api",
-      M4: "feat/write-integration-report",
-    });
-  });
-
-  it("rejects dependency cycles (multi-node and self-loop) with CYCLE_DETECTED", async () => {
-    const root = await makeTempDir("pi-swarm-cycle-");
-    const store = new SwarmStore(root);
-
-    const cyclic = store.validatePlan([
-      makeMission({
-        id: "M1",
-        title: "Mission One",
-        scope: ["src/a"],
-        deps: ["M2"],
-      }),
-      makeMission({
-        id: "M2",
-        title: "Mission Two",
-        scope: ["src/b"],
-        deps: ["M1"],
-      }),
-    ]);
-    assert.equal(cyclic.valid, false);
-    assert.ok(cyclic.errors.some((e) => e.code === "CYCLE_DETECTED"));
-    assert.deepEqual(cyclic.waves, []);
-
-    const selfLoop = store.validatePlan([
-      makeMission({
-        id: "M1",
-        title: "Self Loop",
-        scope: ["src/a"],
-        deps: ["M1"],
-      }),
-    ]);
-    assert.equal(selfLoop.valid, false);
-    assert.ok(selfLoop.errors.some((e) => e.code === "CYCLE_DETECTED"));
-  });
-
-  it("rejects missing dependencies and duplicate mission IDs", async () => {
-    const root = await makeTempDir("pi-swarm-deps-");
-    const store = new SwarmStore(root);
-
-    const missing = store.validatePlan([
-      makeMission({
-        id: "M1",
-        title: "First Task",
-        scope: ["src/a"],
-        deps: ["M99"],
-      }),
-    ]);
-    assert.equal(missing.valid, false);
-    assert.ok(missing.errors.some((e) => e.code === "MISSING_DEP"));
-
-    const dup = store.validatePlan([
-      makeMission({ id: "M1", title: "Alpha One", scope: ["src/a"] }),
-      makeMission({ id: "M1", title: "Beta Two", scope: ["src/b"] }),
-    ]);
-    assert.equal(dup.valid, false);
-    assert.ok(dup.errors.some((e) => e.code === "DUPLICATE_MISSION"));
-  });
-
-  it("enforces printable ASCII titles (INVALID_TITLE) and globally unique branches (DUPLICATE_BRANCH)", async () => {
-    const root = await makeTempDir("pi-swarm-titles-");
-    const store = new SwarmStore(root);
-
-    for (const badTitle of [
-      "实现认证",
-      "Add Auth 🚀",
-      "Line1\nLine2",
-      "   ",
-      "---",
-    ]) {
-      const res = store.validatePlan([
-        makeMission({ id: "M1", title: badTitle, scope: ["src/a"] }),
-      ]);
-      assert.equal(
-        res.valid,
-        false,
-        `Expected title ${JSON.stringify(badTitle)} to fail`,
-      );
-      assert.ok(res.errors.some((e) => e.code === "INVALID_TITLE"));
-    }
-
-    // Collides with existing local git branch
-    const gitCollision = store.validatePlan(
-      [makeMission({ id: "M1", title: "Add Auth", scope: ["src/a"] })],
-      { existingBranches: ["main", "feat/add-auth"] },
-    );
-    assert.equal(gitCollision.valid, false);
-    assert.ok(gitCollision.errors.some((e) => e.code === "DUPLICATE_BRANCH"));
-
-    // Collides within the same batch via slug normalization
-    const batchCollision = store.validatePlan([
-      makeMission({ id: "M1", title: "Add Auth", scope: ["src/a"] }),
-      makeMission({ id: "M2", title: "add_auth!", scope: ["src/b"] }),
-    ]);
-    assert.equal(batchCollision.valid, false);
-    assert.ok(batchCollision.errors.some((e) => e.code === "DUPLICATE_BRANCH"));
-  });
-
-  it("enforces build scope disjointness, allows non-exclusive survey scope, and releases scope on merged/abandoned", async () => {
-    const root = await makeTempDir("pi-swarm-scope-");
-    const store = new SwarmStore(root);
-
-    // Build scope prefix overlap fails
-    const overlap = store.validatePlan([
-      makeMission({ id: "M1", title: "Store Core", scope: ["src/store"] }),
-      makeMission({
-        id: "M2",
-        title: "Store Ledger",
-        scope: ["src/store/ledger.ts"],
-      }),
-    ]);
-    assert.equal(overlap.valid, false);
-    assert.ok(overlap.errors.some((e) => e.code === "SCOPE_OVERLAP"));
-
-    // Sibling prefix with shared string prefix does NOT overlap (src/store vs src/store-v2)
-    assert.equal(scopesOverlap("src/store", "src/store-v2"), false);
-    assert.equal(scopesOverlap("src/store", "src/store/a.ts"), true);
-
-    const siblingOk = store.validatePlan([
-      makeMission({ id: "M1", title: "Store Core", scope: ["./src/store/"] }),
-      makeMission({ id: "M2", title: "Store V2", scope: ["src/store-v2"] }),
-      // Survey sharing exact path with open build mission is allowed!
-      makeMission({
-        id: "S1",
-        title: "Audit Store",
-        kind: "survey",
-        scope: ["src/store"],
-      }),
-    ]);
-    assert.equal(siblingOk.valid, true);
-
-    // Trailing directory glob suffixes normalize cleanly; embedded/partial wildcards are rejected
-    assert.equal(normalizeScopePath("src/store/**"), "src/store");
-    assert.equal(normalizeScopePath("src/store/*"), "src/store");
-    assert.equal(normalizeScopePath("src/routes/[id]"), "src/routes/[id]");
-
-    // Rejects forbidden/traversal/absolute/wildcard scope paths (including .pi/swarm)
-    for (const badScope of [
-      "../escape",
-      "/etc/passwd",
-      ".git/config",
-      ".pi/swarm/runs",
-      "src\\win",
-      "src/*.ts",
-      "src/**/index.ts",
-      "src/file?.ts",
-      "*",
-      "**",
-    ]) {
-      assert.throws(
-        () => normalizeScopePath(badScope),
-        (err) => assertProtocolCode(err, "SCOPE_VIOLATION"),
-      );
-    }
-
-    // Wildcard scope in validatePlan cannot sneak overlapping build missions past plan validation
-    const wildcardPlan = store.validatePlan([
-      makeMission({ id: "M1", title: "Glob Mission", scope: ["src/*.ts"] }),
-      makeMission({ id: "M2", title: "Concrete Mission", scope: ["src/a.ts"] }),
-    ]);
-    assert.equal(wildcardPlan.valid, false);
-    assert.ok(wildcardPlan.errors.some((e) => e.code === "SCOPE_VIOLATION"));
-
-    // Create run, verify scope lock while open, then release on merged and abandoned
-    const run = await store.createRun({
-      id: "run-scope",
-      objective: "Scope lifecycle",
-      verificationContract: "npm test",
-      baseBranch: "main",
-      ownerSessionId: "sess-1",
-      missions: [
-        makeMission({ id: "M1", title: "Alpha Module", scope: ["src/alpha"] }),
-        makeMission({ id: "M2", title: "Beta Module", scope: ["src/beta"] }),
-      ],
-    });
-
-    // Adding overlapping build mission while M1 is planned fails
-    await assert.rejects(
-      () =>
-        store.addMissions(run.id, [
-          makeMission({
-            id: "M3",
-            title: "Alpha Followup",
-            scope: ["src/alpha/sub.ts"],
-          }),
-        ]),
-      (err) => assertProtocolCode(err, "SCOPE_OVERLAP"),
-    );
-
-    // Transition M1 -> active -> completed -> merged (releases src/alpha!)
-    await store.updateMission(run.id, "M1", { status: "active" });
-    await store.updateMission(run.id, "M1", { status: "completed" });
-    await store.markMerged(run.id, "M1", "abc1234567890");
-
-    // Abandon M2 (releases src/beta!)
-    await store.updateMission(run.id, "M2", {
-      status: "abandoned",
-      callerRole: "orchestrator",
-    });
-
-    // Historical branch name from merged M1 is STILL blocked!
-    await assert.rejects(
-      () =>
-        store.addMissions(run.id, [
-          makeMission({
-            id: "M3",
-            title: "Alpha Module",
-            scope: ["src/alpha/sub.ts"],
-          }),
-        ]),
-      (err) => assertProtocolCode(err, "DUPLICATE_BRANCH"),
-    );
-
-    // New build missions with fresh titles CAN reclaim released scopes from M1 & M2!
-    const updated = await store.addMissions(run.id, [
-      makeMission({
-        id: "M3",
-        title: "Alpha Submodule",
-        scope: ["src/alpha/sub.ts"],
-        deps: ["M1"],
-      }),
-      makeMission({
-        id: "M4",
-        title: "Beta Replacement",
-        scope: ["src/beta"],
-      }),
-    ]);
-    assert.deepEqual(updated.missionOrder, ["M1", "M2", "M3", "M4"]);
-  });
-});
-
-// ============================================================================
-// 2. Shared Message Board (SwarmBoard + parseMentions + formatting)
+// 1. Shared Message Board (SwarmBoard, mentions, channels, search, formatting)
 // ============================================================================
 
 describe("SwarmBoard shared message board (board.jsonl)", () => {
-  it("parses @mentions accurately while ignoring emails, duplicates, and trailing punctuation", () => {
+  it("parses @mentions accurately while excluding emails and NOT confusing @#channel with @name", () => {
     assert.deepEqual(parseMentions("@M1 please review"), ["M1"]);
     assert.deepEqual(
       parseMentions(
-        "Hey @M1, check (@validator-M1), [@final-validator], `@orchestrator`, and @all!",
+        "Hey @parser, check (@worker-1), [@verifier], `@orchestrator`, and @all! Ping:@M1,cc:@helper-2",
       ),
-      ["M1", "validator-M1", "final-validator", "orchestrator", "all"],
+      ["parser", "worker-1", "verifier", "orchestrator", "all", "M1", "helper-2"],
     );
-    // Email addresses must NOT be extracted as mentions
+    // Email addresses and double-@ must NOT be extracted as mentions
     assert.deepEqual(
       parseMentions(
-        "Contact foo@bar.com, user.name+tag@sub.example.org, a-b@c.io, a_b@d.net, mailto:ops@site.dev.",
+        "Contact foo@bar.com, user.name+tag@sub.example.org, a-b@c.io, a_b@d.net, mailto:ops@site.dev, @@double.",
       ),
       [],
     );
-    // Mixed emails + real mentions + trailing dots + case-insensitive dedup
+    // Channel mentions (@#channel) must NOT be parsed as member @mentions!
     assert.deepEqual(
       parseMentions(
-        "Email admin@example.com or ask @M1. Also ping @m1 and @M1.2: thanks!",
+        "Notify @#backend and @#frontend, ask @parser, email dev@example.com, ping @Parser.",
       ),
+      ["parser"],
+    );
+    // Trailing dots & case-insensitive dedup preserving first-seen casing
+    assert.deepEqual(
+      parseMentions("Ask @M1. Also ping @m1 and @M1.2: thanks!"),
       ["M1", "M1.2"],
     );
     assert.deepEqual(parseMentions(""), []);
   });
 
-  it("formats single and multi-line board messages cleanly", () => {
+  it("parses @#channel mentions cleanly (lowercased, deduplicated, keeping main for engine/store validation)", () => {
+    assert.deepEqual(
+      parseChannelMentions(
+        "Cross-post to @#backend, (@#Frontend), [@#api-v2], `@#Backend`, and @#x.",
+      ),
+      ["backend", "frontend", "api-v2", "x"],
+    );
+    // Preserves "main" without @# so store/engine can explicitly reject @#main
+    assert.deepEqual(parseChannelMentions("Do not wake @#main or @#MAIN"), [
+      "main",
+    ]);
+    // Ignores member mentions, email-like prefixes, double-at, and numeric starts
+    assert.deepEqual(
+      parseChannelMentions(
+        "@parser @all foo@#bar @@#baz @#123 email@domain.com",
+      ),
+      [],
+    );
+    assert.deepEqual(parseChannelMentions(""), []);
+  });
+
+  it("formats single and multi-line board messages cleanly with channel, mentions, and kind", () => {
     assert.equal(formatBoardMessages([]), "(no board messages yet)");
 
-    const msg1 = {
+    const msg1: BoardMessage = {
       seq: 4,
       runId: "run-b",
-      from: "validator-M1",
-      fromRole: "validator" as const,
+      channel: "backend",
+      from: "verifier",
+      fromRole: "validator",
       text: "Fix missing null check on line 42",
-      mentions: ["M1"],
-      kind: "review" as const,
-      missionId: "M1",
+      mentions: ["parser"],
+      channelMentions: [],
+      kind: "review",
       timestamp: "2026-11-20T12:00:00.000Z",
     };
     assert.equal(
       formatBoardMessage(msg1),
-      "#4 [validator-M1 -> @M1] [review] Fix missing null check on line 42",
+      "#4 [backend] verifier -> @parser: [review] Fix missing null check on line 42",
     );
 
-    const msg2 = {
+    const msg2: BoardMessage = {
       seq: 5,
       runId: "run-b",
-      from: "M1",
-      fromRole: "worker" as const,
+      channel: "main",
+      from: "parser",
+      fromRole: "worker",
       text: "[done] Fixed null check and re-ran tests",
       mentions: ["orchestrator"],
-      kind: "done" as const,
-      missionId: "M1",
+      channelMentions: ["frontend"],
+      kind: "done",
       timestamp: "2026-11-20T12:01:00.000Z",
     };
     // Does not duplicate [done] when text already starts with [done]
     assert.equal(
       formatBoardMessage(msg2),
-      "#5 [M1 -> @orchestrator] [done] Fixed null check and re-ran tests",
+      "#5 [main] parser -> @orchestrator, @#frontend: [done] Fixed null check and re-ran tests",
     );
 
-    const msg3 = {
+    const msg3: BoardMessage = {
       seq: 6,
       runId: "run-b",
-      from: "M2",
-      fromRole: "worker" as const,
+      channel: "main",
+      from: "worker-1",
+      fromRole: "worker",
       text: "reader.ts landed",
       mentions: [],
-      kind: "chat" as const,
+      channelMentions: [],
+      kind: "chat",
       timestamp: "2026-11-20T12:02:00.000Z",
     };
-    assert.equal(formatBoardMessage(msg3), "#6 [M2] reader.ts landed");
+    assert.equal(formatBoardMessage(msg3), "#6 [main] worker-1: reader.ts landed");
 
     const formatted = formatBoardMessages([msg1, msg2, msg3]);
     assert.equal(formatted.split("\n").length, 3);
   });
 
-  it("persists monotonic LF-only board.jsonl, supports since/seqs/limit reads, concurrent posts & symlink protection", async () => {
+  it("persists monotonic LF-only board.jsonl and supports channel, memberChannels, search, seqs, since & limit filtering", async () => {
     const root = await makeTempDir("pi-swarm-board-");
     const board = new SwarmBoard(root);
 
-    // Empty board returns head 0
     assert.equal(await board.getHead("run-board"), 0);
     assert.deepEqual(await board.read("run-board"), { messages: [], head: 0 });
 
-    // Concurrent posts serialize cleanly with monotonic seq 1..6
+    // Concurrent posts across multiple channels serialize cleanly with monotonic seq 1..6
     const posted = await Promise.all([
       board.post("run-board", {
         from: "orchestrator",
         fromRole: "orchestrator",
-        text: "@M1 start auth core (email ignored: dev@example.com)",
+        text: "@parser start auth core (email ignored: dev@example.com)",
         kind: "brief",
-        missionId: "M1",
       }),
       board.post("run-board", {
-        from: "M1",
+        from: "parser",
         fromRole: "worker",
-        text: "@validator-M1 [done] ready for audit",
+        channel: "backend",
+        text: "@verifier [done] JWT validator ready in backend",
         kind: "done",
-        missionId: "M1",
       }),
       board.post("run-board", {
-        from: "validator-M1",
-        fromRole: "validator",
-        text: "@M1 please handle empty token",
-        kind: "review",
-        missionId: "M1",
-      }),
-      board.post("run-board", {
-        from: "M1",
+        from: "ui-dev",
         fromRole: "worker",
-        text: "@validator-M1 fixed in commit abc1234",
-        kind: "fix",
-        missionId: "M1",
+        channel: "frontend",
+        text: "@#backend need /me endpoint schema",
+        kind: "update",
       }),
       board.post("run-board", {
-        from: "validator-M1",
+        from: "verifier",
         fromRole: "validator",
-        text: "@orchestrator clean merge approved",
+        channel: "backend",
+        text: "@parser handle empty bearer token",
         kind: "review",
-        missionId: "M1",
       }),
       board.post("run-board", {
-        from: "orchestrator",
-        fromRole: "orchestrator",
-        text: "@all M1 merged into main",
-        kind: "decision",
-        mentions: ["@M2"],
+        from: "parser",
+        fromRole: "worker",
+        text: "@orchestrator [done] all backend tests pass",
+        kind: "done",
+      }),
+      board.post("run-board", {
+        from: "monitor",
+        fromRole: "monitor",
+        channel: "ops",
+        text: "@orchestrator swarm quiet check",
+        kind: "stall",
+        mentions: ["@all"],
+        channelMentions: ["@#Backend"],
       }),
     ]);
 
@@ -557,11 +298,17 @@ describe("SwarmBoard shared message board (board.jsonl)", () => {
       posted.map((m) => m.seq),
       [1, 2, 3, 4, 5, 6],
     );
-    assert.deepEqual(posted[0].mentions, ["M1"]);
-    assert.deepEqual(posted[5].mentions, ["all", "M2"]);
+    assert.equal(posted[0].channel, DEFAULT_CHANNEL);
+    assert.deepEqual(posted[0].mentions, ["parser"]);
+    assert.deepEqual(posted[0].channelMentions, []);
+    assert.equal(posted[2].channel, "frontend");
+    assert.deepEqual(posted[2].mentions, []);
+    assert.deepEqual(posted[2].channelMentions, ["backend"]);
+    assert.deepEqual(posted[5].mentions, ["orchestrator", "all"]);
+    assert.deepEqual(posted[5].channelMentions, ["backend"]);
     assert.equal(await board.getHead("run-board"), 6);
 
-    // Verify LF-only JSONL on disk at .pi/swarm/runs/<runId>/board.jsonl
+    // LF-only JSONL on disk
     const boardPath = path.join(
       root,
       SWARM_DIR,
@@ -573,15 +320,65 @@ describe("SwarmBoard shared message board (board.jsonl)", () => {
     assert.equal(rawBoard.includes("\r"), false);
     assert.equal(rawBoard.trim().split("\n").length, 6);
 
-    // read({ since }) returns oldest messages after cursor up to limit
-    const since2 = await board.read("run-board", { since: 2, limit: 2 });
-    assert.equal(since2.head, 6);
+    // channel: "*" returns all channels
+    const allCh = await board.read("run-board", { channel: "*" });
+    assert.equal(allCh.head, 6);
     assert.deepEqual(
-      since2.messages.map((m) => m.seq),
-      [3, 4],
+      allCh.messages.map((m) => m.seq),
+      [1, 2, 3, 4, 5, 6],
     );
 
-    // read({ seqs }) returns exact matching seqs in ascending order, ignoring missing/duplicate seqs
+    // channel: "backend" returns only backend messages, preserving global head
+    const backendOnly = await board.read("run-board", { channel: "backend" });
+    assert.equal(backendOnly.head, 6);
+    assert.deepEqual(
+      backendOnly.messages.map((m) => m.seq),
+      [2, 4],
+    );
+
+    // memberChannels filters cleanly to "main" OR any channel in memberChannels
+    const memberView = await board.read("run-board", {
+      memberChannels: ["backend"],
+    });
+    assert.equal(memberView.head, 6);
+    assert.deepEqual(
+      memberView.messages.map((m) => m.seq),
+      [1, 2, 4, 5],
+    );
+
+    // Case-insensitive substring search across text, from, channel, mentions
+    const searchText = await board.read("run-board", { search: "JWT" });
+    assert.deepEqual(
+      searchText.messages.map((m) => m.seq),
+      [2],
+    );
+    const searchFrom = await board.read("run-board", { search: "UI-DEV" });
+    assert.deepEqual(
+      searchFrom.messages.map((m) => m.seq),
+      [3],
+    );
+    const searchChannel = await board.read("run-board", { search: "ops" });
+    assert.deepEqual(
+      searchChannel.messages.map((m) => m.seq),
+      [6],
+    );
+    const searchMention = await board.read("run-board", {
+      search: "@verifier",
+    });
+    assert.deepEqual(
+      searchMention.messages.map((m) => m.seq),
+      [2],
+    );
+
+    // since + limit returns oldest after cursor
+    const since1 = await board.read("run-board", { since: 1, limit: 2 });
+    assert.equal(since1.head, 6);
+    assert.deepEqual(
+      since1.messages.map((m) => m.seq),
+      [2, 3],
+    );
+
+    // seqs returns exact matching seqs in ascending order, ignoring missing/duplicate
     const exact = await board.read("run-board", { seqs: [5, 2, 99, 2] });
     assert.equal(exact.head, 6);
     assert.deepEqual(
@@ -589,7 +386,7 @@ describe("SwarmBoard shared message board (board.jsonl)", () => {
       [2, 5],
     );
 
-    // read({ limit }) without since returns most recent N in oldest-first order
+    // limit without since returns most recent N oldest-first
     const recent3 = await board.read("run-board", { limit: 3 });
     assert.equal(recent3.head, 6);
     assert.deepEqual(
@@ -603,12 +400,32 @@ describe("SwarmBoard shared message board (board.jsonl)", () => {
     assert.equal(afterCorrupt.head, 6);
     assert.equal(afterCorrupt.messages.length, 6);
 
-    // Path traversal & symlink protection
+    // Validation & security guards
+    await assert.rejects(
+      () =>
+        board.post("run-board", {
+          from: "   ",
+          fromRole: "worker",
+          text: "empty sender",
+        }),
+      (err) => assertProtocolCode(err, "INVALID_INPUT"),
+    );
+    await assert.rejects(
+      () =>
+        board.post("run-board", {
+          from: "parser",
+          fromRole: "worker",
+          channel: "bad channel!",
+          text: "bad channel",
+        }),
+      (err) => assertProtocolCode(err, "INVALID_CHANNEL"),
+    );
     assert.throws(
       () => board.getBoardPath("../escape"),
-      (err) => assertProtocolCode(err, "SCOPE_VIOLATION"),
+      (err) => assertProtocolCode(err, "INVALID_INPUT"),
     );
 
+    // Symlink protection
     const outside = path.join(root, "outside-board.jsonl");
     await writeFile(outside, "", "utf8");
     const symRunDir = path.join(root, SWARM_DIR, SWARM_RUNS_DIR, "sym-board");
@@ -616,7 +433,7 @@ describe("SwarmBoard shared message board (board.jsonl)", () => {
     await symlink(outside, path.join(symRunDir, SWARM_BOARD_FILE));
     await assert.rejects(
       () => board.read("sym-board"),
-      (err) => assertProtocolCode(err, "SCOPE_VIOLATION"),
+      (err) => assertProtocolCode(err, "PERMISSION_DENIED"),
     );
     await assert.rejects(
       () =>
@@ -625,27 +442,58 @@ describe("SwarmBoard shared message board (board.jsonl)", () => {
           fromRole: "orchestrator",
           text: "nope",
         }),
-      (err) => assertProtocolCode(err, "SCOPE_VIOLATION"),
+      (err) => assertProtocolCode(err, "PERMISSION_DENIED"),
     );
   });
 });
 
 // ============================================================================
-// 3. Store Persistence, Locks, Revisions, Reviews, Board Delegation, Warm Roster
+// 2. SwarmStore v2: Runs, Members, Channels, Board Delegation, ROSTER.md, Locks
 // ============================================================================
 
-describe("SwarmStore persistence, state machine, board delegation, warm roster & ledger", () => {
-  it("persists state atomically, checks optimistic revisions, renders MISSIONS.md with 3-role models, and recovers stale locks", async () => {
+describe("SwarmStore v2 dynamic roster, channels, board delegation, locks & ROSTER.md", () => {
+  it("validates member and channel names strictly and derives deterministic member branches", () => {
+    assert.equal(validateMemberName("parser"), "parser");
+    assert.equal(validateMemberName("worker-1"), "worker-1");
+    assert.equal(validateChannelName("backend"), "backend");
+    assert.equal(validateChannelName("api-v2"), "api-v2");
+    assert.equal(deriveMemberBranch("run_12345", "parser"), "swarm/run-12345/parser");
+
+    for (const reserved of RESERVED_MEMBER_NAMES) {
+      assert.throws(
+        () => validateMemberName(reserved),
+        (err) => assertProtocolCode(err, "INVALID_NAME"),
+      );
+    }
+    for (const badName of ["", "Parser", "1worker", "bad_name", "a b", " leading", "a".repeat(33)]) {
+      assert.throws(
+        () => validateMemberName(badName),
+        (err) => assertProtocolCode(err, "INVALID_NAME"),
+      );
+    }
+    for (const badChan of ["", "Backend", "1chan", "bad_chan", "#backend", "a b", "a".repeat(33)]) {
+      assert.throws(
+        () => validateChannelName(badChan),
+        (err) => assertProtocolCode(err, "INVALID_CHANNEL"),
+      );
+    }
+  });
+
+  it("creates v2 run, writes ROSTER.md, enforces optimistic revisions, recovers stale locks & serializes concurrent updates", async () => {
     const root = await makeTempDir("pi-swarm-store-");
     const store = new SwarmStore(root, { staleLockMs: 200 });
 
     const created = await store.createRun({
-      id: "run-1",
-      objective: "Implement swarm store",
-      verificationContract: "npm test",
+      id: "run-v2",
+      title: "Dynamic Auth Refactor",
+      objective: "Refactor authentication with parallel workers and validator review",
+      strategy: "Phase 1: research -> Phase 2: implement -> Phase 3: verify",
+      acceptanceCriteria: "npm test && npm run typecheck pass with 0 errors",
       baseBranch: "main",
       ownerSessionId: "sess-owner",
       ownerPid: process.pid,
+      maxConcurrency: 4,
+      validatorEnabled: true,
       keepWorkersWarm: true,
       roleModels: {
         orchestrator: { model: "anthropic/claude-opus-4", thinkingLevel: "high" },
@@ -653,78 +501,71 @@ describe("SwarmStore persistence, state machine, board delegation, warm roster &
         validator: { model: "google/gemini-2.5-pro", thinkingLevel: "high" },
         fallbackModels: ["openai/gpt-4.1"],
       },
-      missions: [
-        makeMission({
-          id: "M1",
-          title: "Core Logic",
-          scope: ["src/core"],
-          tasks: ["Create types", { id: "T2", title: "Add tests" }],
-        }),
-        makeMission({
-          id: "M2",
-          title: "Deliver Spec",
-          kind: "artifact",
-          scope: ["docs/spec.md"],
-          deps: ["M1"],
-        }),
-      ],
     });
 
+    assert.equal(created.version, SWARM_STATE_VERSION);
     assert.equal(created.revision, 1);
-    assert.equal(created.validatorEnabled, true);
-    assert.equal(created.maxValidationRounds, 3);
-    assert.equal(created.finalValidatorEnabled, true);
-    assert.equal(created.keepWorkersWarm, true);
-    assert.equal(created.roleModels?.worker?.model, "openai/gpt-5");
-    assert.equal(created.missions.M1.tasks.length, 2);
-    assert.equal(created.missions.M1.tasks[0].id, "T1");
-    assert.equal(created.missions.M1.tasks[1].id, "T2");
-    assert.equal(await store.getActiveRunId(), "run-1");
+    assert.equal(created.boardHead, 0);
+    assert.equal(created.title, "Dynamic Auth Refactor");
+    assert.ok(created.channels[DEFAULT_CHANNEL]);
+    assert.equal(created.channels[DEFAULT_CHANNEL].archived, false);
+    assert.equal(await store.getActiveRunId(), "run-v2");
 
-    const runs = await store.listRuns();
-    assert.equal(runs.length, 1);
-    assert.equal(runs[0].missionCount, 2);
+    // Duplicate runId rejected
+    await assert.rejects(
+      () =>
+        store.createRun({
+          id: "run-v2",
+          title: "Dup",
+          objective: "Dup",
+          baseBranch: "main",
+          ownerSessionId: "sess-owner",
+        }),
+      (err) => assertProtocolCode(err, "INVALID_INPUT"),
+    );
 
-    // Verify MISSIONS.md generated with Swarm header, 3-role models, mission table & Final Verification
-    const mdPath = path.join(
+    // Check ROSTER.md written on createRun
+    const rosterPath = path.join(
       root,
       SWARM_DIR,
       SWARM_RUNS_DIR,
-      "run-1",
-      SWARM_MISSIONS_FILE,
+      "run-v2",
+      SWARM_ROSTER_FILE,
     );
-    const md1 = await readFile(mdPath, "utf8");
-    assert.match(md1, /^# Swarm Missions — run-1/m);
+    const roster1 = await readFile(rosterPath, "utf8");
+    assert.match(roster1, /^# Dynamic Auth Refactor$/m);
+    assert.match(roster1, /## Objective/);
+    assert.match(roster1, /## Strategy/);
+    assert.match(roster1, /## Acceptance Criteria/);
     assert.match(
-      md1,
+      roster1,
       /\*\*Models:\*\* Orchestrator: `anthropic\/claude-opus-4` \(high\) \| Worker: `openai\/gpt-5` \(medium\) \| Validator: `google\/gemini-2\.5-pro` \(high\) \| Fallbacks: `openai\/gpt-4\.1`/,
     );
+    assert.match(roster1, /\| Channel \| Status \| Topic \| Subscribers \| Created By \|/);
     assert.match(
-      md1,
-      /\| ID \| Title \| Kind \| Deps \| Branch \| Scope \| Status \| Review \| Retries \|/,
+      roster1,
+      /\| Name \| Role \| State \| Model \| Workspace \| Parent \| Channels \| Turns \| Last Read\/Post \| Parked On \|/,
     );
-    assert.match(
-      md1,
-      /\| M1 \| Core Logic \| build \| - \| `feat\/core-logic` \| `src\/core` \| planned \| - \| 0 \|/,
-    );
-    assert.match(md1, /## Final Verification/);
 
-    // Optimistic revision check rejects stale writer
+    // Optimistic revision conflict
     await assert.rejects(
-      () => store.updateRun("run-1", { status: "paused", expectedRevision: 99 }),
+      () => store.updateRun("run-v2", { status: "paused", expectedRevision: 99 }),
       (err) => assertProtocolCode(err, "REVISION_CONFLICT"),
     );
 
-    const paused = await store.updateRun("run-1", {
+    // Rename & pause emit run_titled and run_paused
+    const paused = await store.updateRun("run-v2", {
+      title: "Dynamic Auth Refactor v2",
       status: "paused",
       expectedRevision: 1,
     });
     assert.equal(paused.revision, 2);
+    assert.equal(paused.title, "Dynamic Auth Refactor v2");
     assert.equal(paused.status, "paused");
-    assert.equal(await store.getActiveRunId(), "run-1");
+    assert.equal(await store.getActiveRunId(), "run-v2");
 
-    // Simulate a stale lockfile left by a dead PID -> store automatically recovers it
-    const lockPath = path.join(root, SWARM_DIR, SWARM_LOCKS_DIR, "run-1.lock");
+    // Simulate stale lockfile from dead PID -> automatically recovered
+    const lockPath = path.join(root, SWARM_DIR, SWARM_LOCKS_DIR, "run-v2.lock");
     await mkdir(path.dirname(lockPath), { recursive: true });
     await writeFile(
       lockPath,
@@ -739,7 +580,7 @@ describe("SwarmStore persistence, state machine, board delegation, warm roster &
     const oldTime = new Date(Date.now() - 5_000);
     await utimes(lockPath, oldTime, oldTime);
 
-    const resumed = await store.updateRun("run-1", {
+    const resumed = await store.updateRun("run-v2", {
       status: "active",
       expectedRevision: 2,
     });
@@ -747,720 +588,544 @@ describe("SwarmStore persistence, state machine, board delegation, warm roster &
     assert.equal(resumed.revision, 3);
     assert.equal(await exists(lockPath), false);
 
-    // Concurrent mutations serialize cleanly without lost updates
+    // Register a member and run 8 concurrent updates -> no lost updates
+    await store.addMember("run-v2", {
+      name: "parser",
+      agentId: "agt-parser-1",
+      role: "worker",
+      parentName: "orchestrator",
+      brief: "Implement token parser",
+      workspace: "inherit",
+      cwd: root,
+    });
+
     await Promise.all(
       Array.from({ length: 8 }, (_, idx) =>
-        store.updateMission("run-1", "M1", {
-          progressSummary: `step-${idx}`,
+        store.updateMember("run-v2", "parser", {
+          logLine: `step-${idx}`,
         }),
       ),
     );
-    const afterConcurrent = await store.loadRun("run-1");
-    assert.equal(afterConcurrent.revision, 11);
+    const afterConcurrent = await store.loadRun("run-v2");
+    assert.equal(afterConcurrent.revision, 12); // 3 + 1(addMember) + 8(updates)
+    assert.equal(afterConcurrent.members.parser.logTail.length, 8);
+
+    const events = await store.getRecentEvents("run-v2", 50);
+    assert.deepEqual(
+      events.map((e) => e.type),
+      ["run_created", "run_titled", "run_paused", "run_resumed", "member_added"],
+    );
   });
 
-  it("delegates board posts/reads, tracks sender lastPostBoardSeq, and handles warm roster lifecycle without spurious worker_exited", async () => {
-    const root = await makeTempDir("pi-swarm-warm-");
+  it("manages members, reserved names, channels (create/subscribe/unsubscribe/archive), board posts & auto-emitted events", async () => {
+    const root = await makeTempDir("pi-swarm-channels-");
     const store = new SwarmStore(root);
 
     await store.createRun({
-      id: "run-warm",
-      objective: "Warm persistent workers & board delegation",
-      verificationContract: "npm test",
+      id: "run-dyn",
+      title: "Channel & Roster Test",
+      objective: "Verify full member and channel lifecycle",
       baseBranch: "main",
-      ownerSessionId: "sess-warm",
-      missions: [
-        makeMission({ id: "M1", title: "Auth Core", scope: ["src/auth"] }),
-      ],
+      ownerSessionId: "sess-dyn",
     });
 
-    // Register worker & validator roster entries
-    const afterWorkerSpawn = await store.registerRoster("run-warm", {
-      agentId: "wrk-M1-1",
-      name: "M1",
+    // Reject reserved names and invalid names on addMember
+    for (const bad of ["orchestrator", "coordinator", "all", "monitor", "BadName"]) {
+      await assert.rejects(
+        () =>
+          store.addMember("run-dyn", {
+            name: bad,
+            agentId: "agt-bad",
+            role: "worker",
+            parentName: "orchestrator",
+            brief: "nope",
+            workspace: "inherit",
+            cwd: root,
+          }),
+        (err) => assertProtocolCode(err, "INVALID_NAME"),
+      );
+    }
+
+    // Create a channel before spawning members
+    const backendCh = await store.createChannel("run-dyn", {
+      name: "backend",
+      topic: "API & storage coordination",
+      createdBy: "orchestrator",
+    });
+    assert.equal(backendCh.name, "backend");
+    assert.equal(backendCh.archived, false);
+    assert.deepEqual(backendCh.subscribers, []);
+
+    // Duplicate channel rejected
+    await assert.rejects(
+      () =>
+        store.createChannel("run-dyn", {
+          name: "backend",
+          createdBy: "orchestrator",
+        }),
+      (err) => assertProtocolCode(err, "INVALID_CHANNEL"),
+    );
+
+    // Adding member with nonexistent channel rejected
+    await assert.rejects(
+      () =>
+        store.addMember("run-dyn", {
+          name: "parser",
+          agentId: "agt-1",
+          role: "worker",
+          parentName: "orchestrator",
+          brief: "Parse input",
+          workspace: "share",
+          cwd: store.getWorktreePath("run-dyn", "parser"),
+          branch: "swarm/run-dyn/parser",
+          channels: ["missing-ch"],
+        }),
+      (err) => assertProtocolCode(err, "INVALID_CHANNEL"),
+    );
+
+    // Add worker subscribed to backend (channels[0] is "backend", "main" implicitly included)
+    const afterAdd1 = await store.addMember("run-dyn", {
+      name: "parser",
+      agentId: "agt-parser",
       role: "worker",
-      missionId: "M1",
-      worktreePath: store.getWorktreePath("run-warm", "M1"),
-      branch: "feat/auth-core",
+      parentName: "orchestrator",
+      groupPrefix: "worker",
+      brief: "Implement parser module",
+      workspace: "share",
+      cwd: store.getWorktreePath("run-dyn", "parser"),
+      branch: "swarm/run-dyn/parser",
+      channels: ["backend"],
       model: "openai/gpt-5",
       thinkingLevel: "medium",
-      lastReadBoardSeq: 0,
-      turns: 1,
     });
-    assert.equal(afterWorkerSpawn.roster["wrk-M1-1"].status, "working");
-    assert.equal(afterWorkerSpawn.roster["wrk-M1-1"].model, "openai/gpt-5");
-    assert.equal(afterWorkerSpawn.roster["wrk-M1-1"].turns, 1);
+    assert.deepEqual(afterAdd1.members.parser.channels, ["backend", "main"]);
+    assert.deepEqual(afterAdd1.channels.backend.subscribers, ["parser"]);
+    assert.deepEqual(afterAdd1.channels.main.subscribers, ["parser"]);
 
-    // Duplicate registration while working or waiting is rejected
+    // Duplicate member name rejected
     await assert.rejects(
       () =>
-        store.registerRoster("run-warm", {
-          agentId: "wrk-M1-1",
-          name: "M1",
+        store.addMember("run-dyn", {
+          name: "parser",
+          agentId: "agt-parser-2",
           role: "worker",
-          missionId: "M1",
-          worktreePath: store.getWorktreePath("run-warm", "M1"),
-          branch: "feat/auth-core",
+          parentName: "orchestrator",
+          brief: "Duplicate",
+          workspace: "inherit",
+          cwd: root,
         }),
-      (err) => assertProtocolCode(err, "INVALID_TRANSITION"),
+      (err) => assertProtocolCode(err, "DUPLICATE_MEMBER"),
     );
 
-    // Worker posts to board via store -> updates lastPostBoardSeq & appends single board_posted event
-    const msg1 = await store.postBoardMessage("run-warm", {
-      from: "M1",
+    // Add validator member
+    await store.addMember("run-dyn", {
+      name: "verifier",
+      agentId: "agt-verifier",
+      role: "validator",
+      parentName: "orchestrator",
+      brief: "Review parser diff",
+      workspace: "inherit",
+      cwd: root,
+      model: "google/gemini-2.5-pro",
+      thinkingLevel: "high",
+    });
+
+    // Subscribe & unsubscribe verifier to #backend
+    const subCh = await store.subscribeChannel("run-dyn", "backend", "verifier");
+    assert.deepEqual(subCh.subscribers, ["parser", "verifier"]);
+    let loaded = await store.loadRun("run-dyn");
+    assert.deepEqual(loaded.members.verifier.channels, ["main", "backend"]);
+
+    const unsubCh = await store.unsubscribeChannel(
+      "run-dyn",
+      "backend",
+      "verifier",
+    );
+    assert.deepEqual(unsubCh.subscribers, ["parser"]);
+    loaded = await store.loadRun("run-dyn");
+    assert.deepEqual(loaded.members.verifier.channels, ["main"]);
+
+    // Cannot unsubscribe from or archive "main"
+    await assert.rejects(
+      () => store.unsubscribeChannel("run-dyn", "main", "verifier"),
+      (err) => assertProtocolCode(err, "INVALID_CHANNEL"),
+    );
+    await assert.rejects(
+      () => store.archiveChannel("run-dyn", "main"),
+      (err) => assertProtocolCode(err, "INVALID_CHANNEL"),
+    );
+
+    // Post board message to #backend -> updates state.boardHead & parser.lastPostSeq/lastPostTime
+    const msg1 = await store.postBoardMessage("run-dyn", {
+      from: "parser",
       fromRole: "worker",
-      text: "@validator-M1 [done] auth core implemented",
+      channel: "backend",
+      text: "@verifier [done] parser ready for review",
       kind: "done",
-      missionId: "M1",
     });
     assert.equal(msg1.seq, 1);
-    assert.deepEqual(msg1.mentions, ["validator-M1"]);
-    assert.equal(await store.getBoardHead("run-warm"), 1);
+    assert.equal(msg1.channel, "backend");
+    loaded = await store.loadRun("run-dyn");
+    assert.equal(loaded.boardHead, 1);
+    assert.equal(loaded.members.parser.lastPostSeq, 1);
+    assert.equal(loaded.members.parser.lastPostTime, msg1.timestamp);
 
-    const afterPost = await store.loadRun("run-warm");
-    assert.equal(afterPost.roster["wrk-M1-1"].lastPostBoardSeq, 1);
+    // Posting to nonexistent channel fails with INVALID_CHANNEL
+    await assert.rejects(
+      () =>
+        store.postBoardMessage("run-dyn", {
+          from: "parser",
+          fromRole: "worker",
+          channel: "ghost",
+          text: "hello",
+        }),
+      (err) => assertProtocolCode(err, "INVALID_CHANNEL"),
+    );
 
-    // Orchestrator post does not need a roster entry and still records seq #2 + board_posted
-    const msg2 = await store.postBoardMessage("run-warm", {
-      from: ORCHESTRATOR_BOARD_NAME,
-      fromRole: "orchestrator",
-      text: "@validator-M1 please audit M1",
-      kind: "brief",
-      missionId: "M1",
-    });
-    assert.equal(msg2.seq, 2);
+    // Archive #backend -> removes it from parser.channels, rejects future subscribe/post/addMember
+    const archived = await store.archiveChannel("run-dyn", "backend", "orchestrator");
+    assert.equal(archived.archived, true);
+    assert.ok(archived.archivedAt);
+    loaded = await store.loadRun("run-dyn");
+    assert.deepEqual(loaded.members.parser.channels, ["main"]);
 
-    const boardRead = await store.readBoard("run-warm", { since: 0 });
-    assert.equal(boardRead.head, 2);
-    assert.equal(boardRead.messages.length, 2);
+    await assert.rejects(
+      () => store.subscribeChannel("run-dyn", "backend", "verifier"),
+      (err) => assertProtocolCode(err, "CHANNEL_ARCHIVED"),
+    );
+    await assert.rejects(
+      () =>
+        store.postBoardMessage("run-dyn", {
+          from: "parser",
+          fromRole: "worker",
+          channel: "backend",
+          text: "too late",
+        }),
+      (err) => assertProtocolCode(err, "CHANNEL_ARCHIVED"),
+    );
+    await assert.rejects(
+      () =>
+        store.addMember("run-dyn", {
+          name: "late-worker",
+          agentId: "agt-late",
+          role: "worker",
+          parentName: "orchestrator",
+          brief: "join archived",
+          workspace: "inherit",
+          cwd: root,
+          channels: ["backend"],
+        }),
+      (err) => assertProtocolCode(err, "CHANNEL_ARCHIVED"),
+    );
 
-    // Transition worker: working -> waiting (MUST NOT emit worker_exited!)
-    const waitingState = await store.updateRoster("run-warm", "wrk-M1-1", {
-      status: "waiting",
-      lastReadBoardSeq: 2,
-      currentActivity: null,
-    });
-    assert.equal(waitingState.roster["wrk-M1-1"].status, "waiting");
-    assert.equal(waitingState.roster["wrk-M1-1"].lastReadBoardSeq, 2);
-    assert.equal(waitingState.roster["wrk-M1-1"].currentActivity, undefined);
-
-    // Register validator -> emits validator_spawned
-    await store.registerRoster("run-warm", {
-      agentId: "val-M1-1",
-      name: "validator-M1",
-      role: "validator",
-      missionId: "M1",
-      worktreePath: store.getWorktreePath("run-warm", "M1"),
-      branch: "feat/auth-core",
-      model: "anthropic/claude-sonnet-4",
-    });
-
-    // Wake worker & hot-switch model + clear thinkingLevel: waiting -> working (NO worker_exited!)
-    const wokenState = await store.updateRoster("run-warm", "wrk-M1-1", {
-      status: "working",
-      model: "anthropic/claude-opus-4",
-      thinkingLevel: null,
+    // Test updateMember fields, null clears, logTail cap, and exact auto-emitted events
+    await store.updateMember("run-dyn", "parser", {
+      state: "waiting",
+      briefSeq: 1,
+      lastReadSeq: 1,
+      parkedOn: "waiting for @verifier",
       turns: 2,
-      endedAt: null,
-      currentActivity: "Addressing validator findings",
+      tokens: 1500,
+      tokenBreakdown: {
+        input: 1000,
+        output: 400,
+        cacheRead: 100,
+        cacheWrite: 0,
+        total: 1500,
+      },
+      cost: 0.042,
+      currentActivity: "idle",
+      lastTool: "post_message",
+      logTail: Array.from({ length: SWARM_LOG_TAIL_LIMIT + 10 }, (_, i) => `l${i}`),
+      error: "transient warning",
     });
-    assert.equal(wokenState.roster["wrk-M1-1"].status, "working");
-    assert.equal(wokenState.roster["wrk-M1-1"].model, "anthropic/claude-opus-4");
-    assert.equal(wokenState.roster["wrk-M1-1"].thinkingLevel, undefined);
-    assert.equal(wokenState.roster["wrk-M1-1"].turns, 2);
-    assert.equal(
-      wokenState.roster["wrk-M1-1"].currentActivity,
-      "Addressing validator findings",
-    );
 
-    // Check ledger so far: ZERO worker_exited events during working -> waiting -> working!
-    const midEvents = await store.getRecentEvents("run-warm", 50);
-    assert.equal(
-      midEvents.filter((e) => e.type === "worker_spawned").length,
-      1,
-    );
-    assert.equal(
-      midEvents.filter((e) => e.type === "validator_spawned").length,
-      1,
-    );
-    assert.equal(midEvents.filter((e) => e.type === "board_posted").length, 2);
-    assert.equal(midEvents.filter((e) => e.type === "worker_exited").length, 0);
+    // Clear nullable fields & transition waiting -> working (NO auto-event) -> stopped -> merged -> killed
+    await store.updateMember("run-dyn", "parser", {
+      state: "working",
+      thinkingLevel: null,
+      parkedOn: null,
+      currentActivity: null,
+      lastTool: null,
+      error: null,
+    });
+    let parserRec = (await store.loadRun("run-dyn")).members.parser;
+    assert.equal(parserRec.thinkingLevel, undefined);
+    assert.equal(parserRec.parkedOn, undefined);
+    assert.equal(parserRec.currentActivity, undefined);
+    assert.equal(parserRec.lastTool, undefined);
+    assert.equal(parserRec.error, undefined);
+    assert.equal(parserRec.logTail.length, SWARM_LOG_TAIL_LIMIT);
 
-    // Kill worker permanently -> emits agent_killed
-    const killedState = await store.updateRoster("run-warm", "wrk-M1-1", {
-      status: "killed",
+    await store.updateMember("run-dyn", "parser", {
+      state: "stopped",
+      humanStopped: true,
+    });
+    await store.updateMember("run-dyn", "parser", {
+      mergedCommitSha: "abcdef1234567890",
+    });
+    // Re-setting the exact same mergedCommitSha must NOT emit a duplicate member_merged
+    await store.updateMember("run-dyn", "parser", {
+      mergedCommitSha: "abcdef1234567890",
+    });
+    await store.updateMember("run-dyn", "parser", {
+      state: "killed",
       endedAt: new Date().toISOString(),
     });
-    assert.equal(killedState.roster["wrk-M1-1"].status, "killed");
 
-    // Validator fails -> emits worker_exited
-    await store.updateRoster("run-warm", "val-M1-1", {
-      status: "failed",
-      error: "Provider timeout",
-      endedAt: new Date().toISOString(),
+    // Killed member cannot transition back to waiting/working
+    await assert.rejects(
+      () => store.updateMember("run-dyn", "parser", { state: "working" }),
+      (err) => assertProtocolCode(err, "MEMBER_KILLED"),
+    );
+    // Unknown member fails with MEMBER_NOT_FOUND
+    await assert.rejects(
+      () => store.updateMember("run-dyn", "nobody", { state: "waiting" }),
+      (err) => assertProtocolCode(err, "MEMBER_NOT_FOUND"),
+    );
+
+    // Complete run & verify ROSTER.md + listRuns + exact ledger event sequence
+    await store.updateRun("run-dyn", {
+      status: "completed",
+      completionSummary: "All parser tasks merged and verified.",
     });
 
-    const finalEvents = await store.getRecentEvents("run-warm", 50);
-    assert.equal(
-      finalEvents.filter((e) => e.type === "agent_killed").length,
-      1,
+    assert.equal(await store.getActiveRunId(), null);
+    const runs = await store.listRuns();
+    assert.equal(runs.length, 1);
+    assert.equal(runs[0].title, "Channel & Roster Test");
+    assert.equal(runs[0].memberCount, 2);
+    assert.equal(runs[0].workingCount, 1); // verifier still working
+    assert.equal(runs[0].boardHead, 1);
+
+    const rosterMd = await readFile(
+      path.join(root, SWARM_DIR, SWARM_RUNS_DIR, "run-dyn", SWARM_ROSTER_FILE),
+      "utf8",
     );
-    assert.equal(
-      finalEvents.filter((e) => e.type === "worker_exited").length,
-      1,
+    assert.match(rosterMd, /\| `#backend` \| archived \|/);
+    assert.match(rosterMd, /\| parser \| worker \| killed \|/);
+    assert.match(rosterMd, /## Completion Summary/);
+    assert.match(rosterMd, /All parser tasks merged and verified\./);
+
+    const events = await store.getRecentEvents("run-dyn", 50);
+    assert.deepEqual(
+      events.map((e) => e.type),
+      [
+        "run_created",
+        "channel_created",
+        "member_added",
+        "member_added",
+        "channel_updated",
+        "channel_updated",
+        "board_posted",
+        "channel_archived",
+        "member_waiting",
+        "member_stopped",
+        "member_merged",
+        "member_killed",
+        "run_completed",
+      ],
     );
   });
 
-  it("enforces transitions, validator role checks, scope patching, validation_submitted auto-flip, and artifact approval", async () => {
-    const root = await makeTempDir("pi-swarm-lifecycle-");
+  it("enforces live-session ownership, symlink guards, and partial state.json backfilling", async () => {
+    const root = await makeTempDir("pi-swarm-owner-");
     const store = new SwarmStore(root);
 
-    await store.createRun({
-      id: "run-life",
-      objective: "Full mission lifecycle",
-      verificationContract: "npm test",
+    const run = await store.createRun({
+      id: "run-own",
+      title: "Ownership Check",
+      objective: "Verify ownership checks and backfilling",
       baseBranch: "main",
-      ownerSessionId: "sess-1",
-      missions: [
-        makeMission({ id: "M1", title: "Build Feature", scope: ["src/feat"] }),
-        makeMission({ id: "M2", title: "Other Feature", scope: ["src/other"] }),
-        makeMission({
-          id: "A1",
-          title: "Generate Audit Report",
-          kind: "artifact",
-          scope: ["docs/audit.md"],
-        }),
-      ],
+      ownerSessionId: "sess-a",
+      ownerPid: process.pid,
     });
 
-    // Invalid transition: planned -> merged or planned -> completed
-    await assert.rejects(
-      () => store.updateMission("run-life", "M1", { status: "completed" }),
-      (err) => assertProtocolCode(err, "INVALID_TRANSITION"),
+    // Same session allowed
+    assert.doesNotThrow(() => assertOwnerSession(run, "sess-a"));
+    // Different session while owner PID alive throws OWNERSHIP_CONFLICT
+    assert.throws(
+      () => assertOwnerSession(run, "sess-b", { isPidAlive: () => true }),
+      (err) => assertProtocolCode(err, "OWNERSHIP_CONFLICT"),
     );
-    await assert.rejects(
-      () => store.markMerged("run-life", "M1", "sha1"),
-      (err) => assertProtocolCode(err, "INVALID_TRANSITION"),
-    );
-
-    // Role enforcement: worker cannot abandon or merge; validator cannot mutate mission or patch scope
-    await assert.rejects(
-      () =>
-        store.updateMission("run-life", "M1", {
-          status: "abandoned",
-          callerRole: "worker",
-        }),
-      (err) => assertProtocolCode(err, "ROLE_FORBIDDEN"),
-    );
-    await assert.rejects(
-      () =>
-        store.updateMission("run-life", "M1", {
-          status: "active",
-          callerRole: "validator",
-        }),
-      (err) => assertProtocolCode(err, "ROLE_FORBIDDEN"),
-    );
-    await assert.rejects(
-      () =>
-        store.patchMissionScope("run-life", "M1", ["src/feat", "src/extra"], {
-          callerRole: "validator",
-        }),
-      (err) => assertProtocolCode(err, "ROLE_FORBIDDEN"),
+    // Different session when owner PID dead is allowed
+    assert.doesNotThrow(() =>
+      assertOwnerSession(run, "sess-b", { isPidAlive: () => false }),
     );
 
-    // Scope patching rejects overlap with M2, accepts disjoint expansion
-    await assert.rejects(
-      () =>
-        store.patchMissionScope(
-          "run-life",
-          "M1",
-          ["src/feat", "src/other/sub.ts"],
-          { callerRole: "worker" },
-        ),
-      (err) => assertProtocolCode(err, "SCOPE_OVERLAP"),
-    );
-    const patched = await store.patchMissionScope(
-      "run-life",
-      "M1",
-      ["src/feat", "src/shared-utils"],
-      { callerRole: "worker" },
-    );
-    assert.deepEqual(patched.missions.M1.scope, [
-      "src/feat",
-      "src/shared-utils",
-    ]);
-
-    // Worker runs M1 -> active -> completed
-    await store.updateMission("run-life", "M1", {
-      status: "active",
-      callerRole: "worker",
-    });
-    await store.updateMission("run-life", "M1", {
-      status: "completed",
-      progressSummary: "Implemented feature",
-      callerRole: "worker",
-    });
-
-    // Round 1 non-clean review automatically flips completed -> active & persists verdict file!
-    const badVerdict: MissionReviewVerdict = {
-      commitSha: "1111111abcdef",
-      missionId: "M1",
-      branch: "feat/build-feature",
-      reviewedAt: new Date().toISOString(),
-      reviewerAgentId: "validator-M1",
-      status: "p1-1items",
-      merge: "fix-then-merge",
-      findings: [
-        {
-          severity: "p1",
-          title: "Missing null check",
-          detail: "Handle empty input safely",
-          file: "src/feat/index.ts",
-          line: 42,
-        },
-      ],
-      checks: [{ name: "npm test", passed: true }],
-      decision: "Fix p1 issue before merge",
-    };
-
-    const afterR1 = await store.recordReview("run-life", "M1", badVerdict);
-    assert.equal(afterR1.missions.M1.status, "active");
-    assert.equal(afterR1.missions.M1.reviewRound, 1);
-    assert.equal(afterR1.missions.M1.lastReviewedSha, "1111111abcdef");
-
-    const r1File = path.join(
+    // Partial state.json backfills safely on loadRun
+    const statePath = path.join(
       root,
       SWARM_DIR,
       SWARM_RUNS_DIR,
-      "run-life",
-      SWARM_REVIEWS_DIR,
-      "M1-r1.json",
+      "run-own",
+      SWARM_STATE_FILE,
     );
-    const r1Disk = JSON.parse(
-      await readFile(r1File, "utf8"),
-    ) as MissionReviewVerdict;
-    assert.equal(r1Disk.round, 1);
-    assert.equal(r1Disk.status, "p1-1items");
+    const raw = JSON.parse(await readFile(statePath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    delete raw.channels;
+    delete raw.boardHead;
+    delete raw.strategy;
+    delete raw.acceptanceCriteria;
+    delete raw.keepWorkersWarm;
+    await writeFile(statePath, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
 
-    // Worker fixes & re-completes -> Round 2 "clean" + "hold" ALSO flips completed -> active!
-    await store.updateMission("run-life", "M1", {
-      status: "completed",
-      callerRole: "worker",
-    });
-    const holdVerdict: MissionReviewVerdict = {
-      commitSha: "1515151abcdef",
-      missionId: "M1",
-      branch: "feat/build-feature",
-      reviewedAt: new Date().toISOString(),
-      reviewerAgentId: "validator-M1",
-      status: "clean",
-      merge: "hold",
-      findings: [],
-      checks: [{ name: "npm test", passed: true }],
-      decision: "Hold pending follow-up check",
-    };
-    const afterHold = await store.recordReview("run-life", "M1", holdVerdict);
-    assert.equal(afterHold.missions.M1.status, "active");
-    assert.equal(afterHold.missions.M1.reviewRound, 2);
+    const backfilled = await store.loadRun("run-own");
+    assert.equal(backfilled.version, 2);
+    assert.ok(backfilled.channels[DEFAULT_CHANNEL]);
+    assert.equal(backfilled.boardHead, 0);
+    assert.equal(backfilled.strategy, "");
+    assert.equal(backfilled.acceptanceCriteria, "");
+    assert.equal(backfilled.keepWorkersWarm, DEFAULT_SWARM_SETTINGS.keepWorkersWarm);
 
-    // Worker re-completes -> Round 3 clean + merge keeps status "completed"
-    await store.updateMission("run-life", "M1", {
-      status: "completed",
-      callerRole: "worker",
-    });
-    const cleanVerdict: MissionReviewVerdict = {
-      commitSha: "2222222abcdef",
-      missionId: "M1",
-      branch: "feat/build-feature",
-      reviewedAt: new Date().toISOString(),
-      reviewerAgentId: "validator-M1",
-      status: "clean",
-      merge: "merge",
-      findings: [],
-      checks: [{ name: "npm test", passed: true }],
-      decision: "Clean and ready to merge",
-    };
-
-    const afterR3 = await store.recordReview("run-life", "M1", cleanVerdict);
-    assert.equal(afterR3.missions.M1.status, "completed");
-    assert.equal(afterR3.missions.M1.reviewRound, 3);
-    assert.equal(afterR3.missions.M1.lastReviewedSha, "2222222abcdef");
-
-    const reviewEvents = (await store.getRecentEvents("run-life", 50)).filter(
-      (e) => e.type === "validation_submitted",
-    );
-    assert.equal(reviewEvents.length, 3);
-
-    // Worker cannot call markMerged
+    // Symlinked state.json rejected with PERMISSION_DENIED
+    const outside = path.join(root, "outside-state.json");
+    await writeFile(outside, "{}", "utf8");
+    const symRunDir = path.join(root, SWARM_DIR, SWARM_RUNS_DIR, "sym-run");
+    await mkdir(symRunDir, { recursive: true });
+    await symlink(outside, path.join(symRunDir, SWARM_STATE_FILE));
     await assert.rejects(
-      () => store.markMerged("run-life", "M1", "3333333", { callerRole: "worker" }),
-      (err) => assertProtocolCode(err, "ROLE_FORBIDDEN"),
-    );
-
-    // Orchestrator merges M1 -> terminal state blocks further transitions
-    const merged = await store.markMerged("run-life", "M1", "3333333abcdef");
-    assert.equal(merged.missions.M1.status, "merged");
-    assert.equal(merged.missions.M1.mergedCommitSha, "3333333abcdef");
-    await assert.rejects(
-      () => store.updateMission("run-life", "M1", { status: "active" }),
-      (err) => assertProtocolCode(err, "INVALID_TRANSITION"),
-    );
-
-    // Artifact approval works on artifact mission A1 and rejects build mission M2
-    await assert.rejects(
-      () => store.approveArtifact("run-life", "M2", "aaaa1111"),
-      (err) => assertProtocolCode(err, "INVALID_TRANSITION"),
-    );
-    const approved = await store.approveArtifact("run-life", "A1", "aaaa1111bbbb", {
-      approvedBy: "human",
-    });
-    assert.equal(approved.missions.A1.humanApprovedSha, "aaaa1111bbbb");
-    assert.ok(approved.missions.A1.humanApprovedAt);
-
-    // Verify MISSIONS.md updated with both review badge and artifact approval
-    const md = await readFile(
-      path.join(
-        root,
-        SWARM_DIR,
-        SWARM_RUNS_DIR,
-        "run-life",
-        SWARM_MISSIONS_FILE,
-      ),
-      "utf8",
-    );
-    assert.match(md, /clean \(merge\) @2222222/);
-    assert.match(md, /approved @aaaa111/);
-  });
-
-  it("supports inbox queues, findings, roster logTail bounding, ledger formatting, symlink protection & ownership checks", async () => {
-    const root = await makeTempDir("pi-swarm-comms-");
-    const store = new SwarmStore(root, {
-      isPidAlive: (pid) => pid === 4242,
-    });
-
-    const state = await store.createRun({
-      id: "run-comms",
-      objective: "Comms & audit",
-      verificationContract: "npm test",
-      baseBranch: "main",
-      ownerSessionId: "sess-A",
-      ownerPid: 4242,
-      missions: [
-        makeMission({
-          id: "S1",
-          title: "Explore Codebase",
-          kind: "survey",
-          scope: ["src"],
-        }),
-      ],
-    });
-
-    // Live-session ownership check
-    await store.assertOwnerSession("run-comms", "sess-A");
-    await assert.rejects(
-      () => store.assertOwnerSession("run-comms", "sess-B"),
-      (err) => assertProtocolCode(err, "OWNERSHIP_CONFLICT"),
-    );
-    // Dead PID allows takeover
-    assertOwnerSession({ ...state, ownerPid: 9999 }, "sess-B", {
-      isPidAlive: (pid) => pid === 4242,
-    });
-
-    // Inbox send, unread read, markRead
-    const m1 = await store.sendMessage("run-comms", {
-      from: "orchestrator",
-      to: "S1",
-      missionId: "S1",
-      text: "Check auth middleware",
-    });
-    const m2 = await store.sendMessage("run-comms", {
-      from: "orchestrator",
-      to: "S1",
-      missionId: "S1",
-      text: "Also inspect session cookies",
-    });
-    assert.ok(m1.id && m2.id);
-
-    const unread1 = await store.readInbox("run-comms", "S1", {
-      unreadOnly: true,
-      markRead: true,
-      limit: 1,
-    });
-    assert.equal(unread1.length, 1);
-    assert.equal(unread1[0].id, m1.id);
-    assert.ok(unread1[0].readAt);
-
-    const unread2 = await store.readInbox("run-comms", "S1", {
-      unreadOnly: true,
-      markRead: true,
-    });
-    assert.equal(unread2.length, 1);
-    assert.equal(unread2[0].id, m2.id);
-
-    const unreadAfter = await store.readInbox("run-comms", "S1", {
-      unreadOnly: true,
-    });
-    assert.equal(unreadAfter.length, 0);
-
-    const allMsgs = await store.readInbox("run-comms", "S1");
-    assert.equal(allMsgs.length, 2);
-
-    // Findings persisted to file and run state
-    const finding = await store.recordFinding("run-comms", {
-      missionId: "S1",
-      author: "worker-S1",
-      title: "JWT expiry bug",
-      summary: "Refresh token never rotates",
-      details: "Detailed trace...",
-      files: ["src/auth/jwt.ts"],
-    });
-    const loaded = await store.loadRun("run-comms");
-    assert.equal(loaded.findings.length, 1);
-    assert.equal(loaded.findings[0].id, finding.id);
-
-    // Roster logTail bounding
-    await store.registerRoster("run-comms", {
-      agentId: "agent-1",
-      name: "S1",
-      role: "worker",
-      missionId: "S1",
-      worktreePath: store.getWorktreePath("run-comms", "S1"),
-      branch: loaded.missions.S1.branch,
-    });
-    for (let i = 0; i < SWARM_LOG_TAIL_LIMIT + 10; i += 1) {
-      await store.updateRoster("run-comms", "agent-1", { logLine: `line-${i}` });
-    }
-    const afterLogs = await store.loadRun("run-comms");
-    assert.equal(
-      afterLogs.roster["agent-1"].logTail.length,
-      SWARM_LOG_TAIL_LIMIT,
-    );
-    assert.equal(afterLogs.roster["agent-1"].logTail[0], "line-10");
-
-    // Append-only ledger ordering & formatting
-    const recent = await store.getRecentEvents("run-comms", 3);
-    assert.equal(recent.length, 3);
-    assert.ok((recent[0].seq ?? 0) < (recent[1].seq ?? 0));
-    const formatted = formatLedgerActivity(recent);
-    assert.match(formatted, /finding_recorded/);
-
-    // Direct SwarmLedger handles corrupted trailing line gracefully
-    const ledgerPath = path.join(root, "custom-events.jsonl");
-    const ledger = new SwarmLedger(ledgerPath);
-    await ledger.append({ runId: "r", type: "run_created", summary: "first" });
-    await writeFile(
-      ledgerPath,
-      `${await readFile(ledgerPath, "utf8")}{broken-json\n`,
-      "utf8",
-    );
-    const allEvts = await ledger.readAll();
-    assert.equal(allEvts.length, 1);
-    assert.equal(allEvts[0].summary, "first");
-
-    // Format new SwarmEventType values cleanly
-    const ts = "2026-11-20T12:00:00.000Z";
-    const swarmEvts: SwarmEvent[] = [
-      {
-        id: "b1",
-        runId: "r",
-        type: "board_posted",
-        timestamp: ts,
-        actor: "M1",
-        summary: "Posted update",
-        data: { seq: 7, kind: "done" },
-      },
-      {
-        id: "w1",
-        runId: "r",
-        type: "agent_woken",
-        timestamp: ts,
-        actor: "M1",
-        missionId: "M1",
-        summary: "Woken by validator",
-        data: { boardSeq: 8 },
-      },
-      {
-        id: "m1",
-        runId: "r",
-        type: "agent_model_switched",
-        timestamp: ts,
-        actor: "orchestrator",
-        missionId: "M1",
-        summary: "Switched on rate limit",
-        data: { previousModel: "openai/gpt-5", model: "anthropic/claude-opus-4" },
-      },
-      {
-        id: "k1",
-        runId: "r",
-        type: "agent_killed",
-        timestamp: ts,
-        actor: "orchestrator",
-        missionId: "M1",
-        summary: 'worker "M1" killed.',
-      },
-      {
-        id: "v1",
-        runId: "r",
-        type: "validator_spawned",
-        timestamp: ts,
-        actor: "orchestrator",
-        missionId: "M1",
-        summary: "Spawned validator",
-        data: { model: "google/gemini-2.5-pro" },
-      },
-      {
-        id: "v2",
-        runId: "r",
-        type: "validation_submitted",
-        timestamp: ts,
-        actor: "validator-M1",
-        missionId: "M1",
-        summary: "Checked diff",
-        data: { status: "clean", merge: "merge" },
-      },
-    ];
-    assert.match(formatLedgerEvent(swarmEvts[0]), /board_posted \[#7 · done\] \(M1\)/);
-    assert.match(formatLedgerEvent(swarmEvts[1]), /agent_woken \[M1 · #8\] \(M1\)/);
-    assert.match(
-      formatLedgerEvent(swarmEvts[2]),
-      /agent_model_switched \[M1 · openai\/gpt-5 -> anthropic\/claude-opus-4\] \(orchestrator\)/,
-    );
-    assert.match(formatLedgerEvent(swarmEvts[3]), /agent_killed \[M1\] \(orchestrator\)/);
-    assert.match(
-      formatLedgerEvent(swarmEvts[4]),
-      /validator_spawned \[M1 · google\/gemini-2\.5-pro\] \(orchestrator\)/,
-    );
-    assert.match(
-      formatLedgerEvent(swarmEvts[5]),
-      /validation_submitted \[M1 · clean · merge\] \(validator-M1\)/,
-    );
-
-    // Path traversal & symlink protection
-    assert.throws(
-      () => store.getRunDir("../escape"),
-      (err) => assertProtocolCode(err, "SCOPE_VIOLATION"),
-    );
-
-    const symlinkTarget = path.join(root, "outside.json");
-    await writeFile(symlinkTarget, "{}", "utf8");
-    const evilRunDir = path.join(root, SWARM_DIR, SWARM_RUNS_DIR, "evil-sym");
-    await mkdir(evilRunDir, { recursive: true });
-    await symlink(symlinkTarget, path.join(evilRunDir, SWARM_STATE_FILE));
-    await assert.rejects(
-      () => store.loadRun("evil-sym"),
-      (err) => assertProtocolCode(err, "SCOPE_VIOLATION"),
+      () => store.loadRun("sym-run"),
+      (err) => assertProtocolCode(err, "PERMISSION_DENIED"),
     );
   });
 });
 
 // ============================================================================
-// 4. Layered Settings Loader/Saver & 3-Role Models + fallbackModels + keepWorkersWarm
+// 3. SwarmLedger & v2 Event Formatting
 // ============================================================================
 
-describe("Layered SwarmSettings loader, saver & sanitization", () => {
-  it("uses pi-swarm-settings.json paths, merges defaults <- global <- project, and clamps invalid bounds", async () => {
-    const tmp = await makeTempDir("pi-swarm-settings-");
-    const globalDir = path.join(tmp, "global-agent");
-    const projectRoot = path.join(tmp, "project");
-    await mkdir(globalDir, { recursive: true });
-    await mkdir(projectRoot, { recursive: true });
+describe("SwarmLedger & formatLedgerEvent (all v2 SwarmEventTypes)", () => {
+  it("formats every v2 SwarmEventType cleanly and persists serialized LF-only JSONL", async () => {
+    const root = await makeTempDir("pi-swarm-ledger-");
+    const eventsPath = path.join(root, SWARM_EVENTS_FILE);
+    const ledger = new SwarmLedger(eventsPath);
 
-    assert.equal(
-      getGlobalSettingsPath({ globalDir }),
-      path.join(globalDir, SWARM_SETTINGS_FILE),
-    );
-    assert.equal(
-      getProjectSettingsPath(projectRoot),
-      path.join(projectRoot, ".pi", SWARM_SETTINGS_FILE),
-    );
+    assert.equal(formatLedgerActivity([]), "(no activity yet)");
 
-    // Defaults when neither file exists
-    const defaults = await loadSwarmSettings(projectRoot, { globalDir });
-    assert.deepEqual(defaults, DEFAULT_SWARM_SETTINGS);
-    assert.equal(defaults.keepWorkersWarm, true);
-    assert.deepEqual(defaults.fallbackModels, []);
+    const allTypes: SwarmEventType[] = [
+      "run_created",
+      "run_titled",
+      "run_paused",
+      "run_resumed",
+      "run_completed",
+      "run_abandoned",
+      "member_added",
+      "member_woken",
+      "member_waiting",
+      "member_stopped",
+      "member_killed",
+      "member_model_switched",
+      "member_merged",
+      "member_error",
+      "board_posted",
+      "channel_created",
+      "channel_updated",
+      "channel_archived",
+      "stall_detected",
+      "rate_limit_backoff",
+      "teardown_completed",
+    ];
 
-    // Save global layer with 3-role models + fallbackModels
-    await saveSwarmSettings(
-      "global",
-      {
-        maxConcurrency: 5,
-        orchestratorModel: "anthropic/claude-opus-4",
-        orchestratorThinkingLevel: "high",
-        workerModel: "openai/gpt-5",
-        workerThinkingLevel: "medium",
-        validatorModel: "google/gemini-2.5-pro",
-        validatorThinkingLevel: "xhigh",
-        fallbackModels: [
-          "  openai/gpt-4.1  ",
-          "",
-          "anthropic/claude-sonnet-4",
-          "openai/gpt-4.1", // duplicate -> deduped
-        ],
-        keepWorkersWarm: false,
-        autoRebase: false,
-      },
-      { globalDir, projectRoot },
-    );
-
-    const afterGlobal = await loadSwarmSettings(projectRoot, { globalDir });
-    assert.equal(afterGlobal.orchestratorModel, "anthropic/claude-opus-4");
-    assert.equal(afterGlobal.orchestratorThinkingLevel, "high");
-    assert.equal(afterGlobal.workerModel, "openai/gpt-5");
-    assert.equal(afterGlobal.workerThinkingLevel, "medium");
-    assert.equal(afterGlobal.validatorModel, "google/gemini-2.5-pro");
-    assert.equal(afterGlobal.validatorThinkingLevel, "xhigh");
-    assert.deepEqual(afterGlobal.fallbackModels, [
-      "openai/gpt-4.1",
-      "anthropic/claude-sonnet-4",
-    ]);
-    assert.equal(afterGlobal.keepWorkersWarm, false);
-
-    // Save project layer overriding select keys and testing out-of-range clamping
-    await saveSwarmSettings(
-      "project",
-      {
-        maxConcurrency: 0, // should clamp to 1
-        maxValidationRounds: 99, // should clamp to 10
-        rateLimitBaseBackoffMs: 10_000,
-        rateLimitMaxBackoffMs: 2_000, // should clamp >= base (10_000)
-        workerModel: "", // clears global workerModel
-        keepWorkersWarm: true,
-      },
-      { globalDir, projectRoot },
+    const appended = await Promise.all(
+      allTypes.map((type) =>
+        ledger.append({
+          runId: "run-ledger",
+          type,
+          actor: "orchestrator",
+          memberName: type.startsWith("member_") || type === "stall_detected" || type === "rate_limit_backoff"
+            ? "parser"
+            : undefined,
+          channel: type.startsWith("channel_") || type === "board_posted"
+            ? "backend"
+            : undefined,
+          summary: `Event ${type}`,
+          data: {
+            baseBranch: "main",
+            title: "My Swarm",
+            role: "worker",
+            workspace: "share",
+            model: "openai/gpt-5",
+            previousModel: "openai/gpt-4.1",
+            boardSeq: 7,
+            boardHead: 9,
+            seq: 7,
+            kind: "review",
+            commitSha: "deadbeef1234567",
+            backoffMs: 5000,
+            removed: 2,
+            skipped: 1,
+            errors: 0,
+          },
+        }),
+      ),
     );
 
-    const layered = await loadLayeredSwarmSettings(projectRoot, { globalDir });
-    assert.equal(layered.settings.maxConcurrency, 1);
-    assert.equal(layered.settings.maxValidationRounds, 10);
-    assert.equal(layered.settings.rateLimitBaseBackoffMs, 10_000);
-    assert.equal(layered.settings.rateLimitMaxBackoffMs, 10_000);
-    assert.equal(layered.settings.autoRebase, false); // inherited from global
-    assert.equal(layered.settings.keepWorkersWarm, true); // overridden by project
-    assert.equal(layered.settings.workerThinkingLevel, "medium"); // inherited from global
-    assert.equal(layered.settings.workerModel, undefined); // cleared by project ""
-    assert.equal(layered.settings.orchestratorModel, "anthropic/claude-opus-4");
-    assert.equal(layered.settings.validatorModel, "google/gemini-2.5-pro");
+    assert.equal(appended.length, allTypes.length);
+    assert.deepEqual(
+      appended.map((e) => e.seq),
+      allTypes.map((_, i) => i + 1),
+    );
 
-    // Sanitizer ignores invalid thinking level and non-numeric values
-    const sanitized = sanitizeSwarmSettings({
-      maxConcurrency: Number.NaN,
-      maxValidationRounds: -4,
-      validatorThinkingLevel: "ultra-invalid" as never,
-      keepWorkersWarm: "yes" as never,
-      fallbackModels: ["  m1  ", 42 as never, "", "m2", "m1"],
-      gitTimeoutMs: 50,
-    });
-    assert.equal(sanitized.maxConcurrency, DEFAULT_SWARM_SETTINGS.maxConcurrency);
-    assert.equal(sanitized.maxValidationRounds, 1);
-    assert.equal(sanitized.validatorThinkingLevel, undefined);
-    assert.equal(sanitized.keepWorkersWarm, true);
-    assert.deepEqual(sanitized.fallbackModels, ["m1", "m2"]);
-    assert.equal(sanitized.gitTimeoutMs, 1_000);
+    const recent = await ledger.readRecent(allTypes.length);
+    assert.equal(recent.length, allTypes.length);
+    const formatted = ledger.format(recent);
+    assert.equal(formatted.split("\n").length, allTypes.length);
+
+    // Spot-check key formatted v2 event lines
+    const byType = new Map<SwarmEventType, SwarmEvent>(
+      recent.map((e) => [e.type, e]),
+    );
+    assert.match(
+      formatLedgerEvent(byType.get("member_model_switched")!),
+      /member_model_switched \[parser · openai\/gpt-4\.1 -> openai\/gpt-5\] \(orchestrator\)/,
+    );
+    assert.match(
+      formatLedgerEvent(byType.get("member_merged")!),
+      /member_merged \[parser · @deadbee\] \(orchestrator\)/,
+    );
+    assert.match(
+      formatLedgerEvent(byType.get("board_posted")!),
+      /board_posted \[#7 · #backend · review\] \(orchestrator\)/,
+    );
+    assert.match(
+      formatLedgerEvent(byType.get("channel_archived")!),
+      /channel_archived \[#backend\] \(orchestrator\)/,
+    );
+    assert.match(
+      formatLedgerEvent(byType.get("stall_detected")!),
+      /stall_detected \[parser · head #9\] \(orchestrator\)/,
+    );
+    assert.match(
+      formatLedgerEvent(byType.get("rate_limit_backoff")!),
+      /rate_limit_backoff \[parser · 5000ms\] \(orchestrator\)/,
+    );
+    assert.match(
+      formatLedgerEvent(byType.get("teardown_completed")!),
+      /teardown_completed \[removed 2 · skipped 1\] \(orchestrator\)/,
+    );
+
+    // Symlink protection on ledger
+    const outside = path.join(root, "outside-events.jsonl");
+    await writeFile(outside, "", "utf8");
+    const symEvents = path.join(root, "sym-events.jsonl");
+    await symlink(outside, symEvents);
+    await assert.rejects(
+      () => new SwarmLedger(symEvents).readAll(),
+      (err) => assertProtocolCode(err, "PERMISSION_DENIED"),
+    );
   });
+});
 
-  it("supports Validator & Final Validator settings defaults, bounds (1..10), and project-layer null clears", async () => {
-    const tmp = await makeTempDir("pi-swarm-validator-settings-");
+// ============================================================================
+// 4. SwarmSettings (3-Role Models, Legacy v1 Compatibility, Bounds & Layering)
+// ============================================================================
+
+describe("SwarmSettings layered persistence & legacy compatibility", () => {
+  it("loads defaults, stays 100% compatible with legacy v1 settings files, and layers global/project overrides cleanly", async () => {
+    const tmp = await makeTempDir("pi-swarm-settings-");
     const globalDir = path.join(tmp, "global-agent");
     const projectRoot = path.join(tmp, "project");
     await mkdir(globalDir, { recursive: true });
@@ -1468,632 +1133,150 @@ describe("Layered SwarmSettings loader, saver & sanitization", () => {
 
     // Defaults
     const defaults = await loadSwarmSettings(projectRoot, { globalDir });
+    assert.equal(defaults.maxConcurrency, 6);
     assert.equal(defaults.validatorEnabled, true);
-    assert.equal(defaults.finalValidatorEnabled, true);
-    assert.equal(defaults.maxValidationRounds, 3);
-    assert.equal(defaults.maxFinalAuditRounds, 2);
-    assert.equal(defaults.autoFixOnAuditFail, true);
-    assert.equal(defaults.validatorModel, undefined);
-    assert.equal(defaults.validatorThinkingLevel, undefined);
+    assert.equal(defaults.keepWorkersWarm, true);
+    assert.equal(defaults.stallWatchdogEnabled, true);
+    assert.equal(defaults.stallTimeoutMs, SWARM_DEFAULT_STALL_TIMEOUT_MS);
+    assert.equal(defaults.autoRebase, true);
+    assert.equal(defaults.autoTeardownOnComplete, false);
+    assert.deepEqual(defaults.fallbackModels, []);
 
-    // Bounds & invalid value clamping
-    const clampedLow = sanitizeSwarmSettings({
-      validatorEnabled: "not-a-bool" as never,
-      finalValidatorEnabled: "not-a-bool" as never,
-      maxValidationRounds: 0,
-      maxFinalAuditRounds: 0,
-      autoFixOnAuditFail: 123 as never,
-      orchestratorModel: "   ",
-      validatorModel: "   ",
-      validatorThinkingLevel: "bogus" as never,
-    });
-    assert.equal(clampedLow.validatorEnabled, true);
-    assert.equal(clampedLow.finalValidatorEnabled, true);
-    assert.equal(clampedLow.maxValidationRounds, 1);
-    assert.equal(clampedLow.maxFinalAuditRounds, 1);
-    assert.equal(clampedLow.autoFixOnAuditFail, true);
-    assert.equal(clampedLow.orchestratorModel, undefined);
-    assert.equal(clampedLow.validatorModel, undefined);
-    assert.equal(clampedLow.validatorThinkingLevel, undefined);
-
-    const clampedHigh = sanitizeSwarmSettings({
-      finalValidatorEnabled: false,
-      maxFinalAuditRounds: 42,
-      autoFixOnAuditFail: false,
-      validatorModel: "  anthropic/claude-opus-4  ",
-      validatorThinkingLevel: "xhigh",
-    });
-    assert.equal(clampedHigh.finalValidatorEnabled, false);
-    assert.equal(clampedHigh.maxFinalAuditRounds, 10);
-    assert.equal(clampedHigh.autoFixOnAuditFail, false);
-    assert.equal(clampedHigh.validatorModel, "anthropic/claude-opus-4");
-    assert.equal(clampedHigh.validatorThinkingLevel, "xhigh");
-
-    // Global sets models, thinking levels & fallbackModels; project clears via null
-    await saveSwarmSettings(
-      "global",
-      {
-        finalValidatorEnabled: true,
-        maxFinalAuditRounds: 4,
-        autoFixOnAuditFail: false,
-        orchestratorModel: "anthropic/claude-opus-4",
-        orchestratorThinkingLevel: "high",
-        validatorModel: "openai/gpt-5",
-        validatorThinkingLevel: "high",
-        fallbackModels: ["openai/gpt-4.1", "google/gemini-2.5-pro"],
-      },
-      { globalDir, projectRoot },
+    // Simulate an existing v1 ~/.pi/agent/pi-swarm-settings.json with removed legacy keys!
+    const globalFile = getGlobalSettingsPath({ globalDir });
+    assert.equal(globalFile, path.join(globalDir, SWARM_SETTINGS_FILE));
+    assert.equal(
+      getProjectSettingsPath(projectRoot),
+      path.join(projectRoot, ".pi", SWARM_SETTINGS_FILE),
+    );
+    await writeFile(
+      globalFile,
+      JSON.stringify(
+        {
+          orchestratorModel: "anthropic/claude-opus-4",
+          orchestratorThinkingLevel: "high",
+          workerModel: "openai/gpt-5",
+          workerThinkingLevel: "medium",
+          validatorModel: "google/gemini-2.5-pro",
+          validatorThinkingLevel: "xhigh",
+          fallbackModels: ["openai/gpt-4.1", "anthropic/claude-sonnet-4"],
+          maxConcurrency: 8,
+          keepWorkersWarm: false,
+          autoRebase: false,
+          // Legacy v1 keys & unknown keys MUST be ignored without throwing or warning!
+          finalValidatorEnabled: true,
+          maxValidationRounds: 5,
+          maxFinalAuditRounds: 3,
+          autoFixOnAuditFail: false,
+          autoMergeClean: true,
+          someUnknownFutureKey: { nested: true },
+        },
+        null,
+        2,
+      ),
+      "utf8",
     );
 
-    const inherited = await loadSwarmSettings(projectRoot, { globalDir });
-    assert.equal(inherited.maxFinalAuditRounds, 4);
-    assert.equal(inherited.autoFixOnAuditFail, false);
-    assert.equal(inherited.orchestratorModel, "anthropic/claude-opus-4");
-    assert.equal(inherited.validatorModel, "openai/gpt-5");
-    assert.equal(inherited.validatorThinkingLevel, "high");
-    assert.deepEqual(inherited.fallbackModels, [
+    const fromLegacy = await loadLayeredSwarmSettings(projectRoot, { globalDir });
+    assert.deepEqual(fromLegacy.warnings, []);
+    assert.equal(fromLegacy.settings.orchestratorModel, "anthropic/claude-opus-4");
+    assert.equal(fromLegacy.settings.orchestratorThinkingLevel, "high");
+    assert.equal(fromLegacy.settings.workerModel, "openai/gpt-5");
+    assert.equal(fromLegacy.settings.workerThinkingLevel, "medium");
+    assert.equal(fromLegacy.settings.validatorModel, "google/gemini-2.5-pro");
+    assert.equal(fromLegacy.settings.validatorThinkingLevel, "xhigh");
+    assert.deepEqual(fromLegacy.settings.fallbackModels, [
       "openai/gpt-4.1",
-      "google/gemini-2.5-pro",
+      "anthropic/claude-sonnet-4",
     ]);
+    assert.equal(fromLegacy.settings.maxConcurrency, 8);
+    assert.equal(fromLegacy.settings.keepWorkersWarm, false);
+    assert.equal(fromLegacy.settings.autoRebase, false);
+    assert.equal(fromLegacy.settings.stallWatchdogEnabled, true);
+    assert.equal(fromLegacy.settings.stallTimeoutMs, 45_000);
 
+    // Project layer overrides, clamps out-of-range values, and clears global model via "" / null
     await saveSwarmSettings(
       "project",
       {
-        maxFinalAuditRounds: 99, // clamps to 10
-        orchestratorModel: null as unknown as undefined,
-        validatorModel: null as unknown as undefined,
-        validatorThinkingLevel: null as unknown as undefined,
-        fallbackModels: null as unknown as string[],
+        maxConcurrency: 0, // clamps to 1
+        stallWatchdogEnabled: false,
+        stallTimeoutMs: 100, // clamps to SWARM_SETTINGS_BOUNDS.stallTimeoutMs.min (1000)
+        rateLimitBaseBackoffMs: 10_000,
+        rateLimitMaxBackoffMs: 2_000, // clamps >= base (10_000)
+        workerModel: "", // clears global workerModel
+        validatorModel: null as unknown as undefined, // clears global validatorModel
+        keepWorkersWarm: true,
       },
       { globalDir, projectRoot },
     );
 
     const layered = await loadLayeredSwarmSettings(projectRoot, { globalDir });
-    assert.equal(layered.settings.maxFinalAuditRounds, 10);
-    assert.equal(layered.settings.autoFixOnAuditFail, false); // inherited from global
-    assert.equal(layered.settings.orchestratorModel, undefined); // cleared by project null
+    assert.equal(layered.settings.maxConcurrency, 1);
+    assert.equal(layered.settings.stallWatchdogEnabled, false);
+    assert.equal(
+      layered.settings.stallTimeoutMs,
+      SWARM_SETTINGS_BOUNDS.stallTimeoutMs.min,
+    );
+    assert.equal(layered.settings.rateLimitBaseBackoffMs, 10_000);
+    assert.equal(layered.settings.rateLimitMaxBackoffMs, 10_000);
+    assert.equal(layered.settings.autoRebase, false); // inherited from global
+    assert.equal(layered.settings.keepWorkersWarm, true); // overridden by project
+    assert.equal(layered.settings.workerModel, undefined); // cleared by project ""
     assert.equal(layered.settings.validatorModel, undefined); // cleared by project null
-    assert.equal(layered.settings.validatorThinkingLevel, undefined); // cleared by project null
-    assert.deepEqual(layered.settings.fallbackModels, []); // cleared by project null
-
-    // Verify null persisted cleanly in project file
-    const rawProject = JSON.parse(
-      await readFile(layered.projectPath, "utf8"),
-    ) as Record<string, unknown>;
-    assert.equal(rawProject.orchestratorModel, null);
-    assert.equal(rawProject.validatorModel, null);
-    assert.equal(rawProject.validatorThinkingLevel, null);
-    assert.equal(rawProject.fallbackModels, null);
+    assert.equal(layered.settings.orchestratorModel, "anthropic/claude-opus-4");
 
     // Explicit undefined removes project override so global is inherited again
     await saveSwarmSettings(
       "project",
       {
-        orchestratorModel: undefined,
+        workerModel: undefined,
         validatorModel: undefined,
-        validatorThinkingLevel: undefined,
-        fallbackModels: undefined,
       },
       { globalDir, projectRoot },
     );
     const reInherited = await loadSwarmSettings(projectRoot, { globalDir });
-    assert.equal(reInherited.orchestratorModel, "anthropic/claude-opus-4");
-    assert.equal(reInherited.validatorModel, "openai/gpt-5");
-    assert.equal(reInherited.validatorThinkingLevel, "high");
-    assert.deepEqual(reInherited.fallbackModels, [
-      "openai/gpt-4.1",
-      "google/gemini-2.5-pro",
-    ]);
+    assert.equal(reInherited.workerModel, "openai/gpt-5");
+    assert.equal(reInherited.validatorModel, "google/gemini-2.5-pro");
+
+    // Sanitizer handles malformed types & clamps upper/lower bounds
+    const sanitized = sanitizeSwarmSettings({
+      maxConcurrency: Number.NaN,
+      stallTimeoutMs: 999_999_999,
+      stallWatchdogEnabled: "not-bool" as never,
+      validatorThinkingLevel: "ultra-invalid" as never,
+      fallbackModels: ["  m1  ", 42 as never, "", "m2", "m1"],
+      gitTimeoutMs: 50,
+    });
+    assert.equal(sanitized.maxConcurrency, DEFAULT_SWARM_SETTINGS.maxConcurrency);
+    assert.equal(
+      sanitized.stallTimeoutMs,
+      SWARM_SETTINGS_BOUNDS.stallTimeoutMs.max,
+    );
+    assert.equal(sanitized.stallWatchdogEnabled, true);
+    assert.equal(sanitized.validatorThinkingLevel, undefined);
+    assert.deepEqual(sanitized.fallbackModels, ["m1", "m2"]);
+    assert.equal(sanitized.gitTimeoutMs, SWARM_SETTINGS_BOUNDS.gitTimeoutMs.min);
+
+    // Symlinked project settings file rejected on write
+    const outside = path.join(tmp, "outside-settings.json");
+    await writeFile(outside, "{}", "utf8");
+    const symProject = path.join(tmp, "sym-settings.json");
+    await symlink(outside, symProject);
+    await assert.rejects(
+      () =>
+        saveSwarmSettings(
+          "project",
+          { maxConcurrency: 4 },
+          { projectPath: symProject },
+        ),
+      (err) => assertProtocolCode(err, "PERMISSION_DENIED"),
+    );
   });
 });
 
 // ============================================================================
-// 5. Run-Level Final Validator / Goal Auditor Store Contract
-// ============================================================================
-
-describe("SwarmStore Final Validator / Goal Auditor lifecycle", () => {
-  it("initializes final-audit & swarm defaults, creates audits/ dir, and backfills partial state.json on loadRun", async () => {
-    const root = await makeTempDir("pi-swarm-audit-init-");
-    const store = new SwarmStore(root);
-
-    const created = await store.createRun({
-      id: "run-audit-init",
-      objective: "Verify final audit initialization",
-      verificationContract: "npm test && npm run typecheck",
-      baseBranch: "main",
-      ownerSessionId: "sess-1",
-      missions: [
-        makeMission({ id: "M1", title: "Init Feature", scope: ["src/init"] }),
-      ],
-    });
-
-    assert.equal(created.finalValidatorEnabled, true);
-    assert.equal(created.maxFinalAuditRounds, 2);
-    assert.equal(created.autoFixOnAuditFail, true);
-    assert.equal(created.keepWorkersWarm, true);
-    assert.equal(created.finalAuditStatus, "idle");
-    assert.equal(created.finalAuditRound, 0);
-
-    // audits/ directory exists immediately after createRun
-    const auditsDir = path.join(
-      root,
-      SWARM_DIR,
-      SWARM_RUNS_DIR,
-      "run-audit-init",
-      SWARM_AUDITS_DIR,
-    );
-    assert.equal(await exists(auditsDir), true);
-
-    // Simulate a partial state.json missing optional newer fields
-    const statePath = path.join(
-      root,
-      SWARM_DIR,
-      SWARM_RUNS_DIR,
-      "run-audit-init",
-      SWARM_STATE_FILE,
-    );
-    const raw = JSON.parse(await readFile(statePath, "utf8")) as Record<
-      string,
-      unknown
-    >;
-    delete raw.validatorEnabled;
-    delete raw.maxValidationRounds;
-    delete raw.finalValidatorEnabled;
-    delete raw.maxFinalAuditRounds;
-    delete raw.autoFixOnAuditFail;
-    delete raw.keepWorkersWarm;
-    delete raw.finalAuditStatus;
-    delete raw.finalAuditRound;
-    await writeFile(statePath, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
-
-    const backfilled = await store.loadRun("run-audit-init");
-    assert.equal(
-      backfilled.validatorEnabled,
-      DEFAULT_SWARM_SETTINGS.validatorEnabled,
-    );
-    assert.equal(
-      backfilled.maxValidationRounds,
-      DEFAULT_SWARM_SETTINGS.maxValidationRounds,
-    );
-    assert.equal(
-      backfilled.finalValidatorEnabled,
-      DEFAULT_SWARM_SETTINGS.finalValidatorEnabled,
-    );
-    assert.equal(
-      backfilled.maxFinalAuditRounds,
-      DEFAULT_SWARM_SETTINGS.maxFinalAuditRounds,
-    );
-    assert.equal(
-      backfilled.autoFixOnAuditFail,
-      DEFAULT_SWARM_SETTINGS.autoFixOnAuditFail,
-    );
-    assert.equal(
-      backfilled.keepWorkersWarm,
-      DEFAULT_SWARM_SETTINGS.keepWorkersWarm,
-    );
-    assert.equal(backfilled.finalAuditStatus, "idle");
-    assert.equal(backfilled.finalAuditRound, 0);
-  });
-
-  it("supports final-validator roster with FINAL_AUDIT_MISSION_ID, blocks validator mutations, and persists audits/MISSIONS.md/ledger", async () => {
-    const root = await makeTempDir("pi-swarm-audit-flow-");
-    const store = new SwarmStore(root);
-
-    await store.createRun({
-      id: "run-audit",
-      objective: "End-to-end audit flow",
-      verificationContract: "npm test",
-      baseBranch: "main",
-      ownerSessionId: "sess-audit",
-      maxFinalAuditRounds: 3,
-      missions: [
-        makeMission({ id: "M1", title: "Core Module", scope: ["src/core"] }),
-      ],
-    });
-
-    // Validator cannot mutate missions or patch scope
-    await assert.rejects(
-      () =>
-        store.updateMission("run-audit", "M1", {
-          status: "active",
-          callerRole: "validator",
-        }),
-      (err) => assertProtocolCode(err, "ROLE_FORBIDDEN"),
-    );
-    await assert.rejects(
-      () =>
-        store.patchMissionScope("run-audit", "M1", ["src/core", "src/extra"], {
-          callerRole: "validator",
-        }),
-      (err) => assertProtocolCode(err, "ROLE_FORBIDDEN"),
-    );
-
-    // Non-final-validator roles cannot register with FINAL_AUDIT_MISSION_ID
-    for (const nonFinalRole of ["worker", "validator"] as const) {
-      await assert.rejects(
-        () =>
-          store.registerRoster("run-audit", {
-            agentId: `bad-${nonFinalRole}`,
-            name: `${nonFinalRole}-run`,
-            role: nonFinalRole,
-            missionId: FINAL_AUDIT_MISSION_ID,
-            worktreePath: root,
-            branch: "main",
-          }),
-        (err) => assertProtocolCode(err, "NOT_FOUND"),
-      );
-    }
-
-    // Transition run -> verifying + finalAuditStatus -> running (must NOT duplicate final_audit_started)
-    const verifying = await store.updateRun("run-audit", {
-      status: "verifying",
-      finalAuditStatus: "running",
-    });
-    assert.equal(verifying.status, "verifying");
-    assert.equal(verifying.finalAuditStatus, "running");
-    assert.equal(await store.getActiveRunId(), "run-audit");
-
-    // Register Final Validator roster entry with FINAL_AUDIT_MISSION_ID -> auto-emits single final_audit_started
-    const withFinalValidator = await store.registerRoster("run-audit", {
-      agentId: "final-val-r1",
-      name: FINAL_VALIDATOR_BOARD_NAME,
-      role: "final-validator",
-      missionId: FINAL_AUDIT_MISSION_ID,
-      worktreePath: root,
-      branch: "main",
-    });
-    assert.equal(
-      withFinalValidator.roster["final-val-r1"].role,
-      "final-validator",
-    );
-    assert.equal(
-      withFinalValidator.roster["final-val-r1"].missionId,
-      FINAL_AUDIT_MISSION_ID,
-    );
-
-    // Validation errors on recordFinalAudit
-    await assert.rejects(
-      () =>
-        store.recordFinalAudit("run-audit", {
-          commitSha: "abc1234",
-          baseBranch: "main",
-          auditedAt: new Date().toISOString(),
-          verifierAgentId: "final-val-r1",
-          verdict: "maybe" as never,
-          summary: "Invalid verdict",
-          checks: [],
-          findings: [],
-          round: 1,
-        }),
-      (err) => assertProtocolCode(err, "INVALID_TRANSITION"),
-    );
-    await assert.rejects(
-      () =>
-        store.recordFinalAudit("run-audit", {
-          commitSha: "   ",
-          baseBranch: "main",
-          auditedAt: new Date().toISOString(),
-          verifierAgentId: "final-val-r1",
-          verdict: "approved",
-          summary: "Missing commit sha",
-          checks: [],
-          findings: [],
-          round: 1,
-        }),
-      (err) => assertProtocolCode(err, "AUDIT_REQUIRED"),
-    );
-    await assert.rejects(
-      () =>
-        store.recordFinalAudit("run-audit", {
-          commitSha: "abc1234567890",
-          baseBranch: "main",
-          auditedAt: new Date().toISOString(),
-          verifierAgentId: "final-val-r1",
-          verdict: "approved",
-          summary: "   ",
-          checks: [],
-          findings: [],
-          round: 1,
-        }),
-      (err) => assertProtocolCode(err, "AUDIT_REQUIRED"),
-    );
-
-    // Record Round 1 disapproved verdict
-    const r1Verdict: FinalAuditVerdict = {
-      commitSha: "deadbeef1234567",
-      baseBranch: "main",
-      auditedAt: new Date().toISOString(),
-      verifierAgentId: "final-val-r1",
-      verdict: "disapproved",
-      summary: "Integration test failed on empty token",
-      checks: [
-        { name: "npm run typecheck", passed: true },
-        { name: "npm test", passed: false, detail: "1 failing test" },
-      ],
-      findings: [
-        {
-          severity: "p1",
-          title: "Missing empty token guard",
-          detail: "Auth middleware throws on empty bearer header",
-          file: "src/core/auth.ts",
-          line: 18,
-        },
-      ],
-      recommendedMissions: [
-        {
-          title: "Guard Empty Bearer Token",
-          description: "Handle empty bearer header gracefully",
-          scope: ["src/core"],
-          verification: "npm test",
-        },
-      ],
-      round: 1,
-    };
-
-    const afterR1 = await store.recordFinalAudit("run-audit", r1Verdict);
-    assert.equal(afterR1.finalAuditStatus, "disapproved");
-    assert.equal(afterR1.finalAuditRound, 1);
-    assert.equal(afterR1.lastAuditedSha, "deadbeef1234567");
-    assert.equal(afterR1.latestFinalAudit?.verdict, "disapproved");
-
-    // Verify atomic persistence to audits/audit-r1.json
-    const r1Path = path.join(
-      root,
-      SWARM_DIR,
-      SWARM_RUNS_DIR,
-      "run-audit",
-      SWARM_AUDITS_DIR,
-      "audit-r1.json",
-    );
-    const r1Disk = JSON.parse(
-      await readFile(r1Path, "utf8"),
-    ) as FinalAuditVerdict;
-    assert.equal(r1Disk.round, 1);
-    assert.equal(r1Disk.commitSha, "deadbeef1234567");
-    assert.equal(r1Disk.verdict, "disapproved");
-    assert.equal(r1Disk.findings.length, 1);
-
-    // Verify MISSIONS.md includes Final Verification section
-    const mdPath = path.join(
-      root,
-      SWARM_DIR,
-      SWARM_RUNS_DIR,
-      "run-audit",
-      SWARM_MISSIONS_FILE,
-    );
-    const md1 = await readFile(mdPath, "utf8");
-    assert.match(md1, /## Final Verification/);
-    assert.match(md1, /\*\*Enabled:\*\* yes \(auto-fix: yes\)/);
-    assert.match(md1, /\*\*Status:\*\* `disapproved`/);
-    assert.match(md1, /\*\*Rounds:\*\* 1\/3/);
-    assert.match(md1, /\*\*Last Audited SHA:\*\* `deadbee`/);
-    assert.match(md1, /checks: 1\/2, findings: 1/);
-    assert.match(md1, /Integration test failed on empty token/);
-
-    // Verify exact ledger counts (no duplicate final_audit_started / final_audit_result)
-    const eventsAfterR1 = await store.getRecentEvents("run-audit", 50);
-    assert.equal(
-      eventsAfterR1.filter((e) => e.type === "final_audit_started").length,
-      1,
-    );
-    assert.equal(
-      eventsAfterR1.filter((e) => e.type === "final_audit_result").length,
-      1,
-    );
-
-    // Verify updateRoster works for final-validator role (failed -> worker_exited with [final-audit] tag)
-    await store.updateRoster("run-audit", "final-val-r1", {
-      status: "failed",
-      endedAt: new Date().toISOString(),
-    });
-    const eventsAfterExit = await store.getRecentEvents("run-audit", 50);
-    const exitEvt = eventsAfterExit.find((e) => e.type === "worker_exited");
-    assert.ok(exitEvt);
-    assert.match(formatLedgerEvent(exitEvt), /\[final-audit\]/);
-
-    // Adding a fix mission resets status -> active and finalAuditStatus -> idle while preserving finalAuditRound
-    await store.updateMission("run-audit", "M1", { status: "active" });
-    await store.updateMission("run-audit", "M1", { status: "completed" });
-    await store.markMerged("run-audit", "M1", "aaa1111");
-
-    const afterFixAdd = await store.addMissions("run-audit", [
-      makeMission({
-        id: "F1",
-        title: "Guard Empty Bearer Token",
-        scope: ["src/core"],
-        deps: ["M1"],
-      }),
-    ]);
-    assert.equal(afterFixAdd.status, "active");
-    assert.equal(afterFixAdd.finalAuditStatus, "idle");
-    assert.equal(afterFixAdd.finalAuditRound, 1);
-
-    // Also test addMissions reset from approved state
-    await store.recordFinalAudit("run-audit", {
-      commitSha: "cafebabe9876543",
-      baseBranch: "main",
-      auditedAt: new Date().toISOString(),
-      verifierAgentId: "final-val-r2",
-      verdict: "approved",
-      summary: "All checks green",
-      checks: [{ name: "npm test", passed: true }],
-      findings: [],
-      round: 2,
-    });
-    const afterApprovedAdd = await store.addMissions("run-audit", [
-      makeMission({
-        id: "M2",
-        title: "Followup Docs",
-        kind: "artifact",
-        scope: ["docs/followup.md"],
-      }),
-    ]);
-    assert.equal(afterApprovedAdd.status, "active");
-    assert.equal(afterApprovedAdd.finalAuditStatus, "idle");
-    assert.equal(afterApprovedAdd.finalAuditRound, 2);
-
-    // Verify crisp formatLedgerEvent formatting for all 4 final audit event types
-    const baseTs = "2026-11-20T12:00:00.000Z";
-    const sampleEvents: SwarmEvent[] = [
-      {
-        id: "e1",
-        runId: "run-audit",
-        type: "final_audit_started",
-        timestamp: baseTs,
-        actor: "orchestrator",
-        missionId: FINAL_AUDIT_MISSION_ID,
-        summary: "Started Final Validator on main",
-        data: { round: 1, baseBranch: "main", commitSha: "deadbeef123" },
-      },
-      {
-        id: "e2",
-        runId: "run-audit",
-        type: "final_audit_result",
-        timestamp: baseTs,
-        actor: "final-val-r1",
-        summary: "Final audit round 1 approved @cafebab — All checks green",
-        data: {
-          round: 1,
-          verdict: "approved",
-          commitSha: "cafebabe987",
-          checksPassed: 2,
-          checksTotal: 2,
-          findingsCount: 0,
-        },
-      },
-      {
-        id: "e3",
-        runId: "run-audit",
-        type: "final_audit_skipped",
-        timestamp: baseTs,
-        actor: "alice",
-        summary: "Skipped by alice: emergency hotfix",
-        data: { skippedBy: "alice", reason: "emergency hotfix" },
-      },
-      {
-        id: "e4",
-        runId: "run-audit",
-        type: "final_audit_autofix_planned",
-        timestamp: baseTs,
-        actor: "final-validator",
-        summary: "Scheduled auto-fix mission",
-        data: { missionIds: ["F1", "F2"] },
-      },
-    ];
-
-    assert.match(
-      formatLedgerEvent(sampleEvents[0]),
-      /final_audit_started \[r1 · @deadbee\] \(orchestrator\)/,
-    );
-    assert.match(
-      formatLedgerEvent(sampleEvents[1]),
-      /final_audit_result \[APPROVED · checks 2\/2 · 0 findings\] \(final-val-r1\)/,
-    );
-    assert.match(
-      formatLedgerEvent(sampleEvents[2]),
-      /final_audit_skipped \(alice\) Skipped by alice: emergency hotfix/,
-    );
-    assert.match(
-      formatLedgerEvent(sampleEvents[3]),
-      /final_audit_autofix_planned \[F1, F2\] \(final-validator\)/,
-    );
-  });
-
-  it("enforces strictly human-only skipFinalAudit (ROLE_FORBIDDEN for non-human or omitted callerRole) and completes run when all missions are terminal", async () => {
-    const root = await makeTempDir("pi-swarm-audit-skip-");
-    const store = new SwarmStore(root);
-
-    await store.createRun({
-      id: "run-skip",
-      objective: "Skip sovereignty test",
-      verificationContract: "npm test",
-      baseBranch: "main",
-      ownerSessionId: "sess-skip",
-      missions: [
-        makeMission({ id: "M1", title: "Ship Core", scope: ["src/core"] }),
-        makeMission({ id: "M2", title: "Optional Extra", scope: ["src/extra"] }),
-      ],
-    });
-
-    // Omitted callerRole MUST be rejected with ROLE_FORBIDDEN
-    await assert.rejects(
-      () => store.skipFinalAudit("run-skip", { reason: "omitted role" }),
-      (err) => assertProtocolCode(err, "ROLE_FORBIDDEN"),
-    );
-
-    // Non-human caller roles MUST be rejected with ROLE_FORBIDDEN
-    for (const forbiddenRole of ["orchestrator", "worker", "validator"] as const) {
-      await assert.rejects(
-        () =>
-          store.skipFinalAudit("run-skip", {
-            callerRole: forbiddenRole,
-            reason: "trying to bypass",
-          }),
-        (err) => assertProtocolCode(err, "ROLE_FORBIDDEN"),
-      );
-    }
-
-    // While missions are still open, human skip sets finalAuditStatus=skipped WITHOUT marking run completed
-    const skippedOpen = await store.skipFinalAudit("run-skip", {
-      callerRole: "human",
-      skippedBy: "operator",
-      reason: "pre-approved manual check",
-    });
-    assert.equal(skippedOpen.finalAuditStatus, "skipped");
-    assert.equal(skippedOpen.finalAuditSkippedBy, "operator");
-    assert.ok(skippedOpen.finalAuditSkippedAt);
-    assert.equal(skippedOpen.finalAuditSkipReason, "pre-approved manual check");
-    assert.equal(skippedOpen.status, "active");
-
-    // Complete/merge M1 and abandon M2 -> all missions terminal, simulate verifying state
-    await store.updateMission("run-skip", "M1", { status: "active" });
-    await store.updateMission("run-skip", "M1", { status: "completed" });
-    await store.markMerged("run-skip", "M1", "1234567890abcdef");
-    await store.updateMission("run-skip", "M2", {
-      status: "abandoned",
-      callerRole: "orchestrator",
-    });
-    await store.updateRun("run-skip", {
-      status: "verifying",
-      finalAuditStatus: "disapproved",
-    });
-
-    // Human skip when all missions are terminal transitions run -> completed and emits both events
-    const completed = await store.skipFinalAudit("run-skip", {
-      callerRole: "human",
-      skippedBy: "human",
-      reason: "verified manually in staging",
-    });
-    assert.equal(completed.finalAuditStatus, "skipped");
-    assert.equal(completed.status, "completed");
-    assert.equal(completed.finalAuditSkipReason, "verified manually in staging");
-
-    const events = await store.getRecentEvents("run-skip", 50);
-    assert.equal(
-      events.filter((e) => e.type === "final_audit_skipped").length,
-      2,
-    );
-    assert.equal(events.filter((e) => e.type === "run_completed").length, 1);
-
-    // MISSIONS.md renders skip details cleanly
-    const md = await readFile(
-      path.join(
-        root,
-        SWARM_DIR,
-        SWARM_RUNS_DIR,
-        "run-skip",
-        SWARM_MISSIONS_FILE,
-      ),
-      "utf8",
-    );
-    assert.match(md, /## Final Verification/);
-    assert.match(md, /\*\*Status:\*\* `skipped`/);
-    assert.match(md, /\*\*Skipped:\*\* by human .* verified manually in staging/);
-  });
-});
-
-// ============================================================================
-// 6. Real Git Worktrees, Scope Checking, Auto-Rebase, Merge & Safe Teardown
+// 5. Real Git Worktrees (Rebase, Merge, Diff, Reuse & Safe memberName Teardown)
 // ============================================================================
 
 describe("WorktreeManager real git repository workflows", () => {
@@ -2107,29 +1290,25 @@ describe("WorktreeManager real git repository workflows", () => {
     assert.equal(ready.baseBranch, "main");
     assert.ok(ready.headSha.length >= 40);
 
-    // Verify .git/info/exclude contains .pi/swarm/
     const excludeContent = await readFile(
       path.join(repoDir, ".git", "info", "exclude"),
       "utf8",
     );
     assert.match(excludeContent, /\.pi\/swarm\//);
 
-    // Writing files inside .pi/swarm/ must NOT make base repo dirty
+    // Writing store/board files inside .pi/swarm/ must NOT make base repo dirty
     const store = new SwarmStore(repoDir);
     await store.createRun({
       id: "run-clean",
-      objective: "Clean git status check",
-      verificationContract: "none",
+      title: "Clean Git Status",
+      objective: "Verify .pi/swarm excluded from git status",
       baseBranch: "main",
       ownerSessionId: "sess-1",
-      missions: [
-        makeMission({ id: "M1", title: "First Mission", scope: ["src/a"] }),
-      ],
     });
     await store.postBoardMessage("run-clean", {
       from: "orchestrator",
       fromRole: "orchestrator",
-      text: "@M1 ready",
+      text: "@all ready",
       kind: "brief",
     });
 
@@ -2139,132 +1318,104 @@ describe("WorktreeManager real git repository workflows", () => {
     assert.equal(baseCheck.currentBranch, "main");
   });
 
-  it("creates worktree, enforces scope violations (committed & untracked), auto-rebases cleanly, and merges serialized", async () => {
+  it("creates member worktrees, detects committed/untracked changes, auto-rebases cleanly, and merges", async () => {
     const repoDir = await makeTempDir("pi-swarm-git-flow-");
     const wtMgr = new WorktreeManager(repoDir);
     const store = new SwarmStore(repoDir);
     await wtMgr.ensureRepoReady("main");
 
-    // Create initial baseline files on main
     await commitFile(repoDir, "src/base.txt", "base\n", "add base file");
 
-    const run = await store.createRun({
-      id: "run-git",
-      objective: "Parallel worktree flow",
-      verificationContract: "tests pass",
-      baseBranch: "main",
-      ownerSessionId: "sess-git",
-      missions: [
-        makeMission({ id: "M1", title: "Feature Alpha", scope: ["src/alpha"] }),
-        makeMission({ id: "M2", title: "Feature Beta", scope: ["src/beta"] }),
-      ],
-    });
+    const branchA = deriveMemberBranch("run-git", "alpha");
+    const branchB = deriveMemberBranch("run-git", "beta");
+    const pathA = store.getWorktreePath("run-git", "alpha");
+    const pathB = store.getWorktreePath("run-git", "beta");
 
-    const wt1 = await wtMgr.createWorktree({
-      branch: run.missions.M1.branch,
+    const wtA = await wtMgr.createWorktree({
+      branch: branchA,
       baseBranch: "main",
-      worktreePath: run.missions.M1.worktreePath,
+      worktreePath: pathA,
     });
-    const wt2 = await wtMgr.createWorktree({
-      branch: run.missions.M2.branch,
+    const wtB = await wtMgr.createWorktree({
+      branch: branchB,
       baseBranch: "main",
-      worktreePath: run.missions.M2.worktreePath,
+      worktreePath: pathB,
     });
 
     // Duplicate branch rejected when reuseExistingBranch is false
     await assert.rejects(
       () =>
         wtMgr.createWorktree({
-          branch: run.missions.M1.branch,
+          branch: branchA,
           baseBranch: "main",
           worktreePath: path.join(repoDir, ".pi/swarm/worktrees/dup"),
         }),
-      (err) => assertProtocolCode(err, "DUPLICATE_BRANCH"),
+      (err) => assertProtocolCode(err, "GIT_ERROR"),
     );
 
-    // M1 commits cleanly inside scope
     await commitFile(
-      wt1.worktreePath,
+      wtA.worktreePath,
       "src/alpha/mod.ts",
       "export const a = 1;\n",
       "add alpha",
     );
-    const m1Changed = await wtMgr.getChangedFiles(
-      "main",
-      "HEAD",
-      wt1.worktreePath,
+    assert.deepEqual(
+      await wtMgr.getChangedFiles("main", "HEAD", wtA.worktreePath),
+      ["src/alpha/mod.ts"],
     );
-    assert.deepEqual(m1Changed, ["src/alpha/mod.ts"]);
-    assert.deepEqual(findScopeViolations(m1Changed, run.missions.M1.scope), []);
 
-    // Diff summary works and reports commitsAhead === 1
-    const diffSummary = await wtMgr.getDiffSummary("main", run.missions.M1.branch);
+    const diffSummary = await wtMgr.getDiffSummary("main", branchA);
     assert.equal(diffSummary.commitsAhead, 1);
     assert.deepEqual(diffSummary.changedFiles, ["src/alpha/mod.ts"]);
     assert.match(diffSummary.diff, /export const a = 1;/);
 
-    // Untracked file outside scope in M2 is detected by getChangedFiles + findScopeViolations!
+    // Commit in beta + untracked file -> detected by getChangedFiles & skipped by autoRebase
     await commitFile(
-      wt2.worktreePath,
+      wtB.worktreePath,
       "src/beta/mod.ts",
       "export const b = 2;\n",
       "add beta",
     );
-    const roguePath = path.join(wt2.worktreePath, "src/outside/rogue.ts");
-    await mkdir(path.dirname(roguePath), { recursive: true });
-    await writeFile(roguePath, "oops\n", "utf8");
-
-    const m2ChangedDirty = await wtMgr.getChangedFiles(
-      "main",
-      "HEAD",
-      wt2.worktreePath,
-    );
+    const wipPath = path.join(wtB.worktreePath, "src/beta/wip.ts");
+    await writeFile(wipPath, "wip\n", "utf8");
     assert.deepEqual(
-      findScopeViolations(m2ChangedDirty, run.missions.M2.scope),
-      ["src/outside/rogue.ts"],
+      await wtMgr.getChangedFiles("main", "HEAD", wtB.worktreePath),
+      ["src/beta/mod.ts", "src/beta/wip.ts"],
     );
+    assert.equal((await wtMgr.autoRebase(wtB.worktreePath, "main")).status, "skipped_dirty");
 
-    // Dirty worktree skips autoRebase safely
-    const skippedRebase = await wtMgr.autoRebase(wt2.worktreePath, "main");
-    assert.equal(skippedRebase.status, "skipped_dirty");
+    await rm(wipPath);
 
-    // Clean up rogue untracked file in M2
-    await rm(roguePath);
-
-    // Merge M1 into main -> base advances!
-    const merge1 = await wtMgr.mergeBranch({
+    // Merge alpha into main -> main advances
+    const mergeA = await wtMgr.mergeBranch({
       baseBranch: "main",
-      branch: run.missions.M1.branch,
-      commitMessage: "merge M1 alpha",
+      branch: branchA,
+      commitMessage: "merge alpha",
     });
-    assert.equal(merge1.strategy, "merge");
-    assert.deepEqual(merge1.changedFiles, ["src/alpha/mod.ts"]);
+    assert.equal(mergeA.strategy, "merge");
+    assert.deepEqual(mergeA.changedFiles, ["src/alpha/mod.ts"]);
     assert.equal(await exists(path.join(repoDir, "src/alpha/mod.ts")), true);
 
-    // Now main has advanced; auto-rebase clean M2 onto updated main!
-    const rebased2 = await wtMgr.autoRebase(wt2.worktreePath, "main");
-    assert.equal(rebased2.status, "rebased");
-    assert.ok(rebased2.newHeadSha);
-    assert.equal(
-      await exists(path.join(wt2.worktreePath, "src/alpha/mod.ts")),
-      true,
-    );
+    // Auto-rebase beta onto updated main
+    const rebasedB = await wtMgr.autoRebase(wtB.worktreePath, "main");
+    assert.equal(rebasedB.status, "rebased");
+    assert.ok(rebasedB.newHeadSha);
+    assert.equal(await exists(path.join(wtB.worktreePath, "src/alpha/mod.ts")), true);
 
     // Running autoRebase again reports up-to-date
-    const upToDate = await wtMgr.autoRebase(wt2.worktreePath, "main");
-    assert.equal(upToDate.status, "up-to-date");
+    assert.equal((await wtMgr.autoRebase(wtB.worktreePath, "main")).status, "up-to-date");
 
-    // Merge M2 into main
-    const merge2 = await wtMgr.mergeBranch({
+    // Fast-forward merge beta when noFf: false
+    const mergeB = await wtMgr.mergeBranch({
       baseBranch: "main",
-      branch: run.missions.M2.branch,
-      commitMessage: "merge M2 beta",
+      branch: branchB,
+      noFf: false,
     });
-    assert.equal(merge2.strategy, "merge");
+    assert.equal(mergeB.strategy, "fast-forward");
     assert.equal(await exists(path.join(repoDir, "src/beta/mod.ts")), true);
   });
 
-  it("aborts cleanly on autoRebase conflict and enforces DIRTY_BASE / WRONG_BRANCH on mergeBranch", async () => {
+  it("aborts cleanly on rebase/merge conflicts and enforces DIRTY_BASE & WRONG_BRANCH", async () => {
     const repoDir = await makeTempDir("pi-swarm-git-conflict-");
     const wtMgr = new WorktreeManager(repoDir);
     await wtMgr.ensureRepoReady("main");
@@ -2275,19 +1426,18 @@ describe("WorktreeManager real git repository workflows", () => {
       "seed shared.txt",
     );
 
-    const wtPath = path.join(repoDir, ".pi/swarm/worktrees/run-c/wt-M1");
+    const wtPath = path.join(repoDir, ".pi/swarm/worktrees/run-c/wt-worker");
     await wtMgr.createWorktree({
-      branch: "feat/conflict-mission",
+      branch: "swarm/run-c/worker",
       baseBranch: "main",
       worktreePath: wtPath,
     });
 
-    // Conflicting edit in mission worktree AND on main
     await commitFile(
       wtPath,
       "shared.txt",
-      "line1\nmission-change\nline3\n",
-      "mission edit",
+      "line1\nworker-change\nline3\n",
+      "worker edit",
     );
     await commitFile(
       repoDir,
@@ -2299,195 +1449,167 @@ describe("WorktreeManager real git repository workflows", () => {
     const rebaseRes = await wtMgr.autoRebase(wtPath, "main");
     assert.equal(rebaseRes.status, "conflict");
     assert.deepEqual(rebaseRes.conflictFiles, ["shared.txt"]);
-    // Worktree MUST be cleanly aborted (not dirty / not stuck mid-rebase!)
     assert.equal(await wtMgr.isWorktreeDirty(wtPath), false);
-    assert.equal(await wtMgr.getCurrentBranch(wtPath), "feat/conflict-mission");
+    assert.equal(await wtMgr.getCurrentBranch(wtPath), "swarm/run-c/worker");
 
-    // DIRTY_BASE guard on mergeBranch
+    // DIRTY_BASE guard
     await writeFile(path.join(repoDir, "uncommitted.txt"), "dirty\n", "utf8");
     await assert.rejects(
       () =>
         wtMgr.mergeBranch({
           baseBranch: "main",
-          branch: "feat/conflict-mission",
+          branch: "swarm/run-c/worker",
         }),
       (err) => assertProtocolCode(err, "DIRTY_BASE"),
     );
     await rm(path.join(repoDir, "uncommitted.txt"));
 
-    // WRONG_BRANCH guard on mergeBranch
+    // WRONG_BRANCH guard
     await git(repoDir, ["checkout", "-b", "other-branch"]);
     await assert.rejects(
       () =>
         wtMgr.mergeBranch({
           baseBranch: "main",
-          branch: "feat/conflict-mission",
+          branch: "swarm/run-c/worker",
         }),
       (err) => assertProtocolCode(err, "WRONG_BRANCH"),
     );
     await git(repoDir, ["checkout", "main"]);
 
-    // Direct merge conflict aborts cleanly and throws REBASE_CONFLICT
+    // Direct merge conflict aborts cleanly & throws REBASE_CONFLICT
     await assert.rejects(
       () =>
         wtMgr.mergeBranch({
           baseBranch: "main",
-          branch: "feat/conflict-mission",
+          branch: "swarm/run-c/worker",
         }),
       (err) => assertProtocolCode(err, "REBASE_CONFLICT"),
     );
     assert.equal(await wtMgr.isWorktreeDirty(repoDir), false);
   });
 
-  it("safeTeardown protects dirty & active worktrees, preserves branches & audit trail by default, and deletes branches only when requested", async () => {
+  it("safeTeardown uses memberName, protects dirty & active worktrees, and deletes branches only when requested", async () => {
     const repoDir = await makeTempDir("pi-swarm-git-teardown-");
     const wtMgr = new WorktreeManager(repoDir);
     const store = new SwarmStore(repoDir);
     await wtMgr.ensureRepoReady("main");
 
-    const run = await store.createRun({
+    await store.createRun({
       id: "run-td",
-      objective: "Safe teardown verification",
-      verificationContract: "none",
+      title: "Safe Teardown Verification",
+      objective: "Ensure dirty/active member worktrees are never wiped",
       baseBranch: "main",
       ownerSessionId: "sess-td",
-      missions: [
-        makeMission({ id: "M1", title: "Clean Mission", scope: ["src/clean"] }),
-        makeMission({ id: "M2", title: "Dirty Mission", scope: ["src/dirty"] }),
-        makeMission({
-          id: "M3",
-          title: "Active Mission",
-          scope: ["src/active"],
-        }),
-        makeMission({
-          id: "M4",
-          title: "Delete Branch Mission",
-          scope: ["src/del"],
-        }),
-      ],
     });
 
-    for (const id of ["M1", "M2", "M3", "M4"] as const) {
+    const members = ["clean-w", "dirty-w", "active-w", "delete-w"] as const;
+    const paths: Record<string, string> = {};
+    const branches: Record<string, string> = {};
+
+    for (const name of members) {
+      paths[name] = store.getWorktreePath("run-td", name);
+      branches[name] = deriveMemberBranch("run-td", name);
       await wtMgr.createWorktree({
-        branch: run.missions[id].branch,
+        branch: branches[name],
         baseBranch: "main",
-        worktreePath: run.missions[id].worktreePath,
+        worktreePath: paths[name],
       });
     }
 
-    // Make M2 dirty with uncommitted work that MUST NOT be deleted
-    const dirtyFile = path.join(run.missions.M2.worktreePath, "wip.txt");
+    const dirtyFile = path.join(paths["dirty-w"], "wip.txt");
     await writeFile(dirtyFile, "precious uncommitted work\n", "utf8");
 
-    // Default safeTeardown preserves branches and audit trail
     const td1 = await wtMgr.safeTeardown([
       {
-        missionId: "M1",
-        worktreePath: run.missions.M1.worktreePath,
-        branch: run.missions.M1.branch,
+        memberName: "clean-w",
+        worktreePath: paths["clean-w"],
+        branch: branches["clean-w"],
         hasActiveAgent: false,
       },
       {
-        missionId: "M2",
-        worktreePath: run.missions.M2.worktreePath,
-        branch: run.missions.M2.branch,
+        memberName: "dirty-w",
+        worktreePath: paths["dirty-w"],
+        branch: branches["dirty-w"],
         hasActiveAgent: false,
       },
       {
-        missionId: "M3",
-        worktreePath: run.missions.M3.worktreePath,
-        branch: run.missions.M3.branch,
+        memberName: "active-w",
+        worktreePath: paths["active-w"],
+        branch: branches["active-w"],
         hasActiveAgent: true,
       },
       {
-        missionId: "M9",
-        worktreePath: path.join(repoDir, ".pi/swarm/worktrees/run-td/wt-M9"),
-        branch: "feat/nonexistent",
+        memberName: "ghost-w",
+        worktreePath: store.getWorktreePath("run-td", "ghost-w"),
+        branch: "swarm/run-td/ghost-w",
         hasActiveAgent: false,
       },
     ]);
 
     assert.equal(td1.errors.length, 0);
     assert.deepEqual(
-      td1.removed.map((r) => r.missionId),
-      ["M1"],
+      td1.removed.map((r) => r.memberName),
+      ["clean-w"],
     );
     assert.deepEqual(
-      td1.skipped.map((s) => ({ id: s.missionId, action: s.action })),
+      td1.skipped.map((s) => ({ name: s.memberName, action: s.action })),
       [
-        { id: "M2", action: "skipped_dirty" },
-        { id: "M3", action: "skipped_active" },
-        { id: "M9", action: "missing" },
+        { name: "dirty-w", action: "skipped_dirty" },
+        { name: "active-w", action: "skipped_active" },
+        { name: "ghost-w", action: "missing" },
       ],
     );
 
-    // M1 worktree removed, M1 branch preserved!
-    assert.equal(await exists(run.missions.M1.worktreePath), false);
-    const branchesAfter1 = await wtMgr.listLocalBranches();
-    assert.ok(branchesAfter1.includes(run.missions.M1.branch));
+    assert.equal(await exists(paths["clean-w"]), false);
+    assert.ok((await wtMgr.listLocalBranches()).includes(branches["clean-w"]));
+    assert.equal(await readFile(dirtyFile, "utf8"), "precious uncommitted work\n");
+    assert.equal(await exists(paths["active-w"]), true);
+    assert.equal((await store.loadRun("run-td")).id, "run-td");
 
-    // M2 uncommitted work and M3 active worktree remain intact!
-    assert.equal(
-      await readFile(dirtyFile, "utf8"),
-      "precious uncommitted work\n",
-    );
-    assert.equal(await exists(run.missions.M3.worktreePath), true);
-
-    // .pi/swarm/runs/ audit trail is completely intact!
-    const reloaded = await store.loadRun("run-td");
-    assert.equal(reloaded.id, "run-td");
-
-    // Explicit deleteBranches: true removes M4 worktree BEFORE deleting M4 branch
     const td2 = await wtMgr.safeTeardown(
       [
         {
-          missionId: "M4",
-          worktreePath: run.missions.M4.worktreePath,
-          branch: run.missions.M4.branch,
+          memberName: "delete-w",
+          worktreePath: paths["delete-w"],
+          branch: branches["delete-w"],
           hasActiveAgent: false,
         },
       ],
       { deleteBranches: true },
     );
     assert.equal(td2.removed.length, 1);
-    assert.equal(await exists(run.missions.M4.worktreePath), false);
-    const branchesAfter2 = await wtMgr.listLocalBranches();
-    assert.equal(branchesAfter2.includes(run.missions.M4.branch), false);
+    assert.equal(td2.removed[0].memberName, "delete-w");
+    assert.equal(await exists(paths["delete-w"]), false);
+    assert.equal((await wtMgr.listLocalBranches()).includes(branches["delete-w"]), false);
   });
 
-  it("reuses an existing checked-out worktree on retry / review fix rounds and re-attaches removed worktrees", async () => {
+  it("reuses existing checked-out worktrees and re-attaches removed worktrees cleanly", async () => {
     const repoDir = await makeTempDir("pi-swarm-git-reuse-");
     const wtMgr = new WorktreeManager(repoDir);
     await wtMgr.ensureRepoReady("main");
 
-    const wtPath = path.join(repoDir, ".pi/swarm/worktrees/run-r/wt-M1");
+    const wtPath = path.join(repoDir, ".pi/swarm/worktrees/run-r/wt-parser");
     const first = await wtMgr.createWorktree({
-      branch: "feat/retry-mission",
+      branch: "swarm/run-r/parser",
       baseBranch: "main",
       worktreePath: wtPath,
     });
 
-    // Simulate worker commit in round 1 + uncommitted WIP before retry/fix round
     const round1Sha = await commitFile(
       first.worktreePath,
       "src/retry.ts",
       "export const round = 1;\n",
       "round 1 commit",
     );
-    await writeFile(
-      path.join(first.worktreePath, "wip.tmp"),
-      "in-progress\n",
-      "utf8",
-    );
+    await writeFile(path.join(first.worktreePath, "wip.tmp"), "in-progress\n", "utf8");
 
-    // Re-calling createWorktree with reuseExistingBranch: true on the SAME existing worktree succeeds!
     const reused = await wtMgr.createWorktree({
-      branch: "feat/retry-mission",
+      branch: "swarm/run-r/parser",
       baseBranch: "main",
       worktreePath: wtPath,
       reuseExistingBranch: true,
     });
-    assert.equal(reused.branch, "feat/retry-mission");
+    assert.equal(reused.branch, "swarm/run-r/parser");
     assert.equal(reused.worktreePath, first.worktreePath);
     assert.equal(await wtMgr.getHeadSha(reused.worktreePath), round1Sha);
     assert.equal(
@@ -2495,12 +1617,11 @@ describe("WorktreeManager real git repository workflows", () => {
       "in-progress\n",
     );
 
-    // Asking reuseExistingBranch: true with a DIFFERENT branch at the same worktree path throws WRONG_BRANCH
-    await git(repoDir, ["branch", "feat/other-branch", "main"]);
+    await git(repoDir, ["branch", "swarm/run-r/other", "main"]);
     await assert.rejects(
       () =>
         wtMgr.createWorktree({
-          branch: "feat/other-branch",
+          branch: "swarm/run-r/other",
           baseBranch: "main",
           worktreePath: wtPath,
           reuseExistingBranch: true,
@@ -2508,18 +1629,17 @@ describe("WorktreeManager real git repository workflows", () => {
       (err) => assertProtocolCode(err, "WRONG_BRANCH"),
     );
 
-    // Removing the worktree (keeping the branch) and calling createWorktree(reuseExistingBranch: true) re-attaches cleanly
     await rm(path.join(reused.worktreePath, "wip.tmp"));
     await wtMgr.removeWorktree(wtPath, { force: true });
     assert.equal(await exists(wtPath), false);
 
     const reattached = await wtMgr.createWorktree({
-      branch: "feat/retry-mission",
+      branch: "swarm/run-r/parser",
       baseBranch: "main",
       worktreePath: wtPath,
       reuseExistingBranch: true,
     });
-    assert.equal(reattached.branch, "feat/retry-mission");
+    assert.equal(reattached.branch, "swarm/run-r/parser");
     assert.equal(await wtMgr.getHeadSha(reattached.worktreePath), round1Sha);
   });
 });

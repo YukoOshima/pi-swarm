@@ -10,20 +10,18 @@ export {
 } from "./rate-limit.js";
 
 export {
-  type BuildWorkerTaskPromptOptions,
-  buildFinalValidatorSystemPrompt,
-  buildFinalValidatorTaskPrompt,
+  buildMemberInitialPrompt,
+  buildMemberSystemPrompt,
   buildOrchestratorContextSummary,
-  buildValidatorSystemPrompt,
-  buildValidatorTaskPrompt,
-  buildWorkerSystemPrompt,
-  buildWorkerTaskPrompt,
+  buildOrchestratorPlaybookSection,
+  buildWakeupPrompt,
   formatBoardExcerpt,
   formatBoardExcerptLine,
 } from "./role-prompts.js";
 
 export {
   type CommandGuardResult,
+  extractSessionMessages,
   findOutOfScopeFiles,
   InProcessPiTransport,
   type InProcessPiTransportOptions,
@@ -34,16 +32,20 @@ export {
   normalizeRepoPath,
   resolveRoleModel,
   resolveWorktreeRelativePath,
+  sanitizeForkSeedMessages,
 } from "./transport.js";
 
 export {
-  SwarmOrchestrator,
-  type SwarmOrchestratorDeps,
-} from "./orchestrator.js";
+  SwarmEngine,
+  type SwarmEngineDeps,
+} from "./engine.js";
 
 export {
-  createOrchestratorTools,
-  createSwarmVerifyTool,
-  type OrchestratorToolDeps,
-  registerOrchestratorTools,
-} from "./coordinator-tools.js";
+  createMemberScopedTools,
+  createMemberTools,
+  createSwarmTools,
+  formatSwarmToolError,
+  type MemberScopedToolContext,
+  registerSwarmTools,
+  type SwarmToolDeps,
+} from "./swarm-tools.js";
