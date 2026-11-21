@@ -734,7 +734,7 @@ export interface IWorktreeManager {
   ): Promise<boolean>;
   safeTeardown(
     targets: SafeTeardownTarget[],
-    options?: { deleteBranches?: boolean },
+    options?: { deleteBranches?: boolean; force?: boolean },
   ): Promise<SafeTeardownResult>;
 }
 
@@ -1058,6 +1058,7 @@ export interface TeardownOptions {
   runId?: string;
   deleteBranches?: boolean;
   sessionId?: string;
+  force?: boolean;
 }
 
 export interface SwarmSnapshot {

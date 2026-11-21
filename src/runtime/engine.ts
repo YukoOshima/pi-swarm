@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { assertOwnerSession } from "../store/index.js";
 import {
   ALL_MENTION_NAME,
   CHANNEL_NAME_PATTERN,
@@ -260,6 +261,10 @@ interface LiveMember {
   retryCount: number;
   /** Timer handle for pending automatic rate-limit retry. */
   retryTimer?: ReturnType<typeof setTimeout>;
+  /** Cumulative tokens persisted from previous handles before revival. */
+  priorHandlesTokens: number;
+  /** Cumulative cost persisted from previous handles before revival. */
+  priorHandlesCost: number;
 }
 
 interface BoardWaiter {
@@ -1020,6 +1025,8 @@ export class SwarmEngine implements ISwarmEngine {
           logTail: [...memberRecord.logTail],
           currentActivity: "queued to start",
           retryCount: 0,
+          priorHandlesTokens: 0,
+          priorHandlesCost: 0,
         };
         this.liveMembers.set(spec.name, live);
 
@@ -1297,6 +1304,7 @@ export class SwarmEngine implements ISwarmEngine {
           { ...(unread.length > 0 ? { messages: unread } : {}) },
         );
       }, waitTimeout);
+      timer.unref?.();
     }
 
     this.orchestratorWait = {
@@ -1496,11 +1504,13 @@ export class SwarmEngine implements ISwarmEngine {
             summary: `Timed out after ${Math.round(options.timeoutMs!)}ms while waiting on board.`,
           });
         }, options.timeoutMs);
+        timeoutHandle.unref?.();
       }
 
       if (options.onProgress) {
         emitProgress();
         progressInterval = setInterval(emitProgress, 1000);
+        progressInterval.unref?.();
       }
     });
   }
@@ -1702,6 +1712,8 @@ export class SwarmEngine implements ISwarmEngine {
         logTail: [...member.logTail],
         lastTool: member.lastTool,
         retryCount: 0,
+        priorHandlesTokens: member.tokens,
+        priorHandlesCost: member.cost,
       };
       this.liveMembers.set(member.name, activeLive);
     }
@@ -2386,6 +2398,9 @@ export class SwarmEngine implements ISwarmEngine {
       throw new SwarmProtocolError("NOT_FOUND", "No Swarm run specified for teardown.");
     }
     const run = await this.store.loadRun(targetRunId);
+    if (options?.sessionId?.trim()) {
+      assertOwnerSession(run, options.sessionId.trim());
+    }
     const targets: SafeTeardownTarget[] = [];
 
     for (const member of Object.values(run.members)) {
@@ -2414,6 +2429,7 @@ export class SwarmEngine implements ISwarmEngine {
 
     const result = await this.worktree.safeTeardown(targets, {
       deleteBranches: options?.deleteBranches ?? false,
+      force: options?.force ?? false,
     });
 
     await this.store.appendEvent({
@@ -2900,6 +2916,10 @@ export class SwarmEngine implements ISwarmEngine {
       const systemPrompt = buildMemberSystemPrompt(run, member);
       const engineApi = this.createMemberBridge(runId, member);
 
+      // Accumulate persisted usage from prior handle lifetimes before spawning replacement handle
+      live.priorHandlesTokens = member.tokens;
+      live.priorHandlesCost = member.cost;
+
       const handle = await this.transport.spawnMember({
         agentId: member.agentId,
         name: member.name,
@@ -3062,8 +3082,14 @@ export class SwarmEngine implements ISwarmEngine {
     }
 
     const nextTurns = member.turns + 1;
-    const nextTokens = Math.max(member.tokens, result.tokens);
-    const nextCost = Math.max(member.cost, result.cost);
+    const nextTokens = Math.max(
+      member.tokens,
+      (live?.priorHandlesTokens ?? 0) + result.tokens,
+    );
+    const nextCost = Math.max(
+      member.cost,
+      (live?.priorHandlesCost ?? 0) + result.cost,
+    );
     const effectiveModel = result.model ?? live?.handle?.getModel() ?? member.model;
     const effectiveThinking =
       result.thinkingLevel ?? live?.handle?.getThinkingLevel() ?? member.thinkingLevel;
@@ -3637,6 +3663,8 @@ export class SwarmEngine implements ISwarmEngine {
         logTail: [...member.logTail],
         lastTool: member.lastTool,
         retryCount: 0,
+        priorHandlesTokens: member.tokens,
+        priorHandlesCost: member.cost,
       };
       this.liveMembers.set(memberName, live);
     }
@@ -3842,6 +3870,7 @@ export class SwarmEngine implements ISwarmEngine {
       this.stallTimer = null;
       void this.fireStallWatchdog(armedRunId, armedHead, timeoutMs);
     }, timeoutMs);
+    this.stallTimer.unref?.();
   }
 
   private async fireStallWatchdog(
@@ -4267,13 +4296,19 @@ export class SwarmEngine implements ISwarmEngine {
         member.lastTool = evt.toolName;
       }
       if (evt.tokens !== undefined) {
-        member.tokens = Math.max(member.tokens, evt.tokens);
+        member.tokens = Math.max(
+          member.tokens,
+          (live?.priorHandlesTokens ?? 0) + evt.tokens,
+        );
       }
       if (evt.tokenBreakdown !== undefined) {
         member.tokenBreakdown = evt.tokenBreakdown;
       }
       if (evt.cost !== undefined) {
-        member.cost = Math.max(member.cost, evt.cost);
+        member.cost = Math.max(
+          member.cost,
+          (live?.priorHandlesCost ?? 0) + evt.cost,
+        );
       }
       if (evt.logLine) {
         member.logTail = live ? [...live.logTail] : [...member.logTail, evt.logLine].slice(-50);

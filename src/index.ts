@@ -66,7 +66,6 @@ import {
   type SwarmRunState,
   type SwarmSettings,
   type SwarmSnapshot,
-  type TeardownEntryResult,
   SwarmProtocolError,
   isSwarmProtocolError,
 } from "./types.js";
@@ -663,6 +662,7 @@ function getOrderedMembers(run: SwarmRunState): SwarmMemberRecord[] {
 function buildRunKickoffMessage(
   run: SwarmRunState,
   spawnedInitial: readonly SwarmMemberRecord[],
+  failedInitial?: ReadonlyArray<{ name: string; error: string }>,
 ): string {
   const lines: string[] = [
     `🐝 Dynamic Swarm "${run.title}" (\`${run.id}\`) is live on \`${run.baseBranch}\` (max concurrency: ${run.maxConcurrency}, Validator policy: ${run.validatorEnabled ? "ON" : "OFF"}).`,
@@ -684,6 +684,13 @@ function buildRunKickoffMessage(
       const wsPart = m.branch ? `${m.workspace}:${m.branch}` : m.workspace;
       lines.push(`- \`@${m.name}\` (${m.role}, \`${wsPart}\`)${seqPart}`);
     }
+    if (failedInitial && failedInitial.length > 0) {
+      lines.push("", "Warning: the following initial member(s) failed to spawn during startup:");
+      for (const f of failedInitial) {
+        lines.push(`- \`@${f.name}\`: ${f.error}`);
+      }
+      lines.push('Inspect and re-add or adjust failed members via `swarm{action:"add"}`.');
+    }
     lines.push(
       "",
       `Coordinate dynamically via \`swarm\`, \`post_message\`, \`read_board\`, and \`swarm_wait\`. Call \`swarm_wait{since: ${run.boardHead}}\` to end your turn cleanly and sleep (non-blocking) while waiting — you'll wake automatically on board messages, \`all_idle\`, or any user redirection. Adjust members mid-flight via \`swarm{action:"steer"|"stop"|"model"|"add"}\`, validate independently, merge worktrees/clones, kill finished helpers, and call \`swarm{action:"done", summary}\` when complete.`,
@@ -699,7 +706,7 @@ function buildRunKickoffMessage(
 
 function buildHelpMarkdown(): string {
   return [
-    "### 🐝 Pi Swarm v0.3.0 (`/swarm`) — Dynamic Antigravity Swarm Commands",
+    "### 🐝 Pi Swarm v0.3.4 (`/swarm`) — Dynamic Antigravity Swarm Commands",
     "",
     "| Command | Description |",
     "| --- | --- |",
@@ -710,7 +717,7 @@ function buildHelpMarkdown(): string {
     "| `/swarm graph` | Zero-LLM-turn ASCII/Unicode Spawn Tree & Peer `@mention` / `#channel` interaction graph |",
     "| `/swarm tasks [tab\\|member\\|#ch]` · `/swarm ui` | Open interactive 4-tab Swarm Overlay (**Board** / **Members** / **Graph** / **Search**) |",
     "| `/swarm models` | Zero-LLM-turn 3-role defaults (`orchestrator` / `worker` / `validator`) + live member models |",
-    "| `/swarm model <target> <model\\|default> [thinking]` | Set a role default (`orchestrator` / `worker` / `validator`) OR hot-switch & resume a waiting member |",
+    "| `/swarm model <target> <model\\|default> [thinking]` | Set a role default (`orchestrator` / `worker` / `validator`) OR switch & resume a waiting/stopped member |",
     "| `/swarm steer <member> <message>` | Redirect a working member immediately or wake a parked member with new direction |",
     "| `/swarm merge <member>` | Merge a member's `share` worktree or `branch` clone onto `baseBranch` (`autoRebase` + `--no-ff`) |",
     "| `/swarm kill <member> [--force] [reason]` | Permanently kill a member and remove its clean worktree (`--force` overrides dirty worktree guard) |",
@@ -1579,14 +1586,14 @@ export function createPiSwarmExtension(
         roleModels: buildRoleModelsFromSettings(currentSettings),
       });
 
-      // 4. Persist session-local focus entry (version: 2)
-      persistFocusEntry(pi, createdRun.id, ownerSessionId, "plan_confirmed");
-
-      // 5. Attach & start the run in SwarmEngine
+      // 4. Attach & start the run in SwarmEngine (defer focus entry until initialMembers settle)
       await engine.startRun(createdRun.id, toolCtx);
 
-      // 6. Pre-create any custom channels referenced by initialMembers, then spawn them immediately
+      // 5. Pre-create any custom channels referenced by initialMembers, then spawn them immediately
       const spawnedInitial: SwarmMemberRecord[] = [];
+      const failedInitial: Array<{ name: string; error: string }> = [];
+      let firstInitialErr: unknown;
+
       if (plan.initialMembers && plan.initialMembers.length > 0) {
         const customChannels = new Set<string>();
         for (const memberSpec of plan.initialMembers) {
@@ -1611,19 +1618,44 @@ export function createPiSwarmExtension(
         }
 
         for (const memberSpec of plan.initialMembers) {
-          const added = await engine.addMembers({
-            name: memberSpec.name,
-            role: memberSpec.role,
-            brief: memberSpec.brief,
-            workspace: memberSpec.workspace ?? "inherit",
-            channels: memberSpec.channels,
-            callerName: ORCHESTRATOR_NAME,
-            callerRole: "orchestrator",
-            hostContext: toolCtx,
-          });
-          spawnedInitial.push(...added);
+          try {
+            const added = await engine.addMembers({
+              name: memberSpec.name,
+              role: memberSpec.role,
+              brief: memberSpec.brief,
+              workspace: memberSpec.workspace ?? "inherit",
+              channels: memberSpec.channels,
+              callerName: ORCHESTRATOR_NAME,
+              callerRole: "orchestrator",
+              hostContext: toolCtx,
+            });
+            spawnedInitial.push(...added);
+          } catch (err) {
+            if (firstInitialErr === undefined) {
+              firstInitialErr = err;
+            }
+            failedInitial.push({
+              name: memberSpec.name,
+              error: formatError(err),
+            });
+          }
+        }
+
+        // If ALL initialMembers failed before any started, roll back run cleanly so draft remains intact
+        if (spawnedInitial.length === 0 && firstInitialErr !== undefined) {
+          await engine.attachRun(null, toolCtx).catch(() => {});
+          await store
+            .updateRun(createdRun.id, {
+              status: "abandoned",
+              actor: ORCHESTRATOR_NAME,
+            })
+            .catch(() => {});
+          throw firstInitialErr;
         }
       }
+
+      // 6. Persist session-local focus entry (version: 2) once run is committed
+      persistFocusEntry(pi, createdRun.id, ownerSessionId, "plan_confirmed");
 
       const finalRun = engine.getSnapshot().run ?? createdRun;
 
@@ -1636,7 +1668,7 @@ export function createPiSwarmExtension(
         type: "kickoff",
         runId: finalRun.id,
         summary: `Dynamic Swarm "${finalRun.title}" (${finalRun.id}) launched`,
-        kickoffBody: buildRunKickoffMessage(finalRun, spawnedInitial),
+        kickoffBody: buildRunKickoffMessage(finalRun, spawnedInitial, failedInitial),
       });
 
       return finalRun;
@@ -2516,7 +2548,7 @@ export function createPiSwarmExtension(
       rawArgs: string,
       ctx: ExtensionCommandContext,
     ): Promise<void> {
-      const { engine, worktree } = await ensureBound(ctx);
+      const { engine } = await ensureBound(ctx);
       const snapshot = engine.getSnapshot();
       if (!snapshot.run) {
         const msg = "No focused Swarm run to tear down.";
@@ -2553,37 +2585,8 @@ export function createPiSwarmExtension(
           runId,
           deleteBranches,
           sessionId,
+          force,
         });
-
-        // With explicit --force, remove skipped_dirty worktrees too (still preserving .pi/swarm/runs/)
-        if (force && result.skipped.some((s) => s.action === "skipped_dirty")) {
-          const remainingSkipped: TeardownEntryResult[] = [];
-          for (const entry of result.skipped) {
-            if (entry.action !== "skipped_dirty") {
-              remainingSkipped.push(entry);
-              continue;
-            }
-            try {
-              await worktree.removeWorktree(entry.worktreePath, { force: true });
-              result.removed.push({
-                memberName: entry.memberName,
-                worktreePath: entry.worktreePath,
-                branch: entry.branch,
-                action: "removed",
-                reason: "Force-removed dirty worktree",
-              });
-            } catch (err) {
-              result.errors.push({
-                memberName: entry.memberName,
-                worktreePath: entry.worktreePath,
-                branch: entry.branch,
-                action: "error",
-                reason: formatError(err),
-              });
-            }
-          }
-          result.skipped = remainingSkipped;
-        }
 
         const report = formatTeardownReport(runId, result, force);
         if (ctx.hasUI) {

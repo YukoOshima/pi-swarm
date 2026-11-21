@@ -1625,6 +1625,31 @@ describe("WorktreeManager real git repository workflows", () => {
       (await wtMgr.listLocalBranches()).includes(cloneTdBranch),
       "safeTeardown(deleteBranches: false) must fetch branch from isolated clone before removing clone dir",
     );
+
+    // 5. safeTeardown(force: true, deleteBranches: true) removes dirty worktree AND deletes its branch
+    const dirtyForcePath = store.getWorktreePath("run-td", "dirty-force");
+    const dirtyForceBranch = deriveMemberBranch("run-td", "dirty-force");
+    await wtMgr.createWorktree({
+      branch: dirtyForceBranch,
+      baseBranch: "main",
+      worktreePath: dirtyForcePath,
+    });
+    await writeFile(path.join(dirtyForcePath, "dirty.txt"), "uncommitted\n", "utf8");
+    const tdForce = await wtMgr.safeTeardown(
+      [
+        {
+          memberName: "dirty-force",
+          worktreePath: dirtyForcePath,
+          branch: dirtyForceBranch,
+          hasActiveAgent: false,
+        },
+      ],
+      { force: true, deleteBranches: true },
+    );
+    assert.equal(tdForce.removed.length, 1);
+    assert.equal(tdForce.skipped.length, 0);
+    assert.equal(await exists(dirtyForcePath), false);
+    assert.equal((await wtMgr.listLocalBranches()).includes(dirtyForceBranch), false);
   });
 
   it("reuses existing checked-out worktrees and re-attaches removed worktrees cleanly", async () => {

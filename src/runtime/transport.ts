@@ -876,6 +876,8 @@ export class InProcessPiTransport implements ISwarmTransport {
     let endTurnRequested = false;
     let switchingModel = false;
     let killed = false;
+    let sessionBaselineTokens = 0;
+    let sessionBaselineCost = 0;
     const isKilled = (): boolean => killed;
     let abortedByCaller = false;
     const isAbortedByCaller = (): boolean => abortedByCaller;
@@ -959,16 +961,18 @@ export class InProcessPiTransport implements ISwarmTransport {
       }
       try {
         const stats = activeSession.getSessionStats();
+        const deltaTokens = Math.max(0, stats.tokens.total - sessionBaselineTokens);
+        const deltaCost = Math.max(0, stats.cost - sessionBaselineCost);
         return {
-          tokens: stats.tokens.total,
+          tokens: deltaTokens,
           breakdown: {
             input: stats.tokens.input,
             output: stats.tokens.output,
             cacheRead: stats.tokens.cacheRead,
             cacheWrite: stats.tokens.cacheWrite,
-            total: stats.tokens.total,
+            total: deltaTokens,
           },
-          cost: stats.cost,
+          cost: deltaCost,
         };
       } catch {
         return { tokens: 0, cost: 0 };
@@ -1116,6 +1120,14 @@ export class InProcessPiTransport implements ISwarmTransport {
           session = created.session;
           await session.bindExtensions({});
           currentSessionFile = session.sessionManager?.getSessionFile?.() ?? currentSessionFile;
+          try {
+            const baseline = session.getSessionStats();
+            sessionBaselineTokens = Math.max(0, baseline.tokens.total);
+            sessionBaselineCost = Math.max(0, baseline.cost);
+          } catch {
+            sessionBaselineTokens = 0;
+            sessionBaselineCost = 0;
+          }
 
           // Guarantee immediate turn termination when `swarm_wait` (or self `model` switch) runs
           // inside the same parallel tool batch alongside `post_message`!

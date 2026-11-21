@@ -44,6 +44,7 @@ import {
   createPiSwarmExtension,
   parseSwarmCommand,
 } from "../src/index.js";
+import { WorktreeManager } from "../src/store/index.js";
 import {
   type AgentTurnResult,
   type IQuestionnaireUI,
@@ -2011,6 +2012,107 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     assert.equal(stopRes.details?.stopped, true);
 
     await harness.executeTool(SWARM_TOOL, { action: "done", summary: "API v2 shipped" });
+    await harness.emit("session_shutdown", {});
+  });
+
+  it("5. keeps tool profile & focus consistent on partial/full initial_members launch failure in propose_swarm_plan", async () => {
+    const repoDir = await createTempGitRepo("initial-members-resilience");
+    tempDirs.push(repoDir);
+
+    const spawnFailures = new Set<string>(["broken"]);
+    const mockTransport: ISwarmTransport = {
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        const tracker = createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async () => ({
+            agentId: request.agentId,
+            name: request.name,
+            role: request.role,
+            outcome: "waiting",
+            summary: `${request.name} ready`,
+            tokens: 100,
+            cost: 0.001,
+          }),
+        });
+        return tracker.handle;
+      },
+    };
+
+    const wtMgr = new WorktreeManager(repoDir);
+    const origCreateWt = wtMgr.createWorktree.bind(wtMgr);
+    wtMgr.createWorktree = async (opts) => {
+      for (const bad of spawnFailures) {
+        if (opts.branch.includes(`/${bad}`)) {
+          throw new SwarmProtocolError("GIT_ERROR", `Simulated failure creating worktree for ${bad}`);
+        }
+      }
+      return origCreateWt(opts);
+    };
+
+    const harness = createMockPiHarness(repoDir, { mode: "tui" });
+    const ext = createPiSwarmExtension({
+      transportFactory: () => mockTransport,
+      worktreeFactory: () => wtMgr,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: false,
+      }),
+    });
+    ext(harness.pi);
+    await harness.emit("session_start", {});
+
+    // Case A: SOLE initial_member fails -> full rollback, draft preserved, zero dangling focus entry!
+    await harness.runCommand("swarm-direct", "Run where sole initial member fails");
+    const failAllRes = await harness.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Fail All Initial",
+      objective: "Verify rollback when all initial_members fail",
+      strategy: "Single share worker",
+      acceptance_criteria: "Clean rollback",
+      base_branch: "main",
+      initial_members: [
+        { name: "broken", role: "worker", workspace: "share", brief: "Will fail" },
+      ],
+    });
+    assert.equal(failAllRes.isError, true);
+    assert.equal(
+      harness.branch.some((e) => e.customType === SWARM_FOCUS_ENTRY),
+      false,
+      "Full initial_members failure must NOT leave a dangling focus entry",
+    );
+    assert.equal(
+      harness.pi.getActiveTools().includes(PROPOSE_SWARM_PLAN_TOOL),
+      true,
+      "Drafting tools must remain active when all initial_members fail",
+    );
+
+    // Case B: Partial success (worker ok, broken fails) -> transitions cleanly to `running` tools and warns in kickoff!
+    const partialRes = await harness.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Partial Initial",
+      objective: "Survive partial initial_members failure",
+      strategy: "One succeeds, one fails",
+      acceptance_criteria: "Running tools unlocked + failure surfaced in kickoff",
+      base_branch: "main",
+      initial_members: [
+        { name: "healthy", role: "worker", workspace: "inherit", brief: "Do useful work" },
+        { name: "broken", role: "worker", workspace: "share", brief: "Fail worktree provisioning" },
+      ],
+    });
+    assert.equal(partialRes.isError, undefined);
+    const activeTools = harness.pi.getActiveTools();
+    assert.ok(activeTools.includes(SWARM_TOOL));
+    assert.ok(activeTools.includes(POST_MESSAGE_TOOL));
+    assert.ok(!activeTools.includes(PROPOSE_SWARM_PLAN_TOOL));
+
+    await waitFor(() =>
+      harness.sentMessages.some((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE),
+    );
+    const kickoff = harness.sentMessages
+      .filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE)
+      .pop()!;
+    assert.match(String(kickoff.message.content), /healthy/);
+    assert.match(String(kickoff.message.content), /@broken.*Simulated failure/);
+
+    await harness.executeTool(SWARM_TOOL, { action: "done", summary: "Recovered cleanly" });
     await harness.emit("session_shutdown", {});
   });
 });

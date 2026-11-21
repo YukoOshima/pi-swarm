@@ -3541,4 +3541,75 @@ describe("SwarmEngine — v0.3.1 Hardening & Optimizations", () => {
       }
     }
   });
+
+  it("v0.3.4: enforces owner session on engine.teardown and accumulates tokens/cost across stopped->revived handles", async () => {
+    // A. Cross-session teardown ownership protection
+    {
+      const { engine } = await createTestHarness({ stallWatchdogEnabled: false });
+      try {
+        const ownerSess = engine.getSnapshot().run!.ownerSessionId;
+        await assert.rejects(
+          () => engine.teardown({ sessionId: "foreign-session-999" }),
+          (err) => err instanceof SwarmProtocolError && err.code === "OWNERSHIP_CONFLICT",
+        );
+        const okRes = await engine.teardown({ sessionId: ownerSess });
+        assert.equal(okRes.errors.length, 0);
+      } finally {
+        await engine.dispose();
+      }
+    }
+
+    // B. Exact cross-handle token & cost accumulation across handle #1 (stop) -> handle #2 (revive)
+    {
+      const { engine, transport } = await createTestHarness({
+        stallWatchdogEnabled: false,
+        keepWorkersWarm: false,
+      });
+      let spawnCount = 0;
+      transport.onMember("ledger", async () => {
+        spawnCount += 1;
+        if (spawnCount === 1) {
+          return {
+            outcome: "stopped",
+            summary: "Handle 1 finished initial phase",
+            tokens: 900,
+            cost: 0.009,
+          };
+        }
+        return {
+          outcome: "stopped",
+          summary: "Handle 2 finished follow-up phase",
+          tokens: 300,
+          cost: 0.003,
+        };
+      });
+
+      try {
+        await engine.addMembers({ name: "ledger", brief: "Initial pass" });
+        await waitUntil(() => engine.getSnapshot().run?.members.ledger?.state === "stopped");
+        assert.equal(engine.getSnapshot().run?.members.ledger?.tokens, 900);
+        assert.equal(engine.getSnapshot().totalTokens, 900);
+
+        await engine.postMessage({
+          from: "orchestrator",
+          fromRole: "orchestrator",
+          text: "@ledger Follow-up pass on fresh revived handle",
+        });
+        await waitUntil(
+          () => spawnCount === 2 && engine.getSnapshot().run?.members.ledger?.state === "stopped",
+        );
+
+        const snapAfterRevive = engine.getSnapshot();
+        assert.equal(
+          snapAfterRevive.run?.members.ledger?.tokens,
+          1200,
+          "Revived handle usage must add cleanly onto prior handle total (900 + 300 = 1200)",
+        );
+        assert.ok(Math.abs((snapAfterRevive.run?.members.ledger?.cost ?? 0) - 0.012) < 1e-6);
+        assert.equal(snapAfterRevive.totalTokens, 1200);
+      } finally {
+        await engine.dispose();
+      }
+    }
+  });
 });

@@ -971,12 +971,13 @@ export class WorktreeManager implements IWorktreeManager {
 
   async safeTeardown(
     targets: SafeTeardownTarget[],
-    options?: { deleteBranches?: boolean },
+    options?: { deleteBranches?: boolean; force?: boolean },
   ): Promise<SafeTeardownResult> {
     const removed: TeardownEntryResult[] = [];
     const skipped: TeardownEntryResult[] = [];
     const errors: TeardownEntryResult[] = [];
     const deleteBranches = Boolean(options?.deleteBranches);
+    const force = Boolean(options?.force);
 
     for (const target of targets) {
       const resolvedPath = path.resolve(target.worktreePath);
@@ -1021,7 +1022,7 @@ export class WorktreeManager implements IWorktreeManager {
         }
 
         const dirty = await this.isWorktreeDirty(resolvedPath);
-        if (dirty) {
+        if (dirty && !force) {
           skipped.push({
             memberName: target.memberName,
             worktreePath: resolvedPath,
@@ -1035,7 +1036,11 @@ export class WorktreeManager implements IWorktreeManager {
 
         // Preserve committed branches from isolated `branch` clones before removing dir when keeping branches.
         if (!deleteBranches && target.branch) {
-          await this.fetchBranchFromClone(resolvedPath, target.branch);
+          if (dirty) {
+            await this.fetchBranchFromClone(resolvedPath, target.branch).catch(() => {});
+          } else {
+            await this.fetchBranchFromClone(resolvedPath, target.branch);
+          }
         }
 
         // Deregister worktree BEFORE any branch operations.
@@ -1052,6 +1057,7 @@ export class WorktreeManager implements IWorktreeManager {
           worktreePath: resolvedPath,
           branch: target.branch,
           action: "removed",
+          ...(dirty && force ? { reason: "Force-removed dirty worktree" } : {}),
         });
       } catch (err) {
         errors.push({
