@@ -1,6 +1,6 @@
 {
   "name": "pi-swarm",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Dynamic Antigravity Swarm multi-agent orchestration for Pi with pi-goal-x upfront Q&A planning, 3-role Orchestrator/Worker/Validator models, shared Message Board & channels, warm persistent sessions with context forking, hot model switching, and optional isolated Git worktrees.",
   "type": "module",
   "license": "MIT",

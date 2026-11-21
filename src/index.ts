@@ -36,10 +36,11 @@ import {
   registerDraftingTools,
 } from "./drafting/index.js";
 import {
-  InProcessPiTransport,
-  SwarmEngine,
   buildOrchestratorPlaybookSection,
+  formatBoardExcerptLine,
+  InProcessPiTransport,
   registerSwarmTools,
+  SwarmEngine,
 } from "./runtime/index.js";
 import {
   SWARM_SETTINGS_BOUNDS,
@@ -50,6 +51,7 @@ import {
   saveSwarmSettings,
 } from "./store/index.js";
 import {
+  type BoardMessage,
   type IQuestionnaireUI,
   type ISwarmEngine,
   type ISwarmStore,
@@ -65,7 +67,6 @@ import {
   type SwarmSettings,
   type SwarmSnapshot,
   type TeardownEntryResult,
-  type WaitForBoardOptions,
   isSwarmProtocolError,
 } from "./types.js";
 import {
@@ -132,6 +133,10 @@ export const SWARM_SUBCOMMANDS: ReadonlyArray<{
     name: "model",
     description: "Set role default or hot-switch waiting member (<target> <model|default> [thinking])",
   },
+  {
+    name: "steer",
+    description: "Send dynamic direction/steering to a working or parked member (<member> <message>)",
+  },
   { name: "merge", description: "Merge a member's share/branch worktree into baseBranch" },
   { name: "kill", description: "Permanently kill a member (<member> [--force] [reason])" },
   { name: "done", description: "Complete the active Swarm run and restore idle tools [summary]" },
@@ -165,6 +170,7 @@ const ARG_SUBCOMMANDS = new Set([
   "tasks",
   "ui",
   "model",
+  "steer",
   "merge",
   "kill",
   "done",
@@ -210,6 +216,7 @@ export interface ParsedSwarmInvocation {
     | "ui"
     | "models"
     | "model"
+    | "steer"
     | "merge"
     | "kill"
     | "done"
@@ -242,6 +249,7 @@ export function parseSwarmCommand(rawArgs: string): ParsedSwarmInvocation {
         | "tasks"
         | "ui"
         | "model"
+        | "steer"
         | "merge"
         | "kill"
         | "done"
@@ -677,7 +685,7 @@ function buildRunKickoffMessage(
     }
     lines.push(
       "",
-      `Coordinate dynamically via \`swarm\`, \`post_message\`, \`read_board\`, and \`swarm_wait\`. Call \`swarm_wait{since: ${run.boardHead}}\` to wait for initial reports (or spawn additional members right away), then adapt wave-by-wave, validate independently, merge \`share\`/\`branch\` worktrees, kill finished helpers, and call \`swarm{action:"done", summary}\` when complete.`,
+      `Coordinate dynamically via \`swarm\`, \`post_message\`, \`read_board\`, and \`swarm_wait\`. Call \`swarm_wait{since: ${run.boardHead}}\` to end your turn cleanly and sleep (non-blocking) while waiting — you'll wake automatically on board messages, \`all_idle\`, or any user redirection. Adjust members mid-flight via \`swarm{action:"steer"|"stop"|"model"|"add"}\`, validate independently, merge worktrees/clones, kill finished helpers, and call \`swarm{action:"done", summary}\` when complete.`,
     );
   } else {
     lines.push(
@@ -690,7 +698,7 @@ function buildRunKickoffMessage(
 
 function buildHelpMarkdown(): string {
   return [
-    "### 🐝 Pi Swarm v0.2.0 (`/swarm`) — Dynamic Antigravity Swarm Commands",
+    "### 🐝 Pi Swarm v0.3.0 (`/swarm`) — Dynamic Antigravity Swarm Commands",
     "",
     "| Command | Description |",
     "| --- | --- |",
@@ -701,8 +709,9 @@ function buildHelpMarkdown(): string {
     "| `/swarm graph` | Zero-LLM-turn ASCII/Unicode Spawn Tree & Peer `@mention` / `#channel` interaction graph |",
     "| `/swarm tasks [tab\\|member\\|#ch]` · `/swarm ui` | Open interactive 4-tab Swarm Overlay (**Board** / **Members** / **Graph** / **Search**) |",
     "| `/swarm models` | Zero-LLM-turn 3-role defaults (`orchestrator` / `worker` / `validator`) + live member models |",
-    "| `/swarm model <target> <model\\|default> [thinking]` | Set a role default (`orchestrator` / `worker` / `validator`) OR hot-switch a warm `waiting` member keeping full history |",
-    "| `/swarm merge <member>` | Merge a member's `share`/`branch` worktree onto `baseBranch` (`autoRebase` + `--no-ff`) |",
+    "| `/swarm model <target> <model\\|default> [thinking]` | Set a role default (`orchestrator` / `worker` / `validator`) OR hot-switch & resume a waiting member |",
+    "| `/swarm steer <member> <message>` | Redirect a working member immediately or wake a parked member with new direction |",
+    "| `/swarm merge <member>` | Merge a member's `share` worktree or `branch` clone onto `baseBranch` (`autoRebase` + `--no-ff`) |",
     "| `/swarm kill <member> [--force] [reason]` | Permanently kill a member and remove its clean worktree (`--force` overrides dirty worktree guard) |",
     "| `/swarm done [summary]` | Complete the active Swarm run, dispose warm handles, and restore `idle` tools |",
     "| `/swarm pause [reason]` / `/swarm resume` | Pause or resume member launches and board wakeups |",
@@ -710,9 +719,10 @@ function buildHelpMarkdown(): string {
     "| `/swarm teardown [--force] [--delete-branches]` | Safely remove clean idle worktrees while preserving `.pi/swarm/runs/` audit & board history |",
     "| `/swarm runs` | List all runs stored in `.pi/swarm/runs/` |",
     "| `/swarm focus [run-id\\|none]` | Switch or detach session-local run focus |",
-    "| `/swarm settings` | Inspect or adjust 3-role models, warm sessions, validator policy, stall watchdog & git settings |",
+    "| `/swarm settings` | Inspect or adjust 3-role models, warm pool, smart LLM monitor, & git settings |",
     "| `/swarm help` | Print this command reference (zero LLM turn) |",
     "",
+    "**Mid-Flight Redirection:** While workers run after Orchestrator calls `swarm_wait`, simply type any message directly to the Orchestrator to adjust direction, or run `/swarm steer <member> <msg>`.",
     "**TUI Shortcuts:** `Ctrl+Shift+T` toggles expanded above-editor dashboard · `Esc` collapses expanded dashboard.",
   ].join("\n");
 }
@@ -774,6 +784,7 @@ function formatSettingsMarkdown(
     `| \`keepWorkersWarm\` | ${settings.keepWorkersWarm ? "ON" : "OFF"} |`,
     `| \`validatorEnabled\` | ${settings.validatorEnabled ? "ON" : "OFF"} |`,
     `| \`stallWatchdogEnabled\` | ${settings.stallWatchdogEnabled ? "ON" : "OFF"} |`,
+    `| \`stallMonitorMode\` | \`${settings.stallMonitorMode}\` |`,
     `| \`stallTimeoutMs\` | ${settings.stallTimeoutMs}ms |`,
     `| \`maxConcurrency\` | ${settings.maxConcurrency} |`,
     `| \`maxRetries\` | ${settings.maxRetries} |`,
@@ -799,6 +810,7 @@ interface PendingWakeupItem {
   runId: string | null;
   memberName?: string;
   seq?: number;
+  messages?: BoardMessage[];
   summary: string;
   kickoffBody?: string;
 }
@@ -826,9 +838,7 @@ export function createPiSwarmExtension(
     let unbindShortcuts: (() => void) | undefined;
     let activeWidgetTui: TUI | undefined;
     let isShutDown = false;
-
-    /** Tracks active blocking `swarm_wait` tool calls so we never double-wake the Orchestrator. */
-    let activeSwarmWaitCount = 0;
+    let latestHumanDirection: { text: string; timestamp: string } | undefined;
 
     const widgetState: SwarmWidgetState = createSwarmWidgetState();
 
@@ -1084,12 +1094,25 @@ export function createPiSwarmExtension(
           (w) => w.runId === item.runId && w.seq === item.seq,
         );
         if (existingIdx >= 0) {
-          if (
-            item.type === "stall_detected" &&
-            pendingWakeups[existingIdx]!.type !== "stall_detected"
-          ) {
-            pendingWakeups[existingIdx] = item;
+          const existing = pendingWakeups[existingIdx]!;
+          const mergedBySeq = new Map<number, BoardMessage>();
+          for (const m of existing.messages ?? []) {
+            mergedBySeq.set(m.seq, m);
           }
+          for (const m of item.messages ?? []) {
+            mergedBySeq.set(m.seq, m);
+          }
+          const mergedMessages =
+            mergedBySeq.size > 0
+              ? Array.from(mergedBySeq.values()).sort((a, b) => a.seq - b.seq)
+              : undefined;
+          const keepStall =
+            item.type === "stall_detected" || existing.type === "stall_detected";
+          pendingWakeups[existingIdx] = {
+            ...(item.type === "stall_detected" ? item : existing),
+            type: keepStall ? "stall_detected" : existing.type,
+            ...(mergedMessages ? { messages: mergedMessages } : {}),
+          };
           scheduleWakeupFlush();
           return;
         }
@@ -1176,7 +1199,13 @@ export function createPiSwarmExtension(
           }
 
           const seenKeys = new Set<string>();
+          const formattedBoardMsgs = new Map<number, BoardMessage>();
           for (const item of batch) {
+            if (item.messages) {
+              for (const m of item.messages) {
+                formattedBoardMsgs.set(m.seq, m);
+              }
+            }
             const key =
               item.seq !== undefined
                 ? `seq:${item.seq}`
@@ -1186,6 +1215,14 @@ export function createPiSwarmExtension(
             const seqTag = item.seq !== undefined ? `[#${item.seq}] ` : "";
             const memberTag = item.memberName ? `@${item.memberName}: ` : "";
             lines.push(`- ${seqTag}${memberTag}${item.summary}`);
+          }
+
+          if (formattedBoardMsgs.size > 0) {
+            const ordered = Array.from(formattedBoardMsgs.values()).sort((a, b) => a.seq - b.seq);
+            lines.push("", "Board messages:");
+            for (const msg of ordered) {
+              lines.push(formatBoardExcerptLine(msg, 600));
+            }
           }
 
           const total = snapshot.run.memberOrder.length;
@@ -1241,9 +1278,12 @@ export function createPiSwarmExtension(
         if (ev.snapshot.run?.status !== "active") {
           return;
         }
-        // Skip waking the Orchestrator if a `swarm_wait` tool call is actively awaiting the board,
-        // because `swarm_wait` already delivers those exact messages directly!
-        if (activeSwarmWaitCount > 0) {
+        // Smart monitor surgically targeted a specific member -> do NOT wake Orchestrator.
+        if (
+          ev.type === "stall_detected" &&
+          ev.memberName &&
+          ev.memberName.toLowerCase() !== ORCHESTRATOR_NAME
+        ) {
           return;
         }
         enqueueWakeupItem({
@@ -1251,6 +1291,7 @@ export function createPiSwarmExtension(
           runId: ev.runId,
           memberName: ev.memberName,
           seq: ev.seq,
+          messages: ev.messages,
           summary: ev.summary,
         });
       }
@@ -1413,10 +1454,10 @@ export function createPiSwarmExtension(
 
     async function disposeRuntime(ctx?: ExtensionContext): Promise<void> {
       isShutDown = true;
+      latestHumanDirection = undefined;
       pendingWakeups.length = 0;
       wakeupFlushScheduled = false;
       wakeupInFlight = false;
-      activeSwarmWaitCount = 0;
 
       if (unsubEngine) {
         unsubEngine();
@@ -1469,23 +1510,11 @@ export function createPiSwarmExtension(
 
     /**
      * Engine proxy passed into the 4 core Swarm tools:
-     * - Tracks active `waitForBoard` calls so `handleEngineEvent` skips duplicate wakeups
-     *   while `swarm_wait` is already blocked awaiting those messages.
      * - Restores `"idle"` tool profile immediately after `completeRun` (`swarm{action:"done"}`).
      */
     const toolEngineProxy: ISwarmEngine = new Proxy({} as ISwarmEngine, {
       get(_obj, prop, receiver) {
         const target = ensureBoundSync().engine;
-        if (prop === "waitForBoard") {
-          return async (options: WaitForBoardOptions) => {
-            activeSwarmWaitCount += 1;
-            try {
-              return await target.waitForBoard(options);
-            } finally {
-              activeSwarmWaitCount = Math.max(0, activeSwarmWaitCount - 1);
-            }
-          };
-        }
         if (prop === "completeRun") {
           return async (options: Parameters<ISwarmEngine["completeRun"]>[0]) => {
             const completed = await target.completeRun(options);
@@ -2057,6 +2086,47 @@ export function createPiSwarmExtension(
         });
       } catch (err) {
         const msg = `Failed to switch model for "${target}": ${formatError(err)}`;
+        if (ctx.hasUI) ctx.ui.notify(msg, "error");
+        else emitZeroTurnMessage(ctx, msg);
+      }
+    }
+
+    async function handleSteerCommand(
+      rawArgs: string,
+      ctx: ExtensionCommandContext,
+    ): Promise<void> {
+      const { engine } = await ensureBound(ctx);
+      const snapshot = engine.getSnapshot();
+      if (!snapshot.run) {
+        const msg = "No focused Swarm run. Start one with `/swarm <goal>` first.";
+        if (ctx.hasUI) ctx.ui.notify(msg, "info");
+        else emitZeroTurnMessage(ctx, msg);
+        return;
+      }
+
+      const trimmed = rawArgs.trim();
+      const spaceIdx = trimmed.search(/\s/);
+      const target = (spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx)).replace(/^@/, "").trim();
+      const message = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx).trim();
+
+      if (!target || !message) {
+        const usage = "Usage: `/swarm steer <member-name> <message>`";
+        if (ctx.hasUI) ctx.ui.notify(usage, "warning");
+        emitZeroTurnMessage(ctx, usage);
+        return;
+      }
+
+      try {
+        const res = await engine.steerMember(target, message, "steer", {
+          callerName: "human",
+          callerRole: "human",
+        });
+        refreshUI(ctx);
+        const msg = `Sent dynamic direction to \`@${target}\` (${res.delivery}): ${message}`;
+        if (ctx.hasUI) ctx.ui.notify(`Steered @${target} (${res.delivery}).`, "info");
+        emitZeroTurnMessage(ctx, `⚡ ${msg}`, { target, delivery: res.delivery });
+      } catch (err) {
+        const msg = `Failed to steer @${target}: ${formatError(err)}`;
         if (ctx.hasUI) ctx.ui.notify(msg, "error");
         else emitZeroTurnMessage(ctx, msg);
       }
@@ -2690,6 +2760,7 @@ export function createPiSwarmExtension(
           `keepWorkersWarm: ${currentSettings.keepWorkersWarm ? "ON" : "OFF"}`,
           `validatorEnabled: ${currentSettings.validatorEnabled ? "ON" : "OFF"}`,
           `stallWatchdogEnabled: ${currentSettings.stallWatchdogEnabled ? "ON" : "OFF"}`,
+          `stallMonitorMode: ${currentSettings.stallMonitorMode}`,
           `stallTimeoutMs: ${currentSettings.stallTimeoutMs}`,
           `maxConcurrency: ${currentSettings.maxConcurrency}`,
           `autoRebase: ${currentSettings.autoRebase ? "ON" : "OFF"}`,
@@ -2738,6 +2809,14 @@ export function createPiSwarmExtension(
             });
             ctx.ui.notify(
               `Saved stallWatchdogEnabled = ${currentSettings.stallWatchdogEnabled ? "ON" : "OFF"} (${saveScope}).`,
+              "info",
+            );
+          } else if (picked.startsWith("stallMonitorMode:")) {
+            const nextMode =
+              currentSettings.stallMonitorMode === "llm" ? "deterministic" : "llm";
+            await persistPatch({ stallMonitorMode: nextMode });
+            ctx.ui.notify(
+              `Saved stallMonitorMode = ${currentSettings.stallMonitorMode} (${saveScope}).`,
               "info",
             );
           } else if (picked.startsWith("stallTimeoutMs:")) {
@@ -2920,6 +2999,9 @@ export function createPiSwarmExtension(
           return;
         case "model":
           await handleModelCommand(parsed.rest, ctx);
+          return;
+        case "steer":
+          await handleSteerCommand(parsed.rest, ctx);
           return;
         case "merge":
           await handleMergeCommand(parsed.rest, ctx);
@@ -3119,6 +3201,20 @@ export function createPiSwarmExtension(
         return null;
       }
 
+      if (sub === "steer") {
+        const run = getSnapshotSafe().run;
+        if (!run) return null;
+        const lowerActive = argPrefix.toLowerCase();
+        const items = getOrderedMembers(run)
+          .filter((entry) => entry.state !== "killed" && entry.name.toLowerCase().startsWith(lowerActive))
+          .map((entry): AutocompleteItem => ({
+            value: `steer ${entry.name} `,
+            label: entry.name,
+            description: `${entry.role} [${entry.state}]`,
+          }));
+        return items.length > 0 ? items : null;
+      }
+
       if (sub === "merge") {
         const run = getSnapshotSafe().run;
         if (!run) return null;
@@ -3213,7 +3309,7 @@ export function createPiSwarmExtension(
     // ------------------------------------------------------------------------
     pi.registerCommand("swarm", {
       description:
-        "Pi Swarm v0.2.0 — Dynamic Antigravity Swarm orchestrator (shared #seq board, warm sessions, fork, 3-role models & git worktrees)",
+        "Pi Swarm v0.3.0 — Dynamic Antigravity Swarm orchestrator (shared #seq board, non-blocking swarm_wait, warm disk sessions, fork, 3-role models & git worktrees/clones)",
       getArgumentCompletions: getSwarmCompletions,
       handler: handleSwarmCommand,
     });
@@ -3248,6 +3344,30 @@ export function createPiSwarmExtension(
       await rehydrateSessionState(ctx);
     });
 
+    pi.on("input", (event, _ctx) => {
+      if (
+        event.source === "interactive" &&
+        !draftController.isActive() &&
+        activeEngine
+      ) {
+        const snap = activeEngine.getSnapshot();
+        const trimmedText = event.text.trim();
+        if (
+          snap.run &&
+          snap.run.status === "active" &&
+          trimmedText.length > 0 &&
+          !trimmedText.startsWith("/")
+        ) {
+          activeEngine.clearOrchestratorWait("User sent interactive direction");
+          latestHumanDirection = {
+            text: trimmedText,
+            timestamp: new Date().toISOString(),
+          };
+        }
+      }
+      return { action: "continue" };
+    });
+
     pi.on("before_agent_start", async (event, ctx) => {
       lastCtx = ctx;
       const draft = draftController.getDraft() ?? draftController.rehydrate(ctx);
@@ -3258,7 +3378,11 @@ export function createPiSwarmExtension(
       } else {
         const snapshot = getSnapshotSafe();
         if (isRunningProfileRun(snapshot.run)) {
-          sectionContent = buildOrchestratorPlaybookSection(snapshot);
+          const steerText = latestHumanDirection?.text;
+          latestHumanDirection = undefined;
+          sectionContent = buildOrchestratorPlaybookSection(snapshot, {
+            ...(steerText ? { humanSteeringText: steerText } : {}),
+          });
         }
       }
 

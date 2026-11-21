@@ -7,6 +7,8 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 export type SwarmModelRole = "orchestrator" | "worker" | "validator";
 
+export type StallMonitorMode = "llm" | "deterministic";
+
 export interface SwarmRoleModelConfig {
   model?: string | undefined;
   thinkingLevel?: ThinkingLevel | undefined;
@@ -31,6 +33,7 @@ export interface SwarmSettings {
   validatorEnabled: boolean;
   keepWorkersWarm: boolean;
   stallWatchdogEnabled: boolean;
+  stallMonitorMode: StallMonitorMode;
   stallTimeoutMs: number;
   maxRetries: number;
   rateLimitBaseBackoffMs: number;
@@ -82,6 +85,8 @@ export type SwarmAction =
   | "status"
   | "models"
   | "model"
+  | "steer"
+  | "stop"
   | "kill"
   | "merge"
   | "channel"
@@ -129,6 +134,8 @@ export interface SwarmMemberRecord {
   cwd: string;
   /** Git branch (`swarm/<run-short>/<name>`) for `"share"` / `"branch"`. */
   branch?: string;
+  /** Disk-persisted Pi SessionManager JSONL path for crash/restart recovery. */
+  sessionFile?: string;
   mergedCommitSha?: string;
   forkedFrom?: string;
   /** Subscribed channels; `"main"` is always implicitly included, and `channels[0]` is default. */
@@ -509,6 +516,7 @@ export interface RegisterMemberInput {
   workspace: SwarmWorkspaceMode;
   cwd: string;
   branch?: string;
+  sessionFile?: string;
   forkedFrom?: string;
   channels?: string[];
   state?: SwarmMemberState;
@@ -522,6 +530,7 @@ export interface MemberUpdateInput {
   state?: SwarmMemberState;
   briefSeq?: number;
   branch?: string;
+  sessionFile?: string | null;
   mergedCommitSha?: string;
   channels?: string[];
   model?: string;
@@ -601,6 +610,7 @@ export interface ISwarmStore {
   getRecentEvents(runId: string, limit?: number): Promise<SwarmEvent[]>;
   renderRosterMarkdown(state: SwarmRunState): string;
   getRunDir(runId: string): string;
+  getMemberSessionDir?(runId: string): string;
   getWorktreePath(runId: string, memberName: string): string;
 }
 
@@ -683,6 +693,7 @@ export interface IWorktreeManager {
     baseBranch: string;
     worktreePath: string;
     reuseExistingBranch?: boolean;
+    mode?: "share" | "branch";
   }): Promise<CreateWorktreeResult>;
   removeWorktree(
     worktreePath: string,
@@ -710,6 +721,7 @@ export interface IWorktreeManager {
     branch: string;
     commitMessage?: string;
     noFf?: boolean;
+    sourceWorktreePath?: string;
   }): Promise<MergeBranchResult>;
   getDiffSummary(
     baseBranch: string,
@@ -846,6 +858,23 @@ export interface SwitchModelResult {
   model: string;
   thinkingLevel?: ThinkingLevel;
   member?: SwarmMemberRecord;
+  deferred?: boolean;
+  resumed?: boolean;
+}
+
+export interface ParkOrchestratorWaitOptions {
+  since: number;
+  mentionsOnly?: boolean;
+  timeoutMs?: number;
+}
+
+export interface ParkOrchestratorWaitResult {
+  parked: boolean;
+  wokeBy?: WaitForBoardResult["wokeBy"];
+  messages: BoardMessage[];
+  head: number;
+  activeMembers: string[];
+  summary: string;
 }
 
 export interface WaitForBoardOptions {
@@ -880,6 +909,12 @@ export interface MemberEngineBridge {
   listModels(options?: { all?: boolean }): Promise<AvailableModelInfo[]>;
   addHelper(input: AddHelperInput): Promise<SwarmMemberRecord[]>;
   killHelper(name: string, reason?: string): Promise<void>;
+  stopHelper?(name: string, reason?: string): Promise<void>;
+  steerHelper?(
+    name: string,
+    message: string,
+    mode?: "steer" | "followUp",
+  ): Promise<{ delivery: "steered" | "followUp" | "woken" }>;
   switchModel(
     targetName: string | undefined,
     model: string,
@@ -906,6 +941,9 @@ export interface SpawnMemberRequest {
   modelOverride?: string;
   thinkingLevel?: ThinkingLevel;
   seedMessages?: AgentMessage[];
+  sessionDir?: string;
+  sessionFile?: string;
+  isMonitor?: boolean;
   hostContext?: ExtensionContext;
   onTelemetry?: (event: AgentTelemetryEvent) => void;
   engineApi?: MemberEngineBridge;
@@ -918,6 +956,7 @@ export interface PersistentAgentHandle {
   getState(): SwarmMemberState;
   getModel(): string | undefined;
   getThinkingLevel(): ThinkingLevel | undefined;
+  getSessionFile?(): string | undefined;
   getConversationMessages(): AgentMessage[];
   /** Wakes a `waiting` session with new board messages, preserving full conversation history. */
   wake(prompt: string): Promise<AgentTurnResult>;
@@ -940,6 +979,11 @@ export interface PersistentAgentHandle {
 
 export interface ISwarmTransport {
   spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle>;
+  resolveModel?(
+    modelOverride: string,
+    thinkingLevel?: ThinkingLevel,
+    hostContext?: ExtensionContext,
+  ): Promise<ModelSwitchResult>;
   listAvailableModels?(
     hostContext?: ExtensionContext,
   ): Promise<AvailableModelInfo[]>;
@@ -970,6 +1014,7 @@ export interface SwitchModelOptions {
   model?: string;
   thinkingLevel?: ThinkingLevel;
   reason?: string;
+  autoResume?: boolean;
   callerName?: string;
   callerRole?: CallerRole;
   hostContext?: ExtensionContext;
@@ -1039,6 +1084,7 @@ export interface SwarmEngineEvent {
   runId: string | null;
   memberName?: string;
   seq?: number;
+  messages?: BoardMessage[];
   summary: string;
   snapshot: SwarmSnapshot;
 }
@@ -1053,16 +1099,30 @@ export interface ISwarmEngine {
     title: string,
     options?: { callerRole?: CallerRole; actor?: string },
   ): Promise<SwarmRunState>;
+  updateDirection(
+    patch: {
+      title?: string;
+      objective?: string;
+      strategy?: string;
+      acceptanceCriteria?: string;
+    },
+    options?: { callerRole?: CallerRole; actor?: string },
+  ): Promise<SwarmRunState>;
   addMembers(input: AddMemberInput): Promise<SwarmMemberRecord[]>;
   postMessage(input: PostBoardMessageInput): Promise<BoardMessage>;
   readBoard(options?: ReadBoardOptions): Promise<ReadBoardResult>;
   waitForBoard(options: WaitForBoardOptions): Promise<WaitForBoardResult>;
+  parkOrchestratorWait(
+    options: ParkOrchestratorWaitOptions,
+  ): Promise<ParkOrchestratorWaitResult>;
+  clearOrchestratorWait(reason?: string): void;
   switchModel(options: SwitchModelOptions): Promise<SwitchModelResult>;
   steerMember(
     memberName: string,
     message: string,
     mode?: "steer" | "followUp",
-  ): Promise<void>;
+    options?: { callerName?: string; callerRole?: CallerRole },
+  ): Promise<{ delivery: "steered" | "followUp" | "woken" }>;
   stopMember(memberName: string, options?: StopMemberOptions): Promise<void>;
   killMember(memberName: string, options?: KillMemberOptions): Promise<void>;
   mergeMember(

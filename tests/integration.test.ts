@@ -1072,7 +1072,7 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     assert.equal(kickoffWakeups[0]!.options?.triggerTurn, true);
     assert.equal(kickoffWakeups[0]!.options?.deliverAs, "followUp");
 
-    // 3. Phase 1: spawn researcher -> call blocking swarm_wait -> release researcher -> resolves immediately with NO duplicate wakeup
+    // 3. Phase 1: spawn researcher -> call NON-BLOCKING swarm_wait (terminate: true, parked: true) -> release researcher -> async wakeup arrives cleanly!
     const addResearcherRes = await harness.executeTool(SWARM_TOOL, {
       action: "add",
       name: "researcher",
@@ -1086,29 +1086,27 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
     ).length;
 
-    const waitPromise = harness.executeTool(SWARM_WAIT_TOOL, {
+    const waitRes = await harness.executeTool(SWARM_WAIT_TOOL, {
       since: 1,
       mentions_only: true,
     });
-    // Give waitForBoard a moment to register before releasing researcher
-    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(waitRes.isError, undefined);
+    assert.equal((waitRes as { terminate?: boolean }).terminate, true);
+    assert.equal(waitRes.details.parked, true);
+
     releaseResearcher();
 
-    const waitRes = await waitPromise;
-    assert.equal(waitRes.isError, undefined);
-    assert.equal(waitRes.details.wokeBy, "message");
-    assert.match(waitRes.content[0].text, /compute\(x\) = x \* 2/);
-
-    // Allow any microtasks to flush and confirm active swarm_wait suppressed duplicate wakeup turn
-    await new Promise((r) => setTimeout(r, 40));
-    const wakeupsAfterWait = harness.sentMessages.filter(
-      (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
-    ).length;
-    assert.equal(
-      wakeupsAfterWait,
-      wakeupsBeforeWait,
-      "Active swarm_wait must suppress duplicate background SWARM_WAKEUP_CUSTOM_TYPE turn",
+    // Wait for researcher to post @orchestrator and emit wakeup turn!
+    await waitFor(
+      () =>
+        harness.sentMessages.filter(
+          (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
+        ).length > wakeupsBeforeWait,
     );
+    const researcherWakeup = harness.sentMessages
+      .filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE)
+      .pop()!;
+    assert.match(String(researcherWakeup.message.content), /compute\(x\) = x \* 2/);
 
     // 4. Phase 2: spawn independent validator + share-worktree author -> peer-to-peer warm fix loop!
     const addValidatorRes = await harness.executeTool(SWARM_TOOL, {
@@ -1550,6 +1548,7 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       "ui",
       "models",
       "model",
+      "steer",
       "merge",
       "kill",
       "done",
@@ -1581,6 +1580,7 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     let mutableSettings: SwarmSettings = {
       ...DEFAULT_SWARM_SETTINGS,
       stallWatchdogEnabled: true,
+      stallMonitorMode: "deterministic",
       stallTimeoutMs: 60,
       keepWorkersWarm: true,
     };
@@ -1695,7 +1695,9 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       1,
     );
 
-    // B. Zero-Token Stall Watchdog `[stall]` alert + coalesced wakeup!
+    // Clear idle flag until after scout completes its post-wakeup test in real timing:
+    // Here scout immediately parks cleanly, so monitor fires at 60ms.
+    // Wait for Zero-Token Deterministic Stall Watchdog `[stall]` alert + coalesced wakeup!
     // `scout` parked silently in `waiting` and no `swarm_wait` is active -> watchdog fires after 60ms!
     await waitFor(() =>
       harness.sentMessages.some(
@@ -1812,5 +1814,176 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     assert.equal(harness.terminalInputHandlers.size, 0);
     assert.equal(harness.widgetHistory[harness.widgetHistory.length - 1]?.value, undefined);
     assert.equal(harness.statusHistory[harness.statusHistory.length - 1]?.text, undefined);
+  });
+
+  it("4. supports non-blocking swarm_wait + live mid-flight human redirection (input hook, swarm{action:'steer'}, swarm{action:'stop'}, /swarm steer) and surgical Smart Monitor", async () => {
+    const repoDir = await createTempGitRepo("e2e-steer");
+    tempDirs.push(repoDir);
+
+    let releaseWorker!: () => void;
+    const workerGate = new Promise<void>((r) => {
+      releaseWorker = r;
+    });
+    const workerSteers: string[] = [];
+    const trackers: MockMemberTracker[] = [];
+    let workerTurnCounter = 0;
+
+    const mockTransport: ISwarmTransport = {
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        const tracker = createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async () => {
+            if (request.name === "worker") {
+              workerTurnCounter += 1;
+              await workerGate;
+              await request.engineApi!.postMessage({
+                text: `@orchestrator [done] Adapted direction (steers=${workerSteers.length}): ${workerSteers.join(" | ")}`,
+                kind: "done",
+              });
+              return {
+                agentId: request.agentId,
+                name: request.name,
+                role: request.role,
+                outcome: "waiting",
+                summary: "Completed redirected work",
+                tokens: 200,
+                cost: 0.002,
+              };
+            }
+            return {
+              agentId: request.agentId,
+              name: request.name,
+              role: request.role,
+              outcome: "waiting",
+              summary: "Ready",
+              tokens: 50,
+              cost: 0.001,
+            };
+          },
+        });
+        const origSteer = tracker.handle.steer;
+        tracker.handle.steer = async (msg: string) => {
+          if (request.name === "worker") {
+            workerSteers.push(msg);
+          }
+          await origSteer(msg);
+        };
+        trackers.push(tracker);
+        return tracker.handle;
+      },
+    };
+
+    const harness = createMockPiHarness(repoDir, { mode: "tui" });
+    const ext = createPiSwarmExtension({
+      transportFactory: () => mockTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: false,
+      }),
+    });
+    ext(harness.pi);
+    await harness.emit("session_start", {});
+
+    // 1. Launch Swarm directly
+    await harness.runCommand("swarm-direct", "Build API v1");
+    await harness.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "API Launch",
+      objective: "Build API v1",
+      strategy: "Single worker then validate",
+      acceptance_criteria: "Tests green",
+      base_branch: "main",
+      initial_members: [
+        {
+          name: "worker",
+          role: "worker",
+          workspace: "inherit",
+          brief: "Implement API v1",
+        },
+      ],
+    });
+    await waitFor(() => trackers.length >= 1 && workerTurnCounter === 1);
+
+    // 2. Orchestrator parks non-blockingly via swarm_wait -> returns terminate: true immediately!
+    const headBeforeWait = Number(
+      (await harness.executeTool(READ_BOARD_TOOL, { since: 0 })).details?.head ?? 1,
+    );
+    const parkRes = await harness.executeTool(SWARM_WAIT_TOOL, {
+      since: headBeforeWait,
+      mentions_only: true,
+    });
+    assert.equal(parkRes.isError, undefined);
+    assert.equal((parkRes as { terminate?: boolean }).terminate, true);
+    assert.equal(parkRes.details?.parked, true);
+
+    // 3. Human sends interactive redirection while Orchestrator is idle!
+    const inputRes = await harness.emit("input", {
+      source: "interactive",
+      text: "Change direction: switch API to v2 with streaming support",
+    });
+    assert.equal((inputRes as Array<{ action?: string }>)?.[0]?.action, "continue");
+
+    // `before_agent_start` injects live user direction highlight into `sections.swarm` once
+    const sectionsObj: Record<string, string> = {};
+    await harness.emit("before_agent_start", {
+      systemPromptOptions: { sections: sectionsObj },
+    });
+    assert.match(sectionsObj.swarm ?? "", /Live User Direction Update/);
+    assert.match(sectionsObj.swarm ?? "", /switch API to v2/);
+
+    // Subsequent turn does not repeat stale humanSteeringText notice
+    const sectionsObj2: Record<string, string> = {};
+    await harness.emit("before_agent_start", {
+      systemPromptOptions: { sections: sectionsObj2 },
+    });
+    assert.ok(!(sectionsObj2.swarm ?? "").includes("Live User Direction Update"));
+
+    // 4. Orchestrator updates objective + steers working worker directly + `/swarm steer` slash command
+    const updTitle = await harness.executeTool(SWARM_TOOL, {
+      action: "title",
+      objective: "Build API v2 with streaming support",
+    });
+    assert.equal(updTitle.isError, undefined);
+
+    const steerRes = await harness.executeTool(SWARM_TOOL, {
+      action: "steer",
+      name: "worker",
+      message: "Switch endpoint contract to v2 streaming",
+    });
+    assert.equal(steerRes.isError, undefined);
+    assert.equal(steerRes.details?.delivery, "steered");
+
+    await harness.runCommand("swarm", "steer worker Also add healthcheck route");
+    assert.deepEqual(workerSteers, [
+      "Switch endpoint contract to v2 streaming",
+      "Also add healthcheck route",
+    ]);
+
+    // 5. Release worker -> posts @orchestrator [done] -> Orchestrator receives wakeup turn cleanly!
+    const wakeupsBeforeDone = harness.sentMessages.filter(
+      (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
+    ).length;
+    releaseWorker();
+    await waitFor(
+      () =>
+        harness.sentMessages.filter(
+          (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
+        ).length > wakeupsBeforeDone,
+    );
+    const finalWakeup = harness.sentMessages
+      .filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE)
+      .pop()!;
+    assert.match(String(finalWakeup.message.content), /Adapted direction \(steers=2\)/);
+
+    // 6. Stop parked worker via swarm{action:"stop"} & finish cleanly
+    const stopRes = await harness.executeTool(SWARM_TOOL, {
+      action: "stop",
+      name: "worker",
+      reason: "Paused after handoff",
+    });
+    assert.equal(stopRes.isError, undefined);
+    assert.equal(stopRes.details?.stopped, true);
+
+    await harness.executeTool(SWARM_TOOL, { action: "done", summary: "API v2 shipped" });
+    await harness.emit("session_shutdown", {});
   });
 });

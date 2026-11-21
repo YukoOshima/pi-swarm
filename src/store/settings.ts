@@ -4,7 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { DEFAULT_SWARM_SETTINGS, SWARM_SETTINGS_FILE } from "../constants.js";
-import { SwarmProtocolError, type SwarmSettings } from "../types.js";
+import {
+  type StallMonitorMode,
+  SwarmProtocolError,
+  type SwarmSettings,
+} from "../types.js";
 
 const VALID_THINKING_LEVELS: ReadonlySet<ThinkingLevel> = new Set<ThinkingLevel>([
   "off",
@@ -233,6 +237,10 @@ export function sanitizeSwarmSettings(
       typeof input.stallWatchdogEnabled === "boolean"
         ? input.stallWatchdogEnabled
         : base.stallWatchdogEnabled,
+    stallMonitorMode:
+      input.stallMonitorMode === "llm" || input.stallMonitorMode === "deterministic"
+        ? (input.stallMonitorMode as StallMonitorMode)
+        : base.stallMonitorMode,
     stallTimeoutMs: clampInt(
       input.stallTimeoutMs,
       SWARM_SETTINGS_BOUNDS.stallTimeoutMs.min,
@@ -292,6 +300,12 @@ export function sanitizeSettingsPatch(
     typeof input.stallWatchdogEnabled === "boolean"
   ) {
     patch.stallWatchdogEnabled = input.stallWatchdogEnabled;
+  }
+  if (
+    "stallMonitorMode" in input &&
+    (input.stallMonitorMode === "llm" || input.stallMonitorMode === "deterministic")
+  ) {
+    patch.stallMonitorMode = input.stallMonitorMode;
   }
   if (
     "stallTimeoutMs" in input &&

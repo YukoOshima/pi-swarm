@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import {
   access,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
@@ -1641,5 +1642,103 @@ describe("WorktreeManager real git repository workflows", () => {
     });
     assert.equal(reattached.branch, "swarm/run-r/parser");
     assert.equal(await wtMgr.getHeadSha(reattached.worktreePath), round1Sha);
+  });
+
+  it("creates true isolated git clones for workspace:'branch', persists sessions dir, and rebases/merges/tears down cleanly", async () => {
+    const repoDir = await makeTempDir("pi-swarm-git-branch-clone-");
+    const wtMgr = new WorktreeManager(repoDir);
+    const store = new SwarmStore(repoDir);
+    await wtMgr.ensureRepoReady("main");
+    await commitFile(repoDir, "README.md", "# Base\n", "base readme");
+
+    // Verify SwarmStore session directory & sessionFile persistence + stallMonitorMode setting
+    const run = await store.createRun({
+      id: "run-cl",
+      title: "Branch Clone Test",
+      objective: "Verify isolated clone vs worktree",
+      baseBranch: "main",
+      ownerSessionId: "sess-cl",
+    });
+    const sessionDir = store.getMemberSessionDir(run.id);
+    assert.ok(sessionDir.endsWith(path.join("runs", run.id, "sessions")));
+    await store.addMember(run.id, {
+      name: "cloner",
+      agentId: "cloner-1",
+      role: "worker",
+      parentName: "orchestrator",
+      brief: "Work in isolated clone",
+      workspace: "branch",
+      cwd: repoDir,
+      sessionFile: path.join(sessionDir, "cloner.jsonl"),
+    });
+    const loaded = await store.loadRun(run.id);
+    assert.equal(loaded.members.cloner?.sessionFile, path.join(sessionDir, "cloner.jsonl"));
+
+    // Verify sanitizeSwarmSettings handles stallMonitorMode cleanly
+    assert.equal(sanitizeSwarmSettings({}).stallMonitorMode, "llm");
+    assert.equal(
+      sanitizeSwarmSettings({ stallMonitorMode: "deterministic" }).stallMonitorMode,
+      "deterministic",
+    );
+    assert.equal(
+      sanitizeSwarmSettings({ stallMonitorMode: "invalid" as any }).stallMonitorMode,
+      "llm",
+    );
+
+    const sharePath = store.getWorktreePath(run.id, "sharer");
+    const clonePath = store.getWorktreePath(run.id, "cloner");
+
+    // 1. share -> linked git worktree (.git is a file)
+    await wtMgr.createWorktree({
+      branch: "swarm/run-cl/sharer",
+      baseBranch: "main",
+      worktreePath: sharePath,
+      mode: "share",
+    });
+    const shareGitStat = await lstat(path.join(sharePath, ".git"));
+    assert.equal(shareGitStat.isFile(), true);
+
+    // 2. branch -> full standalone clone (.git is a directory)
+    await wtMgr.createWorktree({
+      branch: "swarm/run-cl/cloner",
+      baseBranch: "main",
+      worktreePath: clonePath,
+      mode: "branch",
+    });
+    const cloneGitStat = await lstat(path.join(clonePath, ".git"));
+    assert.equal(cloneGitStat.isDirectory(), true);
+    assert.equal(await git(repoDir, ["status", "--porcelain"]), "");
+
+    // Commit on base branch AND commit on isolated clone branch -> autoRebase + getDiffSummary + mergeBranch
+    await commitFile(repoDir, "base.txt", "from base\n", "advance base");
+    await commitFile(clonePath, "feature.txt", "from clone\n", "clone work");
+
+    const rebaseRes = await wtMgr.autoRebase(clonePath, "main");
+    assert.equal(rebaseRes.status, "rebased");
+
+    const diffSummary = await wtMgr.getDiffSummary("main", "swarm/run-cl/cloner", {
+      cwd: clonePath,
+    });
+    assert.equal(diffSummary.commitsAhead, 1);
+    assert.deepEqual(diffSummary.changedFiles, ["feature.txt"]);
+
+    const merged = await wtMgr.mergeBranch({
+      baseBranch: "main",
+      branch: "swarm/run-cl/cloner",
+      sourceWorktreePath: clonePath,
+    });
+    assert.equal(merged.strategy, "merge");
+    assert.equal(await readFile(path.join(repoDir, "feature.txt"), "utf8"), "from clone\n");
+
+    // Dirty guard rejects non-force removal of dirty clone, then clean/force removes cleanly
+    await writeFile(path.join(clonePath, "dirty.txt"), "uncommitted\n", "utf8");
+    await assert.rejects(
+      () => wtMgr.removeWorktree(clonePath, { force: false }),
+      (err) => assertProtocolCode(err, "DIRTY_WORKTREE"),
+    );
+    await rm(path.join(clonePath, "dirty.txt"));
+    await wtMgr.removeWorktree(clonePath, { force: false });
+    assert.equal(await exists(clonePath), false);
+    await wtMgr.removeWorktree(sharePath, { force: true });
   });
 });

@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { access, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import {
@@ -238,6 +238,19 @@ export class WorktreeManager implements IWorktreeManager {
     return res.ok;
   }
 
+  /**
+   * Linked git worktrees have a `.git` file pointing back to the main repo;
+   * isolated `branch` clones have their own standalone `.git` directory.
+   */
+  private async isIsolatedClone(dirPath: string): Promise<boolean> {
+    try {
+      const st = await lstat(path.join(path.resolve(dirPath), ".git"));
+      return st.isDirectory();
+    } catch {
+      return false;
+    }
+  }
+
   private async ensureSwarmExcluded(effectiveRepoRoot: string): Promise<void> {
     const commonDirRes = await this.runGit(["rev-parse", "--git-common-dir"], {
       cwd: effectiveRepoRoot,
@@ -391,6 +404,7 @@ export class WorktreeManager implements IWorktreeManager {
     baseBranch: string;
     worktreePath: string;
     reuseExistingBranch?: boolean;
+    mode?: "share" | "branch";
   }): Promise<CreateWorktreeResult> {
     const resolvedWorktree = path.resolve(options.worktreePath);
     await mkdir(path.dirname(resolvedWorktree), { recursive: true });
@@ -402,6 +416,7 @@ export class WorktreeManager implements IWorktreeManager {
     ]);
     const baseSha = baseShaRes.stdout.trim();
 
+    const mode = options.mode ?? "share";
     const exists = await this.branchExists(options.branch);
     if (exists && !options.reuseExistingBranch) {
       throw new SwarmProtocolError(
@@ -409,6 +424,72 @@ export class WorktreeManager implements IWorktreeManager {
         `Branch "${options.branch}" already exists in repository.`,
         { branch: options.branch },
       );
+    }
+
+    if (mode === "branch") {
+      if (await pathExists(resolvedWorktree)) {
+        const isClone = await this.isIsolatedClone(resolvedWorktree);
+        if (options.reuseExistingBranch && isClone) {
+          const currentBranch = await this.getCurrentBranch(resolvedWorktree).catch(
+            () => "",
+          );
+          if (currentBranch === options.branch) {
+            return {
+              branch: options.branch,
+              worktreePath: resolvedWorktree,
+              baseSha,
+            };
+          }
+          if (currentBranch) {
+            throw new SwarmProtocolError(
+              "WRONG_BRANCH",
+              `Existing clone "${resolvedWorktree}" is on branch "${currentBranch}", expected "${options.branch}".`,
+              {
+                worktreePath: resolvedWorktree,
+                currentBranch,
+                expectedBranch: options.branch,
+              },
+            );
+          }
+        }
+        if (!options.reuseExistingBranch) {
+          throw new SwarmProtocolError(
+            "GIT_ERROR",
+            `Clone directory "${resolvedWorktree}" already exists.`,
+            { worktreePath: resolvedWorktree },
+          );
+        }
+        await removeDirectoryWithRetry(resolvedWorktree);
+      }
+
+      await this.runGit([
+        "clone",
+        "--no-hardlinks",
+        "--branch",
+        options.baseBranch,
+        this.repoRoot,
+        resolvedWorktree,
+      ]);
+
+      const cloneBranchExists = await this.branchExists(
+        options.branch,
+        resolvedWorktree,
+      );
+      if (cloneBranchExists) {
+        await this.runGit(["checkout", options.branch], {
+          cwd: resolvedWorktree,
+        });
+      } else {
+        await this.runGit(["checkout", "-b", options.branch], {
+          cwd: resolvedWorktree,
+        });
+      }
+
+      return {
+        branch: options.branch,
+        worktreePath: resolvedWorktree,
+        baseSha,
+      };
     }
 
     if (exists && options.reuseExistingBranch) {
@@ -477,6 +558,18 @@ export class WorktreeManager implements IWorktreeManager {
   ): Promise<void> {
     const resolvedWorktree = path.resolve(worktreePath);
     const force = Boolean(options?.force);
+
+    if (await this.isIsolatedClone(resolvedWorktree)) {
+      if (!force && (await this.isWorktreeDirty(resolvedWorktree))) {
+        throw new SwarmProtocolError(
+          "DIRTY_WORKTREE",
+          `Clone "${resolvedWorktree}" has uncommitted changes.`,
+          { worktreePath: resolvedWorktree },
+        );
+      }
+      await removeDirectoryWithRetry(resolvedWorktree);
+      return;
+    }
 
     const args = force
       ? ["worktree", "remove", "--force", resolvedWorktree]
@@ -622,9 +715,20 @@ export class WorktreeManager implements IWorktreeManager {
       };
     }
 
-    // Check if baseBranch is already an ancestor of HEAD.
+    let rebaseTarget = baseBranch;
+    if (await this.isIsolatedClone(resolved)) {
+      const fetchRes = await this.runGit(
+        ["fetch", "origin", `+refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`],
+        { cwd: resolved, allowFailure: true },
+      );
+      if (fetchRes.ok) {
+        rebaseTarget = `origin/${baseBranch}`;
+      }
+    }
+
+    // Check if rebaseTarget is already an ancestor of HEAD.
     const ancestorRes = await this.runGit(
-      ["merge-base", "--is-ancestor", baseBranch, "HEAD"],
+      ["merge-base", "--is-ancestor", rebaseTarget, "HEAD"],
       { cwd: resolved, allowFailure: true },
     );
     if (ancestorRes.ok) {
@@ -636,7 +740,7 @@ export class WorktreeManager implements IWorktreeManager {
 
     const identityArgs = await this.getIdentityOverrideArgs(resolved);
     const rebaseRes = await this.runGit(
-      [...identityArgs, "rebase", baseBranch],
+      [...identityArgs, "rebase", rebaseTarget],
       { cwd: resolved, allowFailure: true },
     );
 
@@ -693,6 +797,7 @@ export class WorktreeManager implements IWorktreeManager {
     branch: string;
     commitMessage?: string;
     noFf?: boolean;
+    sourceWorktreePath?: string;
   }): Promise<MergeBranchResult> {
     const baseCheck = await this.isBaseCleanOnBranch(options.baseBranch);
     if (baseCheck.currentBranch !== options.baseBranch) {
@@ -713,6 +818,17 @@ export class WorktreeManager implements IWorktreeManager {
           `Base repository on "${options.baseBranch}" has uncommitted changes.`,
         { baseBranch: options.baseBranch },
       );
+    }
+
+    if (options.sourceWorktreePath) {
+      const resolvedSource = path.resolve(options.sourceWorktreePath);
+      if (await this.isIsolatedClone(resolvedSource)) {
+        await this.runGit([
+          "fetch",
+          resolvedSource,
+          `+refs/heads/${options.branch}:refs/heads/${options.branch}`,
+        ]);
+      }
     }
 
     const commitsAhead = await this.getCommitCountAhead(
@@ -793,24 +909,35 @@ export class WorktreeManager implements IWorktreeManager {
     const cwd = options?.cwd;
     const maxDiffBytes = options?.maxDiffBytes ?? SWARM_MAX_DIFF_BYTES;
 
+    let compareBase = baseBranch;
+    if (cwd && (await this.isIsolatedClone(path.resolve(cwd)))) {
+      const fetchRes = await this.runGit(
+        ["fetch", "origin", `+refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`],
+        { cwd, allowFailure: true },
+      );
+      if (fetchRes.ok) {
+        compareBase = `origin/${baseBranch}`;
+      }
+    }
+
     const headSha = (
       await this.runGit(["rev-parse", targetRef], { cwd })
     ).stdout.trim();
     const commitsAhead = await this.getCommitCountAhead(
-      baseBranch,
+      compareBase,
       targetRef,
       cwd,
     );
-    const changedFiles = await this.getChangedFiles(baseBranch, targetRef, cwd);
+    const changedFiles = await this.getChangedFiles(compareBase, targetRef, cwd);
 
     const statRes = await this.runGit(
-      ["diff", "--stat", `${baseBranch}...${targetRef}`],
+      ["diff", "--stat", `${compareBase}...${targetRef}`],
       { cwd, allowFailure: true },
     );
     const stat = (statRes.ok ? statRes.stdout : "").trim();
 
     const diffRes = await this.runGit(
-      ["diff", `${baseBranch}...${targetRef}`],
+      ["diff", `${compareBase}...${targetRef}`],
       {
         cwd,
         allowFailure: true,

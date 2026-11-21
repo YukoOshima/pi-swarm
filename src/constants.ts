@@ -15,7 +15,7 @@ export const DRAFTING_TOOLS = [
   PROPOSE_SWARM_PLAN_TOOL,
 ] as const;
 
-/** Core Antigravity Swarm coordination tool (`title`, `add`, `status`, `models`, `model`, `kill`, `merge`, `channel`, `done`). */
+/** Core Antigravity Swarm coordination tool (`title`, `add`, `status`, `models`, `model`, `steer`, `stop`, `kill`, `merge`, `channel`, `done`). */
 export const SWARM_TOOL = "swarm" as const;
 export const POST_MESSAGE_TOOL = "post_message" as const;
 export const READ_BOARD_TOOL = "read_board" as const;
@@ -45,6 +45,8 @@ export const SWARM_ACTIONS = [
   "status",
   "models",
   "model",
+  "steer",
+  "stop",
   "kill",
   "merge",
   "channel",
@@ -125,6 +127,7 @@ export const SWARM_FOCUS_VERSION = 2 as const;
 export const SWARM_DIR = ".pi/swarm" as const;
 export const SWARM_RUNS_DIR = "runs" as const;
 export const SWARM_WORKTREES_DIR = "worktrees" as const;
+export const SWARM_SESSIONS_DIR = "sessions" as const;
 export const SWARM_ROSTER_FILE = "ROSTER.md" as const;
 export const SWARM_STATE_FILE = "state.json" as const;
 export const SWARM_BOARD_FILE = "board.jsonl" as const;
@@ -136,6 +139,7 @@ export const SWARM_PATHS = Object.freeze({
   root: SWARM_DIR,
   runs: SWARM_RUNS_DIR,
   worktrees: SWARM_WORKTREES_DIR,
+  sessions: SWARM_SESSIONS_DIR,
   rosterFile: SWARM_ROSTER_FILE,
   stateFile: SWARM_STATE_FILE,
   boardFile: SWARM_BOARD_FILE,
@@ -172,6 +176,7 @@ export const DEFAULT_SWARM_SETTINGS: Readonly<SwarmSettings> = Object.freeze({
   validatorEnabled: true,
   keepWorkersWarm: true,
   stallWatchdogEnabled: true,
+  stallMonitorMode: "llm",
   stallTimeoutMs: SWARM_DEFAULT_STALL_TIMEOUT_MS,
   maxRetries: 2,
   rateLimitBaseBackoffMs: 5000,

@@ -26,6 +26,7 @@ import {
   SWARM_LOG_TAIL_LIMIT,
   SWARM_ROSTER_FILE,
   SWARM_RUNS_DIR,
+  SWARM_SESSIONS_DIR,
   SWARM_STATE_FILE,
   SWARM_STATE_VERSION,
   SWARM_WORKTREES_DIR,
@@ -546,6 +547,14 @@ export class SwarmStore implements ISwarmStore {
     return assertWithinRoot(
       this.projectRoot,
       path.join(this.runsRoot, safeRunId),
+    );
+  }
+
+  getMemberSessionDir(runId: string): string {
+    const safeRunId = validateSafeIdentifier(runId, "runId");
+    return assertWithinRoot(
+      this.projectRoot,
+      path.join(this.getRunDir(safeRunId), SWARM_SESSIONS_DIR),
     );
   }
 
@@ -1216,6 +1225,9 @@ export class SwarmStore implements ISwarmStore {
         workspace: member.workspace,
         cwd,
         ...(member.branch !== undefined ? { branch: member.branch } : {}),
+        ...(member.sessionFile !== undefined
+          ? { sessionFile: member.sessionFile }
+          : {}),
         ...(member.forkedFrom !== undefined
           ? { forkedFrom: member.forkedFrom }
           : {}),
@@ -1342,6 +1354,11 @@ export class SwarmStore implements ISwarmStore {
         record.briefSeq = Math.max(0, Math.floor(patch.briefSeq));
       }
       if (patch.branch !== undefined) record.branch = patch.branch;
+      if (patch.sessionFile === null) {
+        delete record.sessionFile;
+      } else if (patch.sessionFile !== undefined) {
+        record.sessionFile = patch.sessionFile;
+      }
       if (patch.mergedCommitSha !== undefined) {
         record.mergedCommitSha = patch.mergedCommitSha;
       }

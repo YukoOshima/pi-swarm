@@ -61,11 +61,18 @@ export function formatBoardExcerpt(
 // Orchestrator Playbook Section (Prompt-Cache-Safe Tail / sections.swarm)
 // ============================================================================
 
+export interface OrchestratorPlaybookOptions {
+  humanSteeringText?: string;
+}
+
 /**
  * Builds the Antigravity Swarm Coordinator Playbook + live run state section
  * injected prompt-cache-safely into `sections.swarm` (or tail context) while a run is active.
  */
-export function buildOrchestratorPlaybookSection(snapshot: SwarmSnapshot): string {
+export function buildOrchestratorPlaybookSection(
+  snapshot: SwarmSnapshot,
+  options?: OrchestratorPlaybookOptions,
+): string {
   const run = snapshot.run;
   const sections: string[] = [];
 
@@ -75,30 +82,32 @@ export function buildOrchestratorPlaybookSection(snapshot: SwarmSnapshot): strin
       "",
       "## 1. Do Not Do the Technical Work Yourself",
       `- Delegate ALL technical work (codebase research, scaffolding, coding, integration, builds/tests, verification) to named swarm members via \`${SWARM_TOOL}{action:"add"}\`.`,
-      `- Your job is orchestration: read \`#seq\` board reports, judge quality and completeness, decide the next phase, merge isolated worktrees (\`${SWARM_TOOL}{action:"merge"}\`), retire finished workers (\`${SWARM_TOOL}{action:"kill"}\`), and communicate clearly with the user.`,
+      `- Your job is orchestration: read \`#seq\` board reports, judge quality and completeness, decide the next phase, merge isolated worktrees/clones (\`${SWARM_TOOL}{action:"merge"}\`), retire finished workers (\`${SWARM_TOOL}{action:"kill"}\`), and adapt seamlessly whenever the user redirects you.`,
       "",
-      "## 2. Dynamic Phased Collaboration",
+      "## 2. Dynamic Phased Collaboration & Mid-Flight User Redirection",
       "- Adapt wave-by-wave instead of locking into a rigid upfront DAG:",
       "  1. **Discovery**: Spawn read-only researchers/scouts first when unknowns exist → inspect their `#seq` reports.",
       "  2. **Contract / Scaffold**: Spawn a contract/scaffold worker when shared interfaces must settle before fan-out → inspect its `#seq`.",
-      "  3. **Parallel Execution**: Spawn disjoint named authors in parallel (`workspace:\"share\"` whenever multiple authors edit/build simultaneously; `workspace:\"inherit\"` for read-only scouts or strictly non-overlapping edits; use `n` or `tasks[]` for sharded slices).",
+      "  3. **Parallel Execution**: Spawn disjoint named authors in parallel (`workspace:\"share\"` for shared git worktrees when multiple authors edit/build simultaneously; `workspace:\"branch\"` for fully isolated git clones; `workspace:\"inherit\"` for read-only scouts; use `n` or `tasks[]` for sharded slices).",
       "  4. **Independent Read-Only Validation**: Spawn independent `role:\"validator\"` members (~1 validator per 2–4 authors) to audit code, diffs, tests, and runtime behavior. NEVER let authors self-certify!",
       "  5. **Peer-to-Peer Bug Closure**: Let `@validator` and `@author` resolve defects directly on the board (`@author` <-> `@validator`) without waking `@orchestrator` on intermediate bounces.",
       `  6. **Land & Complete**: Merge \`share\`/\`branch\` worktrees via \`${SWARM_TOOL}{action:"merge"}\`, kill finished members via \`${SWARM_TOOL}{action:"kill"}\`, and close the run cleanly via \`${SWARM_TOOL}{action:"done", summary}\`.`,
+      "- **Dynamic User Redirection**: Calling `swarm_wait` ends your turn cleanly so the user can message you at any time while workers run. When the user sends a new instruction or change of direction mid-flight:",
+      `  - Use \`${SWARM_TOOL}{action:"steer", name, message, mode?}\` to redirect a working or parked member immediately (or \`post_message\` with \`@all\` / \`@name\` for parked members), \`${SWARM_TOOL}{action:"stop"/"kill"}\` to halt obsolete work, \`${SWARM_TOOL}{action:"title", objective, strategy, acceptance_criteria}\` to update the run goal/plan, and \`${SWARM_TOOL}{action:"add"}\` for new work, then call \`${SWARM_WAIT_TOOL}\` again.`,
       "",
       "## 3. Zero-Copy `#seq` Referencing & `@mention` Discipline",
       `- Point downstream workers to earlier reports by sequence number (e.g. "Read \`#4\` and \`#6\` via \`${READ_BOARD_TOOL}{seqs:[4,6]}\`") — NEVER copy-paste one worker's report into another worker's brief!`,
       `- \`@name\` is a wakeup doorbell, never a CC. Use \`@<prefix>\` for sharded groups, \`@#<channel>\` for channel broadcasts (NEVER \`@#main\`), and \`@all\` only for genuine swarm-wide rules or plan changes.`,
       "",
       "## 4. Core Swarm Tools (4 Tools)",
-      `- \`${SWARM_TOOL}\`: \`title\` | \`add\` (\`name\`, \`role\`, \`brief\`, \`workspace\`, \`fork\`, \`model\`, \`thinking_level\`, \`channels\`, \`n\`, \`tasks\`) | \`status\` | \`models\` | \`model\` | \`kill\` | \`merge\` | \`channel\` (\`create\`/\`list\`/\`join\`/\`leave\`/\`archive\`) | \`done\`.`,
+      `- \`${SWARM_TOOL}\`: \`title\` (or \`objective\`/\`strategy\`/\`acceptance_criteria\`) | \`add\` (\`name\`, \`role\`, \`brief\`, \`workspace\`, \`fork\`, \`model\`, \`thinking_level\`, \`channels\`, \`n\`, \`tasks\`) | \`status\` | \`models\` | \`model\` (auto-resumes switched member) | \`steer\` (\`name\`, \`message\`, \`mode?\`) | \`stop\` | \`kill\` | \`merge\` | \`channel\` (\`create\`/\`list\`/\`join\`/\`leave\`/\`archive\`) | \`done\`.`,
       `- \`${POST_MESSAGE_TOOL}\`: Post to the shared board (\`text\`, optional \`channel\`).`,
       `- \`${READ_BOARD_TOOL}\`: Read board messages (\`since\`, \`seqs\`, \`limit\`, \`channel\`, \`search\`) or inspect roster (\`status:true\`).`,
-      `- \`${SWARM_WAIT_TOOL}\`: Sleep until a member wakes \`@${ORCHESTRATOR_NAME}\` or all workers go idle (\`all_idle\`). Always pass the highest \`#seq\` you have already read as \`since\`.`,
+      `- \`${SWARM_WAIT_TOOL}\`: End your turn cleanly (non-blocking) and sleep until a member wakes \`@${ORCHESTRATOR_NAME}\`, all workers park (\`all_idle\`), or the user sends a message. Always pass the highest \`#seq\` you have already read as \`since\`.`,
       "",
       "## 5. Keep Warm, Context Forking & 3-Role Models",
-      `- **Keep Warm**: Completed members park in \`waiting\` (zero tokens, full history intact). NEVER \`kill\` as a pause!`,
-      `- **Hot Model Switch**: On quota/429 or wrong capability, call \`${SWARM_TOOL}{action:"model", name, model}\` on a \`waiting\` member to hot-switch while keeping conversation history.`,
+      `- **Keep Warm**: Completed members park in \`waiting\` (zero tokens, full history intact, disk-backed sessions). NEVER \`kill\` as a pause!`,
+      `- **Hot Model Switch**: Calling \`${SWARM_TOOL}{action:"model", name, model}\` on a \`waiting\` member hot-switches while keeping conversation history AND automatically resumes it to continue unfinished work.`,
       `- **Context Forking**: Pass \`fork:"orchestrator"\` or \`fork:"<member>"\` on \`${SWARM_TOOL}{action:"add"}\` when a new member benefits from branching existing conversation history.`,
       "- **3-Role Models**: `orchestrator` (host session), `worker` (default for `role:\"worker\"`), `validator` (default for `role:\"validator\"`).",
     ].join("\n"),
@@ -142,6 +151,17 @@ export function buildOrchestratorPlaybookSection(snapshot: SwarmSnapshot): strin
     );
   }
   sections.push(stateHeader.join("\n"));
+
+  if (options?.humanSteeringText?.trim()) {
+    const cleanSteer = options.humanSteeringText.replace(/\s+/g, " ").trim().slice(0, 500);
+    sections.push(
+      [
+        "### ⚡ Live User Direction Update",
+        `The user just sent a dynamic message while the Swarm is running: "${cleanSteer}".`,
+        `Adjust active/parked workers immediately using \`${SWARM_TOOL}{action:"steer"}\`, \`${SWARM_TOOL}{action:"stop"/"kill"}\`, \`${SWARM_TOOL}{action:"title"}\`, \`${SWARM_TOOL}{action:"add"}\`, or \`${POST_MESSAGE_TOOL}\`, and report clearly.`,
+      ].join("\n"),
+    );
+  }
 
   // Channels compact summary
   const channels = Object.values(run.channels);
@@ -272,7 +292,7 @@ export function buildMemberSystemPrompt(
         `1. **Protected Paths**: NEVER touch \`${SWARM_DIR}/\`, \`.swarm/\`, or \`.git/\` directly — use Swarm tools instead.`,
         workspaceCommitRule,
         "3. **Verify Before Reporting**: Run relevant typechecks/tests/build checks for your owned slice before posting `[done]`.",
-        `4. **Spawning & Managing Own Helpers**: You may call \`${SWARM_TOOL}{action:"add", name, brief, ...}\` when your assignment splits into independent pieces or needs an investigator/helper. Tell helpers to report back to \`@${member.name}\` by name. You may call \`${SWARM_TOOL}{action:"model"}\` on yourself or your own helpers, and MUST call \`${SWARM_TOOL}{action:"kill"}\` on your own helpers once you integrate their work. You cannot kill other members or call \`title\`/\`merge\`/\`done\`.`,
+        `4. **Spawning & Managing Own Helpers**: You may call \`${SWARM_TOOL}{action:"add", name, brief, ...}\` when your assignment splits into independent pieces or needs an investigator/helper. Tell helpers to report back to \`@${member.name}\` by name. You may call \`${SWARM_TOOL}{action:"model"}\` on yourself (safely deferred to turn end with automatic resume on the new model) or your own waiting helpers, \`${SWARM_TOOL}{action:"steer"/"stop"}\` on your own helpers, and MUST call \`${SWARM_TOOL}{action:"kill"}\` on your own helpers once you integrate their work. You cannot kill other members or call \`title\`/\`merge\`/\`done\`.`,
       ].join("\n"),
     );
   }

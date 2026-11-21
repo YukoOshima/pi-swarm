@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { describe, it } from "node:test";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type {
-  AgentSession,
-  ExtensionContext,
-  ExtensionToolContext,
-  ToolDefinition,
+import {
+  type AgentSession,
+  type ExtensionContext,
+  type ExtensionToolContext,
+  SessionManager,
+  type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
   DEFAULT_CHANNEL,
@@ -675,6 +679,8 @@ interface ScriptedHandleRecord {
   request: SpawnMemberRequest;
   wakePrompts: string[];
   switchedModels: Array<{ model: string; thinkingLevel?: ThinkingLevel }>;
+  steers: string[];
+  followUps: string[];
   killed: boolean;
   aborted: boolean;
   messages: AgentMessage[];
@@ -710,6 +716,27 @@ class ScriptedTransport implements ISwarmTransport {
     return this.defaultHandler;
   }
 
+  async resolveModel(
+    modelOverride: string,
+    thinkingLevel?: ThinkingLevel,
+  ): Promise<ModelSwitchResult> {
+    const found = this.availableModels.find(
+      (m) =>
+        m.fullId.toLowerCase() === modelOverride.trim().toLowerCase() ||
+        m.id.toLowerCase() === modelOverride.trim().toLowerCase(),
+    );
+    if (!found) {
+      throw new SwarmProtocolError(
+        "MODEL_NOT_FOUND",
+        `Unknown model "${modelOverride}".`,
+      );
+    }
+    return {
+      model: found.fullId,
+      ...(thinkingLevel ? { thinkingLevel } : {}),
+    };
+  }
+
   async listAvailableModels(): Promise<AvailableModelInfo[]> {
     return [...this.availableModels];
   }
@@ -727,6 +754,8 @@ class ScriptedTransport implements ISwarmTransport {
       request,
       wakePrompts: [],
       switchedModels: [],
+      steers: [],
+      followUps: [],
       killed: false,
       aborted: false,
       messages,
@@ -811,8 +840,12 @@ class ScriptedTransport implements ISwarmTransport {
         currentTurnPromise = runTurn(prompt);
         return currentTurnPromise;
       },
-      steer: async () => {},
-      followUp: async () => {},
+      steer: async (message: string) => {
+        record.steers.push(message);
+      },
+      followUp: async (message: string) => {
+        record.followUps.push(message);
+      },
       switchModel: async (modelOverride: string, nextThinking?: ThinkingLevel): Promise<ModelSwitchResult> => {
         if (state === "killed") {
           throw new SwarmProtocolError("MEMBER_KILLED", `${request.name} killed`);
@@ -1613,7 +1646,7 @@ describe("SwarmEngine — Hot switchModel & Quota Auto-Fallback", () => {
       finishWorking();
       await waitUntil(() => engine.getSnapshot().run?.members.busy?.state === "waiting");
 
-      // Hot-switch on waiting member succeeds, logs event, posts [model] notice!
+      // Hot-switch on waiting member succeeds, logs event, posts [model] notice, AND auto-resumes!
       const switched = await engine.switchModel({
         targetName: "busy",
         model: "anthropic/claude-opus-4-6",
@@ -1622,9 +1655,13 @@ describe("SwarmEngine — Hot switchModel & Quota Auto-Fallback", () => {
       });
       assert.equal(switched.model, "anthropic/claude-opus-4-6");
       assert.equal(switched.thinkingLevel, "high");
+      assert.equal(switched.resumed, true);
       assert.ok(store.events.some((e) => e.type === "member_model_switched" && e.memberName === "busy"));
       const board = await store.readBoard("run-dyn", { limit: 20 });
       assert.ok(board.messages.some((m) => m.kind === "model_switch" && m.text.includes("[model]")));
+      await waitUntil(() => transport.handles.get("busy")!.wakePrompts.length >= 1);
+      await waitUntil(() => engine.getSnapshot().run?.members.busy?.state === "waiting");
+      assert.match(transport.handles.get("busy")!.wakePrompts[0]!, /hot-switched to "anthropic\/claude-opus-4-6"/);
 
       // Killed member rejects switchModel
       await engine.killMember("busy");
@@ -1673,6 +1710,7 @@ describe("SwarmEngine — Zero-Token Stall Watchdog", () => {
   it("posts [stall] from monitor when swarm goes silent without @orchestrator, and stays quiet after completeRun", async () => {
     const { engine, store } = await createTestHarness({
       stallWatchdogEnabled: true,
+      stallMonitorMode: "deterministic",
       stallTimeoutMs: 60,
     });
     const stallEvents: SwarmEngineEvent[] = [];
@@ -2572,6 +2610,387 @@ describe("SwarmEngine — Verifier Regression Fixes", () => {
       assert.equal(transport.handles.get("hunter")!.wakePrompts.length, 1);
     } finally {
       await engine.dispose();
+    }
+  });
+});
+
+// ============================================================================
+// 13. v0.3.0 Parity Fixes: Non-Blocking swarm_wait, Self-Switch, Disk Sessions,
+//     Smart LLM Monitor, and Mid-Flight Steering
+// ============================================================================
+
+describe("SwarmEngine — v0.3.0 Antigravity Swarm Parity & Steering", () => {
+  it("parkOrchestratorWait ends turn non-blockingly, wakes once on matching post or all_idle, and clears on user input", async () => {
+    const { engine } = await createTestHarness({ stallWatchdogEnabled: false });
+    const wakeups: SwarmEngineEvent[] = [];
+    engine.subscribe((ev) => {
+      if (ev.type === "wakeup_needed") wakeups.push(ev);
+    });
+
+    try {
+      // Zero active members -> returns immediately parked=false (all_idle)
+      const idleRes = await engine.parkOrchestratorWait({ since: 0 });
+      assert.equal(idleRes.parked, false);
+      assert.equal(idleRes.wokeBy, "all_idle");
+
+      // Active member -> parks non-blockingly and wakes ONCE on @orchestrator with unread messages
+      const { transport } = await createTestHarness({ stallWatchdogEnabled: false });
+      const { engine: eng2, transport: tr2 } = await (async () => {
+        const res = await createTestHarness({ stallWatchdogEnabled: false });
+        return res;
+      })();
+      void transport;
+      const wakeups2: SwarmEngineEvent[] = [];
+      eng2.subscribe((ev) => {
+        if (ev.type === "wakeup_needed") wakeups2.push(ev);
+      });
+
+      let releaseW!: () => void;
+      const wGate = new Promise<void>((r) => {
+        releaseW = r;
+      });
+      tr2.onMember("alpha", async ({ turnIndex }) => {
+        if (turnIndex === 1) await wGate;
+      });
+
+      await eng2.addMembers({ name: "alpha", brief: "Work slowly" });
+      await waitUntil(() => tr2.handles.has("alpha"));
+
+      const parkRes = await eng2.parkOrchestratorWait({ since: 0, mentionsOnly: true });
+      assert.equal(parkRes.parked, true);
+      assert.deepEqual(parkRes.activeMembers, ["alpha"]);
+
+      // Non-mention post does not trigger mentionsOnly wakeup yet
+      await eng2.postMessage({ from: "alpha", fromRole: "worker", text: "progress note" });
+      assert.equal(wakeups2.length, 0);
+
+      // @orchestrator wakes ONCE and attaches all unread messages since #0!
+      await eng2.postMessage({
+        from: "alpha",
+        fromRole: "worker",
+        text: "@orchestrator [done] finished task",
+      });
+      assert.equal(wakeups2.length, 1);
+      assert.equal(wakeups2[0]!.messages?.length, 3); // #1 brief + #2 progress + #3 done
+
+      // clearOrchestratorWait suppresses stale all_idle wakeups after user interrupts
+      const park2 = await eng2.parkOrchestratorWait({ since: eng2.getSnapshot().boardHead });
+      assert.equal(park2.parked, true);
+      eng2.clearOrchestratorWait("User sent message");
+      releaseW();
+      await waitUntil(() => eng2.getSnapshot().workingMemberNames.length === 0);
+      assert.equal(wakeups2.length, 1, "clearOrchestratorWait must suppress subsequent all_idle wakeup");
+
+      await eng2.dispose();
+    } finally {
+      await engine.dispose();
+    }
+  });
+
+  it("supports deferred self model switch from a working member and auto-resumes on the new model", async () => {
+    const { engine, transport } = await createTestHarness({
+      workerModel: "anthropic/claude-sonnet-4-5",
+      fallbackModels: [],
+    });
+
+    try {
+      const modelsSeen: Array<{ turn: number; model: string | undefined; prompt: string }> = [];
+      let selfSwitchRes: unknown;
+      let badSwitchErr: unknown;
+
+      transport.onMember("selfie", async ({ request, prompt, turnIndex, model }) => {
+        modelsSeen.push({ turn: turnIndex, model, prompt });
+        if (turnIndex === 1) {
+          // Invalid model fails synchronously with MODEL_NOT_FOUND
+          try {
+            await request.engineApi!.switchModel("selfie", "nonexistent/model-xyz");
+          } catch (err) {
+            badSwitchErr = err;
+          }
+          // Self-switch while working schedules deferred switch -> terminates turn -> resumes on gemini-2.5-pro!
+          const scopedTools = createMemberScopedTools(request.engineApi!, {
+            name: "selfie",
+            role: "worker",
+            runId: request.runId,
+          });
+          const swarmTool = scopedTools.find((t) => t.name === SWARM_TOOL)!;
+          selfSwitchRes = await swarmTool.execute(
+            "tc-self",
+            {
+              action: "model",
+              model: "google/gemini-2.5-pro",
+              thinking_level: "high",
+              reason: "Need larger context window",
+            },
+            undefined,
+            undefined,
+            {} as ExtensionToolContext,
+          );
+          return { outcome: "waiting", summary: "switching model" };
+        }
+        await request.engineApi!.postMessage({
+          text: `@orchestrator [done] Resumed cleanly on ${model}`,
+        });
+        return { outcome: "waiting", summary: "completed after switch" };
+      });
+
+      const since = engine.getSnapshot().boardHead;
+      await engine.addMembers({ name: "selfie", brief: "Self-switch to larger model" });
+      const waitRes = await engine.waitForBoard({ since, timeoutMs: 3000 });
+
+      assert.equal(waitRes.wokeBy, "message");
+      assert.ok(badSwitchErr instanceof SwarmProtocolError && badSwitchErr.code === "MODEL_NOT_FOUND");
+      assert.equal((selfSwitchRes as { terminate?: boolean }).terminate, true);
+      assert.equal((selfSwitchRes as { details?: { deferred?: boolean } }).details?.deferred, true);
+      assert.equal(modelsSeen.length, 2);
+      assert.equal(modelsSeen[0]!.model, "anthropic/claude-sonnet-4-5");
+      assert.equal(modelsSeen[1]!.model, "google/gemini-2.5-pro");
+      assert.match(modelsSeen[1]!.prompt, /Self model hot-switch to "google\/gemini-2\.5-pro"/);
+    } finally {
+      await engine.dispose();
+    }
+  });
+
+  it("runs Smart LLM Monitor in 'llm' mode (surgical wake, [noop], and deterministic fallback) & supports steerMember", async () => {
+    // 1. Surgical wake of @stuck + steerMember working vs waiting
+    const { engine, transport, store } = await createTestHarness({
+      stallWatchdogEnabled: true,
+      stallMonitorMode: "llm",
+      stallTimeoutMs: 50,
+    });
+    const orchWakeups: SwarmEngineEvent[] = [];
+    const stallEvents: SwarmEngineEvent[] = [];
+    engine.subscribe((ev) => {
+      if (ev.type === "wakeup_needed") orchWakeups.push(ev);
+      if (ev.type === "stall_detected") stallEvents.push(ev);
+    });
+
+    try {
+      let releaseWorker!: () => void;
+      const workerGate = new Promise<void>((r) => {
+        releaseWorker = r;
+      });
+      transport.onMember("stuck", async ({ request, turnIndex }) => {
+        if (turnIndex === 1) {
+          return { outcome: "waiting", summary: "Forgot to ping orchestrator" };
+        }
+        if (turnIndex === 2) {
+          // Monitor woke stuck!
+          await request.engineApi!.postMessage({
+            text: "@orchestrator [done] Unstuck by monitor nudge",
+          });
+          return { outcome: "waiting", summary: "done after nudge" };
+        }
+        await workerGate;
+        return { outcome: "waiting", summary: "steered turn done" };
+      });
+
+      transport.onMember("monitor", async ({ request }) => {
+        assert.equal(request.isMonitor, true);
+        await request.engineApi!.postMessage({
+          text: "@stuck [stall] Please finish and post @orchestrator [done]",
+        });
+        return { outcome: "stopped", summary: "nudged @stuck" };
+      });
+
+      await engine.addMembers({ name: "stuck", brief: "Complete task" });
+
+      // Wait for LLM monitor to run, nudge @stuck, and @stuck to post @orchestrator [done]
+      await waitUntil(
+        () =>
+          stallEvents.length >= 1 &&
+          orchWakeups.some((e) => e.summary.includes("stuck") || e.messages?.some((m) => m.text.includes("[done]"))),
+        3000,
+      );
+
+      assert.equal(stallEvents.length, 1);
+      assert.equal(stallEvents[0]!.memberName, "stuck");
+      // The [stall] itself was NOT addressed to @orchestrator; only @stuck's [done] woke orchestrator
+      assert.ok(store.events.some((e) => e.type === "stall_detected"));
+
+      // Test steerMember on waiting member -> wakes via board post (delivery="woken")
+      const waitTurnPromise = engine.steerMember("stuck", "Now do extra pass", "steer");
+      const steerWaitRes = await waitTurnPromise;
+      assert.equal(steerWaitRes.delivery, "woken");
+      await waitUntil(() => engine.getSnapshot().workingMemberNames.includes("stuck"));
+      await waitUntil(() => (transport.handles.get("stuck")!.steers.length === 0));
+
+      // Test steerMember while working -> delivers live handle.steer (delivery="steered")
+      const workingSteer = await engine.steerMember("stuck", "Redirect to v2", "steer");
+      assert.equal(workingSteer.delivery, "steered");
+      assert.deepEqual(transport.handles.get("stuck")!.steers, ["Redirect to v2"]);
+      releaseWorker();
+      await waitUntil(() => engine.getSnapshot().workingMemberNames.length === 0);
+    } finally {
+      await engine.dispose();
+    }
+
+    // 2. Smart Monitor [noop] stays quiet, and error falls back deterministically
+    const { engine: eng2, transport: tr2, store: store2 } = await createTestHarness({
+      stallWatchdogEnabled: true,
+      stallMonitorMode: "llm",
+      stallTimeoutMs: 50,
+    });
+    try {
+      let monitorCall = 0;
+      tr2.onMember("monitor", async () => {
+        monitorCall += 1;
+        if (monitorCall === 1) {
+          return { outcome: "stopped", summary: "[noop]" };
+        }
+        throw new Error("Monitor LLM unavailable");
+      });
+      await eng2.addMembers({ name: "quiet2", brief: "Finish" });
+      await waitUntil(() => monitorCall >= 1, 1500);
+      await delay(80);
+      assert.equal(
+        (await store2.readBoard("run-dyn")).messages.filter((m) => m.kind === "stall").length,
+        0,
+        "[noop] from LLM monitor must suppress stall post",
+      );
+
+      // Advance boardHead to re-arm watchdog; second monitor call throws -> deterministic fallback posts @orchestrator [stall]!
+      await eng2.postMessage({ from: "quiet2", fromRole: "worker", text: "status ping without mention" });
+      await delay(20);
+      await waitUntil(
+        () => store2.events.some((e) => e.type === "stall_detected"),
+        2000,
+      );
+      const boardMsgs = (await store2.readBoard("run-dyn", { limit: 20 })).messages;
+      const fallbackStall = boardMsgs.find((m) => m.kind === "stall");
+      assert.ok(fallbackStall && fallbackStall.text.includes("@orchestrator [stall]"));
+    } finally {
+      await eng2.dispose();
+    }
+  });
+
+  it("persists member sessions to disk (SessionManager.create/open) across transport restarts and normalizes stale working state", async () => {
+    const tmpRoot = await mkdtemp(path.join(os.tmpdir(), "pi-swarm-session-persist-"));
+    const sessionDir = path.join(tmpRoot, "sessions");
+    try {
+      let capturedSessionFile: string | undefined;
+      const transport = new InProcessPiTransport({
+        agentDir: tmpRoot,
+        createSession: async (opts) => {
+          const fakeSession = {
+            model: opts?.model,
+            sessionManager: opts?.sessionManager,
+            extensionRunner: { hasHandlers: () => false, emit: async () => {} },
+            bindExtensions: async () => {},
+            subscribe: () => () => {},
+            prompt: async (text: string) => {
+              opts?.sessionManager?.appendMessage({
+                role: "user",
+                content: text,
+                timestamp: Date.now(),
+              });
+              opts?.sessionManager?.appendMessage({
+                role: "assistant",
+                content: [{ type: "text", text: `ack: ${text.slice(0, 30)}` }],
+                api: "anthropic-messages",
+                provider: "anthropic",
+                model: "mock",
+                usage: {
+                  input: 1,
+                  output: 1,
+                  cacheRead: 0,
+                  cacheWrite: 0,
+                  totalTokens: 2,
+                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+                },
+                stopReason: "stop",
+                timestamp: Date.now(),
+              });
+            },
+            steer: async () => {},
+            followUp: async () => {},
+            setModel: async () => {},
+            setThinkingLevel: () => {},
+            abort: async () => {},
+            getSessionStats: () => ({
+              tokens: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 },
+              cost: 0,
+            }),
+            dispose: () => {},
+          } as unknown as AgentSession;
+          return {
+            session: fakeSession,
+            extensionsResult: {} as never,
+          };
+        },
+      });
+
+      const handle1 = await transport.spawnMember({
+        agentId: "persisted-1",
+        name: "persisted",
+        role: "worker",
+        runId: "run-p",
+        cwd: tmpRoot,
+        workspace: "inherit",
+        parentName: "orchestrator",
+        brief: "First turn",
+        systemPrompt: "Sys",
+        initialPrompt: "First persisted prompt",
+        keepWarm: true,
+        sessionDir,
+      });
+
+      const res1 = await handle1.currentTurn;
+      assert.equal(res1.outcome, "waiting");
+      capturedSessionFile = handle1.getSessionFile?.();
+      assert.ok(capturedSessionFile, "SessionManager.create must produce a disk sessionFile");
+      await handle1.kill("Simulated Pi process exit");
+
+      // Reopen in a fresh handle using sessionFile (simulating Pi process restart!)
+      const handle2 = await transport.spawnMember({
+        agentId: "persisted-1",
+        name: "persisted",
+        role: "worker",
+        runId: "run-p",
+        cwd: tmpRoot,
+        workspace: "inherit",
+        parentName: "orchestrator",
+        brief: "First turn",
+        systemPrompt: "Sys",
+        initialPrompt: "Resumed after restart",
+        keepWarm: true,
+        sessionDir,
+        sessionFile: capturedSessionFile,
+      });
+      await handle2.currentTurn;
+      const restored = handle2.getConversationMessages();
+      assert.ok(
+        restored.some(
+          (m) => m.role === "user" && typeof m.content === "string" && m.content.includes("First persisted prompt"),
+        ),
+        "Reopened SessionManager must retain messages from before process exit",
+      );
+      assert.ok(
+        restored.some(
+          (m) => m.role === "user" && typeof m.content === "string" && m.content.includes("Resumed after restart"),
+        ),
+      );
+      await handle2.kill("cleanup");
+
+      // Also verify attachRun normalizes stale persisted 'working' members after process restart!
+      const { store, engine } = await createTestHarness();
+      await engine.attachRun(null);
+      await store.addMember("run-dyn", {
+        name: "crashed",
+        agentId: "crashed-1",
+        role: "worker",
+        parentName: "orchestrator",
+        brief: "Was working before crash",
+        workspace: "inherit",
+        cwd: tmpRoot,
+        state: "working",
+        sessionFile: capturedSessionFile,
+      });
+      const attached = await engine.attachRun("run-dyn");
+      assert.equal(attached.run?.members.crashed?.state, "stopped");
+      await engine.dispose();
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true }).catch(() => {});
     }
   });
 });

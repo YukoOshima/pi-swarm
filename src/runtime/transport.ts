@@ -1,3 +1,4 @@
+import { access, mkdir } from "node:fs/promises";
 import path from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
@@ -452,6 +453,79 @@ export function sanitizeForkSeedMessages(messages: readonly AgentMessage[]): Age
   });
 }
 
+async function fileExists(targetPath: string): Promise<boolean> {
+  try {
+    await access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function hasDanglingToolCalls(messages: readonly AgentMessage[]): boolean {
+  const sanitized = sanitizeForkSeedMessages(messages);
+  if (sanitized.length !== messages.length) {
+    return true;
+  }
+  for (let i = 0; i < messages.length; i++) {
+    const a = messages[i];
+    const b = sanitized[i];
+    if (isAssistantMessage(a) && isAssistantMessage(b)) {
+      const aParts = Array.isArray(a.content) ? a.content.length : 0;
+      const bParts = Array.isArray(b.content) ? b.content.length : 0;
+      if (aParts !== bParts) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+async function openOrCreateMemberSessionManager(
+  request: SpawnMemberRequest,
+): Promise<SessionManager> {
+  if (request.sessionFile && (await fileExists(request.sessionFile))) {
+    try {
+      const opened = SessionManager.open(
+        request.sessionFile,
+        request.sessionDir,
+        request.cwd,
+      );
+      const existingMsgs = extractSessionMessages(opened);
+      if (!hasDanglingToolCalls(existingMsgs)) {
+        return opened;
+      }
+      // Recovered from a crash mid-tool-call: open fresh persisted session seeded with sanitized history
+      if (request.sessionDir) {
+        await mkdir(request.sessionDir, { recursive: true });
+        const fresh = SessionManager.create(request.cwd, request.sessionDir);
+        seedMessagesIntoSessionManager(fresh, existingMsgs);
+        return fresh;
+      }
+      const freshMem = SessionManager.inMemory(request.cwd);
+      seedMessagesIntoSessionManager(freshMem, existingMsgs);
+      return freshMem;
+    } catch {
+      // Fall through to creating a new session if corrupt
+    }
+  }
+
+  if (request.sessionDir && !request.isMonitor) {
+    await mkdir(request.sessionDir, { recursive: true });
+    const created = SessionManager.create(request.cwd, request.sessionDir);
+    if (request.seedMessages && request.seedMessages.length > 0) {
+      seedMessagesIntoSessionManager(created, request.seedMessages);
+    }
+    return created;
+  }
+
+  const inMem = SessionManager.inMemory(request.cwd);
+  if (request.seedMessages && request.seedMessages.length > 0) {
+    seedMessagesIntoSessionManager(inMem, request.seedMessages);
+  }
+  return inMem;
+}
+
 function seedMessagesIntoSessionManager(
   sessionManager: SessionManager,
   seedMessages: readonly AgentMessage[],
@@ -696,6 +770,37 @@ export class InProcessPiTransport implements ISwarmTransport {
     this.createSessionFn = options.createSession ?? createAgentSession;
   }
 
+  async resolveModel(
+    modelOverride: string,
+    thinkingLevel?: ThinkingLevel,
+    hostContext?: ExtensionContext,
+  ): Promise<ModelSwitchResult> {
+    const trimmed = modelOverride.trim();
+    if (!trimmed) {
+      throw new SwarmProtocolError("MODEL_NOT_FOUND", "Model identifier must be non-empty.");
+    }
+    const agentDir = this.agentDirOverride ?? getAgentDir();
+    const runtime = await this.resolveModelRuntime(hostContext, agentDir);
+    const cliRes = resolveCliModel({
+      cliModel: trimmed,
+      cliThinking: thinkingLevel,
+      modelRuntime: runtime,
+    });
+    if (!cliRes.model) {
+      throw new SwarmProtocolError(
+        "MODEL_NOT_FOUND",
+        `Model "${trimmed}" could not be resolved in the active Pi model registry.`,
+        { modelOverride: trimmed },
+      );
+    }
+    const resolvedId = formatModelId(cliRes.model) ?? trimmed;
+    const effectiveThinking = thinkingLevel ?? cliRes.thinkingLevel;
+    return {
+      model: resolvedId,
+      ...(effectiveThinking ? { thinkingLevel: effectiveThinking } : {}),
+    };
+  }
+
   async listAvailableModels(
     hostContext?: ExtensionContext,
   ): Promise<AvailableModelInfo[]> {
@@ -762,11 +867,13 @@ export class InProcessPiTransport implements ISwarmTransport {
     let currentModelId: string | undefined =
       request.modelOverride?.trim() || formatModelId(request.hostContext?.model);
     let currentThinkingLevel: ThinkingLevel | undefined = request.thinkingLevel;
+    let currentSessionFile: string | undefined = request.sessionFile;
     let cachedMessages: AgentMessage[] = request.seedMessages
       ? sanitizeForkSeedMessages(request.seedMessages)
       : [];
 
     let promptActive = false;
+    let endTurnRequested = false;
     let switchingModel = false;
     let killed = false;
     const isKilled = (): boolean => killed;
@@ -801,8 +908,9 @@ export class InProcessPiTransport implements ISwarmTransport {
       }
     };
 
-    const allowedTools: string[] =
-      request.role === "validator"
+    const allowedTools: string[] = request.isMonitor
+      ? [POST_MESSAGE_TOOL, READ_BOARD_TOOL]
+      : request.role === "validator"
         ? Array.from(
             new Set<string>([
               ...VALIDATOR_BUILTIN_TOOLS,
@@ -816,18 +924,27 @@ export class InProcessPiTransport implements ISwarmTransport {
         : Array.from(new Set<string>([...WORKER_BUILTIN_TOOLS, ...SWARM_CORE_TOOLS]));
 
     const bridge = request.engineApi ?? createFallbackBridge(request);
-    const customTools: ToolDefinition[] = createMemberScopedTools(bridge, {
+    const allMemberTools: ToolDefinition[] = createMemberScopedTools(bridge, {
       name: request.name,
       role: request.role,
       runId: request.runId,
       onWaitRecorded: ({ since, mentionsOnly }) => {
+        endTurnRequested = true;
         emitTelemetry({
           type: "waiting",
           activity: `waiting (since #${since})`,
           logLine: `swarm_wait since=#${since} mentions_only=${mentionsOnly}`,
         });
       },
+      onSelfModelSwitchScheduled: () => {
+        endTurnRequested = true;
+      },
     });
+    const customTools: ToolDefinition[] = request.isMonitor
+      ? allMemberTools.filter(
+          (t) => t.name === POST_MESSAGE_TOOL || t.name === READ_BOARD_TOOL,
+        )
+      : allMemberTools;
 
     const guardFactory: ExtensionFactory =
       request.role === "validator"
@@ -933,18 +1050,15 @@ export class InProcessPiTransport implements ISwarmTransport {
     ): Promise<AgentTurnResult> => {
       let caughtError: unknown;
       assistantRef.current = undefined;
+      endTurnRequested = false;
 
       try {
         if (options.isInitialTurn) {
           const agentDir = this.agentDirOverride ?? getAgentDir();
           modelRuntime = await this.resolveModelRuntime(request.hostContext, agentDir);
           const settingsManager = SettingsManager.create(request.cwd, agentDir);
-          const sessionManager = SessionManager.inMemory(request.cwd);
-
-          // TRUE Conversation Forking: seed parent messages BEFORE createAgentSession!
-          if (request.seedMessages && request.seedMessages.length > 0) {
-            seedMessagesIntoSessionManager(sessionManager, request.seedMessages);
-          }
+          const sessionManager = await openOrCreateMemberSessionManager(request);
+          currentSessionFile = sessionManager.getSessionFile() ?? currentSessionFile;
 
           let resolvedModel = request.hostContext?.model;
           let resolvedThinking = request.thinkingLevel;
@@ -1001,6 +1115,24 @@ export class InProcessPiTransport implements ISwarmTransport {
 
           session = created.session;
           await session.bindExtensions({});
+          currentSessionFile = session.sessionManager?.getSessionFile?.() ?? currentSessionFile;
+
+          // Guarantee immediate turn termination when `swarm_wait` (or self `model` switch) runs
+          // inside the same parallel tool batch alongside `post_message`!
+          const sessionAgent = (session as unknown as {
+            agent?: {
+              finishTurn?: (turn: unknown, signal?: AbortSignal) => Promise<{ action: "end" | "continue" } | undefined>;
+            };
+          }).agent;
+          if (sessionAgent) {
+            const prevFinishTurn = sessionAgent.finishTurn?.bind(sessionAgent);
+            sessionAgent.finishTurn = async (turn, sig) => {
+              if (endTurnRequested) {
+                return { action: "end" };
+              }
+              return prevFinishTurn ? prevFinishTurn(turn, sig) : undefined;
+            };
+          }
 
           if (killed || abortedByCaller) {
             await disposeSessionOnce(created.session);
@@ -1273,6 +1405,10 @@ export class InProcessPiTransport implements ISwarmTransport {
 
       getThinkingLevel(): ThinkingLevel | undefined {
         return currentThinkingLevel;
+      },
+
+      getSessionFile(): string | undefined {
+        return session?.sessionManager?.getSessionFile?.() ?? currentSessionFile;
       },
 
       getConversationMessages(): AgentMessage[] {

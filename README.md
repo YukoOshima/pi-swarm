@@ -1,9 +1,9 @@
-# 🐝 pi-swarm (`v0.2.0`)
+# 🐝 pi-swarm (`v0.3.0`)
 
 **`pi-swarm`** is a **Dynamic Antigravity Swarm** multi-agent orchestration extension for [Pi](https://github.com/earendil-works/pi) (`v1.5.2+`).
 面向 [Pi](https://github.com/earendil-works/pi) (`v1.5.2+`) 的**动态蜂群（Dynamic Antigravity Swarm）多 Agent 协作与编排扩展**。
 
-Instead of locking work into a rigid upfront DAG, `pi-swarm` v0.2.0 pairs **`pi-goal-x`-style upfront clarification** with **free-form, wave-by-wave dynamic orchestration** over a shared `#seq` Message Board, warm persistent member sessions, true conversation forking, isolated Git worktrees, and 3-role model routing.
+Instead of locking work into a rigid upfront DAG, `pi-swarm` v0.3.0 pairs **`pi-goal-x`-style upfront clarification** with **Antigravity-Swarm-grade dynamic orchestration**: non-blocking turn-ending `swarm_wait`, instant mid-flight user redirection (`swarm{action:"steer"|"stop"|"title"}`), disk-persisted member sessions (`SessionManager.create`/`open`), hot model switching with auto-resume (including self-switch deferral), Smart LLM Monitor (`@monitor`), true isolated `git clone` for `workspace:"branch"`, and 3-role model routing.
 
 ---
 
@@ -43,12 +43,13 @@ Instead of locking work into a rigid upfront DAG, `pi-swarm` v0.2.0 pairs **`pi-
 
 ### 核心特性 / Key Capabilities
 
-- **4 Core Antigravity Swarm Tools (`swarm`, `post_message`, `read_board`, `swarm_wait`)**：编排器（Orchestrator）按需动态拉起/管理成员、建频道、等待消息板（支持防死锁 `all_idle` 退出与进度更新）、合并 worktree、销毁已集成成员并结项；Worker 与 Validator 会话内部亦注入权限受限的同名 4 工具（Worker 可自主拉起 Helper，只读 Validator 仅可拉起只读 Helper）。
-- **Warm Persistent Sessions（温热持久会话）**：启用 `keepWorkersWarm` 后，成员完成一轮后休眠进入零 Token 消耗的 `waiting` 态并完整保留上下文；被 `@mention` 唤醒时直接继续对话，无需重读代码库。
-- **True Conversation `fork`（真实对话分叉）**：`swarm{action:"add", fork:"<member>|orchestrator"}` 通过 Pi `SessionManager.inMemory` 真实继承父成员或主控会话的干净对话历史（自动清理悬空 `toolCall`）。
-- **Zero-Token Stall Watchdog（零 Token 停滞看门狗）**：全部成员休眠且无人调用 `swarm_wait` 超过 `stallTimeoutMs` 时，本地定时器自动在消息板发 `[stall]` 提醒 `@orchestrator`，运行结项后立即静默。
+- **4 Core Antigravity Swarm Tools (`swarm`, `post_message`, `read_board`, `swarm_wait`)**：编排器（Orchestrator）调用 `swarm_wait` 后会像 Antigravity一样**立即结束当前 turn 并异步休眠**，随时接受用户在运行中途发送自然语言调整方向（通过 `swarm{action:"steer"|"stop"|"title"}` 或 `/swarm steer` 实时重定向子 Agent）。
+- **Warm & Disk-Persisted Sessions（温热 + 磁盘持久化会话）**：成员会话落盘至 `.pi/swarm/runs/<run-id>/sessions/`，同进程 `waiting` 保持零 Token 热上下文，即使彻底退出并重启 Pi，下次 `@mention` 仍能从磁盘 JSONL 无损恢复完整对话（自动清理崩溃悬挂 `toolCall`）。
+- **Hot Model Switch Auto-Resume & Self-Switch（切模型自动恢复 + 自切延后）**：手动 `swarm{action:"model"}` 切换完立即自动唤醒继续未竟工作；Worker 对自己调用 `swarm{action:"model"}` 会安全排期在当前 turn 结束时切换并立即在新模型上续跑。
+- **True Conversation `fork`（真实对话分叉）**：`swarm{action:"add", fork:"<member>|orchestrator"}` 真实继承父成员或主控会话的干净对话历史。
+- **Smart LLM Monitor (`stallMonitorMode: "llm"`)**：全部成员空闲超 `stallTimeoutMs` 时，召唤只读诊断官 `@monitor` 分析板子并精准 `@具体卡点成员`（无问题则 `[noop]`，失败自动退化为确定性 `@orchestrator [stall]`）。
 - **Independent Read-Only Validator（独立只读验证官）**：`role:"validator"` 强制隔离写工具（仅开放 `read`/`grep`/`find`/`ls` 与只读 `bash` 护栏），杜绝作者自审自过。
-- **Human Sovereignty & Safety Guards（人类主权与安全护栏）**：人工停止（`humanStopped`）的成员绝不被同伴 `@mention` 自动重启；未提交更改的脏 worktree 拒绝被静默删除（除非显式 `--force`）；`.pi/swarm/` 自动加入 `.git/info/exclude` 不污染仓库。
+- **Share Worktree vs Branch Clone**：`workspace:"share"` 创建共享对象库的 Git worktree，`workspace:"branch"` 创建彻底独立的 `git clone --no-hardlinks`，均支持自动 `autoRebase` 与 `merge`。
 
 ---
 
@@ -158,7 +159,8 @@ Use `swarm{action:"channel", op:"create|list|join|leave|archive", channel, topic
 
 ### Workspace Modes (`inherit` vs `share` vs `branch`)
 - **`inherit` (default)**: Runs directly in the shared repository root — ideal for read-only researchers/scouts, validators, or single non-overlapping edits.
-- **`share` / `branch`**: Provisions an isolated Git worktree at `.pi/swarm/worktrees/<run-id>/wt-<member>/` on branch `swarm/<run-short>/<member>`. Use `share` whenever multiple authors edit or build simultaneously, then land via `swarm{action:"merge", name}` (or `/swarm merge <member>`) and retire via `swarm{action:"kill", name}` (or `/swarm kill <member>`).
+- **`share`**: Provisions a linked Git worktree at `.pi/swarm/worktrees/<run-id>/wt-<member>/` on branch `swarm/<run-short>/<member>` sharing the repository's `.git` object store.
+- **`branch`**: Provisions a **fully isolated standalone `git clone --no-hardlinks`** at `.pi/swarm/worktrees/<run-id>/wt-<member>/` on branch `swarm/<run-short>/<member>`, fetched back automatically on `swarm{action:"merge"}`.
 
 ---
 
@@ -176,8 +178,9 @@ Only **`/swarm`** and **`/swarm-direct`** are registered on Pi.
 | `/swarm graph` | Zero-turn ASCII/Unicode Spawn Tree & Peer `@mention` / `#channel` Interaction Graph | **No** |
 | `/swarm tasks [tab\|member\|#ch]` <br> `/swarm ui [tab\|member\|#ch]` | Open the live 4-tab Swarm Overlay (**Board** / **Members** / **Graph** / **Search**) | **No** |
 | `/swarm models` | Zero-turn overview of 3-role defaults, `fallbackModels`, and every live member's model | **No** |
-| `/swarm model <target> <model\|default> [thinking]` | Set role default (`orchestrator`/`worker`/`validator`) OR hot-switch a warm `waiting` member | **No** |
-| `/swarm merge <member>` | Land a member's clean `share`/`branch` worktree onto `baseBranch` (`autoRebase` + `--no-ff`) | **No** |
+| `/swarm model <target> <model\|default> [thinking]` | Set role default (`orchestrator`/`worker`/`validator`) OR hot-switch & resume a warm `waiting` member | **No** |
+| `/swarm steer <member> <message>` | Steer a working member mid-turn or wake a parked member with new user direction | **No** |
+| `/swarm merge <member>` | Land a member's clean `share` worktree or `branch` clone onto `baseBranch` (`autoRebase` + `--no-ff`) | **No** |
 | `/swarm kill <member> [--force] [reason]` | Permanently kill a member and remove its clean worktree (`--force` overrides dirty guard) | **No** |
 | `/swarm done [summary]` | Complete the active run, dispose warm handles, silence watchdog & restore `idle` tools | **No** |
 | `/swarm pause [reason]` / `/swarm resume` | Pause or resume member launches and board wakeups | **No** |
@@ -243,8 +246,9 @@ Only **`/swarm`** and **`/swarm-direct`** are registered on Pi.
 | `maxConcurrency` | `6` | `1–64`, maximum concurrent working turns |
 | `validatorEnabled` | `true` | Independent read-only Validator policy default |
 | `keepWorkersWarm` | `true` | Keep completed members parked in zero-token warm `waiting` state with full history |
-| `stallWatchdogEnabled` | `true` | Enable Zero-Token Stall Watchdog (`[stall]` board alert when all members idle silently) |
-| `stallTimeoutMs` | `45000` | `1000–3600000`, idle duration before Stall Watchdog posts `[stall]` |
+| `stallWatchdogEnabled` | `true` | Enable Stall Watchdog when all members idle silently |
+| `stallMonitorMode` | `"llm"` | `"llm"` (read-only `@monitor` diagnoses & wakes single bottleneck member) \| `"deterministic"` (zero-token `@orchestrator` alert) |
+| `stallTimeoutMs` | `45000` | `1000–3600000`, idle duration before Stall Watchdog triggers |
 | `maxRetries` | `2` | `0–20`, transient failure retry budget |
 | `rateLimitBaseBackoffMs` / `rateLimitMaxBackoffMs` | `5000` / `60000` | Shared exponential backoff bounds on HTTP 429 |
 | `gitTimeoutMs` | `30000` | `1000–600000`, per-Git command timeout |

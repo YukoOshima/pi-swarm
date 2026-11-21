@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   ALL_MENTION_NAME,
   CHANNEL_NAME_PATTERN,
@@ -33,6 +33,8 @@ import {
   type MemberEngineBridge,
   type MergeBranchResult,
   type MergeMemberOptions,
+  type ParkOrchestratorWaitOptions,
+  type ParkOrchestratorWaitResult,
   type PersistentAgentHandle,
   type PostBoardMessageInput,
   type ReadBoardOptions,
@@ -242,6 +244,14 @@ interface LiveMember {
   currentActivity?: string;
   /** Latest swarm_wait request captured during current turn. */
   lastWaitRequest?: { since: number; mentionsOnly: boolean };
+  /** Pending deferred self model switch scheduled by the member while working. */
+  pendingSelfModelSwitch?: {
+    model: string;
+    thinkingLevel?: ThinkingLevel;
+    reason?: string;
+    callerName: string;
+    callerRole: CallerRole;
+  };
   /** AbortController for cancelling in-flight concurrency/backoff waits on stop/kill/dispose. */
   launchAbort?: AbortController;
   /** Active concurrency slot release callback, if currently holding a slot. */
@@ -306,6 +316,12 @@ export class SwarmEngine implements ISwarmEngine {
 
   private stallTimer: ReturnType<typeof setTimeout> | null = null;
   private stallNoticePostedAtHead: number | null = null;
+  private monitorRunning = false;
+  private orchestratorWait: {
+    since: number;
+    mentionsOnly: boolean;
+    timer: ReturnType<typeof setTimeout> | null;
+  } | null = null;
   private runDonePosted = false;
   private boardHopCount = 0;
   private hopCapAlerted = false;
@@ -368,6 +384,7 @@ export class SwarmEngine implements ISwarmEngine {
 
     if (runId === null) {
       this.cancelStallWatchdog();
+      this.clearOrchestratorWait("Detached from Swarm run.");
       this.resolveAllWaiters("run_ended", "Detached from Swarm run.");
       this.activeRunId = null;
       this.cachedRun = null;
@@ -385,11 +402,26 @@ export class SwarmEngine implements ISwarmEngine {
     const isSameRun = this.activeRunId === runId;
     if (this.activeRunId && !isSameRun) {
       this.cancelStallWatchdog();
+      this.clearOrchestratorWait(`Switched focus to run ${runId}.`);
       this.resolveAllWaiters("run_ended", `Switched focus to run ${runId}.`);
       await this.disposeLiveHandles("Switched active run");
     }
 
-    const run = await this.store.loadRun(runId);
+    let run = await this.store.loadRun(runId);
+
+    // Crash/restart recovery: when attaching a run after a fresh process start (no live handles in memory),
+    // normalize stale persisted `working` members to `stopped` so `@mention` revives them from disk `sessionFile`.
+    if (!isSameRun && run.status === "active") {
+      for (const m of Object.values(run.members)) {
+        if (m.state === "working" && !this.liveMembers.has(m.name)) {
+          run = await this.store.updateMember(run.id, m.name, {
+            state: "stopped",
+            currentActivity: null,
+            parkedOn: "stopped (reloaded; @mention to revive)",
+          });
+        }
+      }
+    }
     const boardRes = await this.store
       .readBoard(runId, { channel: "*", limit: BOARD_CACHE_LIMIT })
       .catch(() => ({ messages: [] as BoardMessage[], head: run.boardHead }));
@@ -429,23 +461,59 @@ export class SwarmEngine implements ISwarmEngine {
     title: string,
     options?: { callerRole?: CallerRole; actor?: string },
   ): Promise<SwarmRunState> {
+    return this.updateDirection({ title }, options);
+  }
+
+  async updateDirection(
+    patch: {
+      title?: string;
+      objective?: string;
+      strategy?: string;
+      acceptanceCriteria?: string;
+    },
+    options?: { callerRole?: CallerRole; actor?: string },
+  ): Promise<SwarmRunState> {
     if (!isOrchestratorOrHuman(options?.callerRole)) {
       throw new SwarmProtocolError(
         "PERMISSION_DENIED",
-        `Role "${options?.callerRole}" is not allowed to change the swarm title.`,
+        `Role "${options?.callerRole}" is not allowed to change swarm title or direction.`,
       );
     }
-    const trimmed = title.trim();
-    if (!trimmed) {
-      throw new SwarmProtocolError("INVALID_INPUT", "Swarm title must be non-empty.");
-    }
     const run = this.requireActiveRun();
-    const updated = await this.store.updateRun(run.id, {
-      title: trimmed,
+    const updatePatch: {
+      title?: string;
+      objective?: string;
+      strategy?: string;
+      acceptanceCriteria?: string;
+      actor?: string;
+    } = {
       actor: options?.actor ?? ORCHESTRATOR_NAME,
-    });
+    };
+
+    if (patch.title !== undefined) {
+      const trimmed = patch.title.trim();
+      if (!trimmed) {
+        throw new SwarmProtocolError("INVALID_INPUT", "Swarm title must be non-empty.");
+      }
+      updatePatch.title = trimmed;
+    }
+    if (patch.objective !== undefined) {
+      const trimmed = patch.objective.trim();
+      if (!trimmed) {
+        throw new SwarmProtocolError("INVALID_INPUT", "Swarm objective must be non-empty.");
+      }
+      updatePatch.objective = trimmed;
+    }
+    if (patch.strategy !== undefined) {
+      updatePatch.strategy = patch.strategy.trim();
+    }
+    if (patch.acceptanceCriteria !== undefined) {
+      updatePatch.acceptanceCriteria = patch.acceptanceCriteria.trim();
+    }
+
+    const updated = await this.store.updateRun(run.id, updatePatch);
     await this.refreshCache(updated);
-    this.emitEngineEvent("snapshot_changed", `Swarm titled "${updated.title}".`);
+    this.emitEngineEvent("snapshot_changed", `Updated swarm "${updated.title}".`);
     return updated;
   }
 
@@ -455,6 +523,7 @@ export class SwarmEngine implements ISwarmEngine {
       throw new SwarmProtocolError("NOT_FOUND", "No active Swarm run to pause.");
     }
     this.cancelStallWatchdog();
+    this.clearOrchestratorWait(reason ?? "Swarm run paused.");
     this.concurrencyGate.pause();
     this.resolveAllWaiters("run_ended", reason ?? "Swarm run paused.");
 
@@ -518,6 +587,7 @@ export class SwarmEngine implements ISwarmEngine {
 
     // Silence watchdog immediately and prevent any further wakes
     this.cancelStallWatchdog();
+    this.clearOrchestratorWait("Run completed.");
     this.runDonePosted = true;
 
     // Post `[done] <summary>` (NO @mentions!) on board directly so Stall Watchdog stays quiet
@@ -780,6 +850,13 @@ export class SwarmEngine implements ISwarmEngine {
             `Cannot fork from killed member "@${sourceMember.name}" (session disposed).`,
             { fork: sourceMember.name },
           );
+        } else if (sourceMember.sessionFile) {
+          try {
+            const reopened = SessionManager.open(sourceMember.sessionFile);
+            seedMessages = sanitizeForkSeedMessages(extractSessionMessages(reopened));
+          } catch {
+            seedMessages = [];
+          }
         } else {
           seedMessages = [];
         }
@@ -828,6 +905,7 @@ export class SwarmEngine implements ISwarmEngine {
           branch,
           baseBranch: run.baseBranch,
           worktreePath,
+          mode: workspaceMode,
         });
         cwd = createdWt.worktreePath;
         branch = createdWt.branch;
@@ -1033,9 +1111,13 @@ export class SwarmEngine implements ISwarmEngine {
     });
 
     // Route wakeups SYNCHRONOUSLY marking `live.waking = true` BEFORE resolving waiters or returning!
+    let emittedOrchWakeup = false;
     if (latestRun.status === "active" && normalizedMsg.fromRole !== "monitor") {
-      await this.routeBoardMessageWakeups(latestRun, normalizedMsg);
+      emittedOrchWakeup = await this.routeBoardMessageWakeups(latestRun, normalizedMsg);
     }
+
+    // If Orchestrator is parked in non-blocking `swarm_wait`, check if this message wakes it (without double-emitting!)
+    this.maybeWakeParkedOrchestratorOnMessage(normalizedMsg, emittedOrchWakeup);
 
     // Notify blocking `waitForBoard` waiters immediately
     this.notifyWaitersOnMessage(normalizedMsg);
@@ -1044,6 +1126,140 @@ export class SwarmEngine implements ISwarmEngine {
     this.maybeArmStallWatchdog();
 
     return normalizedMsg;
+  }
+
+  clearOrchestratorWait(_reason?: string): void {
+    if (!this.orchestratorWait) {
+      return;
+    }
+    if (this.orchestratorWait.timer) {
+      clearTimeout(this.orchestratorWait.timer);
+      this.orchestratorWait.timer = null;
+    }
+    this.orchestratorWait = null;
+    this.maybeArmStallWatchdog();
+  }
+
+  async parkOrchestratorWait(
+    options: ParkOrchestratorWaitOptions,
+  ): Promise<ParkOrchestratorWaitResult> {
+    const since = Number.isFinite(options.since) ? Math.max(0, Math.floor(options.since)) : 0;
+    const mentionsOnly = options.mentionsOnly ?? true;
+    const currentHead = this.cachedRun?.boardHead ?? 0;
+
+    if (!this.activeRunId || !this.cachedRun || this.cachedRun.status !== "active") {
+      return {
+        parked: false,
+        wokeBy: "run_ended",
+        messages: [],
+        head: currentHead,
+        activeMembers: [],
+        summary: "Swarm run is not active.",
+      };
+    }
+
+    const runId = this.activeRunId;
+    const initial = await this.store.readBoard(runId, {
+      since,
+      channel: "*",
+      limit: Number.MAX_SAFE_INTEGER,
+    });
+    const latestHead = Math.max(initial.head, this.cachedRun?.boardHead ?? 0);
+
+    const mergedBySeq = new Map<number, BoardMessage>();
+    for (const m of initial.messages) {
+      mergedBySeq.set(m.seq, m);
+    }
+    for (const m of this.getCachedMessagesSince(since)) {
+      mergedBySeq.set(m.seq, m);
+    }
+    const mergedUnread = Array.from(mergedBySeq.values()).sort((a, b) => a.seq - b.seq);
+
+    if (
+      this.disposed ||
+      this.activeRunId !== runId ||
+      !this.cachedRun ||
+      this.cachedRun.status !== "active"
+    ) {
+      return {
+        parked: false,
+        wokeBy: "run_ended",
+        messages: mergedUnread,
+        head: latestHead,
+        activeMembers: [],
+        summary: "Swarm run is not active.",
+      };
+    }
+
+    const immediateMatches = mergedUnread.filter((m) =>
+      this.doesMessageMatchWaiter(m, ORCHESTRATOR_NAME, mentionsOnly, []),
+    );
+    const activeMembers = this.getWorkingOrPendingMemberNames();
+
+    if (immediateMatches.length > 0) {
+      return {
+        parked: false,
+        wokeBy: "message",
+        messages: mergedUnread,
+        head: latestHead,
+        activeMembers,
+        summary: `${immediateMatches.length} matching board message(s) already waiting since #${since}.`,
+      };
+    }
+
+    if (activeMembers.length === 0) {
+      return {
+        parked: false,
+        wokeBy: "all_idle",
+        messages: mergedUnread,
+        head: latestHead,
+        activeMembers: [],
+        summary: "All swarm members are idle (0 working/pending); nothing left to wait for.",
+      };
+    }
+
+    // Arm non-blocking Orchestrator wait and end Orchestrator's current turn cleanly!
+    if (this.orchestratorWait?.timer) {
+      clearTimeout(this.orchestratorWait.timer);
+    }
+    this.cancelStallWatchdog();
+
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    if (
+      options.timeoutMs !== undefined &&
+      Number.isFinite(options.timeoutMs) &&
+      options.timeoutMs > 0
+    ) {
+      const waitTimeout = Math.max(10, options.timeoutMs);
+      const parkedRunId = runId;
+      timer = setTimeout(() => {
+        if (!this.orchestratorWait || this.disposed || this.activeRunId !== parkedRunId) {
+          return;
+        }
+        const expired = this.orchestratorWait;
+        this.orchestratorWait = null;
+        const unread = this.getCachedMessagesSince(expired.since);
+        this.emitEngineEvent(
+          "wakeup_needed",
+          `swarm_wait timed out after ${Math.round(waitTimeout)}ms (board #${this.cachedRun?.boardHead ?? latestHead})`,
+          { ...(unread.length > 0 ? { messages: unread } : {}) },
+        );
+      }, waitTimeout);
+    }
+
+    this.orchestratorWait = {
+      since,
+      mentionsOnly,
+      timer,
+    };
+
+    return {
+      parked: true,
+      messages: [],
+      head: latestHead,
+      activeMembers,
+      summary: `Parked waiting on ${activeMembers.length} active member(s) since #${since}.`,
+    };
   }
 
   async readBoard(options?: ReadBoardOptions): Promise<ReadBoardResult> {
@@ -1328,6 +1544,44 @@ export class SwarmEngine implements ISwarmEngine {
     }
     const live = this.liveMembers.get(member.name);
     const liveState = live?.handle?.getState() ?? member.state;
+    const isWorkingSelfSwitch =
+      (callerRole === "worker" || callerRole === "validator") &&
+      member.name === callerName &&
+      (member.state === "working" ||
+        liveState === "working" ||
+        Boolean(live?.turnActive) ||
+        Boolean(live?.spawning) ||
+        Boolean(live?.waking));
+
+    // Deferred Self Model Switch (Defect #3): when a worker/validator calls `swarm{action:"model"}`
+    // on itself while running, validate the target model now, schedule switch + immediate resume for turn end.
+    if (isWorkingSelfSwitch && live) {
+      let validatedModel = modelOverride;
+      let validatedThinking = options.thinkingLevel;
+      if (this.transport.resolveModel) {
+        const resolved = await this.transport.resolveModel(
+          modelOverride,
+          options.thinkingLevel,
+          this.hostContext,
+        );
+        validatedModel = resolved.model;
+        validatedThinking = resolved.thinkingLevel ?? options.thinkingLevel;
+      }
+      live.pendingSelfModelSwitch = {
+        model: validatedModel,
+        thinkingLevel: validatedThinking,
+        reason: options.reason,
+        callerName,
+        callerRole,
+      };
+      return {
+        targetName: member.name,
+        model: validatedModel,
+        thinkingLevel: validatedThinking,
+        deferred: true,
+      };
+    }
+
     if (
       member.state !== "waiting" ||
       liveState !== "waiting" ||
@@ -1349,6 +1603,9 @@ export class SwarmEngine implements ISwarmEngine {
       live.switchingModel = true;
     }
 
+    let switchSucceeded = false;
+    let shouldAutoResume = false;
+    let resumePromptText = "";
     try {
       let resolvedModel = modelOverride;
       let resolvedThinking = options.thinkingLevel;
@@ -1382,7 +1639,7 @@ export class SwarmEngine implements ISwarmEngine {
         },
       });
 
-      // Post non-waking `[model]` notice on board (no `@` so it doesn't wake members)
+      // Post non-waking `[model]` notice on board (no `@` so it doesn't duplicate-wake)
       const noticeMsg = await this.store.postBoardMessage(run.id, {
         from: callerName,
         fromRole: callerRole,
@@ -1405,17 +1662,48 @@ export class SwarmEngine implements ISwarmEngine {
         { memberName: member.name },
       );
 
+      switchSucceeded = true;
+      const latestMemberAfter = this.cachedRun?.members[member.name];
+      shouldAutoResume =
+        options.autoResume !== false &&
+        !internal.holdSwitchingLock &&
+        Boolean(live) &&
+        !this.disposed &&
+        this.activeRunId === run.id &&
+        this.cachedRun?.status === "active" &&
+        latestMemberAfter?.state === "waiting" &&
+        live?.handle?.getState() === "waiting";
+      if (shouldAutoResume) {
+        const reasonNote = options.reason ? ` (${options.reason})` : "";
+        resumePromptText = `Your model was hot-switched to "${resolvedModel}"${resolvedThinking ? ` (${resolvedThinking})` : ""}${reasonNote} with your conversation history preserved. Resume any unfinished work immediately, or post an update / call swarm_wait if already done.`;
+      }
+
       return {
         targetName: member.name,
         model: resolvedModel,
         thinkingLevel: resolvedThinking,
-        member: this.cachedRun?.members[member.name],
+        member: latestMemberAfter,
+        ...(shouldAutoResume ? { resumed: true } : {}),
       };
     } finally {
       if (acquiredLock && live) {
         const stillLive = this.liveMembers.get(member.name) === live;
         const currentMember = this.cachedRun?.members[member.name];
         if (
+          stillLive &&
+          !this.disposed &&
+          this.activeRunId === run.id &&
+          this.cachedRun?.status === "active" &&
+          currentMember?.state === "waiting" &&
+          switchSucceeded &&
+          options.autoResume !== false &&
+          live.handle?.getState() === "waiting"
+        ) {
+          // Atomically hand off switchingModel -> waking so the switched member immediately resumes!
+          live.switchingModel = false;
+          live.waking = true;
+          void this.drainMemberPendingWakes(run.id, member.name, resumePromptText);
+        } else if (
           stillLive &&
           !this.disposed &&
           this.activeRunId === run.id &&
@@ -1440,27 +1728,62 @@ export class SwarmEngine implements ISwarmEngine {
     memberName: string,
     message: string,
     mode: "steer" | "followUp" = "steer",
-  ): Promise<void> {
+    options?: { callerName?: string; callerRole?: CallerRole },
+  ): Promise<{ delivery: "steered" | "followUp" | "woken" }> {
     const run = this.requireActiveRun();
     const member = this.findMember(run, memberName);
     if (!member) {
       throw new SwarmProtocolError("MEMBER_NOT_FOUND", `Member "${memberName}" not found.`);
     }
+
+    const callerRole: CallerRole = options?.callerRole ?? "orchestrator";
+    const callerName =
+      options?.callerName?.trim() ||
+      (callerRole === "human" ? "human" : ORCHESTRATOR_NAME);
+
+    if (callerRole === "worker" || callerRole === "validator") {
+      if (member.parentName !== callerName) {
+        throw new SwarmProtocolError(
+          "PERMISSION_DENIED",
+          `Member "@${callerName}" may only steer helpers it added, not "@${member.name}".`,
+        );
+      }
+    } else if (!isOrchestratorOrHuman(callerRole)) {
+      throw new SwarmProtocolError("PERMISSION_DENIED", `Role "${callerRole}" cannot steer members.`);
+    }
+
     if (member.state === "killed") {
       throw new SwarmProtocolError("MEMBER_KILLED", `Member "@${member.name}" has been killed.`);
     }
+
+    const trimmedMsg = message.trim();
+    if (!trimmedMsg) {
+      throw new SwarmProtocolError("INVALID_INPUT", "Steering message must be non-empty.");
+    }
+
     const live = this.liveMembers.get(member.name);
-    if (!live?.handle) {
-      throw new SwarmProtocolError(
-        "MEMBER_NOT_WAITING",
-        `Member "@${member.name}" does not have an active live session.`,
-      );
+    const isLiveWorking =
+      Boolean(live?.handle) &&
+      (live!.handle!.getState() === "working" || live!.turnActive);
+
+    if (isLiveWorking && live?.handle) {
+      if (mode === "followUp") {
+        await live.handle.followUp(trimmedMsg);
+        return { delivery: "followUp" };
+      }
+      await live.handle.steer(trimmedMsg);
+      return { delivery: "steered" };
     }
-    if (mode === "followUp") {
-      await live.handle.followUp(message);
-    } else {
-      await live.handle.steer(message);
-    }
+
+    // Parked waiting or stopped -> wake/revive cleanly via board post targeting @<member>
+    await this.postMessage({
+      from: callerName,
+      fromRole: callerRole,
+      channel: member.channels[0] ?? DEFAULT_CHANNEL,
+      kind: "decision",
+      text: `@${member.name} [steer] ${trimmedMsg}`,
+    });
+    return { delivery: "woken" };
   }
 
   async stopMember(memberName: string, options?: StopMemberOptions): Promise<void> {
@@ -1497,6 +1820,7 @@ export class SwarmEngine implements ISwarmEngine {
       live.waking = false;
       live.turnActive = false;
       live.switchingModel = false;
+      live.pendingSelfModelSwitch = undefined;
       live.parkedMentionsOnly = true;
       live.currentActivity = undefined;
       live.pendingWakes.length = 0;
@@ -1577,6 +1901,7 @@ export class SwarmEngine implements ISwarmEngine {
       live.waking = false;
       live.turnActive = false;
       live.switchingModel = false;
+      live.pendingSelfModelSwitch = undefined;
       live.parkedMentionsOnly = true;
       live.currentActivity = undefined;
       live.pendingWakes.length = 0;
@@ -1712,6 +2037,7 @@ export class SwarmEngine implements ISwarmEngine {
       commitMessage:
         options?.commitMessage ?? `swarm(${member.name}): merge ${member.branch}`,
       noFf: options?.noFf ?? true,
+      sourceWorktreePath: member.cwd,
     });
 
     const actor = options?.callerName ?? ORCHESTRATOR_NAME;
@@ -2061,6 +2387,7 @@ export class SwarmEngine implements ISwarmEngine {
   async dispose(): Promise<void> {
     this.disposed = true;
     this.cancelStallWatchdog();
+    this.clearOrchestratorWait("Swarm engine disposed.");
     this.resolveAllWaiters("run_ended", "Swarm engine disposed.");
     await this.disposeLiveHandles("Engine disposed");
     this.listeners.clear();
@@ -2128,6 +2455,8 @@ export class SwarmEngine implements ISwarmEngine {
         modelOverride: member.model,
         thinkingLevel: member.thinkingLevel,
         seedMessages,
+        sessionDir: this.store.getMemberSessionDir?.(runId),
+        sessionFile: member.sessionFile,
         hostContext,
         onTelemetry: (evt) => this.handleTelemetry(runId, evt),
         engineApi,
@@ -2147,6 +2476,7 @@ export class SwarmEngine implements ISwarmEngine {
       if (resolvedModel) {
         live.triedModels.add(resolvedModel);
       }
+      const sessionFile = handle.getSessionFile?.();
 
       const startActivity =
         member.role === "validator" ? "validating" : "working on assignment";
@@ -2156,6 +2486,7 @@ export class SwarmEngine implements ISwarmEngine {
         state: "working",
         model: resolvedModel ?? member.model,
         thinkingLevel: handle.getThinkingLevel() ?? member.thinkingLevel ?? null,
+        ...(sessionFile ? { sessionFile } : {}),
         currentActivity: startActivity,
       });
 
@@ -2428,6 +2759,8 @@ export class SwarmEngine implements ISwarmEngine {
         modelOverride: member.model,
         thinkingLevel: member.thinkingLevel,
         seedMessages: live.lastMessages.length > 0 ? live.lastMessages : undefined,
+        sessionDir: this.store.getMemberSessionDir?.(runId),
+        sessionFile: member.sessionFile,
         hostContext: this.hostContext,
         onTelemetry: (evt) => this.handleTelemetry(runId, evt),
         engineApi,
@@ -2445,11 +2778,13 @@ export class SwarmEngine implements ISwarmEngine {
       live.waking = false;
       live.parkedMentionsOnly = true;
       live.currentActivity = "revived by board";
+      const revivedSessionFile = handle.getSessionFile?.();
 
       const updated = await this.store.updateMember(runId, memberName, {
         state: "working",
         humanStopped: false,
         lastReadSeq: Math.max(member.lastReadSeq, maxSeq),
+        ...(revivedSessionFile ? { sessionFile: revivedSessionFile } : {}),
         currentActivity: "revived by board",
         error: null,
       });
@@ -2653,6 +2988,46 @@ export class SwarmEngine implements ISwarmEngine {
         live.parkedMentionsOnly = waitReq ? waitReq.mentionsOnly : true;
       }
 
+      // Deferred Self Model Switch (Defect #3): if this member scheduled `swarm{action:"model"}` on itself
+      // during this turn, apply the hot switch NOW while parked in waiting, then immediately resume it!
+      if (live?.pendingSelfModelSwitch && live.handle?.getState() === "waiting" && run.status === "active") {
+        const pendingSwitch = live.pendingSelfModelSwitch;
+        live.pendingSelfModelSwitch = undefined;
+        live.switchingModel = true;
+        live.turnActive = false;
+        try {
+          const switched = await this.performSwitchModel(
+            {
+              targetName: memberName,
+              model: pendingSwitch.model,
+              thinkingLevel: pendingSwitch.thinkingLevel,
+              reason: pendingSwitch.reason,
+              callerName: pendingSwitch.callerName,
+              callerRole: pendingSwitch.callerRole,
+              autoResume: false,
+            },
+            { holdSwitchingLock: true },
+          );
+          live.waking = true;
+          live.switchingModel = false;
+          const reasonNote = pendingSwitch.reason ? ` (${pendingSwitch.reason})` : "";
+          const resumeMsg = `Self model hot-switch to "${switched.model}"${switched.thinkingLevel ? ` (${switched.thinkingLevel})` : ""} completed${reasonNote} with full conversation history preserved. Continue your work immediately.`;
+          void this.drainMemberPendingWakes(runId, memberName, resumeMsg);
+          return;
+        } catch (err) {
+          live.switchingModel = false;
+          const switchErr = err instanceof Error ? err.message : String(err);
+          await this.postMonitorOrchestratorAlert(
+            runId,
+            `@${ORCHESTRATOR_NAME} [error] Deferred self model switch for @${memberName} failed: ${switchErr}`,
+            "update",
+          );
+          this.checkAllIdleAndNotifyWaiters();
+          this.maybeArmStallWatchdog();
+          return;
+        }
+      }
+
       // Check for unread non-mention messages if the member explicitly called swarm_wait{mentions_only:false}
       if (live && waitReq && !waitReq.mentionsOnly && run.status === "active") {
         const unread = await this.store.readBoard(runId, {
@@ -2731,6 +3106,7 @@ export class SwarmEngine implements ISwarmEngine {
               reason: `Auto-fallback after rate limit (${errorText})`,
               callerName: ORCHESTRATOR_NAME,
               callerRole: "orchestrator",
+              autoResume: false,
             },
             { holdSwitchingLock: true },
           );
@@ -2860,7 +3236,7 @@ export class SwarmEngine implements ISwarmEngine {
   private async routeBoardMessageWakeups(
     run: SwarmRunState,
     msg: BoardMessage,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const senderLower = msg.from.toLowerCase();
     const mentionsLower = new Set(msg.mentions.map((m) => m.toLowerCase()));
     const chMentionsLower = new Set(msg.channelMentions.map((c) => c.toLowerCase()));
@@ -2874,10 +3250,19 @@ export class SwarmEngine implements ISwarmEngine {
         chMentionsLower.size > 0);
 
     if (wakesOrchestrator) {
+      let unreadMessages: BoardMessage[] = [msg];
+      if (this.orchestratorWait && msg.seq > this.orchestratorWait.since) {
+        const since = this.orchestratorWait.since;
+        this.clearOrchestratorWait();
+        unreadMessages = this.getCachedMessagesSince(since);
+        if (unreadMessages.length === 0) {
+          unreadMessages = [msg];
+        }
+      }
       this.emitEngineEvent(
         "wakeup_needed",
         `Board #${msg.seq} from ${msg.from} addressed @${ORCHESTRATOR_NAME}`,
-        { seq: msg.seq },
+        { seq: msg.seq, messages: unreadMessages },
       );
     }
 
@@ -2948,7 +3333,7 @@ export class SwarmEngine implements ISwarmEngine {
     }
 
     if (eligibleTargets.length === 0) {
-      return;
+      return wakesOrchestrator;
     }
 
     // Enforce SWARM_MAX_BOARD_HOPS safety cap on peer-to-peer bounce chains!
@@ -2962,7 +3347,7 @@ export class SwarmEngine implements ISwarmEngine {
             "update",
           );
         }
-        return;
+        return wakesOrchestrator;
       }
       this.boardHopCount += 1;
     }
@@ -2970,6 +3355,39 @@ export class SwarmEngine implements ISwarmEngine {
     // Deliver to each eligible target cleanly with synchronous waking lock + coalescing
     for (const targetName of eligibleTargets) {
       this.deliverBoardMessageToMember(run.id, targetName, msg);
+    }
+    return wakesOrchestrator;
+  }
+
+  private maybeWakeParkedOrchestratorOnMessage(
+    msg: BoardMessage,
+    alreadyEmittedWakeup: boolean,
+  ): void {
+    if (alreadyEmittedWakeup || !this.orchestratorWait) {
+      return;
+    }
+    if (msg.seq <= this.orchestratorWait.since) {
+      return;
+    }
+    if (
+      this.doesMessageMatchWaiter(
+        msg,
+        ORCHESTRATOR_NAME,
+        this.orchestratorWait.mentionsOnly,
+        [],
+      )
+    ) {
+      const since = this.orchestratorWait.since;
+      this.clearOrchestratorWait();
+      const unread = this.getCachedMessagesSince(since);
+      this.emitEngineEvent(
+        "wakeup_needed",
+        `New board message #${msg.seq} from ${msg.from} in #${msg.channel}`,
+        {
+          seq: msg.seq,
+          messages: unread.length > 0 ? unread : [msg],
+        },
+      );
     }
   }
 
@@ -3097,11 +3515,21 @@ export class SwarmEngine implements ISwarmEngine {
   }
 
   private checkAllIdleAndNotifyWaiters(): void {
-    if (this.boardWaiters.size === 0) {
-      return;
-    }
     const active = this.getWorkingOrPendingMemberNames();
     if (active.length > 0) {
+      return;
+    }
+    if (this.orchestratorWait) {
+      const since = this.orchestratorWait.since;
+      this.clearOrchestratorWait();
+      const unread = this.getCachedMessagesSince(since);
+      this.emitEngineEvent(
+        "wakeup_needed",
+        "All active swarm members have finished and parked (all_idle).",
+        unread.length > 0 ? { messages: unread } : undefined,
+      );
+    }
+    if (this.boardWaiters.size === 0) {
       return;
     }
     const head = this.cachedRun?.boardHead ?? 0;
@@ -3150,7 +3578,10 @@ export class SwarmEngine implements ISwarmEngine {
     if (!run || run.status !== "active") {
       return;
     }
-    if (this.boardWaiters.size > 0) {
+    if (this.boardWaiters.size > 0 || this.orchestratorWait) {
+      return;
+    }
+    if (this.monitorRunning) {
       return;
     }
     // Require at least one live (non-killed) member parked before considering swarm stalled
@@ -3184,7 +3615,8 @@ export class SwarmEngine implements ISwarmEngine {
       this.disposed ||
       this.runDonePosted ||
       this.activeRunId !== runId ||
-      this.boardWaiters.size > 0
+      this.boardWaiters.size > 0 ||
+      this.monitorRunning
     ) {
       return;
     }
@@ -3194,6 +3626,26 @@ export class SwarmEngine implements ISwarmEngine {
     }
     if (this.getWorkingOrPendingMemberNames().length > 0) {
       return;
+    }
+
+    const settings = this.getEffectiveSettings();
+    if (settings.stallMonitorMode === "llm") {
+      const handledByLlm = await this.runSmartLlmMonitor(run, armedHead, timeoutMs, settings);
+      if (handledByLlm) {
+        return;
+      }
+      // If LLM monitor errored or didn't post `[noop]`, re-verify run didn't advance then fall back deterministically
+      if (
+        this.disposed ||
+        this.runDonePosted ||
+        this.activeRunId !== runId ||
+        this.boardWaiters.size > 0 ||
+        this.cachedRun?.status !== "active" ||
+        this.cachedRun.boardHead !== armedHead ||
+        this.getWorkingOrPendingMemberNames().length > 0
+      ) {
+        return;
+      }
     }
 
     const rosterSummary = run.memberOrder
@@ -3213,6 +3665,17 @@ export class SwarmEngine implements ISwarmEngine {
     const seconds = Math.max(1, Math.round(timeoutMs / 1000));
     const text = `@${ORCHESTRATOR_NAME} [stall] Swarm has been idle for ${seconds}s with 0 working members (board #${armedHead}). Roster: ${rosterSummary}. Latest posts: ${latestSeqs}. Wake a member, spawn next phase, or call swarm{action:"done"}.`;
 
+    await this.emitStallMessage(runId, armedHead, timeoutMs, text, [ORCHESTRATOR_NAME], "deterministic");
+  }
+
+  private async emitStallMessage(
+    runId: string,
+    armedHead: number,
+    timeoutMs: number,
+    text: string,
+    mentions: string[],
+    mode: "llm" | "deterministic",
+  ): Promise<BoardMessage | null> {
     try {
       const stallMsg = await this.store.postBoardMessage(runId, {
         from: MONITOR_NAME,
@@ -3220,7 +3683,7 @@ export class SwarmEngine implements ISwarmEngine {
         channel: DEFAULT_CHANNEL,
         kind: "stall",
         text,
-        mentions: [ORCHESTRATOR_NAME],
+        mentions,
         channelMentions: [],
       });
       this.recordBoardMessageInCache(stallMsg);
@@ -3230,25 +3693,221 @@ export class SwarmEngine implements ISwarmEngine {
         runId,
         type: "stall_detected",
         actor: MONITOR_NAME,
-        summary: `Stall detected after ${timeoutMs}ms idle at board #${armedHead}`,
-        data: { armedHead, stallSeq: stallMsg.seq, timeoutMs },
+        summary: `Stall detected (${mode}) after ${timeoutMs}ms idle at board #${armedHead}`,
+        data: { armedHead, stallSeq: stallMsg.seq, timeoutMs, mode, mentions },
       });
 
       const refreshed = await this.store.loadRun(runId);
       await this.refreshCache(refreshed);
+
+      const latestRun = refreshed;
+      const lowerMentions = mentions.map((m) => m.toLowerCase());
+      const hitsOrchestrator =
+        lowerMentions.length === 0 ||
+        lowerMentions.includes(ORCHESTRATOR_NAME) ||
+        lowerMentions.includes("coordinator") ||
+        lowerMentions.includes(ALL_MENTION_NAME);
 
       this.emitEngineEvent("board_posted", `Posted stall alert #${stallMsg.seq}`, {
         seq: stallMsg.seq,
       });
       this.emitEngineEvent("stall_detected", `Swarm stalled at #${armedHead} (alert #${stallMsg.seq})`, {
         seq: stallMsg.seq,
+        ...(!hitsOrchestrator && mentions[0] ? { memberName: mentions[0] } : {}),
       });
-      this.emitEngineEvent("wakeup_needed", `Stall alert #${stallMsg.seq} for @${ORCHESTRATOR_NAME}`, {
-        seq: stallMsg.seq,
-      });
+
+      if (hitsOrchestrator) {
+        let unread = this.getCachedMessagesSince(
+          this.orchestratorWait ? this.orchestratorWait.since : Math.max(0, stallMsg.seq - 1),
+        );
+        if (this.orchestratorWait) {
+          this.clearOrchestratorWait();
+        }
+        if (unread.length === 0) {
+          unread = [stallMsg];
+        }
+        this.emitEngineEvent("wakeup_needed", `Stall alert #${stallMsg.seq} for @${ORCHESTRATOR_NAME}`, {
+          seq: stallMsg.seq,
+          messages: unread,
+        });
+      } else if (latestRun.status === "active") {
+        // Wake the specific member that the smart monitor identified as the bottleneck
+        await this.routeBoardMessageWakeups(latestRun, stallMsg);
+      }
+
       this.notifyWaitersOnMessage(stallMsg);
+      return stallMsg;
     } catch {
-      // watchdog must never crash host process
+      return null;
+    }
+  }
+
+  private async runSmartLlmMonitor(
+    run: SwarmRunState,
+    armedHead: number,
+    timeoutMs: number,
+    settings: SwarmSettings,
+  ): Promise<boolean> {
+    this.monitorRunning = true;
+    let handle: PersistentAgentHandle | undefined;
+    try {
+      const recent = await this.store
+        .readBoard(run.id, { channel: "*", limit: 15 })
+        .catch(() => ({ messages: this.cachedBoard.slice(-15), head: run.boardHead }));
+
+      const rosterLines = run.memberOrder
+        .map((n) => run.members[n])
+        .filter((m): m is SwarmMemberRecord => Boolean(m && m.state !== "killed"))
+        .map(
+          (m) =>
+            `- @${m.name} (${m.role}) state=${m.state} parent=@${m.parentName} turns=${m.turns} lastPost=${m.lastPostSeq ? `#${m.lastPostSeq}` : "none"} parkedOn=${m.parkedOn ?? "-"} error=${m.error ?? "-"}`,
+        )
+        .join("\n");
+
+      const boardLines = recent.messages
+        .map((m) => `#${m.seq} [#${m.channel}] ${m.from}: ${m.text.replace(/\s+/g, " ").slice(0, 320)}`)
+        .join("\n");
+
+      const monitorSystemPrompt = [
+        "# Pi Swarm Monitor (`@monitor` — Read-Only Stall Diagnostician)",
+        "You diagnose whether the swarm has genuinely stalled and post ONE concise nudge naming ONLY the single member who can unstick the run.",
+        "Rules:",
+        "1. If `[done]` has already been delivered, work looks finished, or the swarm is legitimately waiting on the human, do NOT post to the board — simply reply with `[noop]`.",
+        "2. Otherwise call `post_message` ONCE starting with `@<single-target> [stall] <concrete actionable instruction>` — target `@<member>` if a worker/validator left work incomplete, errored, or missed a handoff, OR `@orchestrator` if next-phase decisions/merges/completion are needed.",
+        "3. Never edit files or spawn workers; you only have `read_board` and `post_message`.",
+      ].join("\n");
+
+      const seconds = Math.max(1, Math.round(timeoutMs / 1000));
+      const monitorPrompt = [
+        `Swarm "${run.title}" (${run.id}) has been idle for ${seconds}s with 0 working members (board head: #${armedHead}).`,
+        `Objective: ${run.objective}`,
+        "",
+        "Active Roster:",
+        rosterLines || "(none)",
+        "",
+        "Recent Board Messages:",
+        boardLines || "(empty)",
+        "",
+        "Diagnose now: either reply `[noop]` or call `post_message` ONCE naming the single member `@<target>` who can unstick the swarm.",
+      ].join("\n");
+
+      let monitorPosted = false;
+      const monitorBridge: MemberEngineBridge = {
+        postMessage: async ({ text }) => {
+          const parsedMentions = mergeUniqueLower([parseHandleMentions(text)]);
+          const targetMention = parsedMentions[0] ? [parsedMentions[0]] : [ORCHESTRATOR_NAME];
+          const posted = await this.emitStallMessage(
+            run.id,
+            armedHead,
+            timeoutMs,
+            text,
+            targetMention,
+            "llm",
+          );
+          if (!posted) {
+            throw new SwarmProtocolError("NOT_FOUND", "Failed to post monitor diagnosis.");
+          }
+          monitorPosted = true;
+          return posted;
+        },
+        readBoard: async (options) => this.readBoard(options),
+        getStatus: async () => {
+          const latest = await this.store.loadRun(run.id);
+          return {
+            runId: latest.id,
+            title: latest.title,
+            status: latest.status,
+            baseBranch: latest.baseBranch,
+            boardHead: latest.boardHead,
+            channels: Object.values(latest.channels),
+            members: latest.memberOrder
+              .map((n) => latest.members[n])
+              .filter((m): m is SwarmMemberRecord => Boolean(m))
+              .map((m) => ({
+                name: m.name,
+                role: m.role,
+                state: m.state,
+                parentName: m.parentName,
+                groupPrefix: m.groupPrefix,
+                workspace: m.workspace,
+                branch: m.branch,
+                model: m.model,
+                thinkingLevel: m.thinkingLevel,
+                channels: m.channels,
+                parkedOn: m.parkedOn,
+                currentActivity: m.currentActivity,
+                lastPostSeq: m.lastPostSeq,
+                lastPostTime: m.lastPostTime,
+                turns: m.turns,
+                tokens: m.tokens,
+                cost: m.cost,
+              })),
+          };
+        },
+        listModels: async (options) => this.listModels(options),
+        addHelper: async () => {
+          throw new SwarmProtocolError("PERMISSION_DENIED", "Monitor cannot spawn members.");
+        },
+        killHelper: async () => {
+          throw new SwarmProtocolError("PERMISSION_DENIED", "Monitor cannot kill members.");
+        },
+        switchModel: async () => {
+          throw new SwarmProtocolError("PERMISSION_DENIED", "Monitor cannot switch models.");
+        },
+        manageChannel: async () => {
+          throw new SwarmProtocolError("PERMISSION_DENIED", "Monitor cannot manage channels.");
+        },
+      };
+
+      const monitorModel =
+        settings.validatorModel ??
+        settings.workerModel ??
+        settings.orchestratorModel;
+      const monitorThinking =
+        settings.validatorThinkingLevel ?? settings.workerThinkingLevel;
+
+      handle = await this.transport.spawnMember({
+        agentId: this.generateAgentIdFn(MONITOR_NAME),
+        name: MONITOR_NAME,
+        role: "validator",
+        runId: run.id,
+        cwd: this.worktree.repoRoot,
+        workspace: "inherit",
+        parentName: ORCHESTRATOR_NAME,
+        brief: "Read-only stall diagnosis",
+        systemPrompt: monitorSystemPrompt,
+        initialPrompt: monitorPrompt,
+        keepWarm: false,
+        modelOverride: monitorModel,
+        thinkingLevel: monitorThinking,
+        hostContext: this.hostContext,
+        engineApi: monitorBridge,
+        isMonitor: true,
+      });
+
+      const turnResult = await Promise.race([
+        handle.currentTurn,
+        new Promise<AgentTurnResult | null>((resolve) => {
+          const t = setTimeout(() => resolve(null), 30_000);
+          t.unref?.();
+        }),
+      ]);
+
+      if (monitorPosted) {
+        return true;
+      }
+      if (turnResult && /\[noop\]/i.test(turnResult.summary)) {
+        this.stallNoticePostedAtHead = armedHead;
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    } finally {
+      this.monitorRunning = false;
+      if (handle) {
+        await handle.kill("Monitor check complete").catch(() => {});
+      }
     }
   }
 
@@ -3273,7 +3932,16 @@ export class SwarmEngine implements ISwarmEngine {
       this.emitEngineEvent("board_posted", `Posted monitor alert #${alertMsg.seq}`, {
         seq: alertMsg.seq,
       });
-      this.emitEngineEvent("wakeup_needed", text, { seq: alertMsg.seq });
+      let unread = this.getCachedMessagesSince(
+        this.orchestratorWait ? this.orchestratorWait.since : Math.max(0, alertMsg.seq - 1),
+      );
+      if (this.orchestratorWait) {
+        this.clearOrchestratorWait();
+      }
+      if (unread.length === 0) {
+        unread = [alertMsg];
+      }
+      this.emitEngineEvent("wakeup_needed", text, { seq: alertMsg.seq, messages: unread });
       this.notifyWaitersOnMessage(alertMsg);
     } catch {
       this.emitEngineEvent("wakeup_needed", text);
@@ -3424,6 +4092,23 @@ export class SwarmEngine implements ISwarmEngine {
       killHelper: async (name: string, reason?: string) =>
         this.killMember(name, {
           reason,
+          callerName: member.name,
+          callerRole: member.role,
+        }),
+
+      stopHelper: async (name: string, reason?: string) =>
+        this.stopMember(name, {
+          reason,
+          callerName: member.name,
+          callerRole: member.role,
+        }),
+
+      steerHelper: async (
+        name: string,
+        message: string,
+        mode?: "steer" | "followUp",
+      ) =>
+        this.steerMember(name, message, mode, {
           callerName: member.name,
           callerRole: member.role,
         }),
@@ -3593,6 +4278,7 @@ export class SwarmEngine implements ISwarmEngine {
         live.waking = false;
         live.turnActive = false;
         live.switchingModel = false;
+        live.pendingSelfModelSwitch = undefined;
         live.parkedMentionsOnly = true;
         live.currentActivity = undefined;
         live.pendingWakes.length = 0;
@@ -3608,7 +4294,7 @@ export class SwarmEngine implements ISwarmEngine {
   private emitEngineEvent(
     type: SwarmEngineEventType,
     summary: string,
-    extra?: { memberName?: string; seq?: number },
+    extra?: { memberName?: string; seq?: number; messages?: BoardMessage[] },
   ): void {
     if (this.listeners.size === 0) return;
     const event: SwarmEngineEvent = {
@@ -3616,6 +4302,7 @@ export class SwarmEngine implements ISwarmEngine {
       runId: this.activeRunId,
       memberName: extra?.memberName,
       seq: extra?.seq,
+      ...(extra?.messages !== undefined ? { messages: extra.messages } : {}),
       summary,
       snapshot: this.getSnapshot(),
     };

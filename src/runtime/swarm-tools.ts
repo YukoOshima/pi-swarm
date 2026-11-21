@@ -276,25 +276,51 @@ export function createSwarmTools(deps: SwarmToolDeps): ToolDefinition[] {
     name: SWARM_TOOL,
     label: "Swarm",
     description:
-      'Manage the dynamic Pi Swarm: set run title ("title"), spawn workers/validators/sharded groups with optional context forking or isolated worktrees ("add"), inspect roster/channels ("status"), list models ("models"), hot-switch a waiting member model ("model"), permanently retire a member ("kill"), land a share/branch worktree ("merge"), manage channels ("channel"), or complete the run ("done").',
+      'Manage the dynamic Pi Swarm: set run title/direction ("title"), spawn workers/validators/sharded groups with optional context forking or isolated worktrees ("add"), inspect roster/channels ("status"), list models ("models"), hot-switch & resume a waiting member model ("model"), steer/redirect a member mid-flight ("steer"), stop a member ("stop"), permanently retire a member ("kill"), land a share/branch worktree ("merge"), manage channels ("channel"), or complete the run ("done").',
     promptSnippet:
-      "Manage dynamic swarm members, models, worktrees, channels, and run lifecycle.",
+      "Manage dynamic swarm members, steering, models, worktrees, channels, and run lifecycle.",
     promptGuidelines: [
-      `Use ${SWARM_TOOL} with action="add" to delegate technical work to named workers or independent read-only validators (workspace="share" when editing simultaneously; fork="<member>|orchestrator" to branch conversation history).`,
-      `Never kill a waiting member as a pause; use action="model" to hot-switch a waiting member on quota/429, action="merge" to land share/branch worktrees, action="kill" once integrated, and action="done" when the run is complete.`,
+      `Use ${SWARM_TOOL} with action="add" to delegate technical work to named workers or independent read-only validators (workspace="share" for shared worktrees or workspace="branch" for isolated clones; fork="<member>|orchestrator" to branch conversation history).`,
+      `Use action="steer" to redirect a working or waiting member mid-flight; action="model" hot-switches and immediately resumes a member; never kill a waiting member as a pause; use action="stop" to pause it, action="merge" to land worktrees, action="kill" once integrated, and action="done" when complete.`,
     ],
     parameters: Type.Object({
       action: stringEnum(SWARM_ACTIONS, {
         description:
-          'Swarm action: "title" | "add" | "status" | "models" | "model" | "kill" | "merge" | "channel" | "done".',
+          'Swarm action: "title" | "add" | "status" | "models" | "model" | "steer" | "stop" | "kill" | "merge" | "channel" | "done".',
       }),
       title: Type.Optional(
-        Type.String({ description: 'Run title (required for action="title").' }),
+        Type.String({ description: 'Run title (for action="title").' }),
+      ),
+      objective: Type.Optional(
+        Type.String({
+          description: 'Optional updated run objective when updating direction via action="title".',
+        }),
+      ),
+      strategy: Type.Optional(
+        Type.String({
+          description: 'Optional updated coordination strategy when updating direction via action="title".',
+        }),
+      ),
+      acceptance_criteria: Type.Optional(
+        Type.String({
+          description: 'Optional updated acceptance criteria when updating direction via action="title".',
+        }),
       ),
       name: Type.Optional(
         Type.String({
           description:
-            'Member name (or base name with n/tasks for "add", target member for "model"/"kill"/"merge", or member to join/leave for "channel").',
+            'Member name (or base name with n/tasks for "add", target member for "model"/"steer"/"stop"/"kill"/"merge", or member to join/leave for "channel").',
+        }),
+      ),
+      message: Type.Optional(
+        Type.String({
+          description: 'Redirection/steering instruction (required for action="steer").',
+        }),
+      ),
+      mode: Type.Optional(
+        stringEnum(["steer", "followUp"], {
+          description: 'Delivery mode for action="steer" on a working member (default "steer").',
+          default: "steer",
         }),
       ),
       role: Type.Optional(
@@ -400,21 +426,38 @@ export function createSwarmTools(deps: SwarmToolDeps): ToolDefinition[] {
 
         switch (params.action) {
           case "title": {
-            const title = params.title?.trim() ?? "";
-            if (!title) {
+            const title = params.title?.trim();
+            const objective = params.objective?.trim();
+            const strategy = params.strategy?.trim();
+            const acceptanceCriteria = params.acceptance_criteria?.trim();
+            if (!title && !objective && !strategy && !acceptanceCriteria) {
               throw new SwarmProtocolError(
                 "INVALID_INPUT",
-                'title is required for swarm{action:"title"}.',
+                'At least one of title, objective, strategy, or acceptance_criteria is required for swarm{action:"title"}.',
               );
             }
-            const updated = await deps.engine.setTitle(title, {
-              callerRole,
-              actor: callerName,
-            });
-            return okResult(`Updated swarm title to "${updated.title}".`, {
-              runId: updated.id,
-              title: updated.title,
-            });
+            const updated = await deps.engine.updateDirection(
+              {
+                ...(title ? { title } : {}),
+                ...(objective ? { objective } : {}),
+                ...(strategy ? { strategy } : {}),
+                ...(acceptanceCriteria ? { acceptanceCriteria } : {}),
+              },
+              {
+                callerRole,
+                actor: callerName,
+              },
+            );
+            return okResult(
+              `Updated swarm direction/title ("${updated.title}").`,
+              {
+                runId: updated.id,
+                title: updated.title,
+                objective: updated.objective,
+                strategy: updated.strategy,
+                acceptanceCriteria: updated.acceptanceCriteria,
+              },
+            );
           }
 
           case "add": {
@@ -503,9 +546,52 @@ export function createSwarmTools(deps: SwarmToolDeps): ToolDefinition[] {
               callerRole,
               hostContext: ctx,
             });
+            const suffix = res.resumed
+              ? " and automatically resumed work (conversation history preserved)"
+              : " (conversation history preserved)";
             return okResult(
-              `Hot-switched @${res.targetName} model -> ${res.model}${res.thinkingLevel ? ` (${res.thinkingLevel})` : ""} (conversation history preserved).`,
+              `Hot-switched @${res.targetName} model -> ${res.model}${res.thinkingLevel ? ` (${res.thinkingLevel})` : ""}${suffix}.`,
               res,
+            );
+          }
+
+          case "steer": {
+            const name = params.name?.trim().replace(/^@/, "") ?? "";
+            const message = params.message?.trim() ?? "";
+            if (!name || !message) {
+              throw new SwarmProtocolError(
+                "INVALID_INPUT",
+                'Both "name" and "message" are required for swarm{action:"steer"}.',
+              );
+            }
+            const steerRes = await deps.engine.steerMember(
+              name,
+              message,
+              params.mode ?? "steer",
+              { callerName, callerRole },
+            );
+            return okResult(
+              `Delivered steering instruction to @${name} via ${steerRes.delivery}.`,
+              { name, ...steerRes },
+            );
+          }
+
+          case "stop": {
+            const name = params.name?.trim().replace(/^@/, "") ?? "";
+            if (!name) {
+              throw new SwarmProtocolError(
+                "INVALID_INPUT",
+                'name is required for swarm{action:"stop"}.',
+              );
+            }
+            await deps.engine.stopMember(name, {
+              reason: params.reason,
+              callerName,
+              callerRole,
+            });
+            return okResult(
+              `Stopped @${name}${params.reason ? ` (${params.reason})` : ""}.`,
+              { name, stopped: true },
             );
           }
 
@@ -719,10 +805,10 @@ export function createSwarmTools(deps: SwarmToolDeps): ToolDefinition[] {
     name: SWARM_WAIT_TOOL,
     label: "Swarm Wait",
     description:
-      "Sleep until a swarm member posts a message addressing you (or any message when mentions_only=false), or until all workers become idle (`all_idle`). Always pass the highest `#seq` you have actually read as `since` so nothing is slept through.",
-    promptSnippet: "Wait for swarm board updates or until all active workers park.",
+      "End your current turn cleanly and sleep (non-blocking) until a swarm member posts a message addressing you (or any message when mentions_only=false), all workers park, or the user sends a new message. Always pass the highest `#seq` you have actually read as `since`.",
+    promptSnippet: "End turn and sleep until woken by a board post, all_idle, or user message.",
     promptGuidelines: [
-      `Call ${SWARM_WAIT_TOOL} after spawning or waking workers instead of polling ${READ_BOARD_TOOL} in a loop. Pass the highest #seq you have actually read as since.`,
+      `Call ${SWARM_WAIT_TOOL} after spawning or waking workers instead of polling ${READ_BOARD_TOOL} in a loop. It ends your turn cleanly so the user can message you anytime while workers run. Pass the highest #seq you have read as since.`,
     ],
     parameters: Type.Object({
       since: Type.Number({
@@ -741,23 +827,32 @@ export function createSwarmTools(deps: SwarmToolDeps): ToolDefinition[] {
         }),
       ),
     }),
-    async execute(_toolCallId, params, signal, onUpdate) {
+    async execute(_toolCallId, params) {
       return runToolSafe(async () => {
-        const res = await deps.engine.waitForBoard({
+        const res = await deps.engine.parkOrchestratorWait({
           since: params.since,
           mentionsOnly: params.mentions_only ?? true,
-          targetName: getCallerName(),
-          signal,
           timeoutMs: params.timeout_ms,
-          onProgress: (progressText) => {
-            onUpdate?.({
-              content: [{ type: "text", text: progressText }],
-              details: { waiting: true, summary: progressText },
-            });
-          },
         });
 
-        const header = `swarm_wait woke (${res.wokeBy}, head: #${res.head}): ${res.summary}`;
+        if (res.parked) {
+          const activeLabel =
+            res.activeMembers.length > 0
+              ? res.activeMembers.map((m) => `@${m}`).join(", ")
+              : "none";
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Parked @${ORCHESTRATOR_NAME} in non-blocking swarm_wait (since #${params.since}, active: ${activeLabel}, head: #${res.head}). Ending turn now — you will wake automatically when a matching post arrives, all workers park, or the user sends a message.`,
+              },
+            ],
+            details: res,
+            terminate: true,
+          };
+        }
+
+        const header = `swarm_wait woke immediately (${res.wokeBy ?? "message"}, head: #${res.head}): ${res.summary}`;
         if (res.messages.length === 0) {
           return okResult(header, res);
         }
@@ -795,6 +890,8 @@ export interface MemberScopedToolContext {
   defaultChannel?: string;
   /** Invoked when a member calls `swarm_wait` so transport/engine can record `since` & `mentionsOnly`. */
   onWaitRecorded?: (wait: { since: number; mentionsOnly: boolean }) => void;
+  /** Invoked when a working member schedules a deferred self model switch. */
+  onSelfModelSwitchScheduled?: () => void;
 }
 
 /**
@@ -961,19 +1058,29 @@ export function createMemberScopedTools(
     label: "Swarm",
     description:
       member.role === "validator"
-        ? 'Scoped Swarm helper tool for read-only validators: inspect roster ("status"), list models ("models"), spawn read-only validator helpers ("add"), switch model for self or own helpers ("model"), kill own helpers ("kill"), or list/join/leave channels ("channel").'
-        : 'Scoped Swarm helper tool for workers: inspect roster ("status"), list models ("models"), spawn helper workers/validators reporting back to you ("add"), switch model for self or own helpers ("model"), kill own helpers ("kill"), or list/join/leave channels ("channel"). Cannot call title/merge/done or touch other members.',
+        ? 'Scoped Swarm helper tool for read-only validators: inspect roster ("status"), list models ("models"), spawn read-only validator helpers ("add"), switch model for self or own helpers ("model"), steer/stop/kill own helpers ("steer"/"stop"/"kill"), or list/join/leave channels ("channel").'
+        : 'Scoped Swarm helper tool for workers: inspect roster ("status"), list models ("models"), spawn helper workers/validators reporting back to you ("add"), switch model for self or own helpers ("model"), steer/stop/kill own helpers ("steer"/"stop"/"kill"), or list/join/leave channels ("channel"). Cannot call title/merge/done or touch other members.',
     promptSnippet:
-      "Inspect swarm status/models, manage your own helpers (add/model/kill), or join/leave channels.",
+      "Inspect swarm status/models, manage your own helpers (add/model/steer/stop/kill), or join/leave channels.",
     parameters: Type.Object({
       action: stringEnum(SWARM_ACTIONS, {
         description:
-          'Allowed member actions: "status" | "models" | "add" | "model" | "kill" | "channel". ("title", "merge", and "done" are orchestrator-only.)',
+          'Allowed member actions: "status" | "models" | "add" | "model" | "steer" | "stop" | "kill" | "channel". ("title", "merge", and "done" are orchestrator-only.)',
       }),
       name: Type.Optional(
         Type.String({
           description:
-            'Helper name (for "add"/"kill"), target name (self or own helper for "model"/"channel").',
+            'Helper name (for "add"/"steer"/"stop"/"kill"), target name (self or own helper for "model"/"channel").',
+        }),
+      ),
+      message: Type.Optional(
+        Type.String({
+          description: 'Steering instruction (required for action="steer").',
+        }),
+      ),
+      mode: Type.Optional(
+        stringEnum(["steer", "followUp"], {
+          description: 'Delivery mode for action="steer" (default "steer").',
         }),
       ),
       role: Type.Optional(
@@ -1096,10 +1203,67 @@ export function createMemberScopedTools(
               params.thinking_level,
               params.reason,
             );
+            if (res.deferred) {
+              member.onSelfModelSwitchScheduled?.();
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `Scheduled self model switch -> ${res.model}${res.thinkingLevel ? ` (${res.thinkingLevel})` : ""}. Ending turn now; you will immediately resume on the new model with conversation history preserved.`,
+                  },
+                ],
+                details: res,
+                terminate: true,
+              };
+            }
             return okResult(
-              `Switched @${res.targetName} model -> ${res.model}${res.thinkingLevel ? ` (${res.thinkingLevel})` : ""}.`,
+              `Switched @${res.targetName} model -> ${res.model}${res.thinkingLevel ? ` (${res.thinkingLevel})` : ""}${res.resumed ? " and resumed work" : ""}.`,
               res,
             );
+          }
+
+          case "steer": {
+            const name = params.name?.trim().replace(/^@/, "") ?? "";
+            const message = params.message?.trim() ?? "";
+            if (!name || !message) {
+              throw new SwarmProtocolError(
+                "INVALID_INPUT",
+                'Both "name" and "message" are required for swarm{action:"steer"}.',
+              );
+            }
+            if (!bridge.steerHelper) {
+              throw new SwarmProtocolError(
+                "PERMISSION_DENIED",
+                `Steering helpers is not supported in this context.`,
+              );
+            }
+            const steerRes = await bridge.steerHelper(
+              name,
+              message,
+              params.mode ?? "steer",
+            );
+            return okResult(
+              `Steered helper @${name} via ${steerRes.delivery}.`,
+              { name, ...steerRes },
+            );
+          }
+
+          case "stop": {
+            const name = params.name?.trim().replace(/^@/, "") ?? "";
+            if (!name) {
+              throw new SwarmProtocolError(
+                "INVALID_INPUT",
+                'name is required for swarm{action:"stop"}.',
+              );
+            }
+            if (!bridge.stopHelper) {
+              throw new SwarmProtocolError(
+                "PERMISSION_DENIED",
+                `Stopping helpers is not supported in this context.`,
+              );
+            }
+            await bridge.stopHelper(name, params.reason);
+            return okResult(`Stopped helper @${name}.`, { name, stopped: true });
           }
 
           case "kill": {
