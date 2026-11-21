@@ -951,82 +951,95 @@ export class SwarmEngine implements ISwarmEngine {
       throw err;
     }
 
-    for (const { spec, cwd, branch } of preparedSpecs) {
-      const agentId = this.generateAgentIdFn(spec.name);
-      await this.store.addMember(
-        run.id,
-        {
+    const registeredWorktrees = new Set<string>();
+    try {
+      for (const { spec, cwd, branch } of preparedSpecs) {
+        const agentId = this.generateAgentIdFn(spec.name);
+        await this.store.addMember(
+          run.id,
+          {
+            name: spec.name,
+            agentId,
+            role: memberRole,
+            parentName,
+            groupPrefix: spec.groupPrefix,
+            brief: spec.brief,
+            workspace: workspaceMode,
+            cwd,
+            branch,
+            forkedFrom,
+            channels,
+            state: "working",
+            model: effectiveModel,
+            thinkingLevel: effectiveThinking,
+            lastReadSeq: this.cachedRun?.boardHead ?? run.boardHead,
+          },
+          { actor: callerName },
+        );
+        if (workspaceMode === "share" || workspaceMode === "branch") {
+          registeredWorktrees.add(cwd);
+        }
+
+        // Post public brief on the shared board as callerName
+        const briefMsg = await this.store.postBoardMessage(run.id, {
+          from: callerName,
+          fromRole: callerRole,
+          channel: primaryChannel,
+          kind: "brief",
+          text: `@${spec.name} ${spec.brief}`,
+        });
+        this.recordBoardMessageInCache(briefMsg);
+
+        const updatedRun = await this.store.updateMember(run.id, spec.name, {
+          briefSeq: briefMsg.seq,
+          lastReadSeq: briefMsg.seq,
+          currentActivity: "queued to start",
+          actor: callerName,
+        });
+        this.setCachedRun(updatedRun);
+
+        const memberRecord = updatedRun.members[spec.name]!;
+        createdRecords.push(memberRecord);
+
+        // Register LiveMember SYNCHRONOUSLY as spawning so waitForBoard never falsely sees all_idle!
+        const live: LiveMember = {
           name: spec.name,
           agentId,
           role: memberRole,
-          parentName,
-          groupPrefix: spec.groupPrefix,
-          brief: spec.brief,
-          workspace: workspaceMode,
-          cwd,
-          branch,
-          forkedFrom,
-          channels,
-          state: "working",
-          model: effectiveModel,
-          thinkingLevel: effectiveThinking,
-          lastReadSeq: this.cachedRun?.boardHead ?? run.boardHead,
-        },
-        { actor: callerName },
-      );
+          spawning: true,
+          waking: false,
+          turnActive: false,
+          switchingModel: false,
+          parkedMentionsOnly: true,
+          pendingWakes: [],
+          deliveredSeqs: new Set<number>([briefMsg.seq]),
+          triedModels: new Set<string>(effectiveModel ? [effectiveModel] : []),
+          lastMessages: seedMessages ? sanitizeForkSeedMessages(seedMessages) : [],
+          logTail: [...memberRecord.logTail],
+          currentActivity: "queued to start",
+          retryCount: 0,
+        };
+        this.liveMembers.set(spec.name, live);
 
-      // Post public brief on the shared board as callerName
-      const briefMsg = await this.store.postBoardMessage(run.id, {
-        from: callerName,
-        fromRole: callerRole,
-        channel: primaryChannel,
-        kind: "brief",
-        text: `@${spec.name} ${spec.brief}`,
-      });
-      this.recordBoardMessageInCache(briefMsg);
+        this.emitEngineEvent("board_posted", `Posted brief #${briefMsg.seq} for @${spec.name}`, {
+          memberName: spec.name,
+          seq: briefMsg.seq,
+        });
+        this.notifyWaitersOnMessage(briefMsg);
 
-      const updatedRun = await this.store.updateMember(run.id, spec.name, {
-        briefSeq: briefMsg.seq,
-        lastReadSeq: briefMsg.seq,
-        currentActivity: "queued to start",
-        actor: callerName,
-      });
-      this.setCachedRun(updatedRun);
-
-      const memberRecord = updatedRun.members[spec.name]!;
-      createdRecords.push(memberRecord);
-
-      // Register LiveMember SYNCHRONOUSLY as spawning so waitForBoard never falsely sees all_idle!
-      const live: LiveMember = {
-        name: spec.name,
-        agentId,
-        role: memberRole,
-        spawning: true,
-        waking: false,
-        turnActive: false,
-        switchingModel: false,
-        parkedMentionsOnly: true,
-        pendingWakes: [],
-        deliveredSeqs: new Set<number>([briefMsg.seq]),
-        triedModels: new Set<string>(effectiveModel ? [effectiveModel] : []),
-        lastMessages: seedMessages ? sanitizeForkSeedMessages(seedMessages) : [],
-        logTail: [...memberRecord.logTail],
-        currentActivity: "queued to start",
-        retryCount: 0,
-      };
-      this.liveMembers.set(spec.name, live);
-
-      this.emitEngineEvent("board_posted", `Posted brief #${briefMsg.seq} for @${spec.name}`, {
-        memberName: spec.name,
-        seq: briefMsg.seq,
-      });
-      this.notifyWaitersOnMessage(briefMsg);
-
-      launches.push({
-        memberName: spec.name,
-        briefSeq: briefMsg.seq,
-        seedMessages: seedMessages ? sanitizeForkSeedMessages(seedMessages) : undefined,
-      });
+        launches.push({
+          memberName: spec.name,
+          briefSeq: briefMsg.seq,
+          seedMessages: seedMessages ? sanitizeForkSeedMessages(seedMessages) : undefined,
+        });
+      }
+    } catch (err) {
+      for (const wtPath of provisionedWorktrees) {
+        if (!registeredWorktrees.has(wtPath)) {
+          await this.worktree.removeWorktree(wtPath, { force: true }).catch(() => {});
+        }
+      }
+      throw err;
     }
 
     await this.refreshCache();
@@ -1769,6 +1782,12 @@ export class SwarmEngine implements ISwarmEngine {
     options?: { callerName?: string; callerRole?: CallerRole },
   ): Promise<{ delivery: "steered" | "followUp" | "woken" }> {
     const run = this.requireActiveRun();
+    if (run.status !== "active") {
+      throw new SwarmProtocolError(
+        "INVALID_INPUT",
+        `Cannot steer members while Swarm run is ${run.status}.`,
+      );
+    }
     const member = this.findMember(run, memberName);
     if (!member) {
       throw new SwarmProtocolError("MEMBER_NOT_FOUND", `Member "${memberName}" not found.`);
@@ -1957,6 +1976,19 @@ export class SwarmEngine implements ISwarmEngine {
     }
 
     if (hasOwnWorktree) {
+      // Preserve committed unmerged branches from isolated `branch` clones in base repo before deleting clone dir!
+      if (
+        member.workspace === "branch" &&
+        member.branch &&
+        !member.mergedCommitSha &&
+        this.worktree.fetchBranchFromClone
+      ) {
+        if (options?.force) {
+          await this.worktree.fetchBranchFromClone(member.cwd, member.branch).catch(() => {});
+        } else {
+          await this.worktree.fetchBranchFromClone(member.cwd, member.branch);
+        }
+      }
       await this.worktree.removeWorktree(member.cwd, { force: Boolean(options?.force) });
     }
 
@@ -3196,7 +3228,8 @@ export class SwarmEngine implements ISwarmEngine {
       if (
         live &&
         live.handle?.getState() === "waiting" &&
-        run.status === "active" &&
+        this.activeRunId === runId &&
+        this.cachedRun?.status === "active" &&
         !this.disposed &&
         settings.maxRetries > 0 &&
         live.retryCount < settings.maxRetries
@@ -3755,8 +3788,8 @@ export class SwarmEngine implements ISwarmEngine {
 
     const settings = this.getEffectiveSettings();
     if (settings.stallMonitorMode === "llm") {
-      const handledByLlm = await this.runSmartLlmMonitor(run, armedHead, timeoutMs, settings);
-      if (handledByLlm) {
+      const llmOutcome = await this.runSmartLlmMonitor(run, armedHead, timeoutMs, settings);
+      if (llmOutcome === "handled" || llmOutcome === "cancelled") {
         return;
       }
       // If LLM monitor errored or didn't post `[noop]`, re-verify run didn't advance then fall back deterministically
@@ -3872,7 +3905,7 @@ export class SwarmEngine implements ISwarmEngine {
     armedHead: number,
     timeoutMs: number,
     settings: SwarmSettings,
-  ): Promise<boolean> {
+  ): Promise<"handled" | "cancelled" | "fallback"> {
     this.monitorRunning = true;
     const abort = new AbortController();
     this.activeMonitorAbort = abort;
@@ -4014,7 +4047,7 @@ export class SwarmEngine implements ISwarmEngine {
 
       if (abort.signal.aborted || this.disposed) {
         await handle.kill("Monitor cancelled before turn start").catch(() => {});
-        return false;
+        return "cancelled";
       }
 
       this.activeMonitorHandle = handle;
@@ -4051,19 +4084,19 @@ export class SwarmEngine implements ISwarmEngine {
       }
 
       if (abort.signal.aborted || this.disposed) {
-        return false;
+        return "cancelled";
       }
 
       if (monitorPosted) {
-        return true;
+        return "handled";
       }
       if (turnResult && /\[noop\]/i.test(turnResult.summary)) {
         this.stallNoticePostedAtHead = armedHead;
-        return true;
+        return "handled";
       }
-      return false;
+      return "fallback";
     } catch {
-      return false;
+      return abort.signal.aborted || this.disposed ? "cancelled" : "fallback";
     } finally {
       if (this.activeMonitorAbort === abort) {
         this.activeMonitorAbort = undefined;

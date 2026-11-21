@@ -728,6 +728,10 @@ export interface IWorktreeManager {
     targetRef: string,
     options?: { maxDiffBytes?: number; cwd?: string },
   ): Promise<DiffSummary>;
+  fetchBranchFromClone?(
+    sourceWorktreePath: string,
+    branch: string,
+  ): Promise<boolean>;
   safeTeardown(
     targets: SafeTeardownTarget[],
     options?: { deleteBranches?: boolean },

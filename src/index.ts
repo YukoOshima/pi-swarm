@@ -1265,6 +1265,7 @@ export function createPiSwarmExtension(
 
       if (ev.type === "run_finished") {
         // `completeRun` is initiated explicitly by orchestrator or human; never fire an extra LLM turn.
+        latestHumanDirection = undefined;
         purgePendingWakeupsForRun(ev.runId);
         applySwarmToolProfile(pi, computeDesiredToolProfile());
         refreshUI();
@@ -1430,6 +1431,7 @@ export function createPiSwarmExtension(
 
       const focusedRunId = rehydrateFocusRunId(ctx);
       if (focusedRunId !== prevFocused) {
+        latestHumanDirection = undefined;
         purgePendingWakeupsForRun(null);
       }
       if (focusedRunId) {
@@ -2359,6 +2361,7 @@ export function createPiSwarmExtension(
           snapshot.run.id,
           reason || "Paused by user",
         );
+        latestHumanDirection = undefined;
         purgePendingWakeupsForRun(updated.id);
         refreshUI(ctx);
         const msg = `Paused Swarm run \`${updated.id}\`.`;
@@ -2471,6 +2474,7 @@ export function createPiSwarmExtension(
         });
       }
 
+      latestHumanDirection = undefined;
       purgePendingWakeupsForRun(run.id);
       await engine.attachRun(run.id, ctx);
       applySwarmToolProfile(pi, computeDesiredToolProfile());

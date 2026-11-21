@@ -1942,6 +1942,22 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     });
     assert.ok(!(sectionsObj2.swarm ?? "").includes("Live User Direction Update"));
 
+    // Verify `/swarm pause` -> `/swarm resume` clears unconsumed `latestHumanDirection` so stale direction doesn't leak
+    await harness.emit("input", {
+      source: "interactive",
+      text: "Stale direction sent right before pause",
+    });
+    await harness.runCommand("swarm", "pause");
+    await harness.runCommand("swarm", "resume");
+    const sectionsAfterPause: Record<string, string> = {};
+    await harness.emit("before_agent_start", {
+      systemPromptOptions: { sections: sectionsAfterPause },
+    });
+    assert.ok(
+      !(sectionsAfterPause.swarm ?? "").includes("Stale direction sent right before pause"),
+      "latestHumanDirection must be cleared on /swarm pause",
+    );
+
     // 4. Orchestrator updates objective + steers working worker directly + `/swarm steer` slash command
     const updTitle = await harness.executeTool(SWARM_TOOL, {
       action: "title",

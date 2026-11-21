@@ -1740,6 +1740,39 @@ describe("WorktreeManager real git repository workflows", () => {
     await wtMgr.removeWorktree(clonePath, { force: false });
     assert.equal(await exists(clonePath), false);
     await wtMgr.removeWorktree(sharePath, { force: true });
+
+    // 3. New isolated clone committed -> kill/remove preserves branch via fetchBranchFromClone,
+    //    and getDiffSummary(cwd=deletedPath) + mergeBranch still succeed!
+    const clone2Path = store.getWorktreePath(run.id, "cloner-killed");
+    const branch2 = "swarm/run-cl/cloner-killed";
+    await wtMgr.createWorktree({
+      branch: branch2,
+      baseBranch: "main",
+      worktreePath: clone2Path,
+      mode: "branch",
+    });
+    await commitFile(clone2Path, "post-kill.txt", "preserved after kill\n", "commit before kill");
+
+    const fetched = await wtMgr.fetchBranchFromClone(clone2Path, branch2);
+    assert.equal(fetched, true);
+    await wtMgr.removeWorktree(clone2Path, { force: false });
+    assert.equal(await exists(clone2Path), false);
+
+    // Passing deleted clone2Path as options.cwd must gracefully fall back to repoRoot
+    const diffAfterKill = await wtMgr.getDiffSummary("main", branch2, { cwd: clone2Path });
+    assert.equal(diffAfterKill.commitsAhead, 1);
+    assert.deepEqual(diffAfterKill.changedFiles, ["post-kill.txt"]);
+
+    const mergedAfterKill = await wtMgr.mergeBranch({
+      baseBranch: "main",
+      branch: branch2,
+      sourceWorktreePath: clone2Path,
+    });
+    assert.equal(mergedAfterKill.strategy, "merge");
+    assert.equal(
+      await readFile(path.join(repoDir, "post-kill.txt"), "utf8"),
+      "preserved after kill\n",
+    );
   });
 
   it("caches SwarmBoard reads/head using stat metadata and invalidates on external writes", async () => {

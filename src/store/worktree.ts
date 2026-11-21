@@ -821,14 +821,7 @@ export class WorktreeManager implements IWorktreeManager {
     }
 
     if (options.sourceWorktreePath) {
-      const resolvedSource = path.resolve(options.sourceWorktreePath);
-      if (await this.isIsolatedClone(resolvedSource)) {
-        await this.runGit([
-          "fetch",
-          resolvedSource,
-          `+refs/heads/${options.branch}:refs/heads/${options.branch}`,
-        ]);
-      }
+      await this.fetchBranchFromClone(options.sourceWorktreePath, options.branch);
     }
 
     const commitsAhead = await this.getCommitCountAhead(
@@ -901,16 +894,34 @@ export class WorktreeManager implements IWorktreeManager {
     };
   }
 
+  async fetchBranchFromClone(
+    sourceWorktreePath: string,
+    branch: string,
+  ): Promise<boolean> {
+    const resolvedSource = path.resolve(sourceWorktreePath);
+    if (!(await this.isIsolatedClone(resolvedSource))) {
+      return false;
+    }
+    await this.runGit([
+      "fetch",
+      resolvedSource,
+      `+refs/heads/${branch}:refs/heads/${branch}`,
+    ]);
+    return true;
+  }
+
   async getDiffSummary(
     baseBranch: string,
     targetRef: string,
     options?: { maxDiffBytes?: number; cwd?: string },
   ): Promise<DiffSummary> {
-    const cwd = options?.cwd;
+    const requestedCwd = options?.cwd ? path.resolve(options.cwd) : undefined;
+    const cwd =
+      requestedCwd && (await pathExists(requestedCwd)) ? requestedCwd : undefined;
     const maxDiffBytes = options?.maxDiffBytes ?? SWARM_MAX_DIFF_BYTES;
 
     let compareBase = baseBranch;
-    if (cwd && (await this.isIsolatedClone(path.resolve(cwd)))) {
+    if (cwd && (await this.isIsolatedClone(cwd))) {
       const fetchRes = await this.runGit(
         ["fetch", "origin", `+refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`],
         { cwd, allowFailure: true },

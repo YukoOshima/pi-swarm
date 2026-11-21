@@ -537,6 +537,7 @@ class MockWorktreeManager implements IWorktreeManager {
   readonly createdWorktrees: Array<{ branch: string; baseBranch: string; worktreePath: string }> = [];
   readonly removedWorktrees: Array<{ worktreePath: string; force?: boolean }> = [];
   readonly mergedBranches: Array<{ baseBranch: string; branch: string }> = [];
+  readonly fetchedClones: Array<{ sourceWorktreePath: string; branch: string }> = [];
   readonly dirtyPaths = new Set<string>();
   failCreateWorktreeFor?: string;
   baseBranchCheck: BaseBranchCleanCheck = { ok: true, currentBranch: "main", dirty: false };
@@ -607,6 +608,11 @@ class MockWorktreeManager implements IWorktreeManager {
 
   async autoRebase(): Promise<AutoRebaseResult> {
     return this.rebaseResult;
+  }
+
+  async fetchBranchFromClone(sourceWorktreePath: string, branch: string): Promise<boolean> {
+    this.fetchedClones.push({ sourceWorktreePath, branch });
+    return true;
   }
 
   async mergeBranch(options: {
@@ -3352,9 +3358,89 @@ describe("SwarmEngine — v0.3.1 Hardening & Optimizations", () => {
       await waitUntil(() => Boolean(monitorRelease), 2000);
 
       await engine.pause("run-dyn", "User paused during monitor");
+      await new Promise((r) => setTimeout(r, 30));
       assert.equal(monitorKilled, true, "pause() must abort & kill active @monitor handle immediately");
+      assert.equal(
+        engine.getSnapshot().recentBoard.some((m) => m.kind === "stall"),
+        false,
+        "Cancelling @monitor on pause() must NOT fall back to deterministic [stall] alert",
+      );
     } finally {
       await engine.dispose();
+    }
+  });
+
+  it("v0.3.2: preserves workspace:'branch' clone branch via fetchBranchFromClone on kill, rolls back on store.addMember failure, and blocks steerMember when paused", async () => {
+    // A. killMember preserves unmerged branch clone before removing worktree directory
+    {
+      const { engine, worktree } = await createTestHarness({ stallWatchdogEnabled: false });
+      try {
+        await engine.addMembers({
+          name: "isolated",
+          workspace: "branch",
+          brief: "Commit work in isolated branch clone",
+        });
+        await waitUntil(() => engine.getSnapshot().run?.members.isolated?.state === "waiting");
+
+        const memberBeforeKill = engine.getSnapshot().run!.members.isolated!;
+        await engine.killMember("isolated", { reason: "Done committing; keep branch for later merge" });
+
+        assert.equal(worktree.fetchedClones.length, 1);
+        assert.equal(worktree.fetchedClones[0]!.sourceWorktreePath, memberBeforeKill.cwd);
+        assert.equal(worktree.fetchedClones[0]!.branch, memberBeforeKill.branch);
+        assert.equal(worktree.removedWorktrees.length, 1);
+      } finally {
+        await engine.dispose();
+      }
+    }
+
+    // B. store.addMember throwing on shard-2 rolls back shard-2 & shard-3 worktrees without deleting registered shard-1
+    {
+      const { engine, store, worktree } = await createTestHarness({ stallWatchdogEnabled: false });
+      const origAddMember = store.addMember.bind(store);
+      store.addMember = async (runId, input) => {
+        if (input.name === "pack-2") {
+          throw new SwarmProtocolError("INVALID_INPUT", "Simulated store write failure on pack-2");
+        }
+        return origAddMember(runId, input);
+      };
+      try {
+        await assert.rejects(
+          () =>
+            engine.addMembers({
+              name: "pack",
+              n: 3,
+              workspace: "share",
+              brief: "Test mid-registration rollback",
+            }),
+          /Simulated store write failure on pack-2/,
+        );
+
+        assert.equal(worktree.createdWorktrees.length, 3);
+        const removedPaths = worktree.removedWorktrees.map((r) => r.worktreePath);
+        assert.equal(removedPaths.length, 2);
+        assert.ok(removedPaths.some((p) => p.endsWith("pack-2")));
+        assert.ok(removedPaths.some((p) => p.endsWith("pack-3")));
+        assert.ok(!removedPaths.some((p) => p.endsWith("pack-1")));
+      } finally {
+        await engine.dispose();
+      }
+    }
+
+    // C. steerMember rejects when run is paused
+    {
+      const { engine } = await createTestHarness({ stallWatchdogEnabled: false });
+      try {
+        await engine.addMembers({ name: "paused-w", brief: "Wait" });
+        await waitUntil(() => engine.getSnapshot().run?.members["paused-w"]?.state === "waiting");
+        await engine.pause("run-dyn", "Pause run");
+        await assert.rejects(
+          () => engine.steerMember("paused-w", "Should fail while paused"),
+          (err) => err instanceof SwarmProtocolError && err.code === "INVALID_INPUT",
+        );
+      } finally {
+        await engine.dispose();
+      }
     }
   });
 });
