@@ -592,12 +592,33 @@ class SwarmOverlayComponent implements Component, Focusable {
     member: SwarmMemberRecord,
     message: string,
   ): Promise<void> {
-    const mentionTag = `@${member.name}`;
-    const text = message.includes(mentionTag)
-      ? message
-      : `${mentionTag} ${message}`;
-    const channel = member.channels[0] || DEFAULT_CHANNEL;
     try {
+      if (typeof this.engine.steerMember === "function") {
+        const res = await this.engine.steerMember(member.name, message, "steer", {
+          callerName: ORCHESTRATOR_NAME,
+          callerRole: "human",
+        });
+        if (this.closed) return;
+        this.snapshot = this.engine.getSnapshot();
+        this.mergeBoardMessages(this.snapshot.recentBoard);
+        if (res.delivery === "steered") {
+          this.setFeedback("success", `Steered @${member.name} mid-turn.`);
+        } else if (res.delivery === "followUp") {
+          this.setFeedback("success", `Queued follow-up for @${member.name}.`);
+        } else {
+          this.setFeedback(
+            "success",
+            `Woke @${member.name} via #${member.channels[0] || DEFAULT_CHANNEL}.`,
+          );
+        }
+        return;
+      }
+
+      const mentionTag = `@${member.name}`;
+      const text = message.includes(mentionTag)
+        ? message
+        : `${mentionTag} ${message}`;
+      const channel = member.channels[0] || DEFAULT_CHANNEL;
       const posted = await this.engine.postMessage({
         from: ORCHESTRATOR_NAME,
         fromRole: "orchestrator",
@@ -1617,7 +1638,9 @@ class SwarmOverlayComponent implements Component, Focusable {
       return `Post to #${mode.channel} as ${ORCHESTRATOR_NAME} (@member to wake):`;
     }
     if (mode.kind === "wake") {
-      return `Wake / message @${mode.member.name}:`;
+      return mode.member.state === "working"
+        ? `Steer @${mode.member.name} mid-turn:`
+        : `Wake / message @${mode.member.name}:`;
     }
     const cur = mode.member.model ?? this.hostModel ?? "host default";
     return `Hot-switch model for ${mode.member.name} (current: ${cur}):`;
@@ -1629,7 +1652,7 @@ class SwarmOverlayComponent implements Component, Focusable {
       text = "[p] post · [c] channel · [↑↓] scroll · [1-4/Tab] tabs · [Esc/q] close";
     } else if (this.activeTab === "members") {
       text =
-        "[w] wake · [m] model · [x] stop · [k] kill · [g] merge · [d] diff · [Esc/q] close";
+        "[w] steer/wake · [m] model · [x] stop · [k] kill · [g] merge · [d] diff · [Esc/q] close";
     } else if (this.activeTab === "graph") {
       text = "[↑↓] scroll · [1-4/Tab] tabs · [Esc/q] close";
     } else {
@@ -1880,17 +1903,30 @@ async function openSwarmBasicMenu(
           "Enter instructions…",
         );
         if (msg && msg.trim()) {
-          const text = msg.trim().includes(`@${member.name}`)
-            ? msg.trim()
-            : `@${member.name} ${msg.trim()}`;
-          const posted = await engine.postMessage({
-            from: ORCHESTRATOR_NAME,
-            fromRole: "orchestrator",
-            text,
-            channel: member.channels[0] || DEFAULT_CHANNEL,
-            kind: "chat",
-          });
-          ctx.ui.notify(`Posted #${posted.seq} for @${member.name}.`, "info");
+          if (typeof engine.steerMember === "function") {
+            const res = await engine.steerMember(member.name, msg.trim(), "steer", {
+              callerName: ORCHESTRATOR_NAME,
+              callerRole: "human",
+            });
+            ctx.ui.notify(
+              res.delivery === "steered"
+                ? `Steered @${member.name} mid-turn.`
+                : `Woke @${member.name}.`,
+              "info",
+            );
+          } else {
+            const text = msg.trim().includes(`@${member.name}`)
+              ? msg.trim()
+              : `@${member.name} ${msg.trim()}`;
+            const posted = await engine.postMessage({
+              from: ORCHESTRATOR_NAME,
+              fromRole: "orchestrator",
+              text,
+              channel: member.channels[0] || DEFAULT_CHANNEL,
+              kind: "chat",
+            });
+            ctx.ui.notify(`Posted #${posted.seq} for @${member.name}.`, "info");
+          }
         }
       } else if (action.startsWith("Hot-switch model on ")) {
         const raw = await ctx.ui.input(

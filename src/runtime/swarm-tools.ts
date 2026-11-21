@@ -31,7 +31,7 @@ import {
   type SwarmSnapshot,
   type SwitchModelResult,
 } from "../types.js";
-import { formatBoardExcerptLine } from "./role-prompts.js";
+import { formatBoardEntryFull } from "./role-prompts.js";
 
 // ============================================================================
 // Helpers & Schema Utilities
@@ -789,9 +789,13 @@ export function createSwarmTools(deps: SwarmToolDeps): ToolDefinition[] {
         if (res.messages.length === 0) {
           return okResult(`Board has no matching messages (head: #${res.head}).`, res);
         }
-        const lines = res.messages.map((m) => formatBoardExcerptLine(m, 600));
+        const perMessageCap =
+          params.seqs && params.seqs.length > 0 ? undefined : 4000;
+        const formatted = res.messages.map((m) =>
+          formatBoardEntryFull(m, perMessageCap),
+        );
         return okResult(
-          `Swarm Board (head: #${res.head}, showing ${res.messages.length}):\n${lines.join("\n")}`,
+          `Swarm Board (head: #${res.head}, showing ${res.messages.length}):\n\n${formatted.join("\n\n")}`,
           res,
         );
       });
@@ -856,7 +860,9 @@ export function createSwarmTools(deps: SwarmToolDeps): ToolDefinition[] {
         if (res.messages.length === 0) {
           return okResult(header, res);
         }
-        const formatted = res.messages.map((m) => formatBoardExcerptLine(m, 600)).join("\n");
+        const formatted = res.messages
+          .map((m) => formatBoardEntryFull(m, 2500))
+          .join("\n\n");
         return okResult(`${header}\n\n${formatted}`, res);
       });
     },
@@ -995,9 +1001,13 @@ export function createMemberScopedTools(
         if (res.messages.length === 0) {
           return okResult(`Board has no matching messages (head: #${res.head}).`, res);
         }
-        const lines = res.messages.map((m) => formatBoardExcerptLine(m, 600));
+        const perMessageCap =
+          params.seqs && params.seqs.length > 0 ? undefined : 4000;
+        const formatted = res.messages.map((m) =>
+          formatBoardEntryFull(m, perMessageCap),
+        );
         return okResult(
-          `Swarm Board (head: #${res.head}, showing ${res.messages.length}):\n${lines.join("\n")}`,
+          `Swarm Board (head: #${res.head}, showing ${res.messages.length}):\n\n${formatted.join("\n\n")}`,
           res,
         );
       });

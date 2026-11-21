@@ -400,9 +400,18 @@ export function formatBoardMessages(
 // SwarmBoard Implementation (Append-Only LF JSONL per Run)
 // ============================================================================
 
+interface BoardCacheEntry {
+  mtimeMs: number;
+  size: number;
+  ino: number;
+  head: number;
+  messages: BoardMessage[];
+}
+
 export class SwarmBoard implements ISwarmBoard {
   readonly projectRoot: string;
   private readonly runsRoot: string;
+  private readonly boardCache = new Map<string, BoardCacheEntry>();
 
   constructor(projectRoot: string) {
     this.projectRoot = path.resolve(projectRoot);
@@ -417,18 +426,49 @@ export class SwarmBoard implements ISwarmBoard {
     );
   }
 
-  private async readAllMessages(runId: string): Promise<BoardMessage[]> {
-    const boardPath = this.getBoardPath(runId);
+  private async loadCachedByPath(boardPath: string): Promise<{
+    messages: BoardMessage[];
+    head: number;
+  }> {
     await assertNoSymlinksWithin(this.projectRoot, boardPath);
     try {
+      const st = await lstat(boardPath);
+      const existing = this.boardCache.get(boardPath);
+      if (
+        existing &&
+        existing.mtimeMs === st.mtimeMs &&
+        existing.size === st.size &&
+        existing.ino === st.ino
+      ) {
+        return {
+          messages: existing.messages,
+          head: existing.head,
+        };
+      }
       const raw = await readFile(boardPath, "utf8");
-      return parseBoardLines(raw);
+      const messages = parseBoardLines(raw);
+      const head = computeHead(messages);
+      this.boardCache.set(boardPath, {
+        mtimeMs: st.mtimeMs,
+        size: st.size,
+        ino: st.ino,
+        head,
+        messages,
+      });
+      return { messages, head };
     } catch (err) {
       if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
-        return [];
+        this.boardCache.delete(boardPath);
+        return { messages: [], head: 0 };
       }
       throw err;
     }
+  }
+
+  private async readAllMessages(runId: string): Promise<BoardMessage[]> {
+    const boardPath = this.getBoardPath(runId);
+    const { messages } = await this.loadCachedByPath(boardPath);
+    return [...messages];
   }
 
   async post(
@@ -452,15 +492,8 @@ export class SwarmBoard implements ISwarmBoard {
       await mkdir(path.dirname(boardPath), { recursive: true });
       await assertNoSymlinksWithin(this.projectRoot, boardPath);
 
-      let head = 0;
-      try {
-        const existing = await readFile(boardPath, "utf8");
-        head = computeHead(parseBoardLines(existing));
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
-          throw err;
-        }
-      }
+      const { messages: existingMessages, head } =
+        await this.loadCachedByPath(boardPath);
 
       const text = typeof input.text === "string" ? input.text.trim() : "";
       const kind: BoardMessageKind =
@@ -486,6 +519,19 @@ export class SwarmBoard implements ISwarmBoard {
 
       const line = `${JSON.stringify(message)}\n`;
       await appendFile(boardPath, line, { encoding: "utf8", flag: "a" });
+      try {
+        const stAfter = await lstat(boardPath);
+        const updatedMessages = [...existingMessages, message];
+        this.boardCache.set(boardPath, {
+          mtimeMs: stAfter.mtimeMs,
+          size: stAfter.size,
+          ino: stAfter.ino,
+          head: message.seq,
+          messages: updatedMessages,
+        });
+      } catch {
+        this.boardCache.delete(boardPath);
+      }
       return message;
     });
   }
@@ -598,7 +644,8 @@ export class SwarmBoard implements ISwarmBoard {
   }
 
   async getHead(runId: string): Promise<number> {
-    const all = await this.readAllMessages(runId);
-    return computeHead(all);
+    const boardPath = this.getBoardPath(runId);
+    const { head } = await this.loadCachedByPath(boardPath);
+    return head;
   }
 }

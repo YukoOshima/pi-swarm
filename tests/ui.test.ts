@@ -1803,4 +1803,73 @@ describe("swarm-overlay", () => {
       );
     }
   });
+
+  it("uses engine.steerMember for [w] so working members receive live mid-turn steering instead of board-only fallback", async () => {
+    const snap = makeSampleSnapshot();
+    const mockEngine = createMockEngine(snap);
+    const steerCalls: Array<{
+      name: string;
+      message: string;
+      mode?: "steer" | "followUp";
+      callerRole?: string;
+    }> = [];
+    mockEngine.engine.steerMember = async (
+      name: string,
+      message: string,
+      mode?: "steer" | "followUp",
+      options?: { callerName?: string; callerRole?: any },
+    ) => {
+      steerCalls.push({ name, message, mode, callerRole: options?.callerRole });
+      const target = snap.run?.members[name];
+      return { delivery: target?.state === "working" ? "steered" : "woken" };
+    };
+
+    const theme = createMockTheme();
+    const mockTui = createMockTUI(32, 100);
+    const ctx = {
+      mode: "tui",
+      hasUI: true,
+      ui: {
+        theme,
+        notify() {},
+        async custom<T>(
+          factory: (
+            tui: TUI,
+            th: Theme,
+            kb: unknown,
+            done: (res: T) => void,
+          ) => Component & { dispose?(): void },
+        ): Promise<T> {
+          return new Promise<T>((resolve) => {
+            const comp = factory(mockTui.tui, theme, {}, resolve);
+            if (isFocusable(comp)) comp.focused = true;
+            void (async () => {
+              await flushAsync();
+              comp.handleInput?.("w");
+              for (const ch of "Focus on parser edge case") {
+                comp.handleInput?.(ch);
+              }
+              comp.handleInput?.("\r");
+              await flushAsync();
+              const plain = stripTerminalSequences(comp.render(100).join("\n"));
+              assert.match(plain, /Steered @worker-1 mid-turn/);
+              comp.handleInput?.("q");
+            })();
+          });
+        },
+      },
+    } as unknown as ExtensionContext;
+
+    await openSwarmOverlay(ctx, mockEngine.engine, null, {
+      initialTab: "members",
+      initialMemberName: "worker-1",
+    });
+
+    assert.equal(steerCalls.length, 1);
+    assert.equal(steerCalls[0]!.name, "worker-1");
+    assert.equal(steerCalls[0]!.message, "Focus on parser edge case");
+    assert.equal(steerCalls[0]!.mode, "steer");
+    assert.equal(steerCalls[0]!.callerRole, "human");
+    assert.equal(mockEngine.posted.length, 0);
+  });
 });

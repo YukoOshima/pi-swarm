@@ -256,6 +256,10 @@ interface LiveMember {
   launchAbort?: AbortController;
   /** Active concurrency slot release callback, if currently holding a slot. */
   releaseSlot?: () => void;
+  /** Number of consecutive automatic retries attempted after rate_limited turns. */
+  retryCount: number;
+  /** Timer handle for pending automatic rate-limit retry. */
+  retryTimer?: ReturnType<typeof setTimeout>;
 }
 
 interface BoardWaiter {
@@ -317,6 +321,10 @@ export class SwarmEngine implements ISwarmEngine {
   private stallTimer: ReturnType<typeof setTimeout> | null = null;
   private stallNoticePostedAtHead: number | null = null;
   private monitorRunning = false;
+  private activeMonitorHandle?: PersistentAgentHandle;
+  private activeMonitorAbort?: AbortController;
+  private monitorTokens = 0;
+  private monitorCost = 0;
   private orchestratorWait: {
     since: number;
     mentionsOnly: boolean;
@@ -384,6 +392,7 @@ export class SwarmEngine implements ISwarmEngine {
 
     if (runId === null) {
       this.cancelStallWatchdog();
+      await this.cancelActiveMonitor("Detached from Swarm run");
       this.clearOrchestratorWait("Detached from Swarm run.");
       this.resolveAllWaiters("run_ended", "Detached from Swarm run.");
       this.activeRunId = null;
@@ -394,6 +403,8 @@ export class SwarmEngine implements ISwarmEngine {
       this.stallNoticePostedAtHead = null;
       this.boardHopCount = 0;
       this.hopCapAlerted = false;
+      this.monitorTokens = 0;
+      this.monitorCost = 0;
       const snap = this.getSnapshot();
       this.emitEngineEvent("snapshot_changed", "Detached from Swarm run.");
       return snap;
@@ -402,8 +413,11 @@ export class SwarmEngine implements ISwarmEngine {
     const isSameRun = this.activeRunId === runId;
     if (this.activeRunId && !isSameRun) {
       this.cancelStallWatchdog();
+      await this.cancelActiveMonitor(`Switched focus to run ${runId}`);
       this.clearOrchestratorWait(`Switched focus to run ${runId}.`);
       this.resolveAllWaiters("run_ended", `Switched focus to run ${runId}.`);
+      this.monitorTokens = 0;
+      this.monitorCost = 0;
       await this.disposeLiveHandles("Switched active run");
     }
 
@@ -523,12 +537,14 @@ export class SwarmEngine implements ISwarmEngine {
       throw new SwarmProtocolError("NOT_FOUND", "No active Swarm run to pause.");
     }
     this.cancelStallWatchdog();
+    await this.cancelActiveMonitor(reason ?? "Swarm run paused");
     this.clearOrchestratorWait(reason ?? "Swarm run paused.");
     this.concurrencyGate.pause();
     this.resolveAllWaiters("run_ended", reason ?? "Swarm run paused.");
 
     // Abort in-flight working turns gracefully while keeping worktrees intact
     for (const live of this.liveMembers.values()) {
+      this.cancelMemberRetryTimer(live);
       live.launchAbort?.abort();
       live.pendingWakes.length = 0;
       if (live.handle && live.handle.getState() === "working") {
@@ -587,6 +603,7 @@ export class SwarmEngine implements ISwarmEngine {
 
     // Silence watchdog immediately and prevent any further wakes
     this.cancelStallWatchdog();
+    await this.cancelActiveMonitor("Run completed");
     this.clearOrchestratorWait("Run completed.");
     this.runDonePosted = true;
 
@@ -894,28 +911,47 @@ export class SwarmEngine implements ISwarmEngine {
 
     this.cancelStallWatchdog();
 
-    for (const spec of specs) {
-      let cwd: string;
-      let branch: string | undefined;
+    const preparedSpecs: Array<{
+      spec: (typeof specs)[number];
+      cwd: string;
+      branch?: string;
+    }> = [];
+    const provisionedWorktrees: string[] = [];
 
-      if (workspaceMode === "share" || workspaceMode === "branch") {
-        branch = `${SWARM_BRANCH_PREFIX}${safeRunBranchSegment}/${spec.name}`;
-        const worktreePath = this.store.getWorktreePath(run.id, spec.name);
-        const createdWt = await this.worktree.createWorktree({
-          branch,
-          baseBranch: run.baseBranch,
-          worktreePath,
-          mode: workspaceMode,
-        });
-        cwd = createdWt.worktreePath;
-        branch = createdWt.branch;
-      } else {
-        cwd =
-          parentMember && parentMember.workspace !== "inherit"
-            ? parentMember.cwd
-            : this.worktree.repoRoot;
+    try {
+      for (const spec of specs) {
+        let cwd: string;
+        let branch: string | undefined;
+
+        if (workspaceMode === "share" || workspaceMode === "branch") {
+          branch = `${SWARM_BRANCH_PREFIX}${safeRunBranchSegment}/${spec.name}`;
+          const worktreePath = this.store.getWorktreePath(run.id, spec.name);
+          const createdWt = await this.worktree.createWorktree({
+            branch,
+            baseBranch: run.baseBranch,
+            worktreePath,
+            mode: workspaceMode,
+          });
+          cwd = createdWt.worktreePath;
+          branch = createdWt.branch;
+          provisionedWorktrees.push(cwd);
+        } else {
+          cwd =
+            parentMember && parentMember.workspace !== "inherit"
+              ? parentMember.cwd
+              : this.worktree.repoRoot;
+        }
+
+        preparedSpecs.push({ spec, cwd, branch });
       }
+    } catch (err) {
+      for (const wtPath of provisionedWorktrees) {
+        await this.worktree.removeWorktree(wtPath, { force: true }).catch(() => {});
+      }
+      throw err;
+    }
 
+    for (const { spec, cwd, branch } of preparedSpecs) {
       const agentId = this.generateAgentIdFn(spec.name);
       await this.store.addMember(
         run.id,
@@ -976,6 +1012,7 @@ export class SwarmEngine implements ISwarmEngine {
         lastMessages: seedMessages ? sanitizeForkSeedMessages(seedMessages) : [],
         logTail: [...memberRecord.logTail],
         currentActivity: "queued to start",
+        retryCount: 0,
       };
       this.liveMembers.set(spec.name, live);
 
@@ -1600,6 +1637,7 @@ export class SwarmEngine implements ISwarmEngine {
     // Acquire synchronous switchingModel lock BEFORE any await so concurrent @mentions queue safely!
     const acquiredLock = !internal.holdSwitchingLock && Boolean(live);
     if (acquiredLock && live) {
+      this.cancelMemberRetryTimer(live);
       live.switchingModel = true;
     }
 
@@ -1762,6 +1800,9 @@ export class SwarmEngine implements ISwarmEngine {
     }
 
     const live = this.liveMembers.get(member.name);
+    if (live) {
+      this.cancelMemberRetryTimer(live);
+    }
     const isLiveWorking =
       Boolean(live?.handle) &&
       (live!.handle!.getState() === "working" || live!.turnActive);
@@ -1815,6 +1856,7 @@ export class SwarmEngine implements ISwarmEngine {
 
     const live = this.liveMembers.get(member.name);
     if (live) {
+      this.cancelMemberRetryTimer(live);
       live.launchAbort?.abort();
       live.spawning = false;
       live.waking = false;
@@ -1896,6 +1938,7 @@ export class SwarmEngine implements ISwarmEngine {
 
     const live = this.liveMembers.get(member.name);
     if (live) {
+      this.cancelMemberRetryTimer(live);
       live.launchAbort?.abort();
       live.spawning = false;
       live.waking = false;
@@ -2328,8 +2371,8 @@ export class SwarmEngine implements ISwarmEngine {
     const settings = this.getEffectiveSettings();
     const roleModels = buildRoleModelsSnapshot(settings, run?.roleModels);
 
-    let totalTokens = 0;
-    let totalCost = 0;
+    let totalTokens = this.monitorTokens;
+    let totalCost = this.monitorCost;
     const workingMemberNames: string[] = [];
     const waitingMemberNames: string[] = [];
 
@@ -2387,6 +2430,7 @@ export class SwarmEngine implements ISwarmEngine {
   async dispose(): Promise<void> {
     this.disposed = true;
     this.cancelStallWatchdog();
+    await this.cancelActiveMonitor("Engine disposed");
     this.clearOrchestratorWait("Swarm engine disposed.");
     this.resolveAllWaiters("run_ended", "Swarm engine disposed.");
     await this.disposeLiveHandles("Engine disposed");
@@ -2446,6 +2490,7 @@ export class SwarmEngine implements ISwarmEngine {
         runId,
         cwd: member.cwd,
         branch: member.branch,
+        baseBranch: run.baseBranch,
         workspace: member.workspace,
         parentName: member.parentName,
         brief: member.brief,
@@ -2750,6 +2795,7 @@ export class SwarmEngine implements ISwarmEngine {
         runId,
         cwd: member.cwd,
         branch: member.branch,
+        baseBranch: run.baseBranch,
         workspace: member.workspace,
         parentName: member.parentName,
         brief: member.brief,
@@ -2985,6 +3031,7 @@ export class SwarmEngine implements ISwarmEngine {
 
       // Remember whether this parked member asked for mentions_only=false so future non-mention posts wake it!
       if (live) {
+        live.retryCount = 0;
         live.parkedMentionsOnly = waitReq ? waitReq.mentionsOnly : true;
       }
 
@@ -3127,7 +3174,7 @@ export class SwarmEngine implements ISwarmEngine {
         live.turnActive = false;
       }
 
-      // Engage shared fleet rate-limit breaker and alert @orchestrator
+      // Engage shared fleet rate-limit breaker
       const delayMs = this.rateLimitBreaker.recordRateLimit(result.retryAfterMs, errorText);
       await this.store.appendEvent({
         runId,
@@ -3136,8 +3183,65 @@ export class SwarmEngine implements ISwarmEngine {
         memberName,
         agentId: member.agentId,
         summary: `Rate-limit backoff (${Math.ceil(delayMs / 1000)}s) after ${memberName} hit: ${errorText}`,
-        data: { delayMs, error: errorText, model: effectiveModel },
+        data: {
+          delayMs,
+          error: errorText,
+          model: effectiveModel,
+          retryCount: live?.retryCount ?? 0,
+          maxRetries: settings.maxRetries,
+        },
       });
+
+      // Automatic backoff retry when `settings.maxRetries` allows and warm handle is parked waiting
+      if (
+        live &&
+        live.handle?.getState() === "waiting" &&
+        run.status === "active" &&
+        !this.disposed &&
+        settings.maxRetries > 0 &&
+        live.retryCount < settings.maxRetries
+      ) {
+        this.cancelMemberRetryTimer(live);
+        live.retryCount += 1;
+        const attempt = live.retryCount;
+        const maxRetries = settings.maxRetries;
+        const backoffSecs = Math.max(1, Math.ceil(delayMs / 1000));
+        const parkedLabel = `rate limited; auto-retry ${attempt}/${maxRetries} in ${backoffSecs}s`;
+
+        const scheduledRun = await this.store.updateMember(runId, memberName, {
+          parkedOn: parkedLabel,
+        });
+        await this.refreshCache(scheduledRun);
+
+        live.retryTimer = setTimeout(() => {
+          live.retryTimer = undefined;
+          if (
+            this.disposed ||
+            this.activeRunId !== runId ||
+            this.cachedRun?.status !== "active" ||
+            this.liveMembers.get(memberName) !== live ||
+            live.handle?.getState() !== "waiting" ||
+            live.spawning ||
+            live.waking ||
+            live.turnActive ||
+            live.switchingModel
+          ) {
+            return;
+          }
+          live.waking = true;
+          this.cancelStallWatchdog();
+          const retryPrompt = `Rate-limit backoff elapsed (automatic retry ${attempt}/${maxRetries} after ${errorText}). Continue your work from where you left off.`;
+          void this.drainMemberPendingWakes(runId, memberName, retryPrompt);
+        }, delayMs);
+        live.retryTimer.unref?.();
+
+        this.emitEngineEvent(
+          "snapshot_changed",
+          `Scheduled retry ${attempt}/${maxRetries} for @${memberName} in ${backoffSecs}s`,
+          { memberName },
+        );
+        return;
+      }
 
       await this.postMonitorOrchestratorAlert(
         runId,
@@ -3419,6 +3523,7 @@ export class SwarmEngine implements ISwarmEngine {
         lastMessages: [],
         logTail: [...member.logTail],
         lastTool: member.lastTool,
+        retryCount: 0,
       };
       this.liveMembers.set(memberName, live);
     }
@@ -3428,6 +3533,7 @@ export class SwarmEngine implements ISwarmEngine {
     }
     live.deliveredSeqs.add(msg.seq);
     live.pendingWakes.push(msg);
+    this.cancelMemberRetryTimer(live);
 
     // If currently spawning, waking, finishing/running a turn, or switching models -> queue safely!
     if (
@@ -3555,6 +3661,25 @@ export class SwarmEngine implements ISwarmEngine {
         head,
         summary,
       });
+    }
+  }
+
+  private cancelMemberRetryTimer(live: LiveMember): void {
+    if (live.retryTimer) {
+      clearTimeout(live.retryTimer);
+      live.retryTimer = undefined;
+    }
+  }
+
+  private async cancelActiveMonitor(reason: string): Promise<void> {
+    const abort = this.activeMonitorAbort;
+    this.activeMonitorAbort = undefined;
+    abort?.abort();
+    const handle = this.activeMonitorHandle;
+    this.activeMonitorHandle = undefined;
+    this.monitorRunning = false;
+    if (handle) {
+      await handle.kill(reason).catch(() => {});
     }
   }
 
@@ -3749,6 +3874,8 @@ export class SwarmEngine implements ISwarmEngine {
     settings: SwarmSettings,
   ): Promise<boolean> {
     this.monitorRunning = true;
+    const abort = new AbortController();
+    this.activeMonitorAbort = abort;
     let handle: PersistentAgentHandle | undefined;
     try {
       const recent = await this.store
@@ -3885,13 +4012,47 @@ export class SwarmEngine implements ISwarmEngine {
         isMonitor: true,
       });
 
+      if (abort.signal.aborted || this.disposed) {
+        await handle.kill("Monitor cancelled before turn start").catch(() => {});
+        return false;
+      }
+
+      this.activeMonitorHandle = handle;
+
+      let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+      let onAbort: (() => void) | undefined;
       const turnResult = await Promise.race([
         handle.currentTurn,
         new Promise<AgentTurnResult | null>((resolve) => {
-          const t = setTimeout(() => resolve(null), 30_000);
-          t.unref?.();
+          timeoutTimer = setTimeout(() => resolve(null), 30_000);
+          timeoutTimer.unref?.();
+          onAbort = () => resolve(null);
+          abort.signal.addEventListener("abort", onAbort, { once: true });
         }),
-      ]);
+      ]).finally(() => {
+        if (timeoutTimer) {
+          clearTimeout(timeoutTimer);
+        }
+        if (onAbort) {
+          abort.signal.removeEventListener("abort", onAbort);
+        }
+      });
+
+      if (turnResult) {
+        const addedTokens = Math.max(0, turnResult.tokens || 0);
+        const addedCost = Math.max(0, turnResult.cost || 0);
+        if (addedTokens > 0 || addedCost > 0) {
+          this.monitorTokens += addedTokens;
+          this.monitorCost += addedCost;
+          this.emitEngineEvent("snapshot_changed", "Updated @monitor usage", {
+            memberName: MONITOR_NAME,
+          });
+        }
+      }
+
+      if (abort.signal.aborted || this.disposed) {
+        return false;
+      }
 
       if (monitorPosted) {
         return true;
@@ -3904,6 +4065,12 @@ export class SwarmEngine implements ISwarmEngine {
     } catch {
       return false;
     } finally {
+      if (this.activeMonitorAbort === abort) {
+        this.activeMonitorAbort = undefined;
+      }
+      if (this.activeMonitorHandle === handle) {
+        this.activeMonitorHandle = undefined;
+      }
       this.monitorRunning = false;
       if (handle) {
         await handle.kill("Monitor check complete").catch(() => {});
@@ -4183,6 +4350,7 @@ export class SwarmEngine implements ISwarmEngine {
         live?.waking ||
         live?.turnActive ||
         live?.switchingModel ||
+        Boolean(live?.retryTimer) ||
         (live && live.pendingWakes.length > 0) ||
         live?.handle?.getState() === "working"
       ) {
@@ -4273,6 +4441,7 @@ export class SwarmEngine implements ISwarmEngine {
     this.liveMembers.clear();
     await Promise.all(
       entries.map(async (live) => {
+        this.cancelMemberRetryTimer(live);
         live.launchAbort?.abort();
         live.spawning = false;
         live.waking = false;

@@ -932,6 +932,7 @@ export interface SpawnMemberRequest {
   runId: string;
   cwd: string;
   branch?: string;
+  baseBranch?: string;
   workspace: SwarmWorkspaceMode;
   parentName: string;
   brief: string;

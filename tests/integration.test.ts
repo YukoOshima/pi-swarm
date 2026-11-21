@@ -1915,9 +1915,14 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     assert.equal((parkRes as { terminate?: boolean }).terminate, true);
     assert.equal(parkRes.details?.parked, true);
 
-    // 3. Human sends interactive redirection while Orchestrator is idle!
+    // 3. Human sends interactive / RPC redirection while Orchestrator is idle!
+    // Source "extension" must be ignored, while "interactive" and "rpc" both capture direction cleanly.
+    await harness.emit("input", {
+      source: "extension",
+      text: "Internal extension echo must not set direction",
+    });
     const inputRes = await harness.emit("input", {
-      source: "interactive",
+      source: "rpc",
       text: "Change direction: switch API to v2 with streaming support",
     });
     assert.equal((inputRes as Array<{ action?: string }>)?.[0]?.action, "continue");

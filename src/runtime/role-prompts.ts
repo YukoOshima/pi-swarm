@@ -57,6 +57,35 @@ export function formatBoardExcerpt(
   return messages.map((m) => formatBoardExcerptLine(m, maxCharsPerLine)).join("\n");
 }
 
+/**
+ * Formats a board message preserving multiline structure, markdown blocks, and formatting.
+ * When `maxChars` is omitted, emits the complete untruncated message body (for `read_board{seqs:[...]}`).
+ */
+export function formatBoardEntryFull(
+  msg: BoardMessage,
+  maxChars?: number,
+): string {
+  const targets: string[] = [];
+  for (const handle of msg.mentions) {
+    targets.push(handle.startsWith("@") ? handle : `@${handle}`);
+  }
+  for (const ch of msg.channelMentions) {
+    const clean = ch.replace(/^@#/, "");
+    targets.push(`@#${clean}`);
+  }
+  const targetPart = targets.length > 0 ? ` -> ${targets.join(",")}` : "";
+  const channelPart = `#${msg.channel || DEFAULT_CHANNEL}`;
+  const kindTag = msg.kind && msg.kind !== "chat" ? ` (${msg.kind})` : "";
+  const header = `#${msg.seq} [${channelPart}] ${msg.from}${targetPart}${kindTag}:`;
+
+  const body = msg.text.trimEnd();
+  if (maxChars !== undefined && body.length > maxChars) {
+    const remaining = body.length - maxChars;
+    return `${header}\n${body.slice(0, maxChars)}\n... [truncated ${remaining} chars; call ${READ_BOARD_TOOL}{seqs:[${msg.seq}]} for full message]`;
+  }
+  return body.length > 0 ? `${header}\n${body}` : header;
+}
+
 // ============================================================================
 // Orchestrator Playbook Section (Prompt-Cache-Safe Tail / sections.swarm)
 // ============================================================================
@@ -328,7 +357,7 @@ export function buildWakeupPrompt(
   messages: readonly BoardMessage[],
   head: number,
 ): string {
-  const formatted = messages.map((m) => formatBoardExcerptLine(m, 600)).join("\n");
+  const formatted = messages.map((m) => formatBoardEntryFull(m, 2500)).join("\n\n");
   return [
     `New shared board message(s) for \`@${member.name}\` (board head: \`#${head}\`):`,
     "",

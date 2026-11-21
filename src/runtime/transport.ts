@@ -566,7 +566,7 @@ function seedMessagesIntoSessionManager(
 // Guard Extension Factories & Fallback Bridge
 // ============================================================================
 
-function createWorkerGuardExtensionFactory(
+export function createWorkerGuardExtensionFactory(
   request: SpawnMemberRequest,
   baseBranch?: string,
 ): ExtensionFactory {
@@ -949,7 +949,7 @@ export class InProcessPiTransport implements ISwarmTransport {
     const guardFactory: ExtensionFactory =
       request.role === "validator"
         ? createValidatorGuardExtensionFactory(request.name, this.validatorReadOnlyBash)
-        : createWorkerGuardExtensionFactory(request);
+        : createWorkerGuardExtensionFactory(request, request.baseBranch);
 
     const readStats = (
       activeSession: AgentSession | undefined,

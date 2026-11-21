@@ -15,12 +15,14 @@ export {
   buildOrchestratorContextSummary,
   buildOrchestratorPlaybookSection,
   buildWakeupPrompt,
+  formatBoardEntryFull,
   formatBoardExcerpt,
   formatBoardExcerptLine,
 } from "./role-prompts.js";
 
 export {
   type CommandGuardResult,
+  createWorkerGuardExtensionFactory,
   extractSessionMessages,
   findOutOfScopeFiles,
   InProcessPiTransport,

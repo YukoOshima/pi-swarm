@@ -1741,4 +1741,56 @@ describe("WorktreeManager real git repository workflows", () => {
     assert.equal(await exists(clonePath), false);
     await wtMgr.removeWorktree(sharePath, { force: true });
   });
+
+  it("caches SwarmBoard reads/head using stat metadata and invalidates on external writes", async () => {
+    const tmp = await makeTempDir("pi-swarm-board-cache-");
+    const board = new SwarmBoard(tmp);
+    const runId = "run-cache";
+
+    assert.equal(await board.getHead(runId), 0);
+    const m1 = await board.post(runId, {
+      from: "orchestrator",
+      fromRole: "orchestrator",
+      text: "First cached message",
+    });
+    const m2 = await board.post(runId, {
+      from: "worker-1",
+      fromRole: "worker",
+      text: "Second cached message",
+    });
+    assert.equal(m1.seq, 1);
+    assert.equal(m2.seq, 2);
+    assert.equal(await board.getHead(runId), 2);
+    assert.equal((await board.read(runId, { since: 0 })).messages.length, 2);
+
+    // Simulate an external writer appending #3 directly to board.jsonl
+    const externalMsg: BoardMessage = {
+      seq: 3,
+      runId,
+      channel: "main",
+      from: "external-proc",
+      fromRole: "worker",
+      text: "@orchestrator External append",
+      mentions: ["orchestrator"],
+      channelMentions: [],
+      kind: "update",
+      timestamp: new Date().toISOString(),
+    };
+    const boardPath = board.getBoardPath(runId);
+    const existingRaw = await readFile(boardPath, "utf8");
+    await writeFile(boardPath, `${existingRaw}${JSON.stringify(externalMsg)}\n`, "utf8");
+
+    assert.equal(await board.getHead(runId), 3);
+    const readAfterExternal = await board.read(runId, { seqs: [3] });
+    assert.equal(readAfterExternal.messages.length, 1);
+    assert.equal(readAfterExternal.messages[0]!.from, "external-proc");
+
+    // Next post through SwarmBoard sees seq=3 and writes seq=4
+    const m4 = await board.post(runId, {
+      from: "orchestrator",
+      fromRole: "orchestrator",
+      text: "Fourth message after invalidation",
+    });
+    assert.equal(m4.seq, 4);
+  });
 });

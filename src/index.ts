@@ -37,7 +37,7 @@ import {
 } from "./drafting/index.js";
 import {
   buildOrchestratorPlaybookSection,
-  formatBoardExcerptLine,
+  formatBoardEntryFull,
   InProcessPiTransport,
   registerSwarmTools,
   SwarmEngine,
@@ -1221,7 +1221,7 @@ export function createPiSwarmExtension(
             const ordered = Array.from(formattedBoardMsgs.values()).sort((a, b) => a.seq - b.seq);
             lines.push("", "Board messages:");
             for (const msg of ordered) {
-              lines.push(formatBoardExcerptLine(msg, 600));
+              lines.push(formatBoardEntryFull(msg, 2500), "");
             }
           }
 
@@ -3346,7 +3346,7 @@ export function createPiSwarmExtension(
 
     pi.on("input", (event, _ctx) => {
       if (
-        event.source === "interactive" &&
+        (event.source === "interactive" || event.source === "rpc") &&
         !draftController.isActive() &&
         activeEngine
       ) {

@@ -28,6 +28,8 @@ import {
   ConcurrencyGate,
   createMemberScopedTools,
   createSwarmTools,
+  createWorkerGuardExtensionFactory,
+  formatBoardEntryFull,
   InProcessPiTransport,
   isForbiddenWorkerBashCommand,
   isProtectedSwarmPath,
@@ -536,6 +538,7 @@ class MockWorktreeManager implements IWorktreeManager {
   readonly removedWorktrees: Array<{ worktreePath: string; force?: boolean }> = [];
   readonly mergedBranches: Array<{ baseBranch: string; branch: string }> = [];
   readonly dirtyPaths = new Set<string>();
+  failCreateWorktreeFor?: string;
   baseBranchCheck: BaseBranchCleanCheck = { ok: true, currentBranch: "main", dirty: false };
   rebaseResult: AutoRebaseResult = { status: "up-to-date" };
   nextMergeSha = "abcdef1234567890abcdef1234567890abcdef12";
@@ -563,6 +566,9 @@ class MockWorktreeManager implements IWorktreeManager {
     baseBranch: string;
     worktreePath: string;
   }): Promise<CreateWorktreeResult> {
+    if (this.failCreateWorktreeFor && options.branch.includes(this.failCreateWorktreeFor)) {
+      throw new SwarmProtocolError("GIT_ERROR", `Simulated worktree failure for ${options.branch}`);
+    }
     this.createdWorktrees.push(options);
     return {
       branch: options.branch,
@@ -2991,6 +2997,364 @@ describe("SwarmEngine — v0.3.0 Antigravity Swarm Parity & Steering", () => {
       await engine.dispose();
     } finally {
       await rm(tmpRoot, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+});
+
+// ============================================================================
+// 14. v0.3.1 Optimizations (Full read_board, baseBranch guard, maxRetries, Rollback, Monitor)
+// ============================================================================
+
+describe("SwarmEngine — v0.3.1 Hardening & Optimizations", () => {
+  it("preserves full multiline content in read_board{seqs:[...]} and formatBoardEntryFull", async () => {
+    const { engine } = await createTestHarness({ stallWatchdogEnabled: false });
+    try {
+      const longBody = [
+        "## Root Cause Analysis",
+        "Line 1",
+        "```ts",
+        "export function check(): boolean {",
+        "  return true;",
+        "}",
+        "```",
+        "Padding: " + "x".repeat(900),
+        "END_MARKER_VISIBLE",
+      ].join("\n");
+
+      const msg = await engine.postMessage({
+        from: "researcher",
+        fromRole: "worker",
+        text: `@orchestrator ${longBody}`,
+        kind: "done",
+      });
+
+      const formattedFull = formatBoardEntryFull(msg);
+      assert.ok(formattedFull.includes("## Root Cause Analysis\nLine 1\n"));
+      assert.ok(
+        formattedFull.includes("```ts\nexport function check(): boolean {\n  return true;\n}\n```"),
+      );
+      assert.ok(formattedFull.includes("END_MARKER_VISIBLE"));
+
+      const tools = createSwarmTools({ engine });
+      const readBoardTool = tools.find((t) => t.name === READ_BOARD_TOOL)!;
+
+      // read_board with explicit seqs returns FULL untruncated multiline content (> 600 chars)
+      const seqResult = await readBoardTool.execute(
+        "tc-seq",
+        { seqs: [msg.seq] },
+        undefined,
+        undefined,
+        {} as ExtensionToolContext,
+      );
+      const seqText = String((seqResult.content[0] as { text: string }).text);
+      assert.ok(seqText.includes("```ts\nexport function check()"));
+      assert.ok(seqText.includes("END_MARKER_VISIBLE"), "read_board{seqs:[...]} must not truncate at 600 chars");
+
+      // Also verify member-scoped read_board{seqs:[...]}
+      const memberTools = createMemberScopedTools(
+        {
+          postMessage: (input) =>
+            engine.postMessage({ ...input, from: "w1", fromRole: "worker" }),
+          readBoard: (opts) => engine.readBoard(opts),
+          getStatus: async () => ({
+            runId: "run-dyn",
+            title: "Test",
+            status: "active",
+            baseBranch: "main",
+            boardHead: msg.seq,
+            members: [],
+            channels: [],
+          }),
+          listModels: (opts) => engine.listModels(opts),
+          addHelper: async () => [],
+          killHelper: async () => {},
+          switchModel: async () => ({ targetName: "w1", model: "openai/gpt-5.4" }),
+          manageChannel: async () => ({ action: "list", summary: "" }),
+        },
+        { name: "w1", role: "worker", runId: "run-dyn" },
+      );
+      const memberRead = memberTools.find((t) => t.name === READ_BOARD_TOOL)!;
+      const memberRes = await memberRead.execute(
+        "tc-mseq",
+        { seqs: [msg.seq] },
+        undefined,
+        undefined,
+        {} as ExtensionToolContext,
+      );
+      const memberText = String((memberRes.content[0] as { text: string }).text);
+      assert.ok(memberText.includes("END_MARKER_VISIBLE"));
+    } finally {
+      await engine.dispose();
+    }
+  });
+
+  it("propagates run.baseBranch to SpawnMemberRequest and blocks checkout/switch <baseBranch> in worker guard", async () => {
+    const seenRequests: SpawnMemberRequest[] = [];
+    const { engine, transport } = await createTestHarness({ stallWatchdogEnabled: false });
+    const origSpawn = transport.spawnMember.bind(transport);
+    transport.spawnMember = async (req: SpawnMemberRequest) => {
+      seenRequests.push(req);
+      return origSpawn(req);
+    };
+
+    try {
+      await engine.addMembers({
+        name: "author",
+        workspace: "share",
+        brief: "Edit inside isolated worktree",
+      });
+      await waitUntil(() => engine.getSnapshot().run?.members.author?.state === "waiting");
+
+      assert.equal(seenRequests.length, 1);
+      assert.equal(seenRequests[0]!.baseBranch, "main");
+
+      // Exercise createWorkerGuardExtensionFactory directly with baseBranch="main"
+      let toolCallHandler: ((event: any) => any) | undefined;
+      const fakePi = {
+        on(ev: string, handler: (event: any) => any) {
+          if (ev === "tool_call") toolCallHandler = handler;
+        },
+      };
+      createWorkerGuardExtensionFactory(seenRequests[0]!, seenRequests[0]!.baseBranch)(fakePi as any);
+      assert.ok(toolCallHandler);
+
+      const blocked = toolCallHandler!({
+        toolName: "bash",
+        input: { command: "git checkout main" },
+      });
+      assert.equal(blocked?.block, true);
+      assert.match(String(blocked?.reason ?? ""), /main/);
+
+      const allowed = toolCallHandler!({
+        toolName: "bash",
+        input: { command: "git status --short" },
+      });
+      assert.equal(allowed, undefined);
+    } finally {
+      await engine.dispose();
+    }
+  });
+
+  it("automatically retries rate_limited turns up to settings.maxRetries and alerts @orchestrator when exhausted", async () => {
+    // Case A: 2 transient 429s then success on attempt #3 (with maxRetries = 2)
+    {
+      let calls = 0;
+      const { engine, transport } = await createTestHarness({
+        fallbackModels: [],
+        maxRetries: 2,
+        rateLimitBaseBackoffMs: 25,
+        rateLimitMaxBackoffMs: 50,
+        stallWatchdogEnabled: false,
+      });
+      try {
+        transport.onMember("retrier", async () => {
+          calls += 1;
+          if (calls <= 2) {
+            return {
+              outcome: "rate_limited",
+              error: `HTTP 429 attempt ${calls}`,
+              retryAfterMs: 25,
+            };
+          }
+          return {
+            outcome: "waiting",
+            summary: "Recovered on retry #2",
+          };
+        });
+
+        await engine.addMembers({ name: "retrier", brief: "Survive transient 429s" });
+        await waitUntil(() => calls === 3 && engine.getSnapshot().run?.members.retrier?.state === "waiting", 3000);
+        assert.equal(calls, 3);
+        assert.equal(engine.getSnapshot().run?.members.retrier?.error, undefined);
+        // No @orchestrator [rate-limit] alert emitted because recovery succeeded within maxRetries
+        assert.ok(
+          !engine.getSnapshot().recentBoard.some((m) => m.text.includes("[rate-limit]")),
+          "Should not escalate @orchestrator [rate-limit] while automatic retries succeed",
+        );
+      } finally {
+        await engine.dispose();
+      }
+    }
+
+    // Case B: exhausts maxRetries = 1 (1 initial + 1 retry = 2 calls), then alerts @orchestrator
+    {
+      let calls = 0;
+      const { engine, transport } = await createTestHarness({
+        fallbackModels: [],
+        maxRetries: 1,
+        rateLimitBaseBackoffMs: 20,
+        rateLimitMaxBackoffMs: 40,
+        stallWatchdogEnabled: false,
+      });
+      try {
+        transport.onMember("exhausted", async () => {
+          calls += 1;
+          return {
+            outcome: "rate_limited",
+            error: "HTTP 429 persistent quota",
+            retryAfterMs: 20,
+          };
+        });
+
+        await engine.addMembers({ name: "exhausted", brief: "Exhaust retry budget" });
+        await waitUntil(
+          () =>
+            calls === 2 &&
+            engine.getSnapshot().recentBoard.some((m) => m.text.includes("[rate-limit]") && m.text.includes("exhausted")),
+          3000,
+        );
+        assert.equal(calls, 2);
+      } finally {
+        await engine.dispose();
+      }
+    }
+  });
+
+  it("rolls back all already-provisioned worktrees cleanly if batch addMembers fails mid-way", async () => {
+    const { engine, worktree } = await createTestHarness({ stallWatchdogEnabled: false });
+    try {
+      worktree.failCreateWorktreeFor = "shard-2";
+
+      await assert.rejects(
+        () =>
+          engine.addMembers({
+            name: "shard",
+            n: 3,
+            workspace: "share",
+            brief: "Parallel isolated shards",
+          }),
+        /Simulated worktree failure/,
+      );
+
+      // shard-1 was created before shard-2 failed -> must be rolled back!
+      assert.equal(worktree.createdWorktrees.length, 1);
+      assert.equal(worktree.removedWorktrees.length, 1);
+      assert.equal(
+        worktree.removedWorktrees[0]!.worktreePath,
+        worktree.createdWorktrees[0]!.worktreePath,
+      );
+      assert.equal(worktree.removedWorktrees[0]!.force, true);
+
+      // Store and board remain completely unpolluted
+      const snap = engine.getSnapshot();
+      assert.equal(snap.run?.memberOrder.length, 0);
+      assert.equal(snap.boardHead, 0);
+    } finally {
+      await engine.dispose();
+    }
+  });
+
+  it("accumulates @monitor tokens/cost into snapshot AND cancels in-flight @monitor on pause()", async () => {
+    let monitorRelease!: () => void;
+    let monitorKilled = false;
+    let monitorMode: "fast" | "hang" = "fast";
+
+    const { engine, transport } = await createTestHarness({
+      stallWatchdogEnabled: true,
+      stallMonitorMode: "llm",
+      stallTimeoutMs: 20,
+    });
+
+    const origSpawn = transport.spawnMember.bind(transport);
+    transport.spawnMember = async (req: SpawnMemberRequest) => {
+      if (req.isMonitor) {
+        if (monitorMode === "fast") {
+          return {
+            agentId: req.agentId,
+            name: req.name,
+            role: req.role,
+            getState: () => "waiting",
+            getModel: () => req.modelOverride,
+            getThinkingLevel: () => req.thinkingLevel,
+            getConversationMessages: () => [],
+            wake: async () => ({
+              agentId: req.agentId,
+              name: req.name,
+              role: req.role,
+              outcome: "waiting",
+              summary: "[noop]",
+              tokens: 0,
+              cost: 0,
+            }),
+            steer: async () => {},
+            followUp: async () => {},
+            switchModel: async (m, t) => ({ model: m, thinkingLevel: t }),
+            abort: async () => {},
+            kill: async () => {},
+            currentTurn: Promise.resolve({
+              agentId: req.agentId,
+              name: req.name,
+              role: req.role,
+              outcome: "waiting",
+              summary: "[noop]",
+              tokens: 450,
+              cost: 0.0125,
+            }),
+          };
+        }
+
+        // Hanging monitor handle to test cancellation on pause()
+        const blocked = new Promise<AgentTurnResult>((resolve) => {
+          monitorRelease = () =>
+            resolve({
+              agentId: req.agentId,
+              name: req.name,
+              role: req.role,
+              outcome: "killed",
+              summary: "cancelled",
+              tokens: 0,
+              cost: 0,
+            });
+        });
+        return {
+          agentId: req.agentId,
+          name: req.name,
+          role: req.role,
+          getState: () => (monitorKilled ? "killed" : "working"),
+          getModel: () => req.modelOverride,
+          getThinkingLevel: () => req.thinkingLevel,
+          getConversationMessages: () => [],
+          wake: async () => blocked,
+          steer: async () => {},
+          followUp: async () => {},
+          switchModel: async (m, t) => ({ model: m, thinkingLevel: t }),
+          abort: async () => {
+            monitorKilled = true;
+            monitorRelease?.();
+          },
+          kill: async () => {
+            monitorKilled = true;
+            monitorRelease?.();
+          },
+          currentTurn: blocked,
+        };
+      }
+      return origSpawn(req);
+    };
+
+    try {
+      await engine.addMembers({ name: "idle-worker", brief: "Park cleanly" });
+      await waitUntil(() => engine.getSnapshot().run?.members["idle-worker"]?.state === "waiting");
+
+      // Wait for fast @monitor check to finish and record usage
+      await waitUntil(() => engine.getSnapshot().totalTokens >= 450, 2000);
+      const snapAfterFast = engine.getSnapshot();
+      assert.ok(snapAfterFast.totalCost >= 0.0125);
+
+      // Now trigger a second stall check that hangs, and cancel it via engine.pause()
+      monitorMode = "hang";
+      await engine.postMessage({
+        from: "orchestrator",
+        fromRole: "orchestrator",
+        text: "Note without mention to advance board head and re-arm watchdog",
+        kind: "update",
+      });
+      await waitUntil(() => Boolean(monitorRelease), 2000);
+
+      await engine.pause("run-dyn", "User paused during monitor");
+      assert.equal(monitorKilled, true, "pause() must abort & kill active @monitor handle immediately");
+    } finally {
+      await engine.dispose();
     }
   });
 });
