@@ -67,6 +67,7 @@ import {
   type SwarmSettings,
   type SwarmSnapshot,
   type TeardownEntryResult,
+  SwarmProtocolError,
   isSwarmProtocolError,
 } from "./types.js";
 import {
@@ -1667,18 +1668,44 @@ export function createPiSwarmExtension(
       engine: toolEngineProxy,
       getCallerRole: () => "orchestrator",
       getCallerName: () => ORCHESTRATOR_NAME,
-      onOrchestratorModelSwitch: async (model, thinkingLevel) => {
-        const { settings, orchestratorApply } = await applyRoleModelChange(
-          "orchestrator",
-          model,
-          thinkingLevel,
+      onOrchestratorModelSwitch: async (model, thinkingLevel, reason) => {
+        const runtimeSettings: SwarmSettings = {
+          ...currentSettings,
+          orchestratorModel: model,
+          ...(thinkingLevel !== undefined
+            ? { orchestratorThinkingLevel: thinkingLevel }
+            : {}),
+        };
+        const orchestratorApply = await applyOrchestratorModel(
+          pi,
           lastCtx,
-          { scope: "project", updateRun: true },
+          runtimeSettings,
+          getLazyFallbackModelRuntime,
         );
+        if (!orchestratorApply.applied && orchestratorApply.warning) {
+          throw new SwarmProtocolError("MODEL_NOT_FOUND", orchestratorApply.warning, {
+            model,
+          });
+        }
+        const appliedModel = orchestratorApply.model ?? model;
+        const appliedThinking = orchestratorApply.thinkingLevel ?? thinkingLevel;
+        const engine = activeEngine;
+        if (engine?.getSnapshot().run) {
+          await engine.switchModel({
+            targetName: ORCHESTRATOR_NAME,
+            model: appliedModel,
+            thinkingLevel: appliedThinking,
+            reason,
+            callerName: ORCHESTRATOR_NAME,
+            callerRole: "orchestrator",
+            hostContext: lastCtx,
+          });
+        }
+        refreshUI(lastCtx);
         return {
           targetName: ORCHESTRATOR_NAME,
-          model: orchestratorApply?.model ?? settings.orchestratorModel ?? model,
-          thinkingLevel: orchestratorApply?.thinkingLevel ?? thinkingLevel,
+          model: appliedModel,
+          thinkingLevel: appliedThinking,
         };
       },
     });
@@ -2767,6 +2794,7 @@ export function createPiSwarmExtension(
           `stallMonitorMode: ${currentSettings.stallMonitorMode}`,
           `stallTimeoutMs: ${currentSettings.stallTimeoutMs}`,
           `maxConcurrency: ${currentSettings.maxConcurrency}`,
+          `maxRetries: ${currentSettings.maxRetries}`,
           `autoRebase: ${currentSettings.autoRebase ? "ON" : "OFF"}`,
           `autoTeardownOnComplete: ${currentSettings.autoTeardownOnComplete ? "ON" : "OFF"}`,
           `Save target: ${saveScope === "project" ? "project (.pi/pi-swarm-settings.json)" : "global (~/.pi/agent/pi-swarm-settings.json)"}`,
@@ -2853,6 +2881,23 @@ export function createPiSwarmExtension(
                 await persistPatch({ maxConcurrency: num });
                 ctx.ui.notify(
                   `Saved maxConcurrency = ${currentSettings.maxConcurrency} (${saveScope}).`,
+                  "info",
+                );
+              }
+            }
+          } else if (picked.startsWith("maxRetries:")) {
+            const raw = await withModalGuard(() =>
+              ctx.ui.input(
+                `Set maxRetries (${SWARM_SETTINGS_BOUNDS.maxRetries.min}-${SWARM_SETTINGS_BOUNDS.maxRetries.max})`,
+                String(currentSettings.maxRetries),
+              ),
+            );
+            if (raw !== undefined && raw.trim()) {
+              const num = Number.parseInt(raw.trim(), 10);
+              if (Number.isFinite(num)) {
+                await persistPatch({ maxRetries: num });
+                ctx.ui.notify(
+                  `Saved maxRetries = ${currentSettings.maxRetries} (${saveScope}).`,
                   "info",
                 );
               }

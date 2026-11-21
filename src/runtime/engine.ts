@@ -647,7 +647,9 @@ export class SwarmEngine implements ISwarmEngine {
       actor,
     });
 
-    if (options.teardown) {
+    const shouldTeardown =
+      options.teardown ?? this.getEffectiveSettings().autoTeardownOnComplete;
+    if (shouldTeardown) {
       await this.teardown({
         runId: run.id,
         deleteBranches: options.deleteBranches,
@@ -1537,17 +1539,50 @@ export class SwarmEngine implements ISwarmEngine {
           `Member "@${callerName}" cannot switch the orchestrator's model.`,
         );
       }
+      const previousModel = run.roleModels.orchestrator?.model;
+      const nextThinking =
+        options.thinkingLevel ?? run.roleModels.orchestrator?.thinkingLevel;
       const nextRoleModels: SwarmRoleModels = {
         ...run.roleModels,
         orchestrator: {
           model: modelOverride,
-          thinkingLevel: options.thinkingLevel ?? run.roleModels.orchestrator?.thinkingLevel,
+          thinkingLevel: nextThinking,
         },
       };
       const updated = await this.store.updateRun(run.id, {
         roleModels: nextRoleModels,
         actor: callerName,
       });
+
+      await this.store.appendEvent({
+        runId: run.id,
+        type: "member_model_switched",
+        actor: callerName,
+        memberName: ORCHESTRATOR_NAME,
+        summary: `Switched @${ORCHESTRATOR_NAME} model -> ${modelOverride}${nextThinking ? ` (${nextThinking})` : ""}${options.reason ? ` (${options.reason})` : ""}`,
+        data: {
+          previousModel,
+          model: modelOverride,
+          thinkingLevel: nextThinking,
+          reason: options.reason,
+        },
+      });
+
+      const noticeMsg = await this.store.postBoardMessage(run.id, {
+        from: callerName,
+        fromRole: callerRole,
+        channel: DEFAULT_CHANNEL,
+        kind: "model_switch",
+        text: `[model] ${ORCHESTRATOR_NAME} switched to ${modelOverride}${nextThinking ? ` (${nextThinking})` : ""}${options.reason ? ` — ${options.reason}` : ""}`,
+        mentions: [],
+        channelMentions: [],
+      });
+      this.recordBoardMessageInCache(noticeMsg);
+      this.emitEngineEvent("board_posted", `Posted model switch #${noticeMsg.seq}`, {
+        memberName: ORCHESTRATOR_NAME,
+        seq: noticeMsg.seq,
+      });
+
       await this.refreshCache(updated);
       this.emitEngineEvent(
         "snapshot_changed",
@@ -1556,7 +1591,7 @@ export class SwarmEngine implements ISwarmEngine {
       return {
         targetName: ORCHESTRATOR_NAME,
         model: modelOverride,
-        thinkingLevel: options.thinkingLevel,
+        thinkingLevel: nextThinking,
       };
     }
 
@@ -1632,9 +1667,10 @@ export class SwarmEngine implements ISwarmEngine {
       };
     }
 
+    const isParkedState = member.state === "waiting" || member.state === "stopped";
     if (
-      member.state !== "waiting" ||
-      liveState !== "waiting" ||
+      !isParkedState ||
+      liveState === "working" ||
       live?.spawning ||
       live?.waking ||
       live?.turnActive ||
@@ -1647,11 +1683,34 @@ export class SwarmEngine implements ISwarmEngine {
       );
     }
 
+    // Ensure a LiveMember record exists if member is persisted `stopped` so lock & revive work cleanly
+    let activeLive = live;
+    if (!activeLive) {
+      activeLive = {
+        name: member.name,
+        agentId: member.agentId,
+        role: member.role,
+        spawning: false,
+        waking: false,
+        turnActive: false,
+        switchingModel: false,
+        parkedMentionsOnly: true,
+        pendingWakes: [],
+        deliveredSeqs: new Set<number>(),
+        triedModels: new Set<string>(member.model ? [member.model] : []),
+        lastMessages: [],
+        logTail: [...member.logTail],
+        lastTool: member.lastTool,
+        retryCount: 0,
+      };
+      this.liveMembers.set(member.name, activeLive);
+    }
+
     // Acquire synchronous switchingModel lock BEFORE any await so concurrent @mentions queue safely!
-    const acquiredLock = !internal.holdSwitchingLock && Boolean(live);
-    if (acquiredLock && live) {
-      this.cancelMemberRetryTimer(live);
-      live.switchingModel = true;
+    const acquiredLock = !internal.holdSwitchingLock;
+    if (acquiredLock) {
+      this.cancelMemberRetryTimer(activeLive);
+      activeLive.switchingModel = true;
     }
 
     let switchSucceeded = false;
@@ -1661,11 +1720,22 @@ export class SwarmEngine implements ISwarmEngine {
       let resolvedModel = modelOverride;
       let resolvedThinking = options.thinkingLevel;
 
-      if (live?.handle) {
-        const switched = await live.handle.switchModel(modelOverride, options.thinkingLevel);
+      if (activeLive.handle && activeLive.handle.getState() === "waiting") {
+        const switched = await activeLive.handle.switchModel(modelOverride, options.thinkingLevel);
         resolvedModel = switched.model;
         resolvedThinking = switched.thinkingLevel ?? options.thinkingLevel;
-        live.triedModels.add(resolvedModel);
+        activeLive.triedModels.add(resolvedModel);
+      } else {
+        if (this.transport.resolveModel) {
+          const resolved = await this.transport.resolveModel(
+            modelOverride,
+            options.thinkingLevel,
+            this.hostContext,
+          );
+          resolvedModel = resolved.model;
+          resolvedThinking = resolved.thinkingLevel ?? options.thinkingLevel;
+        }
+        activeLive.triedModels.add(resolvedModel);
       }
 
       const updatedRun = await this.store.updateMember(run.id, member.name, {
@@ -1709,24 +1779,26 @@ export class SwarmEngine implements ISwarmEngine {
       await this.refreshCache(updatedRun);
       this.emitEngineEvent(
         "snapshot_changed",
-        `Hot-switched @${member.name} model -> ${resolvedModel}`,
+        `${activeLive.handle?.getState() === "waiting" ? "Hot-switched" : "Switched"} @${member.name} model -> ${resolvedModel}`,
         { memberName: member.name },
       );
 
       switchSucceeded = true;
       const latestMemberAfter = this.cachedRun?.members[member.name];
+      const canReviveStopped =
+        latestMemberAfter?.state === "stopped" && !latestMemberAfter.humanStopped;
+      const isWarmWaiting =
+        latestMemberAfter?.state === "waiting" && activeLive.handle?.getState() === "waiting";
       shouldAutoResume =
         options.autoResume !== false &&
         !internal.holdSwitchingLock &&
-        Boolean(live) &&
         !this.disposed &&
         this.activeRunId === run.id &&
         this.cachedRun?.status === "active" &&
-        latestMemberAfter?.state === "waiting" &&
-        live?.handle?.getState() === "waiting";
+        (isWarmWaiting || canReviveStopped);
       if (shouldAutoResume) {
         const reasonNote = options.reason ? ` (${options.reason})` : "";
-        resumePromptText = `Your model was hot-switched to "${resolvedModel}"${resolvedThinking ? ` (${resolvedThinking})` : ""}${reasonNote} with your conversation history preserved. Resume any unfinished work immediately, or post an update / call swarm_wait if already done.`;
+        resumePromptText = `Your model was ${isWarmWaiting ? "hot-switched" : "switched"} to "${resolvedModel}"${resolvedThinking ? ` (${resolvedThinking})` : ""}${reasonNote} with your conversation history preserved. Resume any unfinished work immediately, or post an update / call swarm_wait if already done.`;
       }
 
       return {
@@ -1737,37 +1809,45 @@ export class SwarmEngine implements ISwarmEngine {
         ...(shouldAutoResume ? { resumed: true } : {}),
       };
     } finally {
-      if (acquiredLock && live) {
-        const stillLive = this.liveMembers.get(member.name) === live;
+      if (acquiredLock) {
+        const stillLive = this.liveMembers.get(member.name) === activeLive;
         const currentMember = this.cachedRun?.members[member.name];
+        const canAutoResumeWarm =
+          currentMember?.state === "waiting" && activeLive.handle?.getState() === "waiting";
+        const canAutoReviveStopped =
+          currentMember?.state === "stopped" && !currentMember.humanStopped;
+
         if (
           stillLive &&
           !this.disposed &&
           this.activeRunId === run.id &&
           this.cachedRun?.status === "active" &&
-          currentMember?.state === "waiting" &&
           switchSucceeded &&
           options.autoResume !== false &&
-          live.handle?.getState() === "waiting"
+          (canAutoResumeWarm || canAutoReviveStopped)
         ) {
           // Atomically hand off switchingModel -> waking so the switched member immediately resumes!
-          live.switchingModel = false;
-          live.waking = true;
-          void this.drainMemberPendingWakes(run.id, member.name, resumePromptText);
+          activeLive.switchingModel = false;
+          activeLive.waking = true;
+          if (canAutoResumeWarm) {
+            void this.drainMemberPendingWakes(run.id, member.name, resumePromptText);
+          } else {
+            void this.reviveMemberWithPendingWakes(run.id, member.name, resumePromptText);
+          }
         } else if (
           stillLive &&
           !this.disposed &&
           this.activeRunId === run.id &&
           this.cachedRun?.status === "active" &&
-          currentMember?.state === "waiting" &&
-          live.pendingWakes.length > 0
+          (currentMember?.state === "waiting" || (currentMember?.state === "stopped" && !currentMember.humanStopped)) &&
+          activeLive.pendingWakes.length > 0
         ) {
           // Atomically hand off switchingModel -> waking to drain wakes queued during switch!
-          live.switchingModel = false;
-          live.waking = true;
+          activeLive.switchingModel = false;
+          activeLive.waking = true;
           void this.drainMemberPendingWakes(run.id, member.name);
         } else {
-          live.switchingModel = false;
+          activeLive.switchingModel = false;
           this.checkAllIdleAndNotifyWaiters();
           this.maybeArmStallWatchdog();
         }

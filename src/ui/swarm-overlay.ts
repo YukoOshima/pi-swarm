@@ -1040,10 +1040,10 @@ class SwarmOverlayComponent implements Component, Focusable {
     }
 
     if (ch === "m" || ch === "M") {
-      if (selected.state !== "waiting") {
+      if (selected.state !== "waiting" && selected.state !== "stopped") {
         this.setFeedback(
           "warning",
-          `Cannot hot-switch model while ${selected.name} is ${selected.state} (must be waiting).`,
+          `Cannot hot-switch model while ${selected.name} is ${selected.state} (must be waiting or stopped).`,
         );
         return;
       }
@@ -1875,7 +1875,7 @@ async function openSwarmBasicMenu(
     if (member.state !== "killed") {
       actions.push(`Wake / message @${member.name}`);
     }
-    if (member.state === "waiting") {
+    if (member.state === "waiting" || member.state === "stopped") {
       actions.push(`Hot-switch model on ${member.name}`);
     }
     if (member.state !== "killed") {

@@ -1582,6 +1582,49 @@ describe("WorktreeManager real git repository workflows", () => {
     assert.equal(td2.removed[0].memberName, "delete-w");
     assert.equal(await exists(paths["delete-w"]), false);
     assert.equal((await wtMgr.listLocalBranches()).includes(branches["delete-w"]), false);
+
+    // 3. safeTeardown(deleteBranches: true) also cleans up leaked branches whose worktree dir was already deleted
+    const tdMissingBranch = await wtMgr.safeTeardown(
+      [
+        {
+          memberName: "clean-w",
+          worktreePath: paths["clean-w"], // already removed in td1
+          branch: branches["clean-w"], // branch was kept in td1
+          hasActiveAgent: false,
+        },
+      ],
+      { deleteBranches: true },
+    );
+    assert.equal(tdMissingBranch.removed.length, 1);
+    assert.equal((await wtMgr.listLocalBranches()).includes(branches["clean-w"]), false);
+
+    // 4. safeTeardown(deleteBranches: false) preserves committed branch of an isolated `branch` clone
+    const cloneTdPath = store.getWorktreePath("run-td", "clone-td");
+    const cloneTdBranch = deriveMemberBranch("run-td", "clone-td");
+    await wtMgr.createWorktree({
+      branch: cloneTdBranch,
+      baseBranch: "main",
+      worktreePath: cloneTdPath,
+      mode: "branch",
+    });
+    await commitFile(cloneTdPath, "clone-td.txt", "kept on teardown\n", "clone work");
+    const tdKeepCloneBranch = await wtMgr.safeTeardown(
+      [
+        {
+          memberName: "clone-td",
+          worktreePath: cloneTdPath,
+          branch: cloneTdBranch,
+          hasActiveAgent: false,
+        },
+      ],
+      { deleteBranches: false },
+    );
+    assert.equal(tdKeepCloneBranch.removed.length, 1);
+    assert.equal(await exists(cloneTdPath), false);
+    assert.ok(
+      (await wtMgr.listLocalBranches()).includes(cloneTdBranch),
+      "safeTeardown(deleteBranches: false) must fetch branch from isolated clone before removing clone dir",
+    );
   });
 
   it("reuses existing checked-out worktrees and re-attaches removed worktrees cleanly", async () => {

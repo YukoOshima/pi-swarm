@@ -1510,6 +1510,12 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       "swarm{action:'model'} targeting orchestrator must call pi.setModel()",
     );
     assert.equal(harness.ctx.model?.id, "claude-opus-4-6");
+    const savedAfterOrch = JSON.parse(await readFile(projSettingsPath, "utf8"));
+    assert.equal(
+      savedAfterOrch.orchestratorModel,
+      undefined,
+      "swarm{action:'model'} on orchestrator must stay run-scoped without overwriting project settings",
+    );
 
     // Complete cleanly via `/swarm done` -> zero-turn (0 SWARM_WAKEUP_CUSTOM_TYPE messages!)
     const wakeupsBeforeSlashDone = harness.sentMessages.filter(

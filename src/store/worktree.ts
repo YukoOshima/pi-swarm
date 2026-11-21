@@ -993,6 +993,23 @@ export class WorktreeManager implements IWorktreeManager {
         }
 
         if (!(await pathExists(resolvedPath))) {
+          if (
+            deleteBranches &&
+            target.branch &&
+            (await this.branchExists(target.branch))
+          ) {
+            await this.runGit(["branch", "-D", target.branch], {
+              allowFailure: true,
+            });
+            removed.push({
+              memberName: target.memberName,
+              worktreePath: resolvedPath,
+              branch: target.branch,
+              action: "removed",
+              reason: "Worktree directory already removed; deleted branch.",
+            });
+            continue;
+          }
           skipped.push({
             memberName: target.memberName,
             worktreePath: resolvedPath,
@@ -1014,6 +1031,11 @@ export class WorktreeManager implements IWorktreeManager {
               "Worktree has uncommitted changes; preserved to avoid data loss.",
           });
           continue;
+        }
+
+        // Preserve committed branches from isolated `branch` clones before removing dir when keeping branches.
+        if (!deleteBranches && target.branch) {
+          await this.fetchBranchFromClone(resolvedPath, target.branch);
         }
 
         // Deregister worktree BEFORE any branch operations.

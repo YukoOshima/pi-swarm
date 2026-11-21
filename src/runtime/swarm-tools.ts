@@ -413,6 +413,11 @@ export function createSwarmTools(deps: SwarmToolDeps): ToolDefinition[] {
           description: 'For action="done": optionally remove clean idle worktrees after completion.',
         }),
       ),
+      delete_branches: Type.Optional(
+        Type.Boolean({
+          description: 'For action="done" when teardown=true: also delete local swarm branches.',
+        }),
+      ),
       reason: Type.Optional(
         Type.String({
           description: 'Optional reason for action="model" or action="kill".',
@@ -663,6 +668,7 @@ export function createSwarmTools(deps: SwarmToolDeps): ToolDefinition[] {
             const completed = await deps.engine.completeRun({
               summary,
               teardown: params.teardown,
+              deleteBranches: params.delete_branches,
               callerRole,
               actor: callerName,
             });

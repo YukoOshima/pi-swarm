@@ -3443,4 +3443,102 @@ describe("SwarmEngine — v0.3.1 Hardening & Optimizations", () => {
       }
     }
   });
+
+  it("v0.3.3: honors autoTeardownOnComplete, allows switchModel on stopped members (preserving humanStopped), and logs orchestrator switch", async () => {
+    // A. completeRun honors settings.autoTeardownOnComplete when options.teardown is omitted
+    {
+      const { engine, worktree, store } = await createTestHarness({
+        stallWatchdogEnabled: false,
+        autoTeardownOnComplete: true,
+      });
+      try {
+        await engine.addMembers({
+          name: "sharer",
+          workspace: "share",
+          brief: "Create worktree then park",
+        });
+        await waitUntil(() => engine.getSnapshot().run?.members.sharer?.state === "waiting");
+        assert.equal(worktree.createdWorktrees.length, 1);
+
+        await engine.completeRun({ summary: "Shipped with autoTeardownOnComplete" });
+        const tdEvent = store.events.find((e) => e.type === "teardown_completed");
+        assert.ok(tdEvent, "completeRun must trigger teardown when autoTeardownOnComplete=true");
+        assert.deepEqual((tdEvent.data as any)?.removed, ["sharer"]);
+      } finally {
+        await engine.dispose();
+      }
+    }
+
+    // B. switchModel on stopped members: works cleanly, respects humanStopped sovereignty, and auto-revives non-human-stopped
+    {
+      const { engine, transport, store } = await createTestHarness({
+        stallWatchdogEnabled: false,
+        workerModel: "openai/gpt-5.4",
+      });
+      try {
+        // Human-stopped member -> switchModel updates model + logs event WITHOUT auto-reviving
+        await engine.addMembers({ name: "h-stopped", brief: "Work then human stop" });
+        await waitUntil(() => engine.getSnapshot().run?.members["h-stopped"]?.state === "waiting");
+        await engine.stopMember("h-stopped", { humanStopped: true, callerRole: "human" });
+        assert.equal(engine.getSnapshot().run?.members["h-stopped"]?.state, "stopped");
+
+        const swHuman = await engine.switchModel({
+          targetName: "h-stopped",
+          model: "anthropic/claude-opus-4-6",
+          thinkingLevel: "high",
+          reason: "Upgrade stopped member",
+        });
+        assert.equal(swHuman.model, "anthropic/claude-opus-4-6");
+        assert.equal(swHuman.resumed, undefined);
+        assert.equal(
+          engine.getSnapshot().run?.members["h-stopped"]?.state,
+          "stopped",
+          "humanStopped member must remain stopped after model switch",
+        );
+
+        // Non-human-stopped member -> switchModel updates model AND revives cleanly on new model
+        await engine.addMembers({ name: "n-stopped", brief: "Work then orchestrator stop" });
+        await waitUntil(() => engine.getSnapshot().run?.members["n-stopped"]?.state === "waiting");
+        await engine.stopMember("n-stopped", { humanStopped: false, callerRole: "orchestrator" });
+        const spawnsBefore = transport.spawns.filter((r) => r.name === "n-stopped").length;
+
+        const swAuto = await engine.switchModel({
+          targetName: "n-stopped",
+          model: "google/gemini-2.5-pro",
+        });
+        assert.equal(swAuto.model, "google/gemini-2.5-pro");
+        assert.equal(swAuto.resumed, true);
+        await waitUntil(
+          () =>
+            transport.spawns.filter((r) => r.name === "n-stopped").length === spawnsBefore + 1 &&
+            engine.getSnapshot().run?.members["n-stopped"]?.state === "waiting",
+        );
+        const revivedReq = transport.spawns
+          .filter((r) => r.name === "n-stopped")
+          .pop()!;
+        assert.equal(revivedReq.modelOverride, "google/gemini-2.5-pro");
+
+        // C. Orchestrator model switch logs event & [model] board notice
+        await engine.switchModel({
+          targetName: "orchestrator",
+          model: "anthropic/claude-opus-4-6",
+          thinkingLevel: "high",
+          reason: "Audit synthesis",
+        });
+        assert.ok(
+          store.events.some(
+            (e) => e.type === "member_model_switched" && e.memberName === ORCHESTRATOR_NAME,
+          ),
+        );
+        const board = await store.readBoard("run-dyn", { limit: 20 });
+        assert.ok(
+          board.messages.some(
+            (m) => m.kind === "model_switch" && m.text.includes("orchestrator switched to anthropic/claude-opus-4-6"),
+          ),
+        );
+      } finally {
+        await engine.dispose();
+      }
+    }
+  });
 });
