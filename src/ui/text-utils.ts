@@ -91,12 +91,12 @@ export function stripAllTerminalEscapes(text: string): string {
   if (!text) return "";
   return text
     .replace(
-      /(?:\x1b[\]PX^_]|[\u0090\u0098\u009d\u009e\u009f])[\s\S]*?(?:\x07|\x1b\\|\u009c)/g,
+      /(?:\x1b[\]PX^_]|[\u0090\u0098\u009d\u009e\u009f])(?:\x1b(?!\\)|[^\x1b\r\n\x07\u009c])*?(?:\x07|\x1b\\|\u009c)/g,
       "",
     )
     .replace(/(?:\x1b\[|\u009b)[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]/g, "")
     .replace(/\x1b[\x20-\x2f]*[\x30-\x7e]/g, "")
-    .replace(/\x1b/g, "");
+    .replace(/[\x1b\u0080-\u009f]/g, "");
 }
 
 /**
@@ -1026,8 +1026,19 @@ export function buildSwarmGraphLines(
       targetWidth >= 72
         ? ` ${formatMemberStateBadge(member.state, theme)}`
         : "";
+    const forkTagRaw =
+      targetWidth >= 64 && member.forkedFrom
+        ? `fork:@${sanitizePlainText(member.forkedFrom)}`
+        : "";
+    const forkTag = forkTagRaw
+      ? ` ${theme ? theme.fg("dim", forkTagRaw) : forkTagRaw}`
+      : "";
+    const mergedTag =
+      targetWidth >= 64 && member.mergedCommitSha
+        ? ` ${theme ? theme.fg("dim", "✓merged") : "✓merged"}`
+        : "";
 
-    const row = `${prefix}${connector}${icon} ${nameStr} (${roleStr})${stateTag}${modelPart} ${wsBadge}`;
+    const row = `${prefix}${connector}${icon} ${nameStr} (${roleStr})${stateTag}${modelPart} ${wsBadge}${forkTag}${mergedTag}`;
     lines.push(fitLine(row, targetWidth));
 
     const kids = (childrenOf.get(member.name) ?? []).filter(
@@ -1086,23 +1097,37 @@ export function buildSwarmGraphLines(
 
   const directedCounts = new Map<string, number>();
   const channelCounts = new Map<string, number>();
+  const lastPairMeta = new Map<string, { seq: number; kind: BoardMessageKind }>();
+  const lastChannelMeta = new Map<string, { seq: number; kind: BoardMessageKind }>();
 
   for (const msg of board) {
-    const sender = sanitizePlainText(msg.from).replace(/^@+/, "");
+    const sender = sanitizePlainText(msg.from).replace(/^@+/, "").toLowerCase();
     if (!sender) continue;
+    const msgKind: BoardMessageKind = msg.kind || "chat";
 
     for (const rawMention of msg.mentions) {
-      const target = sanitizePlainText(rawMention).replace(/^@+/, "");
+      const target = sanitizePlainText(rawMention).replace(/^@+/, "").toLowerCase();
       if (!target || target === sender) continue;
       const key = `${sender}\0${target}`;
       directedCounts.set(key, (directedCounts.get(key) ?? 0) + 1);
+
+      const pairKey = sender < target ? `${sender}\0${target}` : `${target}\0${sender}`;
+      const prevPair = lastPairMeta.get(pairKey);
+      if (!prevPair || msg.seq >= prevPair.seq) {
+        lastPairMeta.set(pairKey, { seq: msg.seq, kind: msgKind });
+      }
     }
 
     for (const rawCh of msg.channelMentions ?? []) {
-      const ch = sanitizePlainText(rawCh).replace(/^@#?/, "");
+      const ch = sanitizePlainText(rawCh).replace(/^@#?/, "").toLowerCase();
       if (!ch) continue;
       const key = `${sender}\0#${ch}`;
       channelCounts.set(key, (channelCounts.get(key) ?? 0) + 1);
+
+      const prevCh = lastChannelMeta.get(key);
+      if (!prevCh || msg.seq >= prevCh.seq) {
+        lastChannelMeta.set(key, { seq: msg.seq, kind: msgKind });
+      }
     }
   }
 
@@ -1111,6 +1136,8 @@ export function buildSwarmGraphLines(
     right: string;
     bidirectional: boolean;
     total: number;
+    lastSeq?: number;
+    lastKind?: BoardMessageKind;
     sortKey: string;
   }
 
@@ -1125,6 +1152,7 @@ export function buildSwarmGraphLines(
     const pairKey = a < b ? `${a}\0${b}` : `${b}\0${a}`;
     if (handledPairs.has(pairKey)) continue;
     handledPairs.add(pairKey);
+    const meta = lastPairMeta.get(pairKey);
 
     const ba = directedCounts.get(`${b}\0${a}`) ?? 0;
     if (ab > 0 && ba > 0) {
@@ -1136,6 +1164,8 @@ export function buildSwarmGraphLines(
         right: second,
         bidirectional: true,
         total,
+        lastSeq: meta?.seq,
+        lastKind: meta?.kind,
         sortKey: `${first}<->${second}`,
       });
     } else if (ab > 0) {
@@ -1144,6 +1174,8 @@ export function buildSwarmGraphLines(
         right: b,
         bidirectional: false,
         total: ab,
+        lastSeq: meta?.seq,
+        lastKind: meta?.kind,
         sortKey: `${a}->${b}`,
       });
     }
@@ -1154,11 +1186,14 @@ export function buildSwarmGraphLines(
     if (sep < 0) continue;
     const from = key.slice(0, sep);
     const ch = key.slice(sep + 1);
+    const meta = lastChannelMeta.get(key);
     edges.push({
       left: from,
       right: ch,
       bidirectional: false,
       total: count,
+      lastSeq: meta?.seq,
+      lastKind: meta?.kind,
       sortKey: `${from}->${ch}`,
     });
   }
@@ -1172,6 +1207,10 @@ export function buildSwarmGraphLines(
     for (const edge of edges) {
       const arrowRaw = edge.bidirectional ? "⇄" : "→";
       const countText = `(${edge.total} ${edge.total === 1 ? "msg" : "msgs"})`;
+      const metaText =
+        targetWidth >= 60 && edge.lastSeq !== undefined
+          ? ` · #${edge.lastSeq} [${edge.lastKind ?? "chat"}]`
+          : "";
       if (theme) {
         const leftStyled = theme.bold(edge.left);
         const arrowStyled = theme.fg(
@@ -1182,20 +1221,48 @@ export function buildSwarmGraphLines(
           ? theme.fg("accent", edge.right)
           : theme.bold(edge.right);
         const countStyled = theme.fg("muted", countText);
+        const metaStyled = metaText ? theme.fg("dim", metaText) : "";
         lines.push(
           fitLine(
-            `  ${leftStyled} ${arrowStyled} ${rightStyled} ${countStyled}`,
+            `  ${leftStyled} ${arrowStyled} ${rightStyled} ${countStyled}${metaStyled}`,
             targetWidth,
           ),
         );
       } else {
         lines.push(
           fitLine(
-            `  ${edge.left} ${arrowRaw} ${edge.right} ${countText}`,
+            `  ${edge.left} ${arrowRaw} ${edge.right} ${countText}${metaText}`,
             targetWidth,
           ),
         );
       }
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // 3. Custom #channels (if any non-main channels exist)
+  // --------------------------------------------------------------------------
+  const customChannels = Object.values(run.channels ?? {})
+    .filter((ch) => ch.name && ch.name !== "main")
+    .sort((a, b) => a.name.localeCompare(b.name));
+  if (customChannels.length > 0) {
+    lines.push("");
+    lines.push(
+      targetWidth >= 18
+        ? renderHorizontalRule(targetWidth, "Channels", theme)
+        : fitLine("Channels", targetWidth),
+    );
+    for (const ch of customChannels) {
+      const subs =
+        ch.subscribers.length > 0
+          ? ch.subscribers.map((s) => `@${sanitizePlainText(s)}`).join(", ")
+          : "(no subscribers)";
+      const archivedTag = ch.archived ? " [archived]" : "";
+      const chLabel = `#${sanitizePlainText(ch.name)}${archivedTag}`;
+      const lineText = theme
+        ? `  ${theme.fg(ch.archived ? "dim" : "accent", chLabel)}: ${theme.fg("muted", subs)}`
+        : `  ${chLabel}: ${subs}`;
+      lines.push(fitLine(lineText, targetWidth));
     }
   }
 

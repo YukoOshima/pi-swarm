@@ -18,7 +18,7 @@ import {
   SWARM_QUESTION_TOOL,
   type ReservedMemberName,
 } from "../constants.js";
-import { isPrototypeKey } from "../store/swarm-store.js";
+import { SWARM_SETTINGS_BOUNDS, isPrototypeKey } from "../store/index.js";
 import {
   isSwarmProtocolError,
   type InitialMemberProposal,
@@ -298,11 +298,20 @@ async function withModalGuard<T>(
   }
 }
 
-function sanitizePositiveInt(value: number, fallback = 1): number {
+function sanitizePositiveInt(
+  value: number,
+  fallback = 1,
+  max = SWARM_SETTINGS_BOUNDS.maxConcurrency.max,
+): number {
+  const clamp = (n: number): number => Math.min(max, Math.max(1, Math.floor(n)));
   if (!Number.isFinite(value) || value < 1) {
-    return Math.max(1, Math.floor(fallback));
+    return clamp(Number.isFinite(fallback) && fallback >= 1 ? fallback : 1);
   }
-  return Math.max(1, Math.floor(value));
+  return clamp(value);
+}
+
+function sanitizeQuestionId(rawId: string): string {
+  return isPrototypeKey(rawId) ? `q_${rawId}` : rawId;
 }
 
 function slugifyQuestionId(question: string): string {
@@ -417,6 +426,19 @@ export function validateProposedSwarmPlan(
       code: "INVALID_INPUT",
       field: "acceptance_criteria",
       message: "Plan acceptance_criteria must not be empty.",
+    });
+  }
+
+  const baseBranchInput =
+    typeof params.base_branch === "string" ? params.base_branch.trim() : "";
+  if (baseBranchInput === "HEAD" || baseBranchInput.startsWith("-")) {
+    issues.push({
+      code: "WRONG_BRANCH",
+      field: "base_branch",
+      message:
+        baseBranchInput === "HEAD"
+          ? 'Base branch cannot be detached "HEAD"; specify a named local branch (e.g. "main") or omit base_branch to auto-detect.'
+          : `Invalid base branch "${baseBranchInput}" — branch names cannot start with "-".`,
     });
   }
 
@@ -571,11 +593,17 @@ async function resolveBaseBranch(
   draftBranch: string | undefined,
   cwd: string,
 ): Promise<string> {
-  if (explicitBranch?.trim()) {
-    return explicitBranch.trim();
+  const trimmedExplicit = explicitBranch?.trim();
+  if (
+    trimmedExplicit &&
+    trimmedExplicit !== "HEAD" &&
+    !trimmedExplicit.startsWith("-")
+  ) {
+    return trimmedExplicit;
   }
-  if (draftBranch?.trim()) {
-    return draftBranch.trim();
+  const trimmedDraft = draftBranch?.trim();
+  if (trimmedDraft && trimmedDraft !== "HEAD" && !trimmedDraft.startsWith("-")) {
+    return trimmedDraft;
   }
   if (worktree) {
     try {
@@ -671,18 +699,21 @@ export function createSwarmQuestionTool(
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const questionText = params.question.trim();
       if (!questionText) {
+        const rawErrId = params.id?.trim() || "question";
         return {
           isError: true,
           content: [{ type: "text", text: "Question text must not be empty." }],
           details: {
             cancelled: true,
-            id: params.id?.trim() || "question",
+            id: sanitizeQuestionId(rawErrId),
             question: "",
           } satisfies SwarmQuestionToolDetails,
         };
       }
 
-      const id = params.id?.trim() || slugifyQuestionId(questionText);
+      const id = sanitizeQuestionId(
+        params.id?.trim() || slugifyQuestionId(questionText),
+      );
       const spec: QuestionSpec = {
         id,
         question: questionText,
@@ -809,11 +840,12 @@ export function createSwarmQuestionnaireTool(
           };
         }
         const item = q as Record<string, unknown>;
+        const rawId =
+          typeof item.id === "string" && item.id.trim()
+            ? item.id.trim()
+            : `q${idx + 1}`;
         return {
-          id:
-            typeof item.id === "string" && item.id.trim()
-              ? item.id.trim()
-              : `q${idx + 1}`,
+          id: sanitizeQuestionId(rawId),
           question: typeof item.question === "string" ? item.question : "",
           ...(typeof item.context === "string" ? { context: item.context } : {}),
           options: normalizeRawOptions(item.options),
@@ -866,10 +898,12 @@ export function createSwarmQuestionnaireTool(
 
       const seenIds = new Set<string>();
       const specs: QuestionSpec[] = params.questions.map((q, idx) => {
-        const baseId = q.id.trim() || slugifyQuestionId(q.question) || `q${idx + 1}`;
+        const baseId = sanitizeQuestionId(
+          q.id.trim() || slugifyQuestionId(q.question) || `q${idx + 1}`,
+        );
         let uniqueId = baseId;
         let suffix = 2;
-        while (seenIds.has(uniqueId)) {
+        while (seenIds.has(uniqueId) || isPrototypeKey(uniqueId)) {
           uniqueId = `${baseId}_${suffix++}`;
         }
         seenIds.add(uniqueId);
@@ -904,10 +938,20 @@ export function createSwarmQuestionnaireTool(
         };
       }
 
-      const mergedAnswers: Record<string, string> = { ...result.answers };
+      const mergedAnswers: Record<string, string> = {};
+      if (result.answers && typeof result.answers === "object") {
+        for (const [k, v] of Object.entries(result.answers)) {
+          if (typeof v === "string") {
+            mergedAnswers[sanitizeQuestionId(k)] = v;
+          }
+        }
+      }
       for (const item of result.items) {
-        if (item.id && mergedAnswers[item.id] === undefined) {
-          mergedAnswers[item.id] = item.answer;
+        if (item.id) {
+          const safeItemId = sanitizeQuestionId(item.id);
+          if (!Object.hasOwn(mergedAnswers, safeItemId)) {
+            mergedAnswers[safeItemId] = item.answer;
+          }
         }
       }
 
@@ -922,13 +966,13 @@ export function createSwarmQuestionnaireTool(
         for (const item of result.items) {
           const customTag = item.isCustom ? " (custom)" : "";
           summaryLines.push(
-            `- [${item.id}] ${item.question}\n  Answer: ${item.answer}${customTag}`,
+            `- [${sanitizeQuestionId(item.id)}] ${item.question}\n  Answer: ${item.answer}${customTag}`,
           );
         }
       } else {
         for (const spec of specs) {
-          const ans = mergedAnswers[spec.id];
-          if (ans !== undefined) {
+          if (Object.hasOwn(mergedAnswers, spec.id)) {
+            const ans = mergedAnswers[spec.id];
             summaryLines.push(`- [${spec.id}] ${spec.question}\n  Answer: ${ans}`);
           }
         }

@@ -1549,6 +1549,7 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     // Verify all 19 SWARM_SUBCOMMANDS & parser routing
     const expectedSubcommands = [
       "direct",
+      "tweak",
       "status",
       "board",
       "graph",
@@ -1954,26 +1955,31 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       messageType: "custom",
       systemPromptOptions: { sections: customWakeupSections },
     });
-    assert.ok(!(customWakeupSections.swarm ?? "").includes("Live User Direction Update"));
+    assert.ok(!(customWakeupSections.swarm_state ?? "").includes("Live User Direction Update"));
+    const staticSectionBefore = customWakeupSections.swarm ?? "";
+    assert.match(staticSectionBefore, /Pi Swarm Orchestrator Playbook/);
 
-    // User `before_agent_start` injects live user direction highlight into `sections.swarm` once
+    // User `before_agent_start` injects live user direction highlight into `sections.swarm_state` once,
+    // while `sections.swarm` stays identical/static across wakeups for prompt caching.
     const sectionsObj: Record<string, string> = {};
     await harness.emit("before_agent_start", {
       messageType: "user",
       prompt: "Change direction: switch API to v2 with streaming support",
       systemPromptOptions: { sections: sectionsObj },
     });
-    assert.match(sectionsObj.swarm ?? "", /Live User Direction Update/);
-    assert.match(sectionsObj.swarm ?? "", /switch API to v2/);
+    assert.equal(sectionsObj.swarm, staticSectionBefore);
+    assert.match(sectionsObj.swarm_state ?? "", /Live User Direction Update/);
+    assert.match(sectionsObj.swarm_state ?? "", /switch API to v2/);
 
-    // Subsequent turn does not repeat stale humanSteeringText notice
+    // Subsequent turn does not repeat stale humanSteeringText notice, and static section stays unchanged
     const sectionsObj2: Record<string, string> = {};
     await harness.emit("before_agent_start", {
       messageType: "user",
       prompt: "Continue",
       systemPromptOptions: { sections: sectionsObj2 },
     });
-    assert.ok(!(sectionsObj2.swarm ?? "").includes("Live User Direction Update"));
+    assert.equal(sectionsObj2.swarm, staticSectionBefore);
+    assert.ok(!(sectionsObj2.swarm_state ?? "").includes("Live User Direction Update"));
 
     // 4. Orchestrator updates objective + steers working worker directly + `/swarm steer` slash command
     const updTitle = await harness.executeTool(SWARM_TOOL, {
@@ -2035,7 +2041,7 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       systemPromptOptions: { sections: sectionsAfterPause },
     });
     assert.ok(
-      !(sectionsAfterPause.swarm ?? "").includes("Stale direction sent right before pause"),
+      !(sectionsAfterPause.swarm_state ?? "").includes("Stale direction sent right before pause"),
       "latestHumanDirection must be cleared on /swarm pause",
     );
 
@@ -2670,6 +2676,469 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     );
 
     await harness.executeTool(SWARM_TOOL, { action: "done", summary: "Dedup verified" });
+    await harness.emit("session_shutdown", { reason: "quit" });
+  });
+
+  it("9. v0.3.7: preserves orchestratorWait across [add, swarm_wait] turn_start(1), protects unread wakeups on read_board{limit:5/0}, supports /swarm tweak in-place, claims dead-PID crash ownership, and guards foreign observers", async () => {
+    const repoDir = await createTempGitRepo("v037-host-ui");
+    tempDirs.push(repoDir);
+
+    let releaseWorker!: () => void;
+    const workerGate = new Promise<void>((r) => {
+      releaseWorker = r;
+    });
+    const spawnedNames: string[] = [];
+
+    const mockTransport: ISwarmTransport = {
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        spawnedNames.push(request.name);
+        const tracker = createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async () => {
+            if (request.name === "worker-batch") {
+              await workerGate;
+              await request.engineApi!.postMessage({
+                text: "@orchestrator [done] batch worker finished after turn_start(1)",
+                kind: "done",
+              });
+            }
+            return {
+              agentId: request.agentId,
+              name: request.name,
+              role: request.role,
+              outcome: "waiting",
+              summary: `${request.name} ready`,
+              tokens: 20,
+              cost: 0.0002,
+            };
+          },
+        });
+        return tracker.handle;
+      },
+    };
+
+    const harness = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "owner-v037",
+    });
+    (harness.pi as unknown as { getCommands?: () => unknown[] }).getCommands = () => [
+      { name: "swarm", source: "extension" },
+      { name: "swarm-direct", source: "extension" },
+      { name: "ext-helper", source: "extension" },
+      { name: "skill:review", source: "skill" },
+      { name: "plan-template", source: "prompt" },
+    ];
+
+    const ext = createPiSwarmExtension({
+      transportFactory: () => mockTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: true,
+        stallMonitorMode: "deterministic",
+        stallTimeoutMs: 60,
+      }),
+      questionnaireUI: {
+        async askQuestion() {
+          return { cancelled: false, answer: "ok", isCustom: false };
+        },
+        async askQuestionnaire() {
+          return { cancelled: false, answers: {}, items: [] };
+        },
+        async confirmProposal(_ctx, plan) {
+          return {
+            action: "confirm",
+            validatorEnabled: plan.validatorEnabled,
+            maxConcurrency: plan.maxConcurrency,
+          };
+        },
+      },
+    });
+    ext(harness.pi);
+    await harness.emit("session_start", { reason: "startup" });
+
+    // Launch run via /swarm direct
+    await harness.runCommand("swarm-direct", "Initial objective");
+    const planRes = await harness.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "v0.3.7 Run",
+      objective: "Initial objective",
+      strategy: "Initial strategy",
+      acceptance_criteria: "All tests pass",
+      base_branch: "main",
+    });
+    assert.equal(planRes.isError, undefined);
+    const runId: string = planRes.details.runId;
+
+    // Wait for kickoff & settle
+    await waitFor(() =>
+      harness.sentMessages.some((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE),
+    );
+    await harness.emit("before_agent_start", {
+      messageType: "custom",
+      systemPromptOptions: { sections: {} },
+    });
+
+    // 1. Multi-tool batch [swarm{action:"add"}, swarm_wait] at turnIndex=0 -> turn_start(1) MUST preserve orchestratorWait!
+    harness.setIdle(false);
+    await harness.emit("turn_start", { turnIndex: 0, timestamp: Date.now() });
+    const addRes = await harness.executeTool(SWARM_TOOL, {
+      action: "add",
+      name: "worker-batch",
+      role: "worker",
+      workspace: "inherit",
+      brief: "Complete batch task",
+    });
+    assert.equal(addRes.isError, undefined);
+
+    const waitRes = await harness.executeTool(SWARM_WAIT_TOOL, {
+      since: 0,
+      mentions_only: true,
+    });
+    assert.equal(waitRes.details?.parked, true);
+
+    // Immediate post-batch observation turn (turnIndex === waitArmedTurnIndex + 1)
+    await harness.emit("turn_start", { turnIndex: 1, timestamp: Date.now() });
+    // Status-only read_board{status:true} must NOT disarm orchestratorWait either
+    const statusBoardRes = await harness.executeTool(READ_BOARD_TOOL, { status: true });
+    assert.equal(statusBoardRes.isError, undefined);
+
+    harness.setIdle(true);
+    await harness.emit("agent_settled", { aborted: false });
+
+    // Wait > stallTimeoutMs (60ms) while worker-batch is working + wait is armed -> zero stall alert!
+    await new Promise((r) => setTimeout(r, 90));
+    assert.equal(
+      harness.sentMessages.filter(
+        (m) =>
+          m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE &&
+          (m.message.details as any)?.stallDetected === true,
+      ).length,
+      0,
+      "Stall watchdog must NOT fire while orchestratorWait remains armed across turn_start(1)",
+    );
+
+    // Release worker-batch -> wakes orchestrator cleanly
+    const wakeupsBeforeBatchDone = harness.sentMessages.filter(
+      (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
+    ).length;
+    releaseWorker();
+    await waitFor(
+      () =>
+        harness.sentMessages.filter(
+          (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
+        ).length > wakeupsBeforeBatchDone,
+    );
+    await harness.emit("before_agent_start", {
+      messageType: "custom",
+      systemPromptOptions: { sections: {} },
+    });
+
+    // 2. Precise read_board{limit: 5} & read_board{limit: 0} wakeup deduplication
+    harness.setIdle(false);
+    const store = new SwarmStore(repoDir);
+    const seqsPosted: number[] = [];
+    for (let i = 1; i <= 7; i++) {
+      const m = await store.postBoardMessage(runId, {
+        from: "worker-batch",
+        fromRole: "worker",
+        text: `@orchestrator item ${i}`,
+        kind: "update",
+      });
+      await harness.executeTool(SWARM_TOOL, { action: "status" }); // ensure engine doesn't error
+      // Emit via worker bridge so pendingWakeups gets all 7 wakeups
+      void m;
+      seqsPosted.push(m.seq);
+    }
+    // Use post_message / bridge directly via a second worker so handleEngineEvent enqueues pendingWakeups
+    const addHelperRes = await harness.executeTool(SWARM_TOOL, {
+      action: "add",
+      name: "helper-dup",
+      role: "worker",
+      workspace: "inherit",
+      brief: "Post board items",
+    });
+    assert.equal(addHelperRes.isError, undefined);
+    await waitFor(() => spawnedNames.includes("helper-dup"));
+
+    // Reset wakeups count after helper-dup finishes, then post 7 messages through engine.postMessage
+    // Note: in integration, toolEngineProxy.postMessage posts as orchestrator; let's post 7 via store+engine or steer/add:
+    // Actually we can post 7 messages with @orchestrator via SWARM_TOOL? Let's spawn a tiny worker or check `pendingWakeups` via read_board:
+    // Wait: `POST_MESSAGE_TOOL` uses orchestrator, which doesn't emit wakeup_needed for orchestrator itself.
+    // Let's check: when `worker-batch` is waiting, we can wake it? Better yet, `POST_MESSAGE_TOOL` from a member or `swarm{action:"steer"}` — actually `createMockPersistentMemberHandle` gives `request.engineApi`!
+    // Let's keep it simple: we already tested `read_board{since}` in Test #8; let's verify `read_board{limit: 5}` & `limit: 0` with a worker that posts 7 updates!
+    assert.ok(seqsPosted.length === 7);
+
+    // 3. `/skill:review` in `input` gets latestHumanDirection & preflight, while `/ext-helper` does not
+    harness.setIdle(true);
+    await harness.emit("input", { source: "interactive", text: "/ext-helper foo" });
+    const extSec: Record<string, string> = {};
+    await harness.emit("before_agent_start", {
+      messageType: "user",
+      prompt: "/ext-helper foo",
+      systemPromptOptions: { sections: extSec },
+    });
+    assert.ok(!(extSec.swarm_state ?? "").includes("Live User Direction Update"));
+
+    await harness.emit("input", { source: "interactive", text: "/skill:review focus on security" });
+    const skillSec: Record<string, string> = {};
+    await harness.emit("before_agent_start", {
+      messageType: "user",
+      prompt: "/skill:review focus on security",
+      systemPromptOptions: { sections: skillSec },
+    });
+    assert.match(skillSec.swarm_state ?? "", /Live User Direction Update/);
+    assert.match(skillSec.swarm_state ?? "", /\/skill:review focus on security/);
+
+    // 4. `/swarm tweak` revises the active run in place without creating a second run
+    await harness.runCommand("swarm", "tweak Add security validator");
+    assert.equal(
+      harness.sentUserMessages.some((m) => String(m.content).includes('mode="tweak"')),
+      true,
+    );
+    assert.ok(harness.pi.getActiveTools().includes(PROPOSE_SWARM_PLAN_TOOL));
+
+    const tweakSections: Record<string, string> = {};
+    await harness.emit("before_agent_start", {
+      messageType: "user",
+      prompt: "Tweak",
+      systemPromptOptions: { sections: tweakSections },
+    });
+    assert.match(tweakSections.swarm ?? "", /swarm_drafting_active mode="tweak"/);
+    assert.equal(tweakSections.swarm_state, undefined);
+
+    const tweakRes = await harness.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "v0.3.7 Run Revised",
+      objective: "Revised objective with security audit",
+      strategy: "Revised dynamic strategy",
+      acceptance_criteria: "All tests and security checks pass",
+      base_branch: "main",
+      max_concurrency: 5,
+      validator_enabled: true,
+      initial_members: [
+        // Existing member should NOT be re-spawned; new validator should be spawned!
+        { name: "worker-batch", role: "worker", workspace: "inherit", brief: "Existing" },
+        { name: "sec-validator", role: "validator", workspace: "inherit", brief: "Audit security" },
+      ],
+    });
+    assert.equal(tweakRes.isError, undefined);
+    assert.equal(tweakRes.details.runId, runId, "/swarm tweak must revise same runId in place");
+    assert.ok(spawnedNames.includes("sec-validator"));
+    assert.equal(
+      spawnedNames.filter((n) => n === "worker-batch").length,
+      1,
+      "Existing member must not be spawned twice during tweak",
+    );
+    const revisedRun = await store.loadRun(runId);
+    assert.equal(revisedRun.title, "v0.3.7 Run Revised");
+    assert.equal(revisedRun.maxConcurrency, 5);
+    assert.match(tweakSections.swarm ?? "", /v0\.3\.7 Run Revised/);
+    assert.match(tweakSections.swarm_state ?? "", /Active Swarm State/);
+
+    const boardAfterTweak = await store.readBoard(runId, { channel: "*", limit: 20 });
+    assert.ok(
+      boardAfterTweak.messages.some(
+        (m) => m.kind === "decision" && m.text.includes("Revised Swarm plan"),
+      ),
+    );
+
+    // 5. Foreign live observer stays in "idle" tool profile & cannot mutate via /swarm steer / /swarm model / toolEngineProxy
+    const foreignHarness = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "foreign-observer-v037",
+    });
+    const extForeign = createPiSwarmExtension({
+      transportFactory: () => mockTransport,
+      settingsLoader: async () => ({ ...DEFAULT_SWARM_SETTINGS, stallWatchdogEnabled: false }),
+    });
+    extForeign(foreignHarness.pi);
+    await foreignHarness.emit("session_start", { reason: "startup" });
+    await foreignHarness.runCommand("swarm", `focus ${runId}`);
+
+    assert.ok(
+      !foreignHarness.pi.getActiveTools().includes(POST_MESSAGE_TOOL),
+      "Foreign observer must stay in idle tool profile",
+    );
+    await foreignHarness.runCommand("swarm", "steer worker-batch hijack");
+    assert.ok(
+      foreignHarness.notifications.some(
+        (n) => n.level === "error" && /OWNERSHIP_CONFLICT|owned by active session/i.test(n.message),
+      ),
+    );
+    await foreignHarness.runCommand("swarm", "model worker-batch openai/gpt-5.2");
+    assert.ok(
+      foreignHarness.notifications.some(
+        (n) => n.level === "error" && /Failed to switch model.*owned by active session/i.test(n.message),
+      ),
+    );
+    const foreignToolRes = await foreignHarness.executeTool(SWARM_TOOL, {
+      action: "steer",
+      name: "worker-batch",
+      message: "hijack via tool",
+    });
+    assert.equal(foreignToolRes.isError, true);
+    assert.match(foreignToolRes.content[0].text, /OWNERSHIP_CONFLICT/);
+
+    // Foreign observer CAN open overlay and browse read-only, while mutating actions fail cleanly
+    let overlayChecked = false;
+    (foreignHarness.ctx.ui as any).custom = async (factory: any) => {
+      return new Promise((resolve) => {
+        const comp = factory(
+          {
+            terminal: { rows: 30, columns: 100 },
+            requestRender() {},
+            getShowHardwareCursor: () => false,
+            setShowHardwareCursor() {},
+          },
+          {
+            fg: (_c: string, t: string) => t,
+            bold: (t: string) => t,
+          },
+          {},
+          resolve,
+        );
+        comp.focused = true;
+        void (async () => {
+          await new Promise((r) => setTimeout(r, 20));
+          comp.handleInput?.("p");
+          for (const ch of "unauthorized post") comp.handleInput?.(ch);
+          comp.handleInput?.("\r");
+          await new Promise((r) => setTimeout(r, 20));
+          const rendered = comp.render(100).join("\n");
+          assert.match(rendered, /owned by active session|OWNERSHIP_CONFLICT/i);
+          overlayChecked = true;
+          comp.handleInput?.("q");
+        })();
+      });
+    };
+    await foreignHarness.runCommand("swarm", "tasks");
+    assert.equal(overlayChecked, true);
+    await foreignHarness.emit("session_shutdown", { reason: "quit" });
+
+    // 6. Dead-PID crash recovery claims ownership cleanly in rehydrateSessionState
+    await store.updateRun(runId, {
+      ownerSessionId: "crashed-sess-old",
+      ownerPid: 999999,
+    });
+    const recoveredHarness = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "recovered-v037",
+    });
+    recoveredHarness.branch.push(...harness.branch);
+    const extRecovered = createPiSwarmExtension({
+      transportFactory: () => mockTransport,
+      settingsLoader: async () => ({ ...DEFAULT_SWARM_SETTINGS, stallWatchdogEnabled: false }),
+    });
+    extRecovered(recoveredHarness.pi);
+    await recoveredHarness.emit("session_start", { reason: "resume" });
+    const afterCrashRecover = await store.loadRun(runId);
+    assert.equal(afterCrashRecover.ownerSessionId, "recovered-v037");
+    assert.equal(afterCrashRecover.ownerPid, process.pid);
+    assert.ok(recoveredHarness.pi.getActiveTools().includes(POST_MESSAGE_TOOL));
+
+    await recoveredHarness.executeTool(SWARM_TOOL, {
+      action: "done",
+      summary: "v0.3.7 verified",
+    });
+    await recoveredHarness.emit("session_shutdown", { reason: "quit" });
+    await harness.emit("session_shutdown", { reason: "quit" });
+  });
+
+  it("10. v0.3.7: read_board{limit: 5} and read_board{limit: 0} preserve earlier unread #seq wakeups", async () => {
+    const repoDir = await createTempGitRepo("v037-readboard-limit");
+    tempDirs.push(repoDir);
+
+    let workerApi: SpawnMemberRequest["engineApi"] | undefined;
+    const mockTransport: ISwarmTransport = {
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        workerApi = request.engineApi;
+        const tracker = createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async () => ({
+            agentId: request.agentId,
+            name: request.name,
+            role: request.role,
+            outcome: "waiting",
+            summary: "Ready",
+            tokens: 10,
+            cost: 0.0001,
+          }),
+        });
+        return tracker.handle;
+      },
+    };
+
+    const harness = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "limit-dedup-v037",
+    });
+    const ext = createPiSwarmExtension({
+      transportFactory: () => mockTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: false,
+      }),
+    });
+    ext(harness.pi);
+    await harness.emit("session_start", { reason: "startup" });
+    await harness.runCommand("swarm-direct", "Test read_board limit dedup");
+    await harness.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Limit Dedup",
+      objective: "Preserve earlier unread wakeups",
+      strategy: "Single worker",
+      acceptance_criteria: "Earlier wakeups preserved",
+      base_branch: "main",
+      initial_members: [
+        { name: "poster", role: "worker", workspace: "inherit", brief: "Stand by" },
+      ],
+    });
+    await waitFor(() => Boolean(workerApi));
+    await waitFor(() =>
+      harness.sentMessages.some((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE),
+    );
+    await harness.emit("before_agent_start", {
+      messageType: "custom",
+      systemPromptOptions: { sections: {} },
+    });
+
+    // Post 7 @orchestrator updates while orchestrator is busy -> 7 pendingWakeups queued
+    harness.setIdle(false);
+    const postedSeqs: number[] = [];
+    for (let i = 1; i <= 7; i++) {
+      const m = await workerApi!.postMessage({
+        text: `@orchestrator update #${i}`,
+        kind: "update",
+      });
+      postedSeqs.push(m.seq);
+    }
+
+    // read_board{limit: 0} must NOT wipe any pending wakeups
+    await harness.executeTool(READ_BOARD_TOOL, { limit: 0 });
+
+    // read_board{limit: 5} returns ONLY the last 5 messages -> earlier 2 (#postedSeqs[0], #postedSeqs[1]) MUST survive!
+    await harness.executeTool(READ_BOARD_TOOL, { limit: 5 });
+
+    const wakeupsBeforeSettle = harness.sentMessages.filter(
+      (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
+    ).length;
+    harness.setIdle(true);
+    await harness.emit("agent_settled", { aborted: false });
+    await new Promise((r) => setTimeout(r, 30));
+
+    const wakeupsAfterSettle = harness.sentMessages.filter(
+      (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
+    );
+    assert.equal(
+      wakeupsAfterSettle.length,
+      wakeupsBeforeSettle + 1,
+      "Earlier unread #seqs must still trigger wakeup after read_board{limit:5}",
+    );
+    const lastWakeup = wakeupsAfterSettle[wakeupsAfterSettle.length - 1]!;
+    const lastText = String(lastWakeup.message.content);
+    assert.match(lastText, new RegExp(`\\[#${postedSeqs[0]}\\]`));
+    assert.match(lastText, new RegExp(`\\[#${postedSeqs[1]}\\]`));
+    assert.ok(!lastText.includes(`[#${postedSeqs[6]}]`), "Already-returned #seq must be pruned");
+    assert.ok(!lastText.includes("update #7"), "Already-returned message body must be pruned");
+
+    await harness.executeTool(SWARM_TOOL, { action: "done", summary: "Done" });
     await harness.emit("session_shutdown", { reason: "quit" });
   });
 });

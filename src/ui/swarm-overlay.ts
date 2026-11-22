@@ -75,7 +75,7 @@ const VALID_THINKING_LEVELS: ReadonlySet<ThinkingLevel> = new Set([
   "max",
 ]);
 
-type MemberDetailMode = "info" | "diff";
+type MemberDetailMode = "info" | "logs" | "diff";
 
 type InlineInputMode =
   | { kind: "board_post"; channel: string }
@@ -205,6 +205,8 @@ class SwarmOverlayComponent implements Component, Focusable {
   // Members tab state
   private memberSelectedIndex = 0;
   private memberDetailMode: MemberDetailMode = "info";
+  private memberDetailScrollOffset = 0;
+  private pendingKillConfirm?: { memberName: string; force: boolean };
   private diffState: {
     memberName: string;
     branch: string;
@@ -222,6 +224,13 @@ class SwarmOverlayComponent implements Component, Focusable {
   private searchFocused = false;
   private searchSelectedIndex = 0;
   private readonly searchInput: Input;
+
+  // Expanded post reader (Board [1] & Search [4])
+  private expandedPost: {
+    tab: "board" | "search";
+    seq: number;
+    scrollOffset: number;
+  } | null = null;
 
   // Inline IME action input (Board [p] post, Members [w] wake, Members [m] model)
   private inlineMode: InlineInputMode | undefined;
@@ -292,11 +301,16 @@ class SwarmOverlayComponent implements Component, Focusable {
         this.diffRequestId += 1;
         this.boardSelectedIndex = 0;
         this.searchSelectedIndex = 0;
+        this.memberDetailScrollOffset = 0;
+        this.pendingKillConfirm = undefined;
+        this.expandedPost = null;
       }
 
       if (!ev.snapshot.run) {
         this.inlineMode = undefined;
         this.searchFocused = false;
+        this.pendingKillConfirm = undefined;
+        this.expandedPost = null;
         this.syncInputFocus();
       }
 
@@ -400,6 +414,8 @@ class SwarmOverlayComponent implements Component, Focusable {
   private switchTab(tab: SwarmOverlayTab): void {
     if (this.activeTab === tab) return;
     this.exitInlineMode();
+    this.pendingKillConfirm = undefined;
+    this.expandedPost = null;
     this.activeTab = tab;
     this.feedback = undefined;
     if (tab === "search") {
@@ -543,6 +559,8 @@ class SwarmOverlayComponent implements Component, Focusable {
     this.closed = true;
     this.inlineMode = undefined;
     this.searchFocused = false;
+    this.pendingKillConfirm = undefined;
+    this.expandedPost = null;
     this.inlineInput.focused = false;
     this.searchInput.focused = false;
     if (this.prevHardwareCursor !== null) {
@@ -714,20 +732,27 @@ class SwarmOverlayComponent implements Component, Focusable {
     }
   }
 
-  private async runKillMember(member: SwarmMemberRecord): Promise<void> {
+  private async runKillMember(
+    member: SwarmMemberRecord,
+    force = false,
+  ): Promise<void> {
     if (member.state === "killed") {
       this.setFeedback("warning", `${member.name} is already killed.`);
       return;
     }
     try {
       await this.engine.killMember(member.name, {
+        force,
         reason: "Killed by user",
         callerName: ORCHESTRATOR_NAME,
         callerRole: "human",
       });
       if (this.closed) return;
       this.snapshot = this.engine.getSnapshot();
-      this.setFeedback("warning", `Killed ${member.name} permanently.`);
+      this.setFeedback(
+        "warning",
+        `Killed ${member.name} permanently${force ? " (force)" : ""}.`,
+      );
     } catch (err) {
       this.setFeedback(
         "error",
@@ -901,6 +926,77 @@ class SwarmOverlayComponent implements Component, Focusable {
     // 3. Global close & tab-switch shortcuts
     const ch = decodePrintableChar(data);
 
+    // 2.5. Inline [k] kill confirmation on Members tab
+    if (this.pendingKillConfirm) {
+      if (matchesKey(data, Key.ctrl("c"))) {
+        this.close();
+        return;
+      }
+      if (ch === "f" || ch === "F") {
+        this.pendingKillConfirm.force = !this.pendingKillConfirm.force;
+        this.tui.requestRender();
+        return;
+      }
+      if (ch === "y" || ch === "Y" || matchesKey(data, Key.enter)) {
+        const { memberName, force } = this.pendingKillConfirm;
+        this.pendingKillConfirm = undefined;
+        const target =
+          this.getMembers().find((m) => m.name === memberName) ??
+          this.getSelectedMember();
+        if (target) {
+          void this.runKillMember(target, force);
+        }
+        this.tui.requestRender();
+        return;
+      }
+      if (ch === "n" || ch === "N" || matchesKey(data, Key.escape)) {
+        this.pendingKillConfirm = undefined;
+        this.tui.requestRender();
+        return;
+      }
+      // Navigation or tab keys cancel pending kill confirmation and proceed normally
+      this.pendingKillConfirm = undefined;
+    }
+
+    // 2.6. Expanded multi-line post reader on Board [1] or Search [4]
+    if (this.expandedPost && this.expandedPost.tab === this.activeTab) {
+      if (matchesKey(data, Key.ctrl("c")) || ch === "q" || ch === "Q") {
+        this.close();
+        return;
+      }
+      if (matchesKey(data, Key.escape) || matchesKey(data, Key.enter)) {
+        this.expandedPost = null;
+        this.tui.requestRender();
+        return;
+      }
+      if (matchesKey(data, Key.up) || ch === "k") {
+        this.expandedPost.scrollOffset = Math.max(
+          0,
+          this.expandedPost.scrollOffset - 1,
+        );
+        this.tui.requestRender();
+        return;
+      }
+      if (matchesKey(data, Key.down) || ch === "j") {
+        this.expandedPost.scrollOffset += 1;
+        this.tui.requestRender();
+        return;
+      }
+      if (matchesKey(data, Key.pageUp)) {
+        this.expandedPost.scrollOffset = Math.max(
+          0,
+          this.expandedPost.scrollOffset - 5,
+        );
+        this.tui.requestRender();
+        return;
+      }
+      if (matchesKey(data, Key.pageDown)) {
+        this.expandedPost.scrollOffset += 5;
+        this.tui.requestRender();
+        return;
+      }
+    }
+
     if (
       matchesKey(data, Key.escape) ||
       matchesKey(data, Key.ctrl("c")) ||
@@ -995,6 +1091,15 @@ class SwarmOverlayComponent implements Component, Focusable {
       return;
     }
 
+    if (matchesKey(data, Key.enter)) {
+      const selected = messages[this.boardSelectedIndex];
+      if (selected) {
+        this.expandedPost = { tab: "board", seq: selected.seq, scrollOffset: 0 };
+        this.tui.requestRender();
+      }
+      return;
+    }
+
     if (ch === "c" || ch === "C") {
       const filters = this.getChannelFilterOptions();
       const curIdx = filters.indexOf(this.channelFilter);
@@ -1027,6 +1132,7 @@ class SwarmOverlayComponent implements Component, Focusable {
         this.memberSelectedIndex =
           (this.memberSelectedIndex - 1 + members.length) % members.length;
         this.memberDetailMode = "info";
+        this.memberDetailScrollOffset = 0;
         this.feedback = undefined;
         this.tui.requestRender();
       }
@@ -1037,6 +1143,7 @@ class SwarmOverlayComponent implements Component, Focusable {
         this.memberSelectedIndex =
           (this.memberSelectedIndex + 1) % members.length;
         this.memberDetailMode = "info";
+        this.memberDetailScrollOffset = 0;
         this.feedback = undefined;
         this.tui.requestRender();
       }
@@ -1044,6 +1151,27 @@ class SwarmOverlayComponent implements Component, Focusable {
     }
 
     if (!selected) return;
+
+    if (
+      (this.memberDetailMode === "logs" || this.memberDetailMode === "diff") &&
+      (ch === "[" ||
+        ch === "]" ||
+        matchesKey(data, Key.pageUp) ||
+        matchesKey(data, Key.pageDown))
+    ) {
+      const step =
+        matchesKey(data, Key.pageUp) || matchesKey(data, Key.pageDown) ? 5 : 3;
+      if (ch === "[" || matchesKey(data, Key.pageUp)) {
+        this.memberDetailScrollOffset = Math.max(
+          0,
+          this.memberDetailScrollOffset - step,
+        );
+      } else {
+        this.memberDetailScrollOffset += step;
+      }
+      this.tui.requestRender();
+      return;
+    }
 
     if (ch === "w" || ch === "W") {
       if (selected.state === "killed") {
@@ -1082,7 +1210,13 @@ class SwarmOverlayComponent implements Component, Focusable {
     }
 
     if (ch === "k" || ch === "K") {
-      void this.runKillMember(selected);
+      if (selected.state === "killed") {
+        this.setFeedback("warning", `${selected.name} is already killed.`);
+        return;
+      }
+      this.pendingKillConfirm = { memberName: selected.name, force: false };
+      this.feedback = undefined;
+      this.tui.requestRender();
       return;
     }
 
@@ -1091,7 +1225,16 @@ class SwarmOverlayComponent implements Component, Focusable {
       return;
     }
 
+    if (ch === "l" || ch === "L") {
+      this.memberDetailMode = this.memberDetailMode === "logs" ? "info" : "logs";
+      this.memberDetailScrollOffset = 0;
+      this.feedback = undefined;
+      this.tui.requestRender();
+      return;
+    }
+
     if (ch === "d" || ch === "D") {
+      this.memberDetailScrollOffset = 0;
       this.toggleMemberDiff(selected);
     }
   }
@@ -1139,6 +1282,14 @@ class SwarmOverlayComponent implements Component, Focusable {
       this.searchSelectedIndex =
         (this.searchSelectedIndex + 1) % matches.length;
       this.tui.requestRender();
+      return;
+    }
+    if (matchesKey(data, Key.enter)) {
+      const selected = matches[this.searchSelectedIndex];
+      if (selected) {
+        this.expandedPost = { tab: "search", seq: selected.seq, scrollOffset: 0 };
+        this.tui.requestRender();
+      }
     }
   }
 
@@ -1243,14 +1394,84 @@ class SwarmOverlayComponent implements Component, Focusable {
     return out;
   }
 
+  private renderExpandedPostReader(
+    msg: BoardMessage,
+    innerWidth: number,
+    budget: number,
+  ): string[] {
+    if (budget <= 0) return [];
+    const out: string[] = [];
+    const ch = sanitizePlainText(msg.channel || DEFAULT_CHANNEL);
+    const kindBadge = formatBoardKindBadge(msg.kind, this.theme);
+    const targets = formatTargetsSuffix(msg);
+    const metaLeft = `${this.theme.fg("accent", this.theme.bold(`#${msg.seq}`))} ${this.theme.fg("dim", `[#${ch}]`)} ${kindBadge} ${this.theme.bold(`@${sanitizePlainText(msg.from)}`)}${targets ? this.theme.fg("accent", targets) : ""}`;
+    const metaRight = this.theme.fg("dim", formatClock(msg.timestamp));
+    out.push(
+      innerWidth >= 52
+        ? joinColumns(metaLeft, metaRight, innerWidth)
+        : fitLine(metaLeft, innerWidth),
+    );
+
+    if (out.length < budget) {
+      out.push(
+        renderHorizontalRule(
+          innerWidth,
+          `Full Post #${msg.seq} [Enter/Esc: back]`,
+          this.theme,
+        ),
+      );
+    }
+
+    const bodyBudget = Math.max(0, budget - out.length);
+    if (bodyBudget > 0 && this.expandedPost) {
+      const bodyLines: string[] = [];
+      for (const rawLine of msg.text.split(/\r?\n/)) {
+        const cleanLine = sanitizeDiffLine(rawLine);
+        if (cleanLine.length === 0) {
+          bodyLines.push("");
+        } else {
+          bodyLines.push(...wrapLines(cleanLine, innerWidth));
+        }
+      }
+      if (bodyLines.length === 0) {
+        bodyLines.push(this.theme.fg("dim", "(empty message)"));
+      }
+      const maxOffset = Math.max(0, bodyLines.length - bodyBudget);
+      this.expandedPost.scrollOffset = Math.max(
+        0,
+        Math.min(this.expandedPost.scrollOffset, maxOffset),
+      );
+      const visible = bodyLines.slice(
+        this.expandedPost.scrollOffset,
+        this.expandedPost.scrollOffset + bodyBudget,
+      );
+      out.push(...visible.map((l) => fitLine(l, innerWidth)));
+    }
+
+    return out.slice(0, budget);
+  }
+
   private renderBoardTab(innerWidth: number, budget: number): string[] {
+    if (this.expandedPost && this.expandedPost.tab === "board") {
+      const targetMsg = this.boardMessages.find(
+        (m) => m.seq === this.expandedPost!.seq,
+      );
+      if (targetMsg) {
+        return this.renderExpandedPostReader(targetMsg, innerWidth, budget);
+      }
+      this.expandedPost = null;
+    }
+
     const out: string[] = [];
     const messages = this.getFilteredBoardMessages();
     const filterLabel =
       this.channelFilter === "*"
         ? "Channel: * (all)"
         : `Channel: #${sanitizePlainText(this.channelFilter)}`;
-    const headerRight = this.theme.fg("dim", "[c] filter · [p] post · [↑↓] select");
+    const headerRight = this.theme.fg(
+      "dim",
+      "[Enter] read · [c] filter · [p] post · [↑↓] select",
+    );
     out.push(
       innerWidth >= 56
         ? joinColumns(
@@ -1442,6 +1663,61 @@ class SwarmOverlayComponent implements Component, Focusable {
     return out.slice(0, budget);
   }
 
+  private renderMemberDetailLogs(
+    member: SwarmMemberRecord,
+    innerWidth: number,
+    budget: number,
+  ): string[] {
+    if (budget <= 0) return [];
+    const allLines: string[] = [];
+
+    if (member.brief) {
+      allLines.push(this.theme.fg("muted", "Brief:"));
+      for (const rawLine of member.brief.split(/\r?\n/)) {
+        const cleanLine = sanitizeDiffLine(rawLine);
+        if (!cleanLine) {
+          allLines.push("");
+        } else {
+          allLines.push(...wrapLines(cleanLine, innerWidth));
+        }
+      }
+    }
+
+    if (member.parkedOn) {
+      allLines.push(
+        ...wrapLines(
+          `${this.theme.fg("muted", "Parked on:")} ${sanitizePlainText(member.parkedOn)}`,
+          innerWidth,
+        ),
+      );
+    }
+
+    allLines.push(
+      this.theme.fg("muted", `Log Tail (${member.logTail.length} line(s)):`),
+    );
+    if (member.logTail.length === 0) {
+      allLines.push(this.theme.fg("dim", "  (no log output recorded yet)"));
+    } else {
+      for (const line of member.logTail) {
+        allLines.push(
+          ...wrapLines(
+            this.theme.fg("toolOutput", `  │ ${sanitizePlainText(line)}`),
+            innerWidth,
+          ),
+        );
+      }
+    }
+
+    const maxOffset = Math.max(0, allLines.length - budget);
+    this.memberDetailScrollOffset = Math.max(
+      0,
+      Math.min(this.memberDetailScrollOffset, maxOffset),
+    );
+    return allLines
+      .slice(this.memberDetailScrollOffset, this.memberDetailScrollOffset + budget)
+      .map((l) => fitLine(l, innerWidth));
+  }
+
   private renderMemberDetailDiff(
     member: SwarmMemberRecord,
     innerWidth: number,
@@ -1465,36 +1741,50 @@ class SwarmOverlayComponent implements Component, Focusable {
       return [fitLine(this.theme.fg("dim", "No diff available."), innerWidth)];
     }
 
-    const out: string[] = [];
-    out.push(
-      fitLine(
-        `${this.theme.fg("accent", sanitizePlainText(summary.branch))} vs ${sanitizePlainText(summary.baseBranch)} · ${summary.commitsAhead} commit(s) ahead · ${summary.changedFiles.length} file(s)`,
-        innerWidth,
-      ),
+    const header = fitLine(
+      `${this.theme.fg("accent", sanitizePlainText(summary.branch))} vs ${sanitizePlainText(summary.baseBranch)} · ${summary.commitsAhead} commit(s) ahead · ${summary.changedFiles.length} file(s)`,
+      innerWidth,
     );
-    if (summary.stat && out.length < budget) {
+    const bodyBudget = Math.max(0, budget - 1);
+    if (bodyBudget === 0) {
+      return [header];
+    }
+
+    const bodyLines: string[] = [];
+    if (summary.stat) {
       for (const line of summary.stat.split(/\r?\n/)) {
         const cleanLine = sanitizeDiffLine(line);
         if (!cleanLine.trim()) continue;
-        if (out.length >= Math.min(budget, 4)) break;
-        out.push(fitLine(this.theme.fg("muted", cleanLine), innerWidth));
+        bodyLines.push(fitLine(this.theme.fg("muted", cleanLine), innerWidth));
       }
     }
     const rawDiffLines = summary.diff ? summary.diff.split(/\r?\n/) : [];
     for (const raw of rawDiffLines) {
-      if (out.length >= budget) break;
       const cleanRaw = sanitizeDiffLine(raw);
-      const styled = cleanRaw.startsWith("+") && !cleanRaw.startsWith("+++")
-        ? this.theme.fg("toolDiffAdded", cleanRaw)
-        : cleanRaw.startsWith("-") && !cleanRaw.startsWith("---")
-          ? this.theme.fg("toolDiffRemoved", cleanRaw)
-          : cleanRaw.startsWith("@@")
-            ? this.theme.fg("accent", cleanRaw)
-            : this.theme.fg("toolDiffContext", cleanRaw);
-      out.push(fitLine(styled, innerWidth));
+      const styled =
+        cleanRaw.startsWith("+") && !cleanRaw.startsWith("+++")
+          ? this.theme.fg("toolDiffAdded", cleanRaw)
+          : cleanRaw.startsWith("-") && !cleanRaw.startsWith("---")
+            ? this.theme.fg("toolDiffRemoved", cleanRaw)
+            : cleanRaw.startsWith("@@")
+              ? this.theme.fg("accent", cleanRaw)
+              : this.theme.fg("toolDiffContext", cleanRaw);
+      bodyLines.push(fitLine(styled, innerWidth));
     }
 
-    return out.slice(0, budget);
+    const maxOffset = Math.max(0, bodyLines.length - bodyBudget);
+    this.memberDetailScrollOffset = Math.max(
+      0,
+      Math.min(this.memberDetailScrollOffset, maxOffset),
+    );
+
+    return [
+      header,
+      ...bodyLines.slice(
+        this.memberDetailScrollOffset,
+        this.memberDetailScrollOffset + bodyBudget,
+      ),
+    ];
   }
 
   private renderMembersTab(
@@ -1543,7 +1833,11 @@ class SwarmOverlayComponent implements Component, Focusable {
     const selected = this.getSelectedMember();
     if (selected && out.length < budget - 1) {
       const modeTag =
-        this.memberDetailMode === "diff" ? "Git Diff [d: info]" : "Details & Logs";
+        this.memberDetailMode === "diff"
+          ? "Git Diff [d: info · [/]/PgUp/Dn: scroll]"
+          : this.memberDetailMode === "logs"
+            ? "Brief & Logs [l: info · [/]/PgUp/Dn: scroll]"
+            : "Details & Logs";
       out.push(
         renderHorizontalRule(
           innerWidth,
@@ -1554,6 +1848,8 @@ class SwarmOverlayComponent implements Component, Focusable {
       const detailBudget = Math.max(1, budget - out.length);
       if (this.memberDetailMode === "diff") {
         out.push(...this.renderMemberDetailDiff(selected, innerWidth, detailBudget));
+      } else if (this.memberDetailMode === "logs") {
+        out.push(...this.renderMemberDetailLogs(selected, innerWidth, detailBudget));
       } else {
         out.push(...this.renderMemberDetailInfo(selected, innerWidth, detailBudget));
       }
@@ -1582,6 +1878,16 @@ class SwarmOverlayComponent implements Component, Focusable {
   }
 
   private renderSearchTab(innerWidth: number, budget: number): string[] {
+    if (this.expandedPost && this.expandedPost.tab === "search") {
+      const targetMsg = this.boardMessages.find(
+        (m) => m.seq === this.expandedPost!.seq,
+      );
+      if (targetMsg) {
+        return this.renderExpandedPostReader(targetMsg, innerWidth, budget);
+      }
+      this.expandedPost = null;
+    }
+
     const out: string[] = [];
     const matches = this.getSearchMatches();
 
@@ -1669,18 +1975,33 @@ class SwarmOverlayComponent implements Component, Focusable {
   }
 
   private renderActionBar(innerWidth: number): string {
+    if (this.pendingKillConfirm) {
+      const forceLabel = this.pendingKillConfirm.force ? "ON" : "OFF";
+      const confirmText = `Kill @${sanitizePlainText(this.pendingKillConfirm.memberName)} permanently? [y/Enter] confirm · [f] force dirty: ${forceLabel} · [n/Esc] cancel`;
+      return fitLine(this.theme.fg("warning", confirmText), innerWidth);
+    }
+    if (this.expandedPost && this.expandedPost.tab === this.activeTab) {
+      return fitLine(
+        this.theme.fg(
+          "dim",
+          "[↑↓/PgUp/PgDn] scroll · [Enter/Esc] back to list · [q] close",
+        ),
+        innerWidth,
+      );
+    }
     let text: string;
     if (this.activeTab === "board") {
-      text = "[p] post · [c] channel · [↑↓] scroll · [1-4/Tab] tabs · [Esc/q] close";
+      text =
+        "[Enter] read · [p] post · [c] channel · [↑↓] scroll · [1-4/Tab] tabs · [Esc/q] close";
     } else if (this.activeTab === "members") {
       text =
-        "[w] steer/wake · [m] model · [x] stop · [k] kill · [g] merge · [d] diff · [Esc/q] close";
+        "[w] steer · [m] model · [x] stop · [k] kill · [g] merge · [l] logs · [d] diff · [Esc/q] close";
     } else if (this.activeTab === "graph") {
       text = "[↑↓] scroll · [1-4/Tab] tabs · [Esc/q] close";
     } else {
       text = this.searchFocused
         ? "Type to search · [↑↓] select · [Tab] switch tab · [Esc] finish typing"
-        : "[/] search · [↑↓] select · [1-4/Tab] tabs · [Esc/q] close";
+        : "[/] search · [Enter] read · [↑↓] select · [1-4/Tab] tabs · [Esc/q] close";
     }
     return fitLine(this.theme.fg("dim", text), innerWidth);
   }

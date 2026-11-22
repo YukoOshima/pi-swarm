@@ -69,13 +69,14 @@ function normalizeQuestionOptions(spec: QuestionSpec): {
   const recRaw = spec.recommended?.trim().toLowerCase();
   const normalized: NormalizedOption[] = spec.options.map((opt: QuestionOption) => {
     const value = opt.value ?? opt.label;
+    const safeVal = sanitizePlainText(value);
     const isRecommended =
       recRaw !== undefined &&
       recRaw.length > 0 &&
       (value.trim().toLowerCase() === recRaw ||
         opt.label.trim().toLowerCase() === recRaw);
     return {
-      label: sanitizePlainText(opt.label) || value,
+      label: sanitizePlainText(opt.label) || safeVal || "(option)",
       value,
       description: opt.description ? sanitizePlainText(opt.description) : undefined,
       isRecommended,

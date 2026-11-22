@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { access, lstat, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, readdir, readFile, realpath, rm, rmdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import {
@@ -172,8 +172,10 @@ export class WorktreeManager implements IWorktreeManager {
     const timeout = options?.timeoutMs ?? this.gitTimeoutMs;
     const maxBuffer = options?.maxBuffer ?? DEFAULT_MAX_BUFFER;
 
+    const gitArgs = ["-c", "core.quotePath=false", ...args];
+
     try {
-      const { stdout, stderr } = await execFileAsync("git", args, {
+      const { stdout, stderr } = await execFileAsync("git", gitArgs, {
         cwd,
         timeout,
         maxBuffer,
@@ -244,6 +246,16 @@ export class WorktreeManager implements IWorktreeManager {
     return res.ok;
   }
 
+  async deleteBranch(branch: string): Promise<boolean> {
+    if (!(await this.branchExists(branch))) {
+      return false;
+    }
+    const res = await this.runGit(["branch", "-D", "--", branch], {
+      allowFailure: true,
+    });
+    return res.ok;
+  }
+
   /**
    * Linked git worktrees have a `.git` file pointing back to the main repo;
    * isolated `branch` clones have their own standalone `.git` directory.
@@ -277,9 +289,17 @@ export class WorktreeManager implements IWorktreeManager {
       }
     }
 
-    const pattern = `${SWARM_DIR}/`;
-    const lines = existing.split(/\r?\n/).map((line) => line.trim());
-    if (lines.includes(pattern) || lines.includes(SWARM_DIR)) {
+    const rootPattern = `${SWARM_DIR}/`;
+    const nestedPattern = `**/${SWARM_DIR}/`;
+    const lines = new Set(existing.split(/\r?\n/).map((line) => line.trim()));
+    const missing: string[] = [];
+    if (!lines.has(rootPattern) && !lines.has(SWARM_DIR)) {
+      missing.push(rootPattern);
+    }
+    if (!lines.has(nestedPattern) && !lines.has(`**/${SWARM_DIR}`)) {
+      missing.push(nestedPattern);
+    }
+    if (missing.length === 0) {
       return;
     }
 
@@ -289,7 +309,10 @@ export class WorktreeManager implements IWorktreeManager {
         : existing.endsWith("\n")
           ? ""
           : "\n";
-    const addition = `${prefix}# pi-swarm state & worktrees\n${pattern}\n`;
+    const header = lines.has("# pi-swarm state & worktrees")
+      ? ""
+      : "# pi-swarm state & worktrees\n";
+    const addition = `${prefix}${header}${missing.join("\n")}\n`;
     await writeFile(excludePath, `${existing}${addition}`, "utf8");
   }
 
@@ -490,17 +513,26 @@ export class WorktreeManager implements IWorktreeManager {
             { worktreePath: resolvedWorktree },
           );
         }
+        if (await this.isWorktreeDirty(resolvedWorktree)) {
+          throw new SwarmProtocolError(
+            "DIRTY_WORKTREE",
+            `Existing directory "${resolvedWorktree}" has uncommitted changes or files.`,
+            { worktreePath: resolvedWorktree },
+          );
+        }
         await removeDirectoryWithRetry(resolvedWorktree);
       }
 
       const cloneBranch =
         exists && options.reuseExistingBranch ? options.branch : options.baseBranch;
+      const topLevel = (
+        await this.runGit(["rev-parse", "--show-toplevel"])
+      ).stdout.trim();
       await this.runGit([
         "clone",
-        "--no-hardlinks",
         "--branch",
         cloneBranch,
-        this.repoRoot,
+        topLevel,
         resolvedWorktree,
       ]);
 
@@ -575,10 +607,20 @@ export class WorktreeManager implements IWorktreeManager {
             }
           }
         }
+        const emptyCheck = await readdir(resolvedWorktree).catch(() => null);
+        if (emptyCheck && emptyCheck.length === 0) {
+          await removeDirectoryWithRetry(resolvedWorktree);
+        }
       }
       await this.runGit(["worktree", "prune"], { allowFailure: true });
       await this.runGit(["worktree", "add", resolvedWorktree, options.branch]);
     } else {
+      if (await pathExists(resolvedWorktree)) {
+        const emptyCheck = await readdir(resolvedWorktree).catch(() => null);
+        if (emptyCheck && emptyCheck.length === 0) {
+          await removeDirectoryWithRetry(resolvedWorktree);
+        }
+      }
       await this.runGit([
         "worktree",
         "add",
@@ -678,15 +720,17 @@ export class WorktreeManager implements IWorktreeManager {
     const resolvedWorktree = await this.assertSafeWorktreeTarget(worktreePath);
     const force = Boolean(options?.force);
 
+    if (!force && (await this.isWorktreeDirty(resolvedWorktree))) {
+      throw new SwarmProtocolError(
+        "DIRTY_WORKTREE",
+        `Worktree "${resolvedWorktree}" has uncommitted changes.`,
+        { worktreePath: resolvedWorktree },
+      );
+    }
+
     if (await this.isIsolatedClone(resolvedWorktree)) {
-      if (!force && (await this.isWorktreeDirty(resolvedWorktree))) {
-        throw new SwarmProtocolError(
-          "DIRTY_WORKTREE",
-          `Clone "${resolvedWorktree}" has uncommitted changes.`,
-          { worktreePath: resolvedWorktree },
-        );
-      }
       await removeDirectoryWithRetry(resolvedWorktree);
+      await rmdir(path.dirname(resolvedWorktree)).catch(() => {});
       return;
     }
 
@@ -705,6 +749,7 @@ export class WorktreeManager implements IWorktreeManager {
       await removeDirectoryWithRetry(resolvedWorktree);
     }
 
+    await rmdir(path.dirname(resolvedWorktree)).catch(() => {});
     await this.runGit(["worktree", "prune"], { allowFailure: true });
   }
 
@@ -790,7 +835,8 @@ export class WorktreeManager implements IWorktreeManager {
     if (realTarget !== realRepo) {
       // Never walk up to repoRoot/.git when a member worktree lacks its own .git entry.
       if (!(await pathExists(path.join(realTarget, ".git")))) {
-        return false;
+        const entries = await readdir(realTarget);
+        return entries.length > 0;
       }
       const topRes = await this.runGit(["rev-parse", "--show-toplevel"], {
         cwd: realTarget,
@@ -968,10 +1014,6 @@ export class WorktreeManager implements IWorktreeManager {
       options.baseBranch,
       options.branch,
     );
-    const changedFiles = await this.getChangedFiles(
-      options.baseBranch,
-      options.branch,
-    );
 
     if (commitsAhead === 0) {
       return {
@@ -980,6 +1022,11 @@ export class WorktreeManager implements IWorktreeManager {
         changedFiles: [],
       };
     }
+
+    const changedFiles = await this.getChangedFiles(
+      options.baseBranch,
+      options.branch,
+    );
 
     const branchTipSha = (
       await this.runGit(["rev-parse", options.branch])
@@ -1081,14 +1128,27 @@ export class WorktreeManager implements IWorktreeManager {
     );
     const changedFiles = await this.getChangedFiles(compareBase, targetRef, cwd);
 
+    let diffRange = `${compareBase}...${targetRef}`;
+    if (cwd) {
+      const currentBranch = await this.getCurrentBranch(cwd).catch(() => "");
+      if (targetRef === "HEAD" || (currentBranch && currentBranch === targetRef)) {
+        const mbRes = await this.runGit(["merge-base", compareBase, "HEAD"], {
+          cwd,
+          allowFailure: true,
+        });
+        diffRange =
+          mbRes.ok && mbRes.stdout.trim() ? mbRes.stdout.trim() : compareBase;
+      }
+    }
+
     const statRes = await this.runGit(
-      ["diff", "--stat", `${compareBase}...${targetRef}`],
+      ["diff", "--stat", diffRange],
       { cwd, allowFailure: true },
     );
     const stat = (statRes.ok ? statRes.stdout : "").trim();
 
     const diffRes = await this.runGit(
-      ["diff", `${compareBase}...${targetRef}`],
+      ["diff", diffRange],
       {
         cwd,
         allowFailure: true,
@@ -1191,7 +1251,7 @@ export class WorktreeManager implements IWorktreeManager {
 
         // Preserve committed branches from isolated `branch` clones before removing dir when keeping branches.
         if (!deleteBranches && target.branch) {
-          if (dirty) {
+          if (dirty || force) {
             await this.fetchBranchFromClone(resolvedPath, target.branch).catch(() => {});
           } else {
             await this.fetchBranchFromClone(resolvedPath, target.branch);

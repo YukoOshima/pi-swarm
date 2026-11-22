@@ -1586,11 +1586,26 @@ describe("swarm-overlay", () => {
               assert.equal(mockEngine.switched[0]!.model, "anthropic/claude-opus-4-6");
               assert.equal(mockEngine.switched[0]!.thinkingLevel, "high");
 
-              // [k] Kill helper-lex
+              // [k] Kill helper-lex: Esc cancels, then k -> y confirms
               comp.handleInput?.("k");
+              const killConfirmPlain = stripTerminalSequences(comp.render(100).join("\n"));
+              assert.match(killConfirmPlain, /Kill @helper-lex permanently\?/);
+              assert.match(killConfirmPlain, /force dirty: OFF/);
+              comp.handleInput?.("f");
+              assert.match(
+                stripTerminalSequences(comp.render(100).join("\n")),
+                /force dirty: ON/,
+              );
+              comp.handleInput?.("\x1b");
+              await flushAsync();
+              assert.equal(mockEngine.killed.length, 0, "Esc must cancel kill confirmation");
+
+              comp.handleInput?.("k");
+              comp.handleInput?.("y");
               await flushAsync();
               assert.equal(mockEngine.killed.length, 1);
               assert.equal(mockEngine.killed[0]!.name, "helper-lex");
+              assert.equal(mockEngine.killed[0]!.options?.force, false);
               assert.equal(mockEngine.killed[0]!.options?.reason, "Killed by user");
 
               // --- TAB 3: GRAPH (via Tab key from Members) ---
@@ -2252,5 +2267,227 @@ describe("v0.3.6 UI hardening regressions", () => {
     const second = stripTerminalSequences(widget.render(120).join("\n"));
     assert.match(second, /gpt-5\.4/);
     widget.dispose();
+  });
+});
+
+describe("v0.3.7 UI enhancements", () => {
+  it("keeps subsequent lines intact on unterminated OSC/DCS escapes and strips residual C1 controls", () => {
+    const input = "\x1b]0;unterminated title\nsecond line stays\n\u0085third line\x1b";
+    const stripped = stripAllTerminalEscapes(input);
+    assert.equal(stripped, "0;unterminated title\nsecond line stays\nthird line");
+    assert.ok(stripped.includes("second line stays"));
+    assert.ok(stripped.includes("third line"));
+    assert.ok(!stripped.includes("\x1b"));
+    assert.ok(!stripped.includes("\u0085"));
+  });
+
+  it("questionnaire falls back cleanly when option label contains only escape sequences", async () => {
+    const qUi = createQuestionnaireUI();
+    let capturedChoices: string[] = [];
+    const ctx = {
+      mode: "rpc",
+      hasUI: true,
+      ui: {
+        async select(_title: string, choices: string[]) {
+          capturedChoices = choices;
+          return choices[0];
+        },
+        async input() {
+          return undefined;
+        },
+      },
+    } as unknown as ExtensionContext;
+
+    const res = await qUi.askQuestion(ctx, {
+      id: "esc-opt",
+      question: "Pick one",
+      allowCustom: false,
+      options: [
+        { label: "\x1b[31m\x1b[0m", value: "\x1b]0;bad\x07" },
+        { label: "\x1b[31m\x1b[0m", value: "safe-value" },
+      ],
+    });
+    assert.equal(res.cancelled, false);
+    assert.ok(
+      capturedChoices.some((c) => c === "(option)"),
+      "Escape-only label & value must fall back to '(option)'",
+    );
+    assert.ok(
+      capturedChoices.some((c) => c === "safe-value"),
+      "Escape-only label must fall back to sanitized value",
+    );
+  });
+
+  it("buildSwarmGraphLines normalizes case, shows fork/merged badges, #lastSeq [kind], and custom #channels", () => {
+    const snap = makeSampleSnapshot();
+    const run = snap.run!;
+    run.members["helper-lex"]!.forkedFrom = "worker-1";
+    run.members["worker-1"]!.mergedCommitSha = "abcdef1234567";
+    const board: BoardMessage[] = [
+      ...snap.recentBoard,
+      {
+        seq: 6,
+        runId: run.id,
+        channel: "main",
+        from: "WORKER-1",
+        fromRole: "worker",
+        text: "@VALIDATOR follow up",
+        mentions: ["VALIDATOR"],
+        channelMentions: [],
+        kind: "decision",
+        timestamp: "2026-11-20T17:46:00.000Z",
+      },
+    ];
+
+    const lines = buildSwarmGraphLines(run, board, 100);
+    const joined = lines.join("\n");
+    assert.match(joined, /worker-1.*✓merged/);
+    assert.match(joined, /helper-lex.*fork:@worker-1/);
+    assert.match(joined, /worker-1 ⇄ validator \(4 msgs\) · #6 \[decision\]/);
+    assert.match(joined, /Channels/);
+    assert.match(joined, /#backend: @worker-1, @helper-lex, @validator/);
+    assertAllLinesFit(lines, 100, "v037-graph@100");
+  });
+
+  it("supports [Enter] scrollable post reader on Board/Search, [l] logs+brief & diff scrolling, and [k] force kill", async () => {
+    const snap = makeSampleSnapshot();
+    const longLines = Array.from({ length: 30 }, (_, i) => `Detail line ${i + 1}: important output`).join("\n");
+    snap.recentBoard.push({
+      seq: 6,
+      runId: snap.run!.id,
+      channel: "main",
+      from: "worker-1",
+      fromRole: "worker",
+      text: longLines,
+      mentions: ["orchestrator"],
+      channelMentions: [],
+      kind: "done",
+      timestamp: "2026-11-20T17:46:00.000Z",
+    });
+    snap.boardHead = 6;
+    snap.run!.members["worker-1"]!.logTail = Array.from(
+      { length: 50 },
+      (_, i) => `Log entry #${i + 1}`,
+    );
+
+    const mockTui = createMockTUI(24, 100);
+    const theme = createMockTheme();
+    const killed: Array<{ name: string; force?: boolean }> = [];
+    const engine = {
+      getSnapshot: () => snap,
+      subscribe: () => () => {},
+      async readBoard() {
+        return { messages: snap.recentBoard, head: snap.boardHead };
+      },
+      async killMember(name: string, options?: KillMemberOptions) {
+        killed.push({ name, force: options?.force });
+      },
+    } as unknown as ISwarmEngine;
+
+    const longDiffLines = Array.from(
+      { length: 25 },
+      (_, i) => `+export const line${i + 1} = ${i + 1};`,
+    ).join("\n");
+    const worktree = {
+      async getDiffSummary(baseBranch: string, targetRef: string): Promise<DiffSummary> {
+        return {
+          baseBranch,
+          branch: targetRef,
+          headSha: "abc123",
+          commitsAhead: 1,
+          changedFiles: ["src/big.ts"],
+          stat: " src/big.ts | 25 +++++++++++++++++++++++++",
+          diff: longDiffLines,
+        };
+      },
+    } as unknown as IWorktreeManager;
+
+    const ctx = {
+      mode: "tui",
+      hasUI: true,
+      ui: {
+        theme,
+        notify() {},
+        async custom<T>(
+          factory: (
+            tui: TUI,
+            th: Theme,
+            kb: unknown,
+            done: (r: T) => void,
+          ) => Component & { dispose?(): void },
+        ): Promise<T> {
+          return new Promise<T>((resolve) => {
+            const comp = factory(mockTui.tui, theme, {}, resolve);
+            if (isFocusable(comp)) comp.focused = true;
+            void (async () => {
+              await flushAsync();
+
+              // 1. Board [Enter] full post reader + PgDn scroll + Esc back
+              comp.handleInput?.("\r");
+              const readerTop = stripTerminalSequences(comp.render(100).join("\n"));
+              assert.match(readerTop, /Full Post #6/);
+              assert.match(readerTop, /Detail line 1:/);
+
+              comp.handleInput?.("\x1b[6~"); // PgDn
+              comp.handleInput?.("\x1b[6~"); // PgDn
+              comp.handleInput?.("j");
+              const readerScrolled = stripTerminalSequences(comp.render(100).join("\n"));
+              assert.match(readerScrolled, /Detail line 2[0-9]:|Detail line 30:/);
+
+              comp.handleInput?.("\x1b"); // Esc returns to list, does not close overlay
+              const backToList = stripTerminalSequences(comp.render(100).join("\n"));
+              assert.match(backToList, /Channel: \* \(all\)/);
+
+              // 2. Search [Enter] full post reader
+              comp.handleInput?.("4");
+              for (const ch of "Detail line") {
+                comp.handleInput?.(ch);
+              }
+              comp.handleInput?.("\r"); // exit search input focus
+              comp.handleInput?.("\r"); // open expanded post reader
+              const searchReader = stripTerminalSequences(comp.render(100).join("\n"));
+              assert.match(searchReader, /Full Post #6/);
+              comp.handleInput?.("\r"); // Enter exits reader back to search list
+              assert.match(
+                stripTerminalSequences(comp.render(100).join("\n")),
+                /Matches: 1/,
+              );
+
+              // 3. Members [l] full brief + logTail & ] / PgDn scrolling
+              comp.handleInput?.("2");
+              comp.handleInput?.("l");
+              const logsTop = stripTerminalSequences(comp.render(100).join("\n"));
+              assert.match(logsTop, /Brief & Logs/);
+              assert.match(logsTop, /Log Tail \(50 line\(s\)\)/);
+              for (let i = 0; i < 10; i++) {
+                comp.handleInput?.("\x1b[6~"); // PgDn
+              }
+              const logsBottom = stripTerminalSequences(comp.render(100).join("\n"));
+              assert.match(logsBottom, /Log entry #50/);
+
+              // 4. Members [d] diff scrolling with ] / PgDn
+              comp.handleInput?.("d");
+              await flushAsync();
+              for (let i = 0; i < 6; i++) {
+                comp.handleInput?.("]");
+              }
+              const diffScrolled = stripTerminalSequences(comp.render(100).join("\n"));
+              assert.match(diffScrolled, /export const line2[0-5]/);
+
+              // 5. Members [k] -> [f] force dirty toggle -> [Enter] confirm
+              comp.handleInput?.("k");
+              comp.handleInput?.("f");
+              comp.handleInput?.("\r");
+              await flushAsync();
+
+              comp.handleInput?.("q");
+            })();
+          });
+        },
+      },
+    } as unknown as ExtensionContext;
+
+    await openSwarmOverlay(ctx, engine, worktree);
+    assert.deepEqual(killed, [{ name: "worker-1", force: true }]);
   });
 });

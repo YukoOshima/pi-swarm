@@ -712,6 +712,24 @@ export async function saveSwarmSettings(
       }
     }
 
+    if (
+      sanitizedPatch.rateLimitMaxBackoffMs !== undefined &&
+      sanitizedPatch.rateLimitBaseBackoffMs === undefined &&
+      typeof nextLayer.rateLimitBaseBackoffMs === "number" &&
+      nextLayer.rateLimitBaseBackoffMs > sanitizedPatch.rateLimitMaxBackoffMs
+    ) {
+      nextLayer.rateLimitBaseBackoffMs = sanitizedPatch.rateLimitMaxBackoffMs;
+    }
+
+    if (
+      sanitizedPatch.rateLimitBaseBackoffMs !== undefined &&
+      sanitizedPatch.rateLimitMaxBackoffMs === undefined &&
+      typeof nextLayer.rateLimitMaxBackoffMs === "number" &&
+      nextLayer.rateLimitMaxBackoffMs < sanitizedPatch.rateLimitBaseBackoffMs
+    ) {
+      nextLayer.rateLimitMaxBackoffMs = sanitizedPatch.rateLimitBaseBackoffMs;
+    }
+
     await writeSettingsFileAtomic(targetPath, nextLayer, projectRootForGuard);
 
     if (options?.projectRoot) {

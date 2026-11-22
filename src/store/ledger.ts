@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { appendFile, lstat, mkdir, readFile } from "node:fs/promises";
+import { appendFile, lstat, mkdir, open, readFile } from "node:fs/promises";
 import path from "node:path";
 import {
   SwarmProtocolError,
@@ -77,6 +77,125 @@ function parseEventLines(raw: string): SwarmEvent[] {
   return events;
 }
 
+interface LedgerCacheEntry {
+  ino: number;
+  size: number;
+  mtimeMs: number;
+  lastSeq: number;
+  endsWithNewline: boolean;
+  events: SwarmEvent[];
+}
+
+const ledgerCache = new Map<string, LedgerCacheEntry>();
+
+function computeLastSeq(events: readonly SwarmEvent[], priorCount = 0): number {
+  if (events.length === 0) {
+    return priorCount;
+  }
+  const last = events[events.length - 1];
+  return typeof last.seq === "number" && Number.isFinite(last.seq)
+    ? last.seq
+    : priorCount + events.length;
+}
+
+async function loadCachedLedger(eventsPath: string): Promise<{
+  events: SwarmEvent[];
+  lastSeq: number;
+  endsWithNewline: boolean;
+  size: number;
+}> {
+  const key = path.resolve(eventsPath);
+  await assertPathNotSymlink(key);
+  try {
+    const st = await lstat(key);
+    const existing = ledgerCache.get(key);
+    if (
+      existing &&
+      existing.ino === st.ino &&
+      existing.size === st.size &&
+      existing.mtimeMs === st.mtimeMs
+    ) {
+      return {
+        events: existing.events,
+        lastSeq: existing.lastSeq,
+        endsWithNewline: existing.endsWithNewline,
+        size: existing.size,
+      };
+    }
+
+    if (
+      existing &&
+      st.ino === existing.ino &&
+      st.size > existing.size &&
+      existing.endsWithNewline
+    ) {
+      const delta = st.size - existing.size;
+      const handle = await open(key, "r");
+      let tailText = "";
+      let bytesRead = 0;
+      try {
+        const buf = Buffer.allocUnsafe(delta);
+        while (bytesRead < delta) {
+          const res = await handle.read(
+            buf,
+            bytesRead,
+            delta - bytesRead,
+            existing.size + bytesRead,
+          );
+          if (res.bytesRead === 0) {
+            break;
+          }
+          bytesRead += res.bytesRead;
+        }
+        tailText = buf.subarray(0, bytesRead).toString("utf8");
+      } finally {
+        await handle.close().catch(() => {});
+      }
+
+      if (bytesRead === delta) {
+        const appended = parseEventLines(tailText);
+        const events =
+          appended.length > 0 ? [...existing.events, ...appended] : existing.events;
+        const lastSeq =
+          appended.length > 0
+            ? computeLastSeq(appended, existing.events.length)
+            : existing.lastSeq;
+        const endsWithNewline =
+          tailText.length === 0 ? existing.endsWithNewline : tailText.endsWith("\n");
+        ledgerCache.set(key, {
+          ino: st.ino,
+          size: st.size,
+          mtimeMs: st.mtimeMs,
+          lastSeq,
+          endsWithNewline,
+          events,
+        });
+        return { events, lastSeq, endsWithNewline, size: st.size };
+      }
+    }
+
+    const raw = await readFile(key, "utf8");
+    const endsWithNewline = raw.length === 0 || raw.endsWith("\n");
+    const events = parseEventLines(raw);
+    const lastSeq = computeLastSeq(events);
+    ledgerCache.set(key, {
+      ino: st.ino,
+      size: st.size,
+      mtimeMs: st.mtimeMs,
+      lastSeq,
+      endsWithNewline,
+      events,
+    });
+    return { events, lastSeq, endsWithNewline, size: st.size };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+      ledgerCache.delete(key);
+      return { events: [], lastSeq: 0, endsWithNewline: true, size: 0 };
+    }
+    throw err;
+  }
+}
+
 /**
  * Append a single event to an append-only JSONL ledger file.
  * Serializes concurrent in-process writes and rejects symlinked target files.
@@ -85,25 +204,20 @@ export async function appendLedgerEvent(
   eventsPath: string,
   input: SwarmEventInput,
 ): Promise<SwarmEvent> {
-  return enqueuePathWrite(eventsPath, async () => {
-    await mkdir(path.dirname(eventsPath), { recursive: true });
-    await assertPathNotSymlink(eventsPath);
+  const key = path.resolve(eventsPath);
+  return enqueuePathWrite(key, async () => {
+    await mkdir(path.dirname(key), { recursive: true });
+    await assertPathNotSymlink(key);
 
-    let nextSeq = 1;
-    let needsLeadingNewline = false;
-    try {
-      const existing = await readFile(eventsPath, "utf8");
-      needsLeadingNewline = existing.length > 0 && !existing.endsWith("\n");
-      const parsed = parseEventLines(existing);
-      if (parsed.length > 0) {
-        const last = parsed[parsed.length - 1];
-        nextSeq = typeof last.seq === "number" ? last.seq + 1 : parsed.length + 1;
-      }
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
-        throw err;
-      }
-    }
+    const {
+      events: existingEvents,
+      lastSeq,
+      endsWithNewline,
+      size: prevSize,
+    } = await loadCachedLedger(key);
+
+    const nextSeq = lastSeq + 1;
+    const needsLeadingNewline = !endsWithNewline;
 
     const event: SwarmEvent = {
       id: input.id ?? `evt_${randomUUID().replace(/-/g, "").slice(0, 12)}`,
@@ -119,8 +233,26 @@ export async function appendLedgerEvent(
       ...(input.data !== undefined ? { data: input.data } : {}),
     };
 
-    const line = `${needsLeadingNewline ? "\n" : ""}${JSON.stringify(event)}\n`;
-    await appendFile(eventsPath, line, { encoding: "utf8", flag: "a" });
+    const fullPayload = `${needsLeadingNewline ? "\n" : ""}${JSON.stringify(event)}\n`;
+    await appendFile(key, fullPayload, { encoding: "utf8", flag: "a" });
+    try {
+      const stAfter = await lstat(key);
+      const expectedSize = prevSize + Buffer.byteLength(fullPayload, "utf8");
+      if (stAfter.size === expectedSize) {
+        ledgerCache.set(key, {
+          ino: stAfter.ino,
+          size: stAfter.size,
+          mtimeMs: stAfter.mtimeMs,
+          lastSeq: nextSeq,
+          endsWithNewline: true,
+          events: [...existingEvents, event],
+        });
+      } else {
+        ledgerCache.delete(key);
+      }
+    } catch {
+      ledgerCache.delete(key);
+    }
     return event;
   });
 }
@@ -129,16 +261,8 @@ export async function appendLedgerEvent(
 export async function readAllLedgerEvents(
   eventsPath: string,
 ): Promise<SwarmEvent[]> {
-  await assertPathNotSymlink(eventsPath);
-  try {
-    const raw = await readFile(eventsPath, "utf8");
-    return parseEventLines(raw);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
-      return [];
-    }
-    throw err;
-  }
+  const { events } = await loadCachedLedger(eventsPath);
+  return [...events];
 }
 
 /** Read the most recent `limit` events from a JSONL ledger file (chronological order). */
@@ -149,11 +273,11 @@ export async function readRecentLedgerEvents(
   if (limit <= 0) {
     return [];
   }
-  const all = await readAllLedgerEvents(eventsPath);
-  if (all.length <= limit) {
-    return all;
+  const { events } = await loadCachedLedger(eventsPath);
+  if (events.length <= limit) {
+    return [...events];
   }
-  return all.slice(all.length - limit);
+  return events.slice(events.length - limit);
 }
 
 function formatShortTime(isoTimestamp: string): string {

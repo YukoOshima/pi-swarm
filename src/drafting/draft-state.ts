@@ -8,6 +8,7 @@ import {
   SWARM_DRAFT_ENTRY,
   SWARM_DRAFT_VERSION,
 } from "../constants.js";
+import { SWARM_SETTINGS_BOUNDS, isPrototypeKey } from "../store/index.js";
 import type { ActiveSwarmDraft, SwarmDraftMode, SwarmSettings } from "../types.js";
 
 // ============================================================================
@@ -126,15 +127,21 @@ function sanitizeConcurrency(value: number): number {
   if (!Number.isFinite(value) || value < 1) {
     return 1;
   }
-  return Math.max(1, Math.floor(value));
+  return Math.min(
+    SWARM_SETTINGS_BOUNDS.maxConcurrency.max,
+    Math.max(1, Math.floor(value)),
+  );
 }
 
 function cloneEcho(echo?: Record<string, string>): Record<string, string> | undefined {
-  if (!echo) {
+  if (!echo || typeof echo !== "object" || Array.isArray(echo)) {
     return undefined;
   }
   const entries = Object.entries(echo).filter(
-    ([key, val]) => typeof key === "string" && typeof val === "string",
+    ([key, val]) =>
+      typeof key === "string" &&
+      !isPrototypeKey(key) &&
+      typeof val === "string",
   );
   if (entries.length === 0) {
     return undefined;
@@ -190,6 +197,10 @@ function isSwarmDraftState(value: unknown): value is SwarmDraftState {
     (obj.targetRunId === undefined || typeof obj.targetRunId === "string") &&
     (obj.baseBranch === undefined || typeof obj.baseBranch === "string") &&
     (obj.autoConfirm === undefined || typeof obj.autoConfirm === "boolean") &&
+    (obj.questionnaireEcho === undefined ||
+      (typeof obj.questionnaireEcho === "object" &&
+        obj.questionnaireEcho !== null &&
+        !Array.isArray(obj.questionnaireEcho))) &&
     (obj.clearedAt === undefined || typeof obj.clearedAt === "string")
   );
 }
@@ -309,8 +320,8 @@ export function updateDraft(
   const mergedEcho =
     patch.questionnaireEcho !== undefined
       ? {
-          ...(current.questionnaireEcho ?? {}),
-          ...patch.questionnaireEcho,
+          ...(cloneEcho(current.questionnaireEcho) ?? {}),
+          ...(cloneEcho(patch.questionnaireEcho) ?? {}),
         }
       : current.questionnaireEcho;
 

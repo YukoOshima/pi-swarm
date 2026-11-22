@@ -37,7 +37,9 @@ import {
   registerDraftingTools,
 } from "./drafting/index.js";
 import {
+  buildOrchestratorLiveStateSection,
   buildOrchestratorPlaybookSection,
+  buildOrchestratorStaticSection,
   formatBoardEntryFull,
   InProcessPiTransport,
   registerSwarmTools,
@@ -48,6 +50,7 @@ import {
   SwarmStore,
   WorktreeManager,
   assertOwnerSession,
+  isProcessAlive,
   loadLayeredSwarmSettings,
   loadSwarmSettings,
   saveSwarmSettings,
@@ -124,6 +127,7 @@ export const SWARM_SUBCOMMANDS: ReadonlyArray<{
   description: string;
 }> = [
   { name: "direct", description: "Fast-path plan & launch Dynamic Swarm without Q&A" },
+  { name: "tweak", description: "Revise the focused Swarm plan, strategy, or add members interactively" },
   { name: "status", description: "Zero-turn Swarm status dashboard" },
   {
     name: "board",
@@ -170,6 +174,7 @@ const SINGLE_WORD_SUBCOMMANDS = new Set([
 
 const ARG_SUBCOMMANDS = new Set([
   "direct",
+  "tweak",
   "board",
   "tasks",
   "ui",
@@ -213,6 +218,7 @@ export interface ParsedSwarmInvocation {
     | "bare"
     | "goal"
     | "direct"
+    | "tweak"
     | "status"
     | "board"
     | "graph"
@@ -249,6 +255,7 @@ export function parseSwarmCommand(rawArgs: string): ParsedSwarmInvocation {
     return {
       kind: head as
         | "direct"
+        | "tweak"
         | "board"
         | "tasks"
         | "ui"
@@ -733,12 +740,13 @@ function buildRunKickoffMessage(
 
 function buildHelpMarkdown(): string {
   return [
-    "### 🐝 Pi Swarm v0.3.6 (`/swarm`) — Dynamic Antigravity Swarm Commands",
+    "### 🐝 Pi Swarm v0.3.7 (`/swarm`) — Dynamic Antigravity Swarm Commands",
     "",
     "| Command | Description |",
     "| --- | --- |",
     "| `/swarm [goal]` | Interactive upfront Q&A → Flexible Dynamic Swarm Plan confirmation (or 0-turn action menu when a run is focused) |",
     "| `/swarm direct <goal>` · `/swarm-direct <goal>` | Fast-path: skip Q&A, propose plan with auto-confirm, and launch Dynamic Swarm immediately |",
+    "| `/swarm tweak [guidance]` | Revise the focused Swarm plan, strategy, or add members interactively |",
     "| `/swarm status` | Zero-LLM-turn dashboard: 3-role models, channels, member roster, recent board & events |",
     "| `/swarm board [limit] [--channel <ch>] [--search <q>]` | Zero-LLM-turn shared `#seq` Message Board feed (filterable by channel or substring) |",
     "| `/swarm graph` | Zero-LLM-turn ASCII/Unicode Spawn Tree & Peer `@mention` / `#channel` interaction graph |",
@@ -880,6 +888,8 @@ export function createPiSwarmExtension(
     let activeSessionId: string | undefined;
     let sessionStartReason: SessionStartEvent["reason"] | undefined;
     let activeRunSections: Record<string, string> | undefined;
+    let currentTurnIndex = 0;
+    let waitArmedTurnIndex: number | null = null;
 
     const widgetState: SwarmWidgetState = createSwarmWidgetState();
 
@@ -959,19 +969,166 @@ export function createPiSwarmExtension(
       return activeEngine?.getSnapshot() ?? createEmptySnapshot(currentSettings);
     }
 
+    function getCurrentSessionId(ctx?: ExtensionContext): string {
+      const raw = ctx?.sessionManager?.getSessionId?.()?.trim();
+      if (raw) {
+        return raw;
+      }
+      const fromLast = lastCtx?.sessionManager?.getSessionId?.()?.trim();
+      if (fromLast) {
+        return fromLast;
+      }
+      return activeSessionId || "session-unknown";
+    }
+
+    function isCurrentSessionOwner(
+      run: SwarmRunState | null | undefined,
+      ctx?: ExtensionContext,
+    ): boolean {
+      if (!run) {
+        return false;
+      }
+      const sid = getCurrentSessionId(ctx);
+      if (!run.ownerSessionId || run.ownerSessionId === sid) {
+        return true;
+      }
+      return !(run.ownerPid > 0 && isProcessAlive(run.ownerPid));
+    }
+
+    async function releaseRunOwnershipIfHeld(
+      store: ISwarmStore,
+      runId: string | null | undefined,
+      sessionId: string,
+    ): Promise<void> {
+      if (!runId) {
+        return;
+      }
+      try {
+        const run = await store.loadRun(runId);
+        if (run.ownerSessionId === sessionId && run.ownerPid === process.pid) {
+          await store.updateRun(runId, {
+            ownerPid: 0,
+            actor: ORCHESTRATOR_NAME,
+          });
+        }
+      } catch {
+        // best-effort ownership release
+      }
+    }
+
+    async function claimRunOwnershipIfAvailable(
+      store: ISwarmStore,
+      engine: ISwarmEngine,
+      run: SwarmRunState | null | undefined,
+      sessionId: string,
+      ctx: ExtensionContext,
+      allowSamePidFork: boolean,
+    ): Promise<SwarmRunState | null> {
+      if (!run || !isRunningProfileRun(run) || !sessionId) {
+        return run ?? null;
+      }
+      const canClaim =
+        run.ownerPid === 0 ||
+        !isProcessAlive(run.ownerPid) ||
+        (allowSamePidFork && run.ownerPid === process.pid);
+      if (!canClaim) {
+        return run;
+      }
+      if (run.ownerSessionId === sessionId && run.ownerPid === process.pid) {
+        return run;
+      }
+      try {
+        const updated = await store.updateRun(run.id, {
+          ownerSessionId: sessionId,
+          ownerPid: process.pid,
+          actor: ORCHESTRATOR_NAME,
+        });
+        if (engine.getSnapshot().activeRunId === run.id) {
+          await engine.attachRun(run.id, ctx);
+          return engine.getSnapshot().run;
+        }
+        return updated;
+      } catch {
+        return run;
+      }
+    }
+
+    function disarmOrchestratorWait(reason: string): void {
+      waitArmedTurnIndex = null;
+      activeEngine?.clearOrchestratorWait(reason);
+    }
+
+    function isExtensionSlashCommand(text: string): boolean {
+      if (!text.startsWith("/")) {
+        return false;
+      }
+      const body = text.slice(1).trim();
+      if (!body) {
+        return false;
+      }
+      const spaceIdx = body.search(/\s/);
+      const cmdName = (spaceIdx === -1 ? body : body.slice(0, spaceIdx)).toLowerCase();
+      if (cmdName === "swarm" || cmdName === "swarm-direct") {
+        return true;
+      }
+      const cmds = typeof pi.getCommands === "function" ? pi.getCommands() : undefined;
+      if (Array.isArray(cmds)) {
+        return cmds.some(
+          (c) => c.source === "extension" && c.name.toLowerCase() === cmdName,
+        );
+      }
+      return false;
+    }
+
     function isRunningProfileRun(run: SwarmRunState | null | undefined): boolean {
       return Boolean(run && (run.status === "active" || run.status === "paused"));
     }
 
-    function computeDesiredToolProfile(): SwarmToolProfileMode {
+    function computeDesiredToolProfile(ctx?: ExtensionContext): SwarmToolProfileMode {
       if (draftController.isActive()) {
         return "drafting";
       }
       const run = getSnapshotSafe().run;
-      if (isRunningProfileRun(run)) {
+      if (isRunningProfileRun(run) && isCurrentSessionOwner(run, ctx)) {
         return "running";
       }
       return "idle";
+    }
+
+    function syncActiveRunSections(options?: {
+      ctx?: ExtensionContext;
+      includeRecentBoard?: boolean;
+      humanSteeringText?: string;
+      ignoreDraft?: boolean;
+    }): void {
+      if (!activeRunSections) {
+        return;
+      }
+      const draft = options?.ignoreDraft ? null : draftController.getDraft();
+      if (isDraftActive(draft)) {
+        activeRunSections.swarm = buildDraftingSystemOverlay(draft);
+        delete activeRunSections.swarm_state;
+        return;
+      }
+      const snapshot = getSnapshotSafe();
+      if (
+        isRunningProfileRun(snapshot.run) &&
+        isCurrentSessionOwner(snapshot.run, options?.ctx)
+      ) {
+        activeRunSections.swarm = buildOrchestratorStaticSection(snapshot);
+        activeRunSections.swarm_state = buildOrchestratorLiveStateSection(
+          snapshot,
+          {
+            includeRecentBoard: options?.includeRecentBoard ?? false,
+            ...(options?.humanSteeringText
+              ? { humanSteeringText: options.humanSteeringText }
+              : {}),
+          },
+        );
+        return;
+      }
+      delete activeRunSections.swarm;
+      delete activeRunSections.swarm_state;
     }
 
     function syncDraftWidgetState(draft: SwarmDraftState | null): void {
@@ -980,11 +1137,15 @@ export function createPiSwarmExtension(
       widgetState.draftSeed = draft?.seed;
     }
 
-    function refreshUI(ctxOverride?: ExtensionContext): void {
+    function refreshUI(
+      ctxOverride?: ExtensionContext,
+      snapshotOverride?: SwarmSnapshot,
+    ): void {
       const ctx = ctxOverride ?? lastCtx;
       activeWidgetTui?.requestRender();
       if (ctx?.hasUI) {
-        const line = formatStatusLine(getSnapshotSafe(), draftController.isActive());
+        const snapshot = snapshotOverride ?? getSnapshotSafe();
+        const line = formatStatusLine(snapshot, draftController.isActive());
         ctx.ui.setStatus(SWARM_STATUS_KEY, line);
       }
     }
@@ -1302,7 +1463,7 @@ export function createPiSwarmExtension(
           }
         }
 
-        activeEngine?.clearOrchestratorWait("Flushing orchestrator wakeup");
+        disarmOrchestratorWait("Flushing orchestrator wakeup");
         pi.sendMessage(
           {
             customType: SWARM_WAKEUP_CUSTOM_TYPE,
@@ -1325,7 +1486,7 @@ export function createPiSwarmExtension(
             wakeupInFlight = false;
             wakeupSafetyTimer = undefined;
             scheduleWakeupFlush();
-          }, 50);
+          }, 300);
           wakeupSafetyTimer.unref?.();
         }
       } catch (err) {
@@ -1342,9 +1503,11 @@ export function createPiSwarmExtension(
       if (ev.type === "run_finished") {
         // `completeRun` is initiated explicitly by orchestrator or human; never fire an extra LLM turn.
         latestHumanDirection = undefined;
+        waitArmedTurnIndex = null;
         purgePendingWakeupsForRun(ev.runId);
         applySwarmToolProfile(pi, computeDesiredToolProfile());
-        refreshUI();
+        syncActiveRunSections();
+        refreshUI(undefined, ev.snapshot);
         return;
       }
 
@@ -1352,7 +1515,7 @@ export function createPiSwarmExtension(
         applySwarmToolProfile(pi, computeDesiredToolProfile());
       }
 
-      refreshUI();
+      refreshUI(undefined, ev.snapshot);
 
       if (ev.type === "wakeup_needed" || ev.type === "stall_detected") {
         // Only wake while the run is actively executing.
@@ -1510,10 +1673,18 @@ export function createPiSwarmExtension(
     async function rehydrateSessionState(ctx: ExtensionContext): Promise<void> {
       const { store, engine } = await ensureBound(ctx);
       const prevFocused = engine.getSnapshot().activeRunId;
+      const currentSessionId = ctx.sessionManager?.getSessionId?.()?.trim() || "";
 
       latestHumanDirection = undefined;
       const focusedRunId = rehydrateFocusRunId(ctx);
-      if (focusedRunId !== prevFocused) {
+      if (prevFocused && prevFocused !== focusedRunId) {
+        await releaseRunOwnershipIfHeld(
+          store,
+          prevFocused,
+          currentSessionId || getCurrentSessionId(ctx),
+        );
+        purgePendingWakeupsForRun(null);
+      } else if (focusedRunId !== prevFocused) {
         purgePendingWakeupsForRun(null);
       }
       if (focusedRunId) {
@@ -1527,36 +1698,26 @@ export function createPiSwarmExtension(
       }
 
       let snapshot = engine.getSnapshot();
-      const currentSessionId = ctx.sessionManager?.getSessionId?.()?.trim() || "";
-      if (
-        snapshot.run &&
-        isRunningProfileRun(snapshot.run) &&
-        currentSessionId.length > 0 &&
-        (snapshot.run.ownerPid === 0 ||
-          (sessionStartReason === "fork" && snapshot.run.ownerPid === process.pid)) &&
-        (snapshot.run.ownerSessionId !== currentSessionId ||
-          snapshot.run.ownerPid !== process.pid)
-      ) {
-        try {
-          await store.updateRun(snapshot.run.id, {
-            ownerSessionId: currentSessionId,
-            ownerPid: process.pid,
-            actor: ORCHESTRATOR_NAME,
-          });
-          await engine.attachRun(snapshot.run.id, ctx);
-          snapshot = engine.getSnapshot();
-        } catch {
-          // best-effort ownership claim on /fork, /new, /resume
-        }
-      }
+      const allowSamePidFork = sessionStartReason === "fork";
+      await claimRunOwnershipIfAvailable(
+        store,
+        engine,
+        snapshot.run,
+        currentSessionId,
+        ctx,
+        allowSamePidFork,
+      );
       sessionStartReason = undefined;
+      snapshot = engine.getSnapshot();
 
-      const hasFocusedRun = isRunningProfileRun(snapshot.run);
+      const hasFocusedRun =
+        isRunningProfileRun(snapshot.run) && isCurrentSessionOwner(snapshot.run, ctx);
       const draft = draftController.rehydrate(ctx, {
         syncToolProfile: true,
         hasActiveRun: hasFocusedRun,
       });
       syncDraftWidgetState(draft);
+      syncActiveRunSections({ ctx });
       refreshUI(ctx);
     }
 
@@ -1564,6 +1725,8 @@ export function createPiSwarmExtension(
       isShutDown = true;
       latestHumanDirection = undefined;
       activeRunSections = undefined;
+      currentTurnIndex = 0;
+      waitArmedTurnIndex = null;
       pendingWakeups.length = 0;
       wakeupFlushScheduled = false;
       clearWakeupInFlight();
@@ -1618,18 +1781,63 @@ export function createPiSwarmExtension(
       () => ensureBoundSync().worktree,
     );
 
+    const MUTATING_ENGINE_METHODS = new Set<string | symbol>([
+      "setTitle",
+      "updateDirection",
+      "addMembers",
+      "postMessage",
+      "switchModel",
+      "steerMember",
+      "stopMember",
+      "killMember",
+      "mergeMember",
+      "manageChannel",
+      "completeRun",
+      "pause",
+      "resume",
+      "teardown",
+    ]);
+
+    async function assertToolEngineOwner(target: ISwarmEngine): Promise<void> {
+      const run = target.getSnapshot().run;
+      if (run && activeStore) {
+        await assertFocusedRunOwner(
+          activeStore,
+          run.id,
+          lastCtx ?? ({ sessionManager: { getSessionId: () => getCurrentSessionId() } } as unknown as ExtensionContext),
+        );
+      }
+    }
+
     /**
      * Engine proxy passed into the 4 core Swarm tools:
-     * - Restores `"idle"` tool profile immediately after `completeRun` (`swarm{action:"done"}`).
+     * - Preserves `orchestratorWait` across `[..., swarm_wait]` multi-tool batches.
+     * - Enforces live-session ownership on mutating tool calls.
+     * - Deduplicates `readBoard` wakeups precisely and restores `"idle"` profile after `completeRun`.
      */
     const toolEngineProxy: ISwarmEngine = new Proxy({} as ISwarmEngine, {
       get(_obj, prop, receiver) {
         const target = ensureBoundSync().engine;
+        if (prop === "clearOrchestratorWait") {
+          return (reason?: string) => {
+            waitArmedTurnIndex = null;
+            target.clearOrchestratorWait(reason);
+          };
+        }
         if (prop === "completeRun") {
           return async (options: Parameters<ISwarmEngine["completeRun"]>[0]) => {
-            const completed = await target.completeRun(options);
+            if (waitArmedTurnIndex !== null && currentTurnIndex > waitArmedTurnIndex) {
+              disarmOrchestratorWait("Tool completeRun invoked after swarm_wait turn");
+            }
+            await assertToolEngineOwner(target);
+            const completed = await target.completeRun({
+              ...options,
+              sessionId: options.sessionId ?? getCurrentSessionId(lastCtx),
+            });
+            waitArmedTurnIndex = null;
             purgePendingWakeupsForRun(completed.id);
             applySwarmToolProfile(pi, computeDesiredToolProfile());
+            syncActiveRunSections();
             refreshUI();
             return completed;
           };
@@ -1639,6 +1847,7 @@ export function createPiSwarmExtension(
             options: Parameters<ISwarmEngine["parkOrchestratorWait"]>[0],
           ) => {
             const res = await target.parkOrchestratorWait(options);
+            waitArmedTurnIndex = res.parked ? currentTurnIndex : null;
             const activeRunId = target.getSnapshot().activeRunId;
             const seenSeq = res.parked ? options.since : Math.max(options.since, res.head);
             if (activeRunId && Number.isFinite(seenSeq)) {
@@ -1659,26 +1868,49 @@ export function createPiSwarmExtension(
         }
         if (prop === "readBoard") {
           return async (options?: Parameters<ISwarmEngine["readBoard"]>[0]) => {
+            if (waitArmedTurnIndex !== null && currentTurnIndex > waitArmedTurnIndex) {
+              disarmOrchestratorWait("Tool readBoard invoked after swarm_wait turn");
+            }
             const res = await target.readBoard(options);
-            if (!options?.channel && !options?.search && !options?.seqs) {
-              const activeRunId = target.getSnapshot().activeRunId;
-              const maxSeen =
-                res.messages.length > 0
-                  ? Math.max(...res.messages.map((m) => m.seq))
-                  : (options?.since ?? 0) <= res.head
-                    ? res.head
-                    : 0;
-              if (activeRunId && maxSeen > 0) {
-                for (let i = pendingWakeups.length - 1; i >= 0; i--) {
-                  const item = pendingWakeups[i]!;
-                  if (
-                    item.type === "wakeup_needed" &&
-                    item.runId === activeRunId &&
-                    item.seq !== undefined &&
-                    item.seq <= maxSeen
-                  ) {
-                    pendingWakeups.splice(i, 1);
-                  }
+            const activeRunId = target.getSnapshot().activeRunId;
+            if (!activeRunId) {
+              return res;
+            }
+            const returnedSeqs = new Set(res.messages.map((m) => m.seq));
+            const isEmptyCatchUpSince =
+              options?.since !== undefined &&
+              (options.limit === undefined || options.limit > 0) &&
+              (!options.channel || options.channel.trim() === "*") &&
+              !options.search &&
+              !options.seqs &&
+              res.messages.length === 0 &&
+              options.since >= res.head;
+
+            for (let i = pendingWakeups.length - 1; i >= 0; i--) {
+              const item = pendingWakeups[i]!;
+              if (item.type !== "wakeup_needed" || item.runId !== activeRunId) {
+                continue;
+              }
+              if (
+                isEmptyCatchUpSince &&
+                item.seq !== undefined &&
+                item.seq <= options!.since!
+              ) {
+                pendingWakeups.splice(i, 1);
+                continue;
+              }
+              if (returnedSeqs.size > 0) {
+                if (item.messages && item.messages.length > 0) {
+                  item.messages = item.messages.filter(
+                    (m) => !returnedSeqs.has(m.seq),
+                  );
+                }
+                if (
+                  item.seq !== undefined &&
+                  returnedSeqs.has(item.seq) &&
+                  (!item.messages || item.messages.length === 0)
+                ) {
+                  pendingWakeups.splice(i, 1);
                 }
               }
             }
@@ -1686,7 +1918,23 @@ export function createPiSwarmExtension(
           };
         }
         const value = Reflect.get(target, prop, receiver);
-        return typeof value === "function" ? value.bind(target) : value;
+        if (typeof value !== "function") {
+          return value;
+        }
+        if (prop === "getSnapshot" || prop === "subscribe") {
+          return value.bind(target);
+        }
+        return async (...args: unknown[]) => {
+          if (waitArmedTurnIndex !== null && currentTurnIndex > waitArmedTurnIndex) {
+            disarmOrchestratorWait(
+              `Tool "${String(prop)}" invoked after swarm_wait turn`,
+            );
+          }
+          if (MUTATING_ENGINE_METHODS.has(prop)) {
+            await assertToolEngineOwner(target);
+          }
+          return (value as (...a: unknown[]) => unknown).apply(target, args);
+        };
       },
       has(_obj, prop) {
         return prop in ensureBoundSync().engine;
@@ -1702,6 +1950,86 @@ export function createPiSwarmExtension(
     // ------------------------------------------------------------------------
     // Plan Confirmation Callback (`propose_swarm_plan` -> real store/git/engine)
     // ------------------------------------------------------------------------
+    async function spawnInitialMembersForRun(
+      engine: ISwarmEngine,
+      plan: ProposedSwarmPlan,
+      toolCtx: ExtensionContext,
+      existingMembers?: Record<string, SwarmMemberRecord>,
+    ): Promise<{
+      spawnedInitial: SwarmMemberRecord[];
+      failedInitial: Array<{ name: string; error: string }>;
+      firstInitialErr: unknown;
+      attemptedCount: number;
+    }> {
+      const spawnedInitial: SwarmMemberRecord[] = [];
+      const failedInitial: Array<{ name: string; error: string }> = [];
+      let firstInitialErr: unknown;
+      let attemptedCount = 0;
+
+      if (!plan.initialMembers || plan.initialMembers.length === 0) {
+        return { spawnedInitial, failedInitial, firstInitialErr, attemptedCount };
+      }
+
+      const candidates = existingMembers
+        ? plan.initialMembers.filter(
+            (m) => !Object.hasOwn(existingMembers, m.name),
+          )
+        : plan.initialMembers;
+
+      if (candidates.length === 0) {
+        return { spawnedInitial, failedInitial, firstInitialErr, attemptedCount };
+      }
+
+      const customChannels = new Set<string>();
+      for (const memberSpec of candidates) {
+        for (const rawCh of memberSpec.channels ?? []) {
+          const clean = rawCh.trim().replace(/^@#?/, "").toLowerCase();
+          if (clean && clean !== DEFAULT_CHANNEL) {
+            customChannels.add(clean);
+          }
+        }
+      }
+      for (const ch of customChannels) {
+        try {
+          await engine.manageChannel({
+            action: "create",
+            name: ch,
+            callerName: ORCHESTRATOR_NAME,
+            callerRole: "orchestrator",
+          });
+        } catch {
+          // ignore if channel already exists
+        }
+      }
+
+      for (const memberSpec of candidates) {
+        attemptedCount += 1;
+        try {
+          const added = await engine.addMembers({
+            name: memberSpec.name,
+            role: memberSpec.role,
+            brief: memberSpec.brief,
+            workspace: memberSpec.workspace ?? "inherit",
+            channels: memberSpec.channels,
+            callerName: ORCHESTRATOR_NAME,
+            callerRole: "orchestrator",
+            hostContext: toolCtx,
+          });
+          spawnedInitial.push(...added);
+        } catch (err) {
+          if (firstInitialErr === undefined) {
+            firstInitialErr = err;
+          }
+          failedInitial.push({
+            name: memberSpec.name,
+            error: formatError(err),
+          });
+        }
+      }
+
+      return { spawnedInitial, failedInitial, firstInitialErr, attemptedCount };
+    }
+
     async function handlePlanConfirmed(
       plan: ProposedSwarmPlan,
       toolCtx: ExtensionContext,
@@ -1709,7 +2037,7 @@ export function createPiSwarmExtension(
       const { store, worktree, engine } = await ensureBound(toolCtx);
       await reloadSettings(toolCtx.cwd);
 
-      // 1. Apply configured Orchestrator model cleanly before launching the run
+      // 1. Apply configured Orchestrator model cleanly before launching/revising the run
       await applyOrchestratorModel(
         pi,
         toolCtx,
@@ -1717,10 +2045,109 @@ export function createPiSwarmExtension(
         getLazyFallbackModelRuntime,
       );
 
+      const ownerSessionId = getSessionIdSafe(toolCtx);
+      const activeDraft = draftController.getDraft();
+
+      // Tweak mode: revise targetRunId in place
+      if (activeDraft?.mode === "tweak" && activeDraft.targetRunId) {
+        const targetRunId = activeDraft.targetRunId;
+        const existingRun = await store.loadRun(targetRunId);
+        if (isTerminalRunStatus(existingRun.status)) {
+          throw new SwarmProtocolError(
+            "INVALID_INPUT",
+            `Cannot tweak Swarm run "${existingRun.id}" because it is ${existingRun.status}.`,
+          );
+        }
+        await assertFocusedRunOwner(store, existingRun.id, toolCtx);
+
+        const prevFocusedRunId = engine.getSnapshot().activeRunId;
+        if (prevFocusedRunId && prevFocusedRunId !== existingRun.id) {
+          await releaseRunOwnershipIfHeld(store, prevFocusedRunId, ownerSessionId);
+        }
+
+        let revisedRun = await store.updateRun(existingRun.id, {
+          title: plan.title,
+          objective: plan.objective,
+          strategy: plan.strategy,
+          acceptanceCriteria: plan.acceptanceCriteria,
+          maxConcurrency: plan.maxConcurrency,
+          validatorEnabled: plan.validatorEnabled,
+          roleModels: buildRoleModelsFromSettings(currentSettings),
+          ownerSessionId,
+          ownerPid: process.pid,
+          actor: ORCHESTRATOR_NAME,
+        });
+
+        await engine.attachRun(revisedRun.id, toolCtx);
+        if (revisedRun.status === "paused") {
+          revisedRun = await engine.resume(revisedRun.id, toolCtx);
+        }
+
+        const { spawnedInitial, failedInitial, firstInitialErr, attemptedCount } =
+          await spawnInitialMembersForRun(
+            engine,
+            plan,
+            toolCtx,
+            revisedRun.members,
+          );
+
+        if (
+          attemptedCount > 0 &&
+          spawnedInitial.length === 0 &&
+          firstInitialErr !== undefined
+        ) {
+          throw firstInitialErr;
+        }
+
+        await engine.postMessage({
+          from: ORCHESTRATOR_NAME,
+          fromRole: "orchestrator",
+          channel: DEFAULT_CHANNEL,
+          kind: "decision",
+          text: `@all [decision] Revised Swarm plan: "${revisedRun.title}" — ${revisedRun.objective}`,
+        });
+
+        if (prevFocusedRunId !== revisedRun.id) {
+          persistFocusEntry(pi, revisedRun.id, ownerSessionId, "plan_tweaked");
+        }
+
+        const finalRun = engine.getSnapshot().run ?? revisedRun;
+        applySwarmToolProfile(pi, "running");
+        syncActiveRunSections({ ctx: toolCtx, ignoreDraft: true });
+        refreshUI(toolCtx);
+
+        enqueueWakeupItem({
+          type: "kickoff",
+          runId: finalRun.id,
+          summary: `Revised Dynamic Swarm "${finalRun.title}" (${finalRun.id})`,
+          kickoffBody: buildRunKickoffMessage(
+            finalRun,
+            spawnedInitial,
+            failedInitial,
+          ),
+        });
+
+        return finalRun;
+      }
+
       // 2. Ensure git repo is ready and `.pi/swarm/` is excluded via `.git/info/exclude`
       const ready = await worktree.ensureRepoReady(plan.baseBranch);
       const effectiveBaseBranch = ready.baseBranch || plan.baseBranch;
-      const ownerSessionId = getSessionIdSafe(toolCtx);
+
+      // Release previously focused run ownership if switching runs (restored on rollback)
+      const prevFocusedRunId = engine.getSnapshot().activeRunId;
+      let releasedPrevOwnership = false;
+      if (prevFocusedRunId) {
+        const prevRunBefore = await store.loadRun(prevFocusedRunId).catch(() => null);
+        if (
+          prevRunBefore &&
+          prevRunBefore.ownerSessionId === ownerSessionId &&
+          prevRunBefore.ownerPid === process.pid
+        ) {
+          await releaseRunOwnershipIfHeld(store, prevFocusedRunId, ownerSessionId);
+          releasedPrevOwnership = true;
+        }
+      }
 
       // 3. Create v2 Swarm run in store
       const createdRun = await store.createRun({
@@ -1741,68 +2168,34 @@ export function createPiSwarmExtension(
       await engine.startRun(createdRun.id, toolCtx);
 
       // 5. Pre-create any custom channels referenced by initialMembers, then spawn them immediately
-      const spawnedInitial: SwarmMemberRecord[] = [];
-      const failedInitial: Array<{ name: string; error: string }> = [];
-      let firstInitialErr: unknown;
+      const { spawnedInitial, failedInitial, firstInitialErr, attemptedCount } =
+        await spawnInitialMembersForRun(engine, plan, toolCtx);
 
-      if (plan.initialMembers && plan.initialMembers.length > 0) {
-        const customChannels = new Set<string>();
-        for (const memberSpec of plan.initialMembers) {
-          for (const rawCh of memberSpec.channels ?? []) {
-            const clean = rawCh.trim().replace(/^@#?/, "").toLowerCase();
-            if (clean && clean !== DEFAULT_CHANNEL) {
-              customChannels.add(clean);
-            }
+      // If ALL initialMembers failed before any started, roll back run cleanly so draft remains intact
+      if (
+        attemptedCount > 0 &&
+        spawnedInitial.length === 0 &&
+        firstInitialErr !== undefined
+      ) {
+        await engine.attachRun(null, toolCtx).catch(() => {});
+        await store
+          .updateRun(createdRun.id, {
+            status: "abandoned",
+            actor: ORCHESTRATOR_NAME,
+          })
+          .catch(() => {});
+        if (prevFocusedRunId) {
+          if (releasedPrevOwnership) {
+            await store
+              .updateRun(prevFocusedRunId, {
+                ownerPid: process.pid,
+                actor: ORCHESTRATOR_NAME,
+              })
+              .catch(() => {});
           }
+          await engine.attachRun(prevFocusedRunId, toolCtx).catch(() => {});
         }
-        for (const ch of customChannels) {
-          try {
-            await engine.manageChannel({
-              action: "create",
-              name: ch,
-              callerName: ORCHESTRATOR_NAME,
-              callerRole: "orchestrator",
-            });
-          } catch {
-            // ignore if channel already exists
-          }
-        }
-
-        for (const memberSpec of plan.initialMembers) {
-          try {
-            const added = await engine.addMembers({
-              name: memberSpec.name,
-              role: memberSpec.role,
-              brief: memberSpec.brief,
-              workspace: memberSpec.workspace ?? "inherit",
-              channels: memberSpec.channels,
-              callerName: ORCHESTRATOR_NAME,
-              callerRole: "orchestrator",
-              hostContext: toolCtx,
-            });
-            spawnedInitial.push(...added);
-          } catch (err) {
-            if (firstInitialErr === undefined) {
-              firstInitialErr = err;
-            }
-            failedInitial.push({
-              name: memberSpec.name,
-              error: formatError(err),
-            });
-          }
-        }
-
-        // If ALL initialMembers failed before any started, roll back run cleanly so draft remains intact
-        if (spawnedInitial.length === 0 && firstInitialErr !== undefined) {
-          await engine.attachRun(null, toolCtx).catch(() => {});
-          await store
-            .updateRun(createdRun.id, {
-              status: "abandoned",
-              actor: ORCHESTRATOR_NAME,
-            })
-            .catch(() => {});
-          throw firstInitialErr;
-        }
+        throw firstInitialErr;
       }
 
       // 6. Persist session-local focus entry (version: 2) once run is committed
@@ -1812,9 +2205,7 @@ export function createPiSwarmExtension(
 
       // 7. Swap tool profile to `"running"` (4 core tools) & refresh UI
       applySwarmToolProfile(pi, "running");
-      if (activeRunSections) {
-        activeRunSections.swarm = buildOrchestratorPlaybookSection(engine.getSnapshot());
-      }
+      syncActiveRunSections({ ctx: toolCtx, ignoreDraft: true });
       refreshUI(toolCtx);
 
       // 8. Schedule a single clean settled-boundary kickoff so Orchestrator immediately coordinates
@@ -1843,9 +2234,10 @@ export function createPiSwarmExtension(
       onDraftChanged: (draft, toolCtx) => {
         syncDraftWidgetState(draft);
         if (!draft) {
-          applySwarmToolProfile(pi, computeDesiredToolProfile());
+          applySwarmToolProfile(pi, computeDesiredToolProfile(toolCtx));
           scheduleWakeupFlush(toolCtx);
         }
+        syncActiveRunSections({ ctx: toolCtx });
         refreshUI(toolCtx);
       },
     });
@@ -1905,9 +2297,9 @@ export function createPiSwarmExtension(
       cwd: string,
     ): Promise<string> {
       try {
-        const branch = await worktree.getCurrentBranch(cwd);
-        if (branch.trim()) {
-          return branch.trim();
+        const branch = (await worktree.getCurrentBranch(cwd)).trim();
+        if (branch && branch !== "HEAD") {
+          return branch;
         }
       } catch {
         // Repo might not exist yet; default to main until ensureRepoReady runs.
@@ -1946,8 +2338,8 @@ export function createPiSwarmExtension(
       }
 
       syncDraftWidgetState(res.draft);
-      if (!ctx.isIdle() && activeRunSections) {
-        activeRunSections.swarm = buildDraftingSystemOverlay(res.draft);
+      if (!ctx.isIdle()) {
+        syncActiveRunSections({ ctx });
       }
       refreshUI(ctx);
 
@@ -2023,13 +2415,95 @@ export function createPiSwarmExtension(
       }
 
       syncDraftWidgetState(activeDraft);
-      if (!ctx.isIdle() && activeRunSections) {
-        activeRunSections.swarm = buildDraftingSystemOverlay(activeDraft);
+      if (!ctx.isIdle()) {
+        syncActiveRunSections({ ctx });
       }
       refreshUI(ctx);
 
       const directPrompt = buildDirectPlanPrompt(goal, baseBranch, currentSettings);
       pi.sendUserMessage(directPrompt, {
+        deliverAs: ctx.isIdle() ? "followUp" : "steer",
+        expandPromptTemplates: false,
+      });
+    }
+
+    async function handleTweakCommand(
+      rawSeed: string,
+      ctx: ExtensionCommandContext,
+    ): Promise<void> {
+      const { store, engine } = await ensureBound(ctx);
+      await reloadSettings(ctx.cwd);
+
+      const snapshot = engine.getSnapshot();
+      if (!snapshot.run) {
+        const msg = "No focused Swarm run to tweak. Start one with `/swarm <goal>` first.";
+        if (ctx.hasUI) ctx.ui.notify(msg, "info");
+        else emitZeroTurnMessage(ctx, msg);
+        return;
+      }
+      if (isTerminalRunStatus(snapshot.run.status)) {
+        const msg = `Cannot tweak Swarm run \`${snapshot.run.id}\` because it is already ${snapshot.run.status}.`;
+        if (ctx.hasUI) ctx.ui.notify(msg, "warning");
+        else emitZeroTurnMessage(ctx, msg);
+        return;
+      }
+
+      try {
+        await assertFocusedRunOwner(store, snapshot.run.id, ctx);
+      } catch (err) {
+        const msg = `Tweak failed: ${formatError(err)}`;
+        if (ctx.hasUI) ctx.ui.notify(msg, "error");
+        else emitZeroTurnMessage(ctx, msg);
+        return;
+      }
+
+      const run = snapshot.run;
+      await applyOrchestratorModel(
+        pi,
+        ctx,
+        currentSettings,
+        getLazyFallbackModelRuntime,
+      );
+
+      const seed = rawSeed.trim() || run.objective;
+      const res = await draftController.startOrResolve(ctx, {
+        mode: "tweak",
+        seed,
+        targetRunId: run.id,
+        validatorEnabled: run.validatorEnabled,
+        maxConcurrency: run.maxConcurrency,
+        baseBranch: run.baseBranch,
+      });
+
+      if (res.action === "cancelled" || !res.draft) {
+        if (ctx.hasUI) {
+          ctx.ui.notify("Kept current Swarm draft state unchanged.", "info");
+        }
+        return;
+      }
+
+      syncDraftWidgetState(res.draft);
+      if (!ctx.isIdle()) {
+        syncActiveRunSections({ ctx });
+      }
+      refreshUI(ctx);
+
+      const kickoffPrompt = buildDraftingKickoffPrompt(res.draft.seed, "tweak", {
+        baseBranch: res.draft.baseBranch ?? run.baseBranch,
+        maxConcurrency: res.draft.maxConcurrency,
+        validatorEnabled: res.draft.validatorEnabled,
+        roleModels: buildRoleModelsFromSettings(currentSettings),
+        targetRun: {
+          id: run.id,
+          title: run.title,
+          objective: run.objective,
+          baseBranch: run.baseBranch,
+          memberCount: run.memberOrder.length,
+        },
+        existingEcho: res.draft.questionnaireEcho,
+      });
+
+      pi.sendUserMessage(kickoffPrompt, {
         deliverAs: ctx.isIdle() ? "followUp" : "steer",
         expandPromptTemplates: false,
       });
@@ -2128,10 +2602,15 @@ export function createPiSwarmExtension(
       rawArg: string,
       ctx: ExtensionCommandContext,
     ): Promise<void> {
-      const { engine, worktree } = await ensureBound(ctx);
+      const { store, engine, worktree } = await ensureBound(ctx);
       if (!ctx.hasUI) {
         await handleStatusCommand(ctx);
         return;
+      }
+
+      const current = engine.getSnapshot();
+      if (current.activeRunId) {
+        await engine.attachRun(current.activeRunId, ctx).catch(() => {});
       }
 
       const arg = rawArg.trim();
@@ -2161,7 +2640,26 @@ export function createPiSwarmExtension(
         }
       }
 
-      await openSwarmOverlay(ctx, engine, worktree, {
+      const overlayEngine: ISwarmEngine = new Proxy(engine, {
+        get(target, prop) {
+          const value = Reflect.get(target, prop, target);
+          if (typeof value !== "function") {
+            return value;
+          }
+          if (MUTATING_ENGINE_METHODS.has(prop)) {
+            return async (...args: unknown[]) => {
+              const snap = target.getSnapshot();
+              if (snap.run) {
+                await assertFocusedRunOwner(store, snap.run.id, ctx);
+              }
+              return (value as (...a: unknown[]) => unknown).apply(target, args);
+            };
+          }
+          return value.bind(target);
+        },
+      });
+
+      await openSwarmOverlay(ctx, overlayEngine, worktree, {
         onModalEnter,
         onModalExit,
         ...(initialTab ? { initialTab } : {}),
@@ -2193,7 +2691,7 @@ export function createPiSwarmExtension(
       rawArgs: string,
       ctx: ExtensionCommandContext,
     ): Promise<void> {
-      const { engine } = await ensureBound(ctx);
+      const { store, engine } = await ensureBound(ctx);
       const tokens = tokenizeCommandArgs(rawArgs.trim());
 
       if (tokens.length === 0) {
@@ -2279,6 +2777,7 @@ export function createPiSwarmExtension(
       }
 
       try {
+        await assertFocusedRunOwner(store, snapshot.run.id, ctx);
         const switched = await engine.switchModel({
           targetName: target,
           model: modelArg,
@@ -2316,11 +2815,20 @@ export function createPiSwarmExtension(
       rawArgs: string,
       ctx: ExtensionCommandContext,
     ): Promise<void> {
-      const { engine } = await ensureBound(ctx);
+      const { store, engine } = await ensureBound(ctx);
       const snapshot = engine.getSnapshot();
       if (!snapshot.run) {
         const msg = "No focused Swarm run. Start one with `/swarm <goal>` first.";
         if (ctx.hasUI) ctx.ui.notify(msg, "info");
+        else emitZeroTurnMessage(ctx, msg);
+        return;
+      }
+
+      try {
+        await assertFocusedRunOwner(store, snapshot.run.id, ctx);
+      } catch (err) {
+        const msg = `Failed to steer: ${formatError(err)}`;
+        if (ctx.hasUI) ctx.ui.notify(msg, "error");
         else emitZeroTurnMessage(ctx, msg);
         return;
       }
@@ -2379,14 +2887,30 @@ export function createPiSwarmExtension(
       let target = tokens[0]?.replace(/^@/, "").trim() ?? "";
 
       if (!target) {
-        const candidates = getOrderedMembers(snapshot.run).filter(
+        const ordered = getOrderedMembers(snapshot.run).filter(
           (m) => (m.workspace === "share" || m.workspace === "branch") && Boolean(m.branch),
         );
+        const orderIdx = new Map<string, number>();
+        ordered.forEach((m, idx) => orderIdx.set(m.name, idx));
+        const mergeRank = (m: SwarmMemberRecord): number => {
+          if (!m.mergedCommitSha) {
+            return m.state === "waiting" || m.state === "stopped" ? 0 : 1;
+          }
+          return 2;
+        };
+        const candidates = [...ordered].sort((a, b) => {
+          const rDiff = mergeRank(a) - mergeRank(b);
+          if (rDiff !== 0) return rDiff;
+          return (orderIdx.get(a.name) ?? 0) - (orderIdx.get(b.name) ?? 0);
+        });
         if (candidates.length > 0 && ctx.hasUI) {
           const choiceMap = new Map<string, string>();
           const choices: string[] = [];
           for (const entry of candidates) {
-            const label = `@${entry.name} [${entry.state}] (${entry.branch})`;
+            const mergedTag = entry.mergedCommitSha
+              ? ` [merged:${entry.mergedCommitSha.slice(0, 7)}]`
+              : "";
+            const label = `@${entry.name} [${entry.state}] (${entry.branch})${mergedTag}`;
             choiceMap.set(label, entry.name);
             choices.push(label);
           }
@@ -2564,6 +3088,18 @@ export function createPiSwarmExtension(
         if (entered === undefined) {
           return;
         }
+        const latestSnap = engine.getSnapshot();
+        if (
+          latestSnap.run?.id !== snapshot.run.id ||
+          isTerminalRunStatus(latestSnap.run.status)
+        ) {
+          const msg = latestSnap.run
+            ? `Swarm run \`${latestSnap.run.id}\` is already ${latestSnap.run.status}.`
+            : "Focused Swarm run is no longer attached.";
+          if (ctx.hasUI) ctx.ui.notify(msg, "info");
+          else emitZeroTurnMessage(ctx, msg);
+          return;
+        }
         summary = entered.trim() || "Completed by user via /swarm done";
       }
       if (!summary) {
@@ -2580,7 +3116,8 @@ export function createPiSwarmExtension(
           sessionId,
         });
         purgePendingWakeupsForRun(completed.id);
-        applySwarmToolProfile(pi, computeDesiredToolProfile());
+        applySwarmToolProfile(pi, computeDesiredToolProfile(ctx));
+        syncActiveRunSections({ ctx });
         refreshUI(ctx);
         const msg = `Completed Swarm run "${completed.title}" (\`${completed.id}\`): ${summary} — restored \`idle\` tool profile.`;
         if (ctx.hasUI) {
@@ -2653,9 +3190,24 @@ export function createPiSwarmExtension(
       try {
         await assertFocusedRunOwner(store, snapshot.run.id, ctx);
         const updated = await engine.resume(snapshot.run.id, ctx);
-        applySwarmToolProfile(pi, computeDesiredToolProfile());
+        applySwarmToolProfile(pi, computeDesiredToolProfile(ctx));
+        syncActiveRunSections({ ctx });
         refreshUI(ctx);
-        const msg = `Resumed Swarm run \`${updated.id}\`.`;
+        const members = getOrderedMembers(updated);
+        const workingCount = members.filter((m) => m.state === "working").length;
+        const parked = members.filter(
+          (m) => m.state === "waiting" || m.state === "stopped",
+        );
+        let parkedNote = "";
+        if (workingCount === 0 && parked.length > 0) {
+          const preview = parked
+            .slice(0, 8)
+            .map((m) => `\`@${m.name}\` (${m.state})`)
+            .join(", ");
+          const extra = parked.length > 8 ? `, … +${parked.length - 8} more` : "";
+          parkedNote = ` Parked (0 working): ${preview}${extra} — wake via \`post_message\` or \`/swarm steer\`.`;
+        }
+        const msg = `Resumed Swarm run \`${updated.id}\`.${parkedNote}`;
         if (ctx.hasUI) ctx.ui.notify(`Resumed Swarm run ${updated.id}.`, "info");
         emitZeroTurnMessage(ctx, `▶ ${msg}`, { runId: updated.id, status: updated.status });
       } catch (err) {
@@ -2671,11 +3223,13 @@ export function createPiSwarmExtension(
       // 1. If a planning draft is active, cancel the draft and restore normal tool profile
       if (draftController.isActive()) {
         const snapshot = engine.getSnapshot();
-        const nextProfile: SwarmToolProfileMode = isRunningProfileRun(snapshot.run)
-          ? "running"
-          : "idle";
+        const nextProfile: SwarmToolProfileMode =
+          isRunningProfileRun(snapshot.run) && isCurrentSessionOwner(snapshot.run, ctx)
+            ? "running"
+            : "idle";
         draftController.clear(nextProfile);
         syncDraftWidgetState(null);
+        syncActiveRunSections({ ctx });
         refreshUI(ctx);
         const msg = `Cancelled active Swarm draft and restored \`${nextProfile}\` tools.`;
         if (ctx.hasUI) ctx.ui.notify("Cancelled active Swarm draft.", "info");
@@ -2725,9 +3279,23 @@ export function createPiSwarmExtension(
         }
       }
 
-      const cancelReason = "Cancelled by user via /swarm cancel";
       const latestSnap = engine.getSnapshot();
-      const latestRun = latestSnap.run ?? run;
+      if (
+        latestSnap.run?.id !== run.id ||
+        isTerminalRunStatus(latestSnap.run.status)
+      ) {
+        const msg = latestSnap.run
+          ? `Swarm run \`${latestSnap.run.id}\` is already ${latestSnap.run.status}.`
+          : "Focused Swarm run is no longer attached.";
+        if (ctx.hasUI) ctx.ui.notify(msg, "info");
+        else emitZeroTurnMessage(ctx, msg);
+        return;
+      }
+
+      const cancelReason = "Cancelled by user via /swarm cancel";
+      await engine.pause(run.id, cancelReason).catch(() => {});
+      const postPauseSnap = engine.getSnapshot();
+      const latestRun = postPauseSnap.run ?? latestSnap.run ?? run;
       for (const member of getOrderedMembers(latestRun)) {
         if (member.state === "killed") continue;
         try {
@@ -2751,7 +3319,8 @@ export function createPiSwarmExtension(
         }
       }
 
-      if (run.status !== "completed" && run.status !== "abandoned") {
+      const refreshedRun = await store.loadRun(run.id).catch(() => latestRun);
+      if (!isTerminalRunStatus(refreshedRun.status)) {
         await store.updateRun(run.id, {
           status: "abandoned",
           actor: "human",
@@ -2759,9 +3328,12 @@ export function createPiSwarmExtension(
       }
 
       latestHumanDirection = undefined;
+      waitArmedTurnIndex = null;
       purgePendingWakeupsForRun(run.id);
+      await engine.attachRun(null, ctx);
       await engine.attachRun(run.id, ctx);
-      applySwarmToolProfile(pi, computeDesiredToolProfile());
+      applySwarmToolProfile(pi, computeDesiredToolProfile(ctx));
+      syncActiveRunSections({ ctx });
       refreshUI(ctx);
 
       const msg = `Stopped active members and marked Swarm run \`${run.id}\` as abandoned (audit trail, board & worktrees preserved).`;
@@ -2894,10 +3466,13 @@ export function createPiSwarmExtension(
       const sessionId = getSessionIdSafe(ctx);
 
       if (target === "none" || target === "--clear" || target === "off") {
+        const prevFocused = engine.getSnapshot().activeRunId;
+        await releaseRunOwnershipIfHeld(store, prevFocused, sessionId);
         purgePendingWakeupsForRun(null);
         await engine.attachRun(null, ctx);
         persistFocusEntry(pi, null, sessionId, "user_unfocus");
-        applySwarmToolProfile(pi, computeDesiredToolProfile());
+        applySwarmToolProfile(pi, computeDesiredToolProfile(ctx));
+        syncActiveRunSections({ ctx });
         refreshUI(ctx);
         const msg = "Detached session focus from Swarm run.";
         if (ctx.hasUI) ctx.ui.notify(msg, "info");
@@ -2940,10 +3515,13 @@ export function createPiSwarmExtension(
         }
         const mapped = choiceMap.get(picked);
         if (mapped === null) {
+          const prevFocused = engine.getSnapshot().activeRunId;
+          await releaseRunOwnershipIfHeld(store, prevFocused, sessionId);
           purgePendingWakeupsForRun(null);
           await engine.attachRun(null, ctx);
           persistFocusEntry(pi, null, sessionId, "user_unfocus");
-          applySwarmToolProfile(pi, computeDesiredToolProfile());
+          applySwarmToolProfile(pi, computeDesiredToolProfile(ctx));
+          syncActiveRunSections({ ctx });
           refreshUI(ctx);
           ctx.ui.notify("Detached session focus.", "info");
           return;
@@ -2956,12 +3534,23 @@ export function createPiSwarmExtension(
       try {
         await store.loadRun(chosenRunId);
         const prevFocused = engine.getSnapshot().activeRunId;
-        if (prevFocused !== chosenRunId) {
+        if (prevFocused && prevFocused !== chosenRunId) {
+          await releaseRunOwnershipIfHeld(store, prevFocused, sessionId);
           purgePendingWakeupsForRun(null);
         }
-        const snapshot = await engine.attachRun(chosenRunId, ctx);
+        let snapshot = await engine.attachRun(chosenRunId, ctx);
+        await claimRunOwnershipIfAvailable(
+          store,
+          engine,
+          snapshot.run,
+          sessionId,
+          ctx,
+          false,
+        );
+        snapshot = engine.getSnapshot();
         persistFocusEntry(pi, chosenRunId, sessionId, "user_focus");
-        applySwarmToolProfile(pi, computeDesiredToolProfile());
+        applySwarmToolProfile(pi, computeDesiredToolProfile(ctx));
+        syncActiveRunSections({ ctx });
         refreshUI(ctx);
 
         const msg = `Focused Swarm run \`${chosenRunId}\` (${snapshot.run?.status ?? "unknown"}).`;
@@ -3005,11 +3594,17 @@ export function createPiSwarmExtension(
         role: SwarmModelRole,
         label: string,
         currentValue: string | undefined,
+        currentThinking: ThinkingLevel | undefined,
       ): Promise<void> => {
+        const defaultInput = currentValue
+          ? currentThinking
+            ? `${currentValue} ${currentThinking}`
+            : currentValue
+          : "";
         const raw = await withModalGuard(() =>
           ctx.ui.input(
-            `Set ${label} (model ID, or "default" / empty to inherit host)`,
-            currentValue ?? "",
+            `Set ${label} (model ID [thinking], or "default" / empty to inherit host)`,
+            defaultInput,
           ),
         );
         if (raw === undefined) {
@@ -3017,26 +3612,47 @@ export function createPiSwarmExtension(
         }
         const trimmed = raw.trim();
         const isClear = !trimmed || CLEAR_MODEL_TOKENS.has(trimmed.toLowerCase());
+        let modelValue: string | undefined;
+        let thinkingLevel: ThinkingLevel | undefined;
+        if (!isClear) {
+          const parts = trimmed.split(/\s+/).filter(Boolean);
+          if (parts.length >= 2) {
+            const lastRaw = parts[parts.length - 1]!;
+            const lastLower = lastRaw.toLowerCase();
+            if (!isThinkingLevel(lastLower)) {
+              ctx.ui.notify(
+                `Invalid thinking level "${lastRaw}". Valid values: off, minimal, low, medium, high, xhigh, max.`,
+                "error",
+              );
+              return;
+            }
+            modelValue = parts.slice(0, -1).join(" ");
+            thinkingLevel = lastLower;
+          } else {
+            modelValue = trimmed;
+          }
+        }
         await applyRoleModelChange(
           role,
-          isClear ? undefined : trimmed,
-          undefined,
+          modelValue,
+          thinkingLevel,
           ctx,
           { scope: saveScope, updateRun: true },
         );
         ctx.ui.notify(
           isClear
             ? `Cleared ${label} to host default (${saveScope}).`
-            : `Saved ${label} = ${trimmed} (${saveScope}).`,
+            : `Saved ${label} = ${modelValue}${thinkingLevel ? ` (${thinkingLevel})` : ""} (${saveScope}).`,
           "info",
         );
       };
 
       while (true) {
         const items = [
-          `orchestratorModel: ${currentSettings.orchestratorModel ?? "(inherit host)"}`,
-          `workerModel: ${currentSettings.workerModel ?? "(inherit host)"}`,
-          `validatorModel: ${currentSettings.validatorModel ?? "(inherit host)"}`,
+          `orchestratorModel: ${formatModelSettingCell(currentSettings.orchestratorModel, currentSettings.orchestratorThinkingLevel)}`,
+          `workerModel: ${formatModelSettingCell(currentSettings.workerModel, currentSettings.workerThinkingLevel)}`,
+          `validatorModel: ${formatModelSettingCell(currentSettings.validatorModel, currentSettings.validatorThinkingLevel)}`,
+          `fallbackModels: ${currentSettings.fallbackModels.length > 0 ? currentSettings.fallbackModels.join(", ") : "(none)"}`,
           `keepWorkersWarm: ${currentSettings.keepWorkersWarm ? "ON" : "OFF"}`,
           `validatorEnabled: ${currentSettings.validatorEnabled ? "ON" : "OFF"}`,
           `stallWatchdogEnabled: ${currentSettings.stallWatchdogEnabled ? "ON" : "OFF"}`,
@@ -3066,15 +3682,55 @@ export function createPiSwarmExtension(
               "orchestrator",
               "orchestratorModel",
               currentSettings.orchestratorModel,
+              currentSettings.orchestratorThinkingLevel,
             );
           } else if (picked.startsWith("workerModel:")) {
-            await promptRoleModel("worker", "workerModel", currentSettings.workerModel);
+            await promptRoleModel(
+              "worker",
+              "workerModel",
+              currentSettings.workerModel,
+              currentSettings.workerThinkingLevel,
+            );
           } else if (picked.startsWith("validatorModel:")) {
             await promptRoleModel(
               "validator",
               "validatorModel",
               currentSettings.validatorModel,
+              currentSettings.validatorThinkingLevel,
             );
+          } else if (picked.startsWith("fallbackModels:")) {
+            const raw = await withModalGuard(() =>
+              ctx.ui.input(
+                'Set fallbackModels (comma/space-separated model IDs, or "clear" for none)',
+                currentSettings.fallbackModels.join(", "),
+              ),
+            );
+            if (raw !== undefined) {
+              const trimmed = raw.trim();
+              const nextFallbacks =
+                !trimmed || CLEAR_MODEL_TOKENS.has(trimmed.toLowerCase())
+                  ? []
+                  : Array.from(
+                      new Set(
+                        trimmed
+                          .split(/[\s,]+/)
+                          .map((s) => s.trim())
+                          .filter(
+                            (s) =>
+                              s.length > 0 &&
+                              !CLEAR_MODEL_TOKENS.has(s.toLowerCase()),
+                          ),
+                      ),
+                    );
+              await persistPatch({ fallbackModels: nextFallbacks });
+              await syncActiveRunRoleModels(ctx);
+              ctx.ui.notify(
+                nextFallbacks.length > 0
+                  ? `Saved fallbackModels = [${nextFallbacks.join(", ")}] (${saveScope}).`
+                  : `Cleared fallbackModels (${saveScope}).`,
+                "info",
+              );
+            }
           } else if (picked.startsWith("keepWorkersWarm:")) {
             await persistPatch({ keepWorkersWarm: !currentSettings.keepWorkersWarm });
             ctx.ui.notify(
@@ -3253,6 +3909,7 @@ export function createPiSwarmExtension(
       const boardLabel = `Show Board — shared #seq Message Board (#${snapshot.boardHead})`;
       const graphLabel = "Show Graph — Spawn Tree & Peer @mention interaction graph";
       const modelsLabel = "Manage Models — 3-role defaults & live member models";
+      const tweakLabel = "Tweak — revise plan, strategy, or add members interactively";
       const doneLabel = "Complete Swarm (/swarm done) — finish run & restore idle tools";
       const newSwarmLabel = "Start New Swarm — interactive planning interview";
       const focusLabel = "Switch Focused Run — list / attach / detach";
@@ -3266,7 +3923,7 @@ export function createPiSwarmExtension(
         boardLabel,
         graphLabel,
         modelsLabel,
-        ...(showDone ? [pauseOrResumeLabel, doneLabel] : []),
+        ...(showDone ? [tweakLabel, pauseOrResumeLabel, doneLabel] : []),
         newSwarmLabel,
         focusLabel,
         settingsLabel,
@@ -3292,6 +3949,8 @@ export function createPiSwarmExtension(
         await handleGraphCommand(ctx);
       } else if (choice === modelsLabel) {
         await handleModelsCommand(ctx);
+      } else if (choice === tweakLabel) {
+        await handleTweakCommand("", ctx);
       } else if (choice === pauseOrResumeLabel) {
         if (run.status === "paused") {
           await handleResumeCommand(ctx);
@@ -3331,6 +3990,9 @@ export function createPiSwarmExtension(
           return;
         case "direct":
           await startDirectSwarm(parsed.rest, ctx);
+          return;
+        case "tweak":
+          await handleTweakCommand(parsed.rest, ctx);
           return;
         case "status":
           await handleStatusCommand(ctx);
@@ -3660,7 +4322,7 @@ export function createPiSwarmExtension(
     // ------------------------------------------------------------------------
     pi.registerCommand("swarm", {
       description:
-        "Pi Swarm v0.3.6 — Dynamic Antigravity Swarm orchestrator (shared #seq board, non-blocking swarm_wait, warm disk sessions, fork, 3-role models & git worktrees/clones)",
+        "Pi Swarm v0.3.7 — Dynamic Antigravity Swarm orchestrator (shared #seq board, non-blocking swarm_wait, warm disk sessions, fork, 3-role models & git worktrees/clones)",
       getArgumentCompletions: getSwarmCompletions,
       handler: handleSwarmCommand,
     });
@@ -3714,6 +4376,7 @@ export function createPiSwarmExtension(
     });
 
     pi.on("turn_start", (event) => {
+      currentTurnIndex = event.turnIndex;
       if (event.turnIndex > 0) {
         const activeRunId = activeEngine?.getSnapshot().activeRunId;
         if (activeRunId) {
@@ -3724,7 +4387,18 @@ export function createPiSwarmExtension(
             }
           }
         }
-        activeEngine?.clearOrchestratorWait("Turn continued in multi-tool batch");
+        if (
+          waitArmedTurnIndex !== null &&
+          event.turnIndex > waitArmedTurnIndex + 1
+        ) {
+          disarmOrchestratorWait("Turn continued past swarm_wait batch");
+        }
+      }
+    });
+
+    pi.on("message_start", (event) => {
+      if ((event.message as { role?: string } | undefined)?.role === "user") {
+        disarmOrchestratorWait("User message started");
       }
     });
 
@@ -3735,7 +4409,11 @@ export function createPiSwarmExtension(
       const isUserSource =
         event.source === "interactive" || event.source === "rpc";
       const trimmedText = event.text.trim();
-      if (isUserSource && trimmedText.length > 0 && !trimmedText.startsWith("/")) {
+      if (
+        isUserSource &&
+        trimmedText.length > 0 &&
+        !isExtensionSlashCommand(trimmedText)
+      ) {
         if ((ctx ?? lastCtx)?.isIdle()) {
           userPromptPreflight = true;
           if (userPromptPreflightTimer) {
@@ -3744,13 +4422,18 @@ export function createPiSwarmExtension(
           userPromptPreflightTimer = setTimeout(() => {
             userPromptPreflight = false;
             userPromptPreflightTimer = undefined;
-          }, 0);
+            scheduleWakeupFlush();
+          }, 5_000);
           userPromptPreflightTimer.unref?.();
         }
         if (!draftController.isActive() && activeEngine) {
           const snap = activeEngine.getSnapshot();
-          if (snap.run && snap.run.status === "active") {
-            activeEngine.clearOrchestratorWait("User sent interactive direction");
+          if (
+            snap.run &&
+            snap.run.status === "active" &&
+            isCurrentSessionOwner(snap.run, ctx ?? lastCtx)
+          ) {
+            disarmOrchestratorWait("User sent interactive direction");
             latestHumanDirection = {
               text: trimmedText,
               timestamp: new Date().toISOString(),
@@ -3763,18 +4446,55 @@ export function createPiSwarmExtension(
 
     pi.on("before_agent_start", async (event, ctx) => {
       lastCtx = ctx;
+      currentTurnIndex = 0;
+      disarmOrchestratorWait("New agent run started");
       clearWakeupInFlight();
       clearUserPromptPreflight();
       activeRunSections = event.systemPromptOptions?.sections;
 
       const draft = draftController.getDraft() ?? draftController.rehydrate(ctx);
-      let sectionContent: string | undefined;
 
+      if (event.systemPromptOptions?.sections) {
+        if (isDraftActive(draft)) {
+          event.systemPromptOptions.sections.swarm =
+            buildDraftingSystemOverlay(draft);
+          delete event.systemPromptOptions.sections.swarm_state;
+        } else {
+          const snapshot = getSnapshotSafe();
+          if (
+            isRunningProfileRun(snapshot.run) &&
+            isCurrentSessionOwner(snapshot.run, ctx)
+          ) {
+            const steerText =
+              event.messageType === "user" ? latestHumanDirection?.text : undefined;
+            if (event.messageType === "user") {
+              latestHumanDirection = undefined;
+            }
+            event.systemPromptOptions.sections.swarm =
+              buildOrchestratorStaticSection(snapshot);
+            event.systemPromptOptions.sections.swarm_state =
+              buildOrchestratorLiveStateSection(snapshot, {
+                includeRecentBoard: event.messageType === "user",
+                ...(steerText ? { humanSteeringText: steerText } : {}),
+              });
+          } else {
+            delete event.systemPromptOptions.sections.swarm;
+            delete event.systemPromptOptions.sections.swarm_state;
+          }
+        }
+        return undefined;
+      }
+
+      // Fallback for non-standard harnesses without systemPromptOptions.sections
+      let sectionContent: string | undefined;
       if (isDraftActive(draft)) {
         sectionContent = buildDraftingSystemOverlay(draft);
       } else {
         const snapshot = getSnapshotSafe();
-        if (isRunningProfileRun(snapshot.run)) {
+        if (
+          isRunningProfileRun(snapshot.run) &&
+          isCurrentSessionOwner(snapshot.run, ctx)
+        ) {
           const steerText =
             event.messageType === "user" ? latestHumanDirection?.text : undefined;
           if (event.messageType === "user") {
@@ -3786,17 +4506,6 @@ export function createPiSwarmExtension(
         }
       }
 
-      // Prompt-cache-safe tail section injection: NEVER return { systemPrompt }!
-      if (event.systemPromptOptions?.sections) {
-        if (sectionContent) {
-          event.systemPromptOptions.sections.swarm = sectionContent;
-        } else {
-          delete event.systemPromptOptions.sections.swarm;
-        }
-        return undefined;
-      }
-
-      // Fallback for non-standard harnesses without systemPromptOptions.sections
       if (sectionContent) {
         return {
           message: {
@@ -3827,19 +4536,9 @@ export function createPiSwarmExtension(
     pi.on("session_shutdown", async (event, ctx) => {
       const runId = activeEngine?.getSnapshot().activeRunId;
       if (event.reason !== "reload" && activeStore && runId) {
-        try {
-          const run = await activeStore.loadRun(runId);
-          const rawSid = ctx?.sessionManager?.getSessionId?.()?.trim();
-          const currentSid = rawSid || activeSessionId || getSessionIdSafe(ctx);
-          if (run.ownerSessionId === currentSid && run.ownerPid === process.pid) {
-            await activeStore.updateRun(runId, {
-              ownerPid: 0,
-              actor: ORCHESTRATOR_NAME,
-            });
-          }
-        } catch {
-          // best-effort ownership release on session shutdown
-        }
+        const rawSid = ctx?.sessionManager?.getSessionId?.()?.trim();
+        const currentSid = rawSid || activeSessionId || getSessionIdSafe(ctx);
+        await releaseRunOwnershipIfHeld(activeStore, runId, currentSid);
       }
       await disposeRuntime(ctx);
     });

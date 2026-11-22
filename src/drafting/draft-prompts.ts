@@ -110,7 +110,11 @@ export function buildDraftingKickoffPrompt(
   options: DraftingKickoffOptions = {},
 ): string {
   const trimmedSeed = seed.trim();
-  const baseBranch = options.baseBranch?.trim() || "(auto-detect current branch)";
+  const rawBaseBranch = options.baseBranch?.trim();
+  const baseBranch =
+    rawBaseBranch && rawBaseBranch !== "HEAD"
+      ? rawBaseBranch
+      : "(auto-detect current branch)";
   const maxConcurrency =
     options.maxConcurrency ?? DEFAULT_SWARM_SETTINGS.maxConcurrency;
   const validatorEnabled =
@@ -241,15 +245,23 @@ export function buildDirectPlanPrompt(
   baseBranch: string,
   settings: Pick<SwarmSettings, "maxConcurrency" | "validatorEnabled">,
 ): string {
+  const trimmedBranch = baseBranch?.trim();
+  const hasNamedBranch = Boolean(trimmedBranch && trimmedBranch !== "HEAD");
+  const displayBranch = hasNamedBranch
+    ? trimmedBranch!
+    : "(auto-detect current branch)";
+  const baseBranchRule = hasNamedBranch
+    ? `   - Use \`base_branch: "${escapeXml(trimmedBranch!)}"\`, \`max_concurrency: ${settings.maxConcurrency}\`, \`validator_enabled: ${settings.validatorEnabled ? "true" : "false"}\`.`
+    : `   - Omit \`base_branch\` (auto-detect current branch), and use \`max_concurrency: ${settings.maxConcurrency}\`, \`validator_enabled: ${settings.validatorEnabled ? "true" : "false"}\`.`;
   const lines: string[] = [
-    `<swarm_direct_plan base_branch="${escapeXml(baseBranch)}" max_concurrency="${settings.maxConcurrency}" validator_enabled="${settings.validatorEnabled ? "true" : "false"}" auto_confirm="true">`,
+    `<swarm_direct_plan base_branch="${escapeXml(displayBranch)}" max_concurrency="${settings.maxConcurrency}" validator_enabled="${settings.validatorEnabled ? "true" : "false"}" auto_confirm="true">`,
     `<goal>${escapeXml(goal.trim())}</goal>`,
     "<instructions>",
     "Fast-path `pi-swarm` launch (`/swarm direct`) as the **Orchestrator** (`autoConfirm: true`):",
     `1. Skip interactive Q&A — do NOT call \`${SWARM_QUESTION_TOOL}\` or \`${SWARM_QUESTIONNAIRE_TOOL}\`.`,
     "2. Do NOT edit or implement code directly; perform a quick read-only inspection (`ls`, `find`, `grep`, `read`) if needed to ground your dynamic strategy and acceptance criteria in the real repository layout.",
     `3. Immediately call \`${PROPOSE_SWARM_PLAN_TOOL}\` with a **Flexible Dynamic Swarm Plan** (not a rigid pre-locked file-level DAG):`,
-    `   - Use \`base_branch: "${escapeXml(baseBranch)}"\`, \`max_concurrency: ${settings.maxConcurrency}\`, \`validator_enabled: ${settings.validatorEnabled ? "true" : "false"}\`.`,
+    baseBranchRule,
     `   - Provide \`title\`, \`objective\`, phased dynamic \`strategy\`, concrete testable \`acceptance_criteria\`, and optional \`initial_members\` (unique lowercase names matching \`${MEMBER_NAME_PATTERN.source}\`, avoiding ${RESERVED_MEMBER_NAMES.join(", ")}).`,
     `4. Because this draft runs with \`autoConfirm: true\`, calling \`${PROPOSE_SWARM_PLAN_TOOL}\` validates and launches the Dynamic Swarm immediately without a confirmation modal. Do NOT dump the full plan in prose beforehand.`,
     "</instructions>",

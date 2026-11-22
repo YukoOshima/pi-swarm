@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { Stats } from "node:fs";
 import {
   lstat,
   mkdir,
@@ -94,12 +95,23 @@ const DEFAULT_LOCK_RETRY_MS = 20;
 // Pure Protocol Helpers
 // ============================================================================
 
-/** Return true for prototype-polluting keys (`__proto__`, `prototype`, `constructor`, or `Object.prototype` keys). */
+const PROTOTYPE_KEY_SET = new Set([
+  "__proto__",
+  "prototype",
+  "constructor",
+  "tostring",
+  "valueof",
+  "hasownproperty",
+  "isprototypeof",
+  "propertyisenumerable",
+  "tolocalestring",
+]);
+
+/** Return true for prototype-polluting keys (`__proto__`, `prototype`, `constructor`, `Object.prototype` keys, and their lowercase equivalents). */
 export function isPrototypeKey(k: string): boolean {
   return (
-    k === "__proto__" ||
-    k === "prototype" ||
-    k === "constructor" ||
+    PROTOTYPE_KEY_SET.has(k) ||
+    PROTOTYPE_KEY_SET.has(k.toLowerCase()) ||
     k in Object.prototype
   );
 }
@@ -328,21 +340,33 @@ async function assertNoSymlinksWithin(
   }
 }
 
-async function writeFileAtomic(
-  rootDir: string,
+async function assertLeafNotSymlink(targetPath: string): Promise<void> {
+  try {
+    const st = await lstat(targetPath);
+    if (st.isSymbolicLink()) {
+      throw new SwarmProtocolError(
+        "PERMISSION_DENIED",
+        `Refusing to traverse symlink inside project: ${targetPath}`,
+        { path: targetPath },
+      );
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+      return;
+    }
+    throw err;
+  }
+}
+
+async function writeTmpAndRename(
   targetPath: string,
   content: string,
-): Promise<void> {
-  const resolvedTarget = assertWithinRoot(rootDir, targetPath);
-  await assertNoSymlinksWithin(rootDir, resolvedTarget);
-  const dir = path.dirname(resolvedTarget);
-  await mkdir(dir, { recursive: true });
-  await assertNoSymlinksWithin(rootDir, dir);
-
-  const tmpPath = `${resolvedTarget}.tmp.${process.pid}.${randomUUID().slice(0, 8)}`;
+): Promise<Stats> {
+  const tmpPath = `${targetPath}.tmp.${process.pid}.${randomUUID().slice(0, 8)}`;
   try {
     await writeFile(tmpPath, content, { encoding: "utf8", flag: "wx" });
-    await rename(tmpPath, resolvedTarget);
+    await rename(tmpPath, targetPath);
+    return await lstat(targetPath);
   } catch (err) {
     await unlink(tmpPath).catch(() => {});
     throw err;
@@ -561,6 +585,14 @@ interface LockFilePayload {
   createdAt: string;
 }
 
+interface RunStateCacheEntry {
+  ino: number;
+  size: number;
+  mtimeMs: number;
+  state: SwarmRunState;
+  lastRosterBody?: string;
+}
+
 export interface SwarmStoreOptions {
   staleLockMs?: number;
   lockTimeoutMs?: number;
@@ -586,6 +618,9 @@ export class SwarmStore implements ISwarmStore {
 
   /** In-process per-run mutex queues to serialize local async mutations cleanly. */
   private readonly runQueues = new Map<string, Promise<unknown>>();
+
+  /** Stat-validated per-run state.json and ROSTER.md cache. */
+  private readonly stateCache = new Map<string, RunStateCacheEntry>();
 
   constructor(projectRoot: string, options?: SwarmStoreOptions) {
     this.projectRoot = path.resolve(projectRoot);
@@ -825,6 +860,11 @@ export class SwarmStore implements ISwarmStore {
               } catch {
                 tokenMatches = false;
               }
+            } else if (
+              confirmStat.size !== reapStat.size ||
+              confirmStat.mtimeMs !== reapStat.mtimeMs
+            ) {
+              tokenMatches = false;
             }
             if (tokenMatches) {
               await unlink(reapPath).catch(() => {});
@@ -881,17 +921,29 @@ export class SwarmStore implements ISwarmStore {
         return false;
       }
 
-      // Re-verify inode/dev and token right before unlink so a concurrent release+reacquire is never deleted.
+      // Re-verify inode/dev and token (or size/mtime for 0-byte/unparsed locks) right before unlink so a concurrent release+reacquire is never deleted.
       const currentStat = await lstat(lockPath);
       if (currentStat.ino !== st.ino || currentStat.dev !== st.dev) {
         return false;
       }
       if (expectedToken !== undefined) {
-        const currentRaw = await readFile(lockPath, "utf8");
-        const currentInfo = JSON.parse(currentRaw) as Partial<LockFilePayload>;
-        if (currentInfo.token !== expectedToken) {
+        try {
+          const currentRaw = await readFile(lockPath, "utf8");
+          const currentInfo = JSON.parse(currentRaw) as Partial<LockFilePayload>;
+          if (currentInfo.token !== expectedToken) {
+            return false;
+          }
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+            throw err;
+          }
           return false;
         }
+      } else if (
+        currentStat.size !== st.size ||
+        currentStat.mtimeMs !== st.mtimeMs
+      ) {
+        return false;
       }
 
       // Confirm we still hold the .reap lock right before unlinking lockPath.
@@ -962,9 +1014,21 @@ export class SwarmStore implements ISwarmStore {
   }
 
   private async readStateUnlocked(runId: string): Promise<SwarmRunState> {
-    const statePath = this.getStatePath(runId);
+    const safeRunId = validateSafeIdentifier(runId, "runId");
+    const statePath = this.getStatePath(safeRunId);
     await assertNoSymlinksWithin(this.projectRoot, statePath);
     try {
+      const st = await lstat(statePath);
+      const cached = this.stateCache.get(safeRunId);
+      if (
+        cached &&
+        cached.ino === st.ino &&
+        cached.size === st.size &&
+        cached.mtimeMs === st.mtimeMs
+      ) {
+        return structuredClone(cached.state);
+      }
+
       const raw = await readFile(statePath, "utf8");
       const parsed = JSON.parse(raw) as SwarmRunState;
       if (
@@ -972,26 +1036,36 @@ export class SwarmStore implements ISwarmStore {
         typeof parsed !== "object" ||
         typeof parsed.id !== "string"
       ) {
+        this.stateCache.delete(safeRunId);
         throw new SwarmProtocolError(
           "NOT_FOUND",
-          `Corrupted run state for "${runId}"`,
-          { runId },
+          `Corrupted run state for "${safeRunId}"`,
+          { runId: safeRunId },
         );
       }
-      return backfillRunState(parsed);
+      const backfilled = backfillRunState(parsed);
+      this.stateCache.set(safeRunId, {
+        ino: st.ino,
+        size: st.size,
+        mtimeMs: st.mtimeMs,
+        state: structuredClone(backfilled),
+      });
+      return backfilled;
     } catch (err) {
       if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+        this.stateCache.delete(safeRunId);
         throw new SwarmProtocolError(
           "NOT_FOUND",
-          `Swarm run "${runId}" not found`,
-          { runId },
+          `Swarm run "${safeRunId}" not found`,
+          { runId: safeRunId },
         );
       }
       if (err instanceof SyntaxError) {
+        this.stateCache.delete(safeRunId);
         throw new SwarmProtocolError(
           "NOT_FOUND",
-          `Corrupted run state for "${runId}"`,
-          { runId },
+          `Corrupted run state for "${safeRunId}"`,
+          { runId: safeRunId },
         );
       }
       throw err;
@@ -1001,16 +1075,45 @@ export class SwarmStore implements ISwarmStore {
   private async persistStateUnlocked(
     state: SwarmRunState,
   ): Promise<SwarmRunState> {
-    const statePath = this.getStatePath(state.id);
-    const rosterMdPath = this.getRosterMarkdownPath(state.id);
-    const json = `${JSON.stringify(state, null, 2)}\n`;
-    await writeFileAtomic(this.projectRoot, statePath, json);
-    await writeFileAtomic(
+    const runDir = this.getRunDir(state.id);
+    await assertNoSymlinksWithin(this.projectRoot, runDir);
+    await mkdir(runDir, { recursive: true });
+    await assertNoSymlinksWithin(this.projectRoot, runDir);
+
+    const statePath = assertWithinRoot(
       this.projectRoot,
-      rosterMdPath,
-      this.renderRosterMarkdown(state),
+      path.join(runDir, SWARM_STATE_FILE),
     );
-    return structuredClone(state);
+    const rosterMdPath = assertWithinRoot(
+      this.projectRoot,
+      path.join(runDir, SWARM_ROSTER_FILE),
+    );
+    const json = `${JSON.stringify(state, null, 2)}\n`;
+    const rosterBody = this.renderRosterMarkdown(state);
+    const cached = this.stateCache.get(state.id);
+    const shouldWriteRoster = rosterBody !== cached?.lastRosterBody;
+
+    await assertLeafNotSymlink(statePath);
+    if (shouldWriteRoster) {
+      await assertLeafNotSymlink(rosterMdPath);
+    }
+
+    const [stateStat] = await Promise.all([
+      writeTmpAndRename(statePath, json),
+      ...(shouldWriteRoster
+        ? [writeTmpAndRename(rosterMdPath, rosterBody)]
+        : []),
+    ]);
+
+    const cachedState = structuredClone(state);
+    this.stateCache.set(state.id, {
+      ino: stateStat.ino,
+      size: stateStat.size,
+      mtimeMs: stateStat.mtimeMs,
+      state: cachedState,
+      lastRosterBody: rosterBody,
+    });
+    return structuredClone(cachedState);
   }
 
   private checkExpectedRevision(
@@ -1175,39 +1278,48 @@ export class SwarmStore implements ISwarmStore {
       throw err;
     }
 
+    const validEntries = entries.filter(
+      (entry) => SAFE_ID_RE.test(entry) && !entry.includes(".."),
+    );
     const summaries: RunSummary[] = [];
-    for (const entry of entries) {
-      if (!SAFE_ID_RE.test(entry) || entry.includes("..")) {
-        continue;
+    const CONCURRENCY = 8;
+    let cursor = 0;
+
+    const worker = async (): Promise<void> => {
+      while (cursor < validEntries.length) {
+        const entry = validEntries[cursor++];
+        try {
+          const state = await this.readStateUnlocked(entry);
+          const allMembers = Object.values(state.members);
+          const workingCount = allMembers.filter(
+            (m) => m.state === "working",
+          ).length;
+          const waitingCount = allMembers.filter(
+            (m) => m.state === "waiting",
+          ).length;
+          summaries.push({
+            id: state.id,
+            title: state.title,
+            objective: state.objective,
+            baseBranch: state.baseBranch,
+            status: state.status,
+            memberCount: allMembers.length,
+            workingCount,
+            waitingCount,
+            boardHead: state.boardHead,
+            ownerSessionId: state.ownerSessionId,
+            ownerPid: state.ownerPid,
+            createdAt: state.createdAt,
+            updatedAt: state.updatedAt,
+          });
+        } catch {
+          // Ignore non-run or unreadable subdirectories.
+        }
       }
-      try {
-        const state = await this.readStateUnlocked(entry);
-        const allMembers = Object.values(state.members);
-        const workingCount = allMembers.filter(
-          (m) => m.state === "working",
-        ).length;
-        const waitingCount = allMembers.filter(
-          (m) => m.state === "waiting",
-        ).length;
-        summaries.push({
-          id: state.id,
-          title: state.title,
-          objective: state.objective,
-          baseBranch: state.baseBranch,
-          status: state.status,
-          memberCount: allMembers.length,
-          workingCount,
-          waitingCount,
-          boardHead: state.boardHead,
-          ownerSessionId: state.ownerSessionId,
-          ownerPid: state.ownerPid,
-          createdAt: state.createdAt,
-          updatedAt: state.updatedAt,
-        });
-      } catch {
-        // Ignore non-run or unreadable subdirectories.
-      }
-    }
+    };
+
+    const workerCount = Math.min(CONCURRENCY, validEntries.length);
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
 
     summaries.sort((a, b) => {
       const cmp = b.updatedAt.localeCompare(a.updatedAt);

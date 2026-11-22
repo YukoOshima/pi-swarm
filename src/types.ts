@@ -742,6 +742,8 @@ export interface IWorktreeManager {
     sourceWorktreePath: string,
     branch: string,
   ): Promise<boolean>;
+  /** Delete a local git branch if it exists (used for rollback cleanup). */
+  deleteBranch?(branch: string): Promise<boolean>;
   safeTeardown(
     targets: SafeTeardownTarget[],
     options?: { deleteBranches?: boolean; force?: boolean },

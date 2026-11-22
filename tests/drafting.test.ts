@@ -2122,3 +2122,267 @@ describe("v0.3.6 drafting regression fixes", () => {
     assert.equal(harnessDelegated.setActiveToolsCalls.length, callsBeforeCancel);
   });
 });
+
+// ============================================================================
+// 8. v0.3.7 Audit Regression Tests (Detached HEAD, maxConcurrency Cap, Prototype Keys)
+// ============================================================================
+
+describe("v0.3.7 drafting regression fixes", () => {
+  it("rejects base_branch 'HEAD' and '-' prefixes in validateProposedSwarmPlan and ignores draft baseBranch 'HEAD' in resolveBaseBranch", async () => {
+    for (const badBranch of ["HEAD", "  HEAD  ", "-foo", "--orphan"]) {
+      const res = validateProposedSwarmPlan(
+        makeSamplePlanParams({ base_branch: badBranch }),
+      );
+      assert.equal(res.valid, false, `expected ${badBranch} to be rejected`);
+      if (!res.valid) {
+        assert.equal(res.issues[0]?.code, "WRONG_BRANCH");
+        assert.equal(res.issues[0]?.field, "base_branch");
+      }
+    }
+
+    const harness = new MockPiHarness();
+    const confirmedPlans: ProposedSwarmPlan[] = [];
+    const controller = registerDraftingTools(harness.api, {
+      worktree: createMockWorktree({ currentBranch: "develop" }),
+      ui: {
+        askQuestion: async () => ({ cancelled: true, isCustom: false }),
+        askQuestionnaire: async () => ({ cancelled: true, answers: {}, items: [] }),
+        confirmProposal: async (_ctx, plan) => ({
+          action: "confirm",
+          validatorEnabled: plan.validatorEnabled,
+          maxConcurrency: plan.maxConcurrency,
+        }),
+      },
+      getSettings: () => ({ ...DEFAULT_SWARM_SETTINGS }),
+      onPlanConfirmed: async (plan) => {
+        confirmedPlans.push(plan);
+        return createMockRun(plan);
+      },
+    });
+
+    // Draft initialized with detached HEAD -> resolveBaseBranch ignores "HEAD" and detects "develop"
+    controller.start({
+      seed: "Draft with detached HEAD",
+      baseBranch: "HEAD",
+      validatorEnabled: true,
+      maxConcurrency: 4,
+    });
+    const ctx = harness.createContext();
+    const proposeTool = harness.registeredTools.get(PROPOSE_SWARM_PLAN_TOOL);
+    const res = await proposeTool.execute(
+      "tc-draft-head",
+      makeSamplePlanParams(),
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(res.isError, undefined);
+    assert.equal(confirmedPlans[0]?.baseBranch, "develop");
+  });
+
+  it("treats baseBranch 'HEAD' as unset in buildDirectPlanPrompt & buildDraftingKickoffPrompt", () => {
+    const settings: SwarmSettings = {
+      ...DEFAULT_SWARM_SETTINGS,
+      maxConcurrency: 4,
+      validatorEnabled: true,
+    };
+
+    const directHead = buildDirectPlanPrompt("Ship feature", "HEAD", settings);
+    assert.match(directHead, /base_branch="\(auto-detect current branch\)"/);
+    assert.ok(!directHead.includes('base_branch: "HEAD"'));
+    assert.match(directHead, /Omit `base_branch`/);
+
+    const kickoffHead = buildDraftingKickoffPrompt("Ship feature", "swarm", {
+      baseBranch: "HEAD",
+    });
+    assert.match(kickoffHead, /base_branch="\(auto-detect current branch\)"/);
+  });
+
+  it("caps maxConcurrency at 64 across draft-state and propose_swarm_plan", async () => {
+    const harness = new MockPiHarness();
+    const started = startDraft(harness.api, {
+      seed: "Cap concurrency",
+      maxConcurrency: 999,
+    });
+    assert.equal(started.maxConcurrency, 64);
+
+    const updated = updateDraft(harness.api, started, { maxConcurrency: 500 });
+    assert.equal(updated.maxConcurrency, 64);
+
+    const ctx = harness.createContext();
+    assert.equal(rehydrateDraft(ctx)?.maxConcurrency, 64);
+
+    const confirmedPlans: ProposedSwarmPlan[] = [];
+    let callCount = 0;
+    const controller = registerDraftingTools(harness.api, {
+      worktree: createMockWorktree(),
+      ui: {
+        askQuestion: async () => ({ cancelled: true, isCustom: false }),
+        askQuestionnaire: async () => ({ cancelled: true, answers: {}, items: [] }),
+        confirmProposal: async () => {
+          callCount += 1;
+          if (callCount === 1) {
+            return {
+              action: "continue",
+              validatorEnabled: true,
+              maxConcurrency: 500,
+              feedback: "Keep refining",
+            };
+          }
+          return {
+            action: "confirm",
+            validatorEnabled: true,
+            maxConcurrency: 200,
+          };
+        },
+      },
+      getSettings: () => ({ ...DEFAULT_SWARM_SETTINGS }),
+      onPlanConfirmed: async (plan) => {
+        confirmedPlans.push(plan);
+        return createMockRun(plan);
+      },
+    });
+    controller.start({ seed: "Tool cap", maxConcurrency: 128 });
+
+    const proposeTool = harness.registeredTools.get(PROPOSE_SWARM_PLAN_TOOL);
+    const theme = createMockTheme();
+    const rendered = proposeTool
+      .renderCall(makeSamplePlanParams({ max_concurrency: 999 }), theme, {} as any)
+      .render(120)
+      .join("\n");
+    assert.match(rendered, /\*\*Max Concurrency:\*\* 64/);
+
+    const contRes = await proposeTool.execute(
+      "tc-cap-cont",
+      makeSamplePlanParams({ max_concurrency: 999 }),
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(
+      (contRes.details as ProposeSwarmPlanToolDetails).plan?.maxConcurrency,
+      64,
+    );
+    assert.equal(controller.getDraft()?.maxConcurrency, 64);
+
+    const confRes = await proposeTool.execute(
+      "tc-cap-conf",
+      makeSamplePlanParams({ max_concurrency: 999 }),
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(
+      (confRes.details as ProposeSwarmPlanToolDetails).plan?.maxConcurrency,
+      64,
+    );
+    assert.equal(confirmedPlans[0]?.maxConcurrency, 64);
+  });
+
+  it("validates questionnaireEcho shape on rehydrate, strips prototype keys in cloneEcho, and sanitizes prototype question ids", async () => {
+    const harness = new MockPiHarness();
+    const ctx = harness.createContext();
+
+    // Non-object / array questionnaireEcho is rejected on rehydrate
+    for (const badEcho of [[], "bad", 123, null]) {
+      harness.api.appendEntry(SWARM_DRAFT_ENTRY, {
+        version: 2,
+        mode: "swarm",
+        seed: "Bad echo shape",
+        startedAt: new Date().toISOString(),
+        validatorEnabled: true,
+        maxConcurrency: 3,
+        questionnaireEcho: badEcho,
+      });
+      assert.equal(rehydrateDraft(ctx), null);
+    }
+
+    // Prototype keys in questionnaireEcho are stripped in startDraft & updateDraft
+    const protoEcho = JSON.parse(
+      '{"__proto__":"pollute","constructor":"bad","toString":"fn","valid_q":"ok"}',
+    ) as Record<string, string>;
+    const cleanDraft = startDraft(harness.api, {
+      seed: "Clean echo",
+      questionnaireEcho: protoEcho,
+    });
+    assert.deepEqual(cleanDraft.questionnaireEcho, { valid_q: "ok" });
+    assert.equal(Object.hasOwn(cleanDraft.questionnaireEcho!, "constructor"), false);
+
+    // swarm_question & swarm_questionnaire sanitize prototype question IDs and use Object.hasOwn
+    const seenIds: string[] = [];
+    const controller = registerDraftingTools(harness.api, {
+      worktree: createMockWorktree(),
+      ui: {
+        askQuestion: async (_ctx, spec) => {
+          seenIds.push(spec.id);
+          return { cancelled: false, answer: "Answer 1", isCustom: false };
+        },
+        askQuestionnaire: async (_ctx, specs) => {
+          seenIds.push(...specs.map((s) => s.id));
+          return {
+            cancelled: false,
+            answers: {},
+            items: [
+              {
+                id: "toString",
+                question: "Pick one",
+                answer: "Own answer",
+                isCustom: false,
+              },
+            ],
+          };
+        },
+        confirmProposal: async () => ({
+          action: "cancel",
+          validatorEnabled: true,
+          maxConcurrency: 3,
+        }),
+      },
+      getSettings: () => ({ ...DEFAULT_SWARM_SETTINGS }),
+      onPlanConfirmed: async (plan) => createMockRun(plan),
+    });
+    controller.start({ seed: "Proto question ids" });
+
+    const qTool = harness.registeredTools.get(SWARM_QUESTION_TOOL);
+    const qRes = await qTool.execute(
+      "tc-proto-q",
+      qTool.prepareArguments({
+        id: "constructor",
+        question: "Which mode?",
+        options: [{ label: "A" }],
+      }),
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal((qRes.details as SwarmQuestionToolDetails).id, "q_constructor");
+
+    const qnTool = harness.registeredTools.get(SWARM_QUESTIONNAIRE_TOOL);
+    const qnRes = await qnTool.execute(
+      "tc-proto-qn",
+      qnTool.prepareArguments({
+        questions: [
+          {
+            id: "toString",
+            question: "Pick one",
+            options: [{ label: "Own answer" }],
+          },
+          {
+            id: "__proto__",
+            question: "Pick two",
+            options: [{ label: "Safe" }],
+          },
+        ],
+      }),
+      undefined,
+      undefined,
+      ctx,
+    );
+    const qnDetails = qnRes.details as SwarmQuestionnaireToolDetails;
+    assert.deepEqual(seenIds, ["q_constructor", "q_toString", "q___proto__"]);
+    assert.equal(Object.hasOwn(qnDetails.answers, "q_toString"), true);
+    assert.equal(qnDetails.answers.q_toString, "Own answer");
+    assert.equal(controller.getDraft()?.questionnaireEcho?.q_constructor, "Answer 1");
+    assert.equal(controller.getDraft()?.questionnaireEcho?.q_toString, "Own answer");
+  });
+});

@@ -35,6 +35,7 @@ export {
   assertOwnerSession,
   deriveMemberBranch,
   isProcessAlive,
+  isPrototypeKey,
   normalizeRelativeRepoPath,
   validateChannelName,
   validateMemberName,

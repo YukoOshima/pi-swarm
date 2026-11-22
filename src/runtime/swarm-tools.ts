@@ -957,7 +957,10 @@ export function createMemberScopedTools(
           ...msg.mentions.map((m) => `@${m}`),
           ...msg.channelMentions.map((c) => `@#${c}`),
         ];
-        const targetText = targets.length > 0 ? ` (notified: ${targets.join(", ")})` : "";
+        const targetText =
+          targets.length > 0
+            ? ` (notified: ${targets.join(", ")})`
+            : " (no @mention included — no peer was woken)";
         return okResult(`Posted #${msg.seq} to #${msg.channel}${targetText}.`, msg);
       });
     },

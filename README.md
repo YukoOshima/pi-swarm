@@ -1,9 +1,9 @@
-# 🐝 pi-swarm (`v0.3.6`)
+# 🐝 pi-swarm (`v0.3.7`)
 
 **`pi-swarm`** is a **Dynamic Antigravity Swarm** multi-agent orchestration extension for [Pi](https://github.com/earendil-works/pi) (`v1.5.2+`).
 面向 [Pi](https://github.com/earendil-works/pi) (`v1.5.2+`) 的**动态蜂群（Dynamic Antigravity Swarm）多 Agent 协作与编排扩展**。
 
-Instead of locking work into a rigid upfront DAG, `pi-swarm` v0.3.6 pairs **`pi-goal-x`-style upfront clarification** with **Antigravity-Swarm-grade dynamic orchestration**: non-blocking turn-ending `swarm_wait`, instant mid-flight user redirection (`swarm{action:"steer"|"stop"|"title"}`), disk-persisted member sessions (`SessionManager.create`/`open`), hot model switching with auto-resume (including self-switch deferral), Smart LLM Monitor (`@monitor`), true isolated `git clone` for `workspace:"branch"`, and 3-role model routing.
+Instead of locking work into a rigid upfront DAG, `pi-swarm` v0.3.7 pairs **`pi-goal-x`-style upfront clarification** with **Antigravity-Swarm-grade dynamic orchestration**: non-blocking turn-ending `swarm_wait`, instant mid-flight user redirection (`swarm{action:"steer"|"stop"|"title"}`), interactive plan revision (`/swarm tweak`), disk-persisted member sessions (`SessionManager.create`/`open`), hot model switching with auto-resume (including self-switch deferral), Smart LLM Monitor (`@monitor`), true isolated `git clone` for `workspace:"branch"`, and 3-role model routing.
 
 ---
 
@@ -175,6 +175,7 @@ Only **`/swarm`** and **`/swarm-direct`** are registered on Pi.
 | `/swarm <goal>` | Interactive `pi-goal-x` drafting (`orchestratorModel` → Q&A → plan confirm → Dynamic Swarm) | Yes |
 | `/swarm` (bare) | No focused run: start drafting. Focused run: open 0-turn action menu (UI / Status / Board / Graph / Models / Pause-Resume / Done / New / Focus / Settings / Teardown) | No (with run) |
 | `/swarm direct <goal>` <br> `/swarm-direct <goal>` | Fast-path: skip Q&A (`autoConfirm: true`), propose plan and launch Dynamic Swarm immediately | Yes |
+| `/swarm tweak [guidance]` | Revise the focused active/paused Swarm plan, strategy, or spawn additional members interactively | Yes |
 | `/swarm status` | Zero-turn dashboard: 3-role models, channels, roster table, recent board & events | **No** |
 | `/swarm board [limit] [--channel <ch>] [--search <q>]` | Zero-turn shared `#seq` Message Board feed with optional channel & substring filters | **No** |
 | `/swarm graph` | Zero-turn ASCII/Unicode Spawn Tree & Peer `@mention` / `#channel` Interaction Graph | **No** |
@@ -204,10 +205,10 @@ Only **`/swarm`** and **`/swarm-direct`** are registered on Pi.
 ### `/swarm tasks` (`/swarm ui`) 4-Tab Interactive Overlay
 - **`1` / `2` / `3` / `4`** or **`Tab` / `Shift+Tab`**: Switch tabs — **[1] Board** · **[2] Members** · **[3] Graph** · **[4] Search**
 - **`↑` / `↓`** (plus **`j` / `k`** on Board / Graph / Search tabs): Navigate messages or scroll (on Members tab, **`↑` / `↓`** navigates and **`k`** kills the selected member)
-- **Board Tab `[1]`**: **`p`** post a board message (`@mention` / `@#channel`) · **`c`** cycle channel filter (`*` / `#main` / custom channels)
-- **Members Tab `[2]`**: **`w`** wake/message selected member · **`m`** hot-switch model (`waiting` or `stopped` member, keeps full history) · **`x`** human-stop member · **`k`** kill member · **`g`** merge `share`/`branch` worktree · **`d`** toggle member details vs Git diff summary
-- **Graph Tab `[3]`**: Live Spawn Tree & Peer `@mention` / `#channel` Interaction Graph (`buildSwarmGraphLines`)
-- **Search Tab `[4]`**: Live IME substring search across every `#seq` message on the board
+- **Board Tab `[1]`**: **`Enter`** open full scrollable `#seq` post reader (**`↑`/`↓`/`j`/`k`/`PgUp`/`PgDn`** scroll, **`Enter`/`Esc`** back) · **`p`** post a board message (`@mention` / `@#channel`) · **`c`** cycle channel filter (`*` / `#main` / custom channels)
+- **Members Tab `[2]`**: **`w`** wake/message selected member · **`m`** hot-switch model (`waiting` or `stopped` member, keeps full history) · **`x`** human-stop member · **`k`** kill member (opens inline **`[y/Enter]`** confirm / **`[f]`** force dirty toggle / **`[n/Esc]`** cancel) · **`g`** merge `share`/`branch` worktree · **`l`** toggle full `brief` + `logTail` view (**`[`/`]`/`PgUp`/`PgDn`** scroll) · **`d`** toggle member details vs scrollable Git diff summary (**`[`/`]`/`PgUp`/`PgDn`** scroll)
+- **Graph Tab `[3]`**: Live Spawn Tree (with `fork:@from` / `✓merged` badges) & Peer `@mention` / `#channel` Interaction Graph (`buildSwarmGraphLines`)
+- **Search Tab `[4]`**: Live IME substring search across every `#seq` message on the board (**`Enter`** opens full scrollable post reader after finishing query)
 - **`Esc` / `q`**: Close overlay cleanly (unsubscribes engine listener & restores terminal cursor)
 
 ### Plan Confirmation Modal (`propose_swarm_plan`)

@@ -250,12 +250,12 @@ const VALIDATOR_FORBIDDEN_PATTERNS: ReadonlyArray<{ pattern: RegExp; reason: str
     reason: "In-place `perl -i` is blocked in read-only validator sessions.",
   },
   {
-    pattern: /(?:^|(?:[;&|\r\n(]|`|\$\()\s*)(?:rm|rmdir|mv|cp|mkdir|touch|chmod|chown|ln|truncate|dd|install|patch)\b/,
+    pattern: /(?:^|(?:[;&|\r\n]|`|\$\()\s*)(?:\(\s*)*(?:rm|rmdir|mv|cp|mkdir|touch|chmod|chown|ln|truncate|dd|install|patch)\b/,
     reason: "Filesystem mutation commands are blocked in read-only validator sessions.",
   },
   {
     pattern:
-      /\bgit\b(?:\s+-[^\s]+(?:\s+[^\s]+)?)*\s+(?:add|commit|rm|mv|checkout|switch|reset|rebase|merge|cherry-pick|clean|stash|push|pull|fetch|tag|apply|am|restore|worktree)\b/,
+      /\bgit\b(?:\s+-[^\s]+(?:\s+[^\s]+)?)*\s+(?:add|commit|rm|mv|checkout|switch|reset|rebase|merge|cherry-pick|clean|stash|push|pull|fetch|tag|apply|am|restore|worktree)(?=\s|$|[;&|)\r\n`])/,
     reason: "Mutating git subcommands are blocked in read-only validator sessions.",
   },
   {
@@ -268,6 +268,81 @@ const VALIDATOR_FORBIDDEN_PATTERNS: ReadonlyArray<{ pattern: RegExp; reason: str
   },
 ];
 
+function maskQuotedShellLiterals(command: string): string {
+  // Preserve shell-eval invocations (`sh -c`, `bash -c`, `eval`, etc.) unmasked so nested mutations stay blocked.
+  if (/(?:^|[;&|\r\n(]\s*|\s)(?:sh|bash|zsh|dash|ksh|fish|eval)\b/.test(command)) {
+    return command;
+  }
+  let out = "";
+  let i = 0;
+  while (i < command.length) {
+    const ch = command[i]!;
+    if (ch === "\\" && i + 1 < command.length) {
+      out += ch + command[i + 1]!;
+      i += 2;
+      continue;
+    }
+    if (ch === "'") {
+      out += "'";
+      i += 1;
+      while (i < command.length && command[i] !== "'") {
+        i += 1;
+      }
+      if (i < command.length) {
+        out += "'";
+        i += 1;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      out += '"';
+      i += 1;
+      while (i < command.length && command[i] !== '"') {
+        const inner = command[i]!;
+        if (inner === "\\" && i + 1 < command.length) {
+          i += 2;
+          continue;
+        }
+        if (inner === "`") {
+          out += "`";
+          i += 1;
+          while (i < command.length && command[i] !== "`") {
+            out += command[i]!;
+            i += 1;
+          }
+          if (i < command.length) {
+            out += "`";
+            i += 1;
+          }
+          continue;
+        }
+        if (inner === "$" && command[i + 1] === "(") {
+          out += "$(";
+          i += 2;
+          let depth = 1;
+          while (i < command.length && depth > 0) {
+            const sub = command[i]!;
+            if (sub === "(") depth += 1;
+            else if (sub === ")") depth -= 1;
+            out += sub;
+            i += 1;
+          }
+          continue;
+        }
+        i += 1;
+      }
+      if (i < command.length) {
+        out += '"';
+        i += 1;
+      }
+      continue;
+    }
+    out += ch;
+    i += 1;
+  }
+  return out;
+}
+
 /**
  * Guard for bash commands executed by an independent read-only Validator.
  * Rejects file writes, redirects, mutating git commands, and package mutations
@@ -278,8 +353,9 @@ export function isReadOnlyValidationCommand(command: string): CommandGuardResult
   if (!trimmed) {
     return { allowed: true };
   }
+  const normalized = maskQuotedShellLiterals(trimmed);
   for (const rule of VALIDATOR_FORBIDDEN_PATTERNS) {
-    if (rule.pattern.test(trimmed)) {
+    if (rule.pattern.test(normalized)) {
       return { allowed: false, reason: rule.reason };
     }
   }
@@ -307,7 +383,7 @@ export function isForbiddenWorkerBashCommand(command: string, baseBranch = ""): 
     };
   }
 
-  if (/\bgit\b(?:\s+-[^\s]+(?:\s+[^\s]+)?)*\s+(?:merge|push|worktree)\b/.test(trimmed)) {
+  if (/\bgit\b(?:\s+-[^\s]+(?:\s+[^\s]+)?)*\s+(?:merge|push|worktree)(?=\s|$|[;&|)\r\n`])/.test(trimmed)) {
     return {
       allowed: false,
       reason:
@@ -574,6 +650,18 @@ function seedMessagesIntoSessionManager(
             false,
           );
         }
+        continue;
+      }
+      if (
+        rec.role === "custom" &&
+        typeof (sessionManager as any).appendCustomMessageEntry === "function"
+      ) {
+        sessionManager.appendCustomMessageEntry(
+          String(rec.customType ?? "custom"),
+          rec.content as any,
+          Boolean(rec.display),
+          rec.details,
+        );
         continue;
       }
       sessionManager.appendMessage(
@@ -897,15 +985,26 @@ export class InProcessPiTransport implements ISwarmTransport {
     const initialSessionManager = await openOrCreateMemberSessionManager(request);
     let currentSessionFile: string | undefined =
       initialSessionManager.getSessionFile() ?? request.sessionFile;
-    let cachedMessages: AgentMessage[] = request.seedMessages
-      ? sanitizeForkSeedMessages(request.seedMessages)
-      : [];
+    const initialMessages = extractSessionMessages(initialSessionManager);
+    let cachedMessages: AgentMessage[] =
+      initialMessages.length > 0
+        ? initialMessages
+        : request.seedMessages
+          ? sanitizeForkSeedMessages(request.seedMessages)
+          : [];
 
     let promptActive = false;
     let endTurnRequested = false;
     let switchingModel = false;
     let killed = false;
     let sessionBaselineTokens = 0;
+    let sessionBaselineBreakdown: TokenUsage = {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      total: 0,
+    };
     let sessionBaselineCost = 0;
     const isKilled = (): boolean => killed;
     let abortedByCaller = false;
@@ -990,15 +1089,28 @@ export class InProcessPiTransport implements ISwarmTransport {
       }
       try {
         const stats = activeSession.getSessionStats();
+        const deltaInput = Math.max(0, (stats.tokens.input ?? 0) - sessionBaselineBreakdown.input);
+        const deltaOutput = Math.max(
+          0,
+          (stats.tokens.output ?? 0) - sessionBaselineBreakdown.output,
+        );
+        const deltaCacheRead = Math.max(
+          0,
+          (stats.tokens.cacheRead ?? 0) - sessionBaselineBreakdown.cacheRead,
+        );
+        const deltaCacheWrite = Math.max(
+          0,
+          (stats.tokens.cacheWrite ?? 0) - sessionBaselineBreakdown.cacheWrite,
+        );
         const deltaTokens = Math.max(0, stats.tokens.total - sessionBaselineTokens);
         const deltaCost = Math.max(0, stats.cost - sessionBaselineCost);
         return {
           tokens: deltaTokens,
           breakdown: {
-            input: stats.tokens.input,
-            output: stats.tokens.output,
-            cacheRead: stats.tokens.cacheRead,
-            cacheWrite: stats.tokens.cacheWrite,
+            input: deltaInput,
+            output: deltaOutput,
+            cacheRead: deltaCacheRead,
+            cacheWrite: deltaCacheWrite,
             total: deltaTokens,
           },
           cost: deltaCost,
@@ -1156,9 +1268,23 @@ export class InProcessPiTransport implements ISwarmTransport {
           try {
             const baseline = session.getSessionStats();
             sessionBaselineTokens = Math.max(0, baseline.tokens.total);
+            sessionBaselineBreakdown = {
+              input: Math.max(0, baseline.tokens.input ?? 0),
+              output: Math.max(0, baseline.tokens.output ?? 0),
+              cacheRead: Math.max(0, baseline.tokens.cacheRead ?? 0),
+              cacheWrite: Math.max(0, baseline.tokens.cacheWrite ?? 0),
+              total: Math.max(0, baseline.tokens.total ?? 0),
+            };
             sessionBaselineCost = Math.max(0, baseline.cost);
           } catch {
             sessionBaselineTokens = 0;
+            sessionBaselineBreakdown = {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              total: 0,
+            };
             sessionBaselineCost = 0;
           }
 

@@ -2414,3 +2414,331 @@ describe("v0.3.6 store, board, ledger, settings & worktree regression fixes", ()
     );
   });
 });
+
+// ============================================================================
+// 7. v0.3.7 Regression Tests (Monorepo Subdir, Fast Clone, Tail Caches, Locks, Backoff)
+// ============================================================================
+
+describe("v0.3.7 store, board, ledger, settings & worktree regression fixes", () => {
+  it("rejects prototype-key channels in SwarmBoard, performs O(1) incremental tail reads on board & ledger, and handles concurrent size mismatches", async () => {
+    const tmp = await makeTempDir("pi-swarm-v037-tail-");
+    const board = new SwarmBoard(tmp);
+    const runId = "run-tail";
+
+    // Prototype key channel rejected in SwarmBoard.post
+    for (const protoCh of ["constructor", "toString", "__proto__"]) {
+      await assert.rejects(
+        () =>
+          board.post(runId, {
+            from: "orchestrator",
+            fromRole: "orchestrator",
+            channel: protoCh,
+            text: "should fail",
+          }),
+        (err) => assertProtocolCode(err, "INVALID_CHANNEL"),
+      );
+    }
+
+    // Populate board + warm cache
+    await board.post(runId, {
+      from: "orchestrator",
+      fromRole: "orchestrator",
+      text: "msg 1 (UTF-8: 测试)",
+    });
+    const r1 = await board.read(runId);
+    assert.equal(r1.head, 1);
+
+    // External append (same inode, larger size, prior endsWithNewline === true) -> incremental tail read
+    const boardPath = board.getBoardPath(runId);
+    const ext2: BoardMessage = {
+      seq: 2,
+      runId,
+      channel: "main",
+      from: "worker-1",
+      fromRole: "worker",
+      text: "external tail msg 测试 🚀",
+      mentions: [],
+      channelMentions: [],
+      kind: "update",
+      timestamp: new Date().toISOString(),
+    };
+    const { appendFile } = await import("node:fs/promises");
+    await appendFile(boardPath, `${JSON.stringify(ext2)}\n`, "utf8");
+    const r2 = await board.read(runId);
+    assert.equal(r2.head, 2);
+    assert.equal(r2.messages.length, 2);
+    assert.equal(r2.messages[1]?.text, "external tail msg 测试 🚀");
+
+    // Partial trailing line -> incremental tail read preserves valid messages & sets endsWithNewline=false; next post adds leading "\n"
+    await appendFile(boardPath, '{"seq":3,"partial":', "utf8");
+    const rPartial = await board.read(runId);
+    assert.equal(rPartial.head, 2);
+    const m3 = await board.post(runId, {
+      from: "worker-1",
+      fromRole: "worker",
+      text: "recovered after partial",
+    });
+    assert.equal(m3.seq, 3);
+    assert.equal((await board.read(runId)).messages.length, 3);
+
+    // SwarmLedger incremental tail read + O(1) readRecent
+    const eventsPath = path.join(tmp, SWARM_DIR, SWARM_RUNS_DIR, runId, SWARM_EVENTS_FILE);
+    const ledger = new SwarmLedger(eventsPath);
+    const e1 = await ledger.append({
+      runId,
+      type: "run_created",
+      summary: "Created run",
+    });
+    assert.equal(e1.seq, 1);
+    assert.equal((await ledger.readRecent(10)).length, 1);
+
+    const extEvt: SwarmEvent = {
+      id: "evt_ext_2",
+      seq: 2,
+      runId,
+      type: "board_posted",
+      timestamp: new Date().toISOString(),
+      summary: "External ledger event 测试",
+    };
+    await appendFile(eventsPath, `${JSON.stringify(extEvt)}\n`, "utf8");
+    const recent2 = await ledger.readRecent(1);
+    assert.equal(recent2.length, 1);
+    assert.equal(recent2[0]?.seq, 2);
+    assert.equal(recent2[0]?.summary, "External ledger event 测试");
+
+    const e3 = await ledger.append({
+      runId,
+      type: "run_completed",
+      summary: "Completed",
+    });
+    assert.equal(e3.seq, 3);
+    assert.equal((await ledger.readAll()).length, 3);
+  });
+
+  it("caches SwarmStore state, guards 0-byte lock recovery TOCTOU, parallelizes listRuns, and reconciles sibling backoff bounds", async () => {
+    const tmp = await makeTempDir("pi-swarm-v037-store-");
+    const store = new SwarmStore(tmp, {
+      staleLockMs: 500,
+      lockTimeoutMs: 200,
+      lockRetryMs: 10,
+    });
+
+    // Create 10 runs to exercise bounded-concurrency (8) listRuns
+    for (let i = 1; i <= 10; i++) {
+      await store.createRun({
+        id: `run-${String(i).padStart(2, "0")}`,
+        title: `Run ${i}`,
+        objective: `Objective ${i}`,
+        baseBranch: "main",
+        ownerSessionId: "sess-1",
+      });
+    }
+    const runs = await store.listRuns();
+    assert.equal(runs.length, 10);
+
+    // stateCache defensive clone: mutating loaded state does not pollute subsequent loadRun
+    const loaded1 = await store.loadRun("run-01");
+    loaded1.title = "MUTATED";
+    const loaded2 = await store.loadRun("run-01");
+    assert.equal(loaded2.title, "Run 1");
+
+    // 0-byte lock recovery still recovers stale unchanged 0-byte lock
+    const lockPath = path.join(tmp, SWARM_DIR, SWARM_LOCKS_DIR, "run-01.lock");
+    await writeFile(lockPath, "", "utf8");
+    const past = new Date(Date.now() - 5_000);
+    await utimes(lockPath, past, past);
+    const updated = await store.updateRun("run-01", { title: "Run 1 Updated" });
+    assert.equal(updated.title, "Run 1 Updated");
+    assert.equal(await exists(lockPath), false);
+
+    // 0-byte lock TOCTOU guard: if size/mtime changes on same inode, tryRecoverStaleLock returns false and does not unlink
+    await writeFile(lockPath, "", "utf8");
+    await utimes(lockPath, past, past);
+    const stBefore = await lstat(lockPath);
+    // Simulate concurrent writer populating the lock file right after initial stat
+    await writeFile(
+      lockPath,
+      JSON.stringify({
+        pid: process.pid,
+        token: "live-sibling",
+        hostname: os.hostname(),
+        createdAt: new Date().toISOString(),
+      }),
+      "utf8",
+    );
+    const stAfter = await lstat(lockPath);
+    assert.equal(stBefore.ino, stAfter.ino);
+    assert.notEqual(stBefore.size, stAfter.size);
+    // Active live lock is NOT recovered and updateRun times out cleanly with REVISION_CONFLICT
+    await assert.rejects(
+      () => store.updateRun("run-01", { title: "Should Wait" }),
+      (err) => assertProtocolCode(err, "REVISION_CONFLICT"),
+    );
+    await rm(lockPath, { force: true });
+
+    // saveSwarmSettings sibling backoff reconciliation (both directions)
+    const globalDir = path.join(tmp, "global-agent");
+    const projectRoot = path.join(tmp, "proj-backoff");
+    await mkdir(globalDir, { recursive: true });
+    await mkdir(projectRoot, { recursive: true });
+
+    await saveSwarmSettings(
+      "project",
+      { rateLimitBaseBackoffMs: 10_000, rateLimitMaxBackoffMs: 30_000 },
+      { globalDir, projectRoot },
+    );
+    // Patching only max below existing base lowers base to match
+    const lowered = await saveSwarmSettings(
+      "project",
+      { rateLimitMaxBackoffMs: 2_000 },
+      { globalDir, projectRoot },
+    );
+    assert.equal(lowered.rateLimitBaseBackoffMs, 2_000);
+    assert.equal(lowered.rateLimitMaxBackoffMs, 2_000);
+
+    // Patching only base above existing max raises max to match
+    const raised = await saveSwarmSettings(
+      "project",
+      { rateLimitBaseBackoffMs: 15_000 },
+      { globalDir, projectRoot },
+    );
+    assert.equal(raised.rateLimitBaseBackoffMs, 15_000);
+    assert.equal(raised.rateLimitMaxBackoffMs, 15_000);
+  });
+
+  it("supports monorepo subdirectories, UTF-8/CJK filenames, hardlinked fast clones, deleteBranch, live diff, and worktree edge cases", async () => {
+    const monorepoRoot = await makeTempDir("pi-swarm-v037-monorepo-");
+    const rootMgr = new WorktreeManager(monorepoRoot);
+    await rootMgr.ensureRepoReady("main");
+    await commitFile(monorepoRoot, "packages/app/README.md", "# App\n", "seed app");
+
+    // Monorepo subdirectory WorktreeManager
+    const subRoot = path.join(monorepoRoot, "packages", "app");
+    const subMgr = new WorktreeManager(subRoot);
+    const subReady = await subMgr.ensureRepoReady("main");
+    assert.equal(subReady.baseBranch, "main");
+
+    // info/exclude contains BOTH .pi/swarm/ and **/.pi/swarm/
+    const excludeContent = await readFile(
+      path.join(monorepoRoot, ".git", "info", "exclude"),
+      "utf8",
+    );
+    assert.match(excludeContent, /^\.pi\/swarm\/$/m);
+    assert.match(excludeContent, /^\*\*\/\.pi\/swarm\/$/m);
+
+    // Creating .pi/swarm/ inside packages/app does NOT trigger DIRTY_BASE
+    const subSwarmFile = path.join(subRoot, SWARM_DIR, "runs", "r1", "state.json");
+    await mkdir(path.dirname(subSwarmFile), { recursive: true });
+    await writeFile(subSwarmFile, "{}\n", "utf8");
+    const baseCheck = await subMgr.isBaseCleanOnBranch("main");
+    assert.equal(baseCheck.ok, true);
+    assert.equal(baseCheck.dirty, false);
+
+    // mode: "branch" inside monorepo subdir clones from topLevel cleanly (no --no-hardlinks)
+    const cloneDir = path.join(subRoot, SWARM_DIR, "worktrees", "run-m", "wt-cloner");
+    const cloneBranch = "swarm/run-m/cloner";
+    await subMgr.createWorktree({
+      branch: cloneBranch,
+      baseBranch: "main",
+      worktreePath: cloneDir,
+      mode: "branch",
+    });
+
+    // UTF-8 / CJK filenames are not octal-quoted in getChangedFiles & getDiffSummary
+    const cjkRelPath = "packages/app/测试文件.ts";
+    await commitFile(cloneDir, cjkRelPath, "export const x = 1;\n", "cjk commit");
+    // Add live uncommitted staged + unstaged edits on top of committed change
+    await writeFile(
+      path.join(cloneDir, "packages/app/README.md"),
+      "# App\nlive unstaged edit\n",
+      "utf8",
+    );
+    await writeFile(path.join(cloneDir, cjkRelPath), "export const x = 2;\n", "utf8");
+    await git(cloneDir, ["add", cjkRelPath]);
+
+    const liveDiff = await subMgr.getDiffSummary("main", cloneBranch, {
+      cwd: cloneDir,
+    });
+    assert.equal(liveDiff.commitsAhead, 1);
+    assert.ok(liveDiff.changedFiles.includes(cjkRelPath));
+    assert.ok(liveDiff.changedFiles.includes("packages/app/README.md"));
+    assert.match(liveDiff.diff, /live unstaged edit/);
+    assert.match(liveDiff.diff, /export const x = 2;/);
+
+    // Non-empty directory without .git is treated as dirty; removeWorktree throws DIRTY_WORKTREE for both share & branch
+    await assert.rejects(
+      () => subMgr.removeWorktree(cloneDir, { force: false }),
+      (err) => assertProtocolCode(err, "DIRTY_WORKTREE"),
+    );
+    await subMgr.removeWorktree(cloneDir, { force: true });
+    assert.equal(await exists(cloneDir), false);
+    // Parent <runId> directory cleaned up best-effort when empty
+    assert.equal(await exists(path.dirname(cloneDir)), false);
+
+    // No-op mergeBranch returns strategy: "noop" and changedFiles: []
+    await git(monorepoRoot, ["branch", "swarm/run-m/noop", "main"]);
+    const noopRes = await subMgr.mergeBranch({
+      baseBranch: "main",
+      branch: "swarm/run-m/noop",
+    });
+    assert.equal(noopRes.strategy, "noop");
+    assert.deepEqual(noopRes.changedFiles, []);
+    assert.equal(await subMgr.deleteBranch("swarm/run-m/noop"), true);
+    assert.equal(await subMgr.deleteBranch("swarm/run-m/noop"), false);
+
+    // Broken dir without .git: empty -> false, non-empty -> true
+    const brokenNonEmpty = path.join(subRoot, SWARM_DIR, "worktrees", "run-b", "wt-broken");
+    await mkdir(brokenNonEmpty, { recursive: true });
+    assert.equal(await subMgr.isWorktreeDirty(brokenNonEmpty), false);
+    await writeFile(path.join(brokenNonEmpty, "uncommitted.txt"), "keep me\n", "utf8");
+    assert.equal(await subMgr.isWorktreeDirty(brokenNonEmpty), true);
+
+    // createWorktree(mode: "branch", reuseExistingBranch: true) refuses to wipe non-empty non-clone dir
+    await assert.rejects(
+      () =>
+        subMgr.createWorktree({
+          branch: "swarm/run-b/broken",
+          baseBranch: "main",
+          worktreePath: brokenNonEmpty,
+          mode: "branch",
+          reuseExistingBranch: true,
+        }),
+      (err) => assertProtocolCode(err, "DIRTY_WORKTREE"),
+    );
+    await rm(path.join(brokenNonEmpty, "uncommitted.txt"));
+
+    // createWorktree(mode: "share") cleans up leftover empty directory before git worktree add
+    const shareRes = await subMgr.createWorktree({
+      branch: "swarm/run-b/broken",
+      baseBranch: "main",
+      worktreePath: brokenNonEmpty,
+      mode: "share",
+    });
+    assert.equal(shareRes.branch, "swarm/run-b/broken");
+    await writeFile(path.join(brokenNonEmpty, "dirty-share.txt"), "dirty\n", "utf8");
+    await assert.rejects(
+      () => subMgr.removeWorktree(brokenNonEmpty, { force: false }),
+      (err) => assertProtocolCode(err, "DIRTY_WORKTREE"),
+    );
+
+    // safeTeardown(force: true) catches fetchBranchFromClone errors on broken clone
+    const brokenClone = path.join(subRoot, SWARM_DIR, "worktrees", "run-b", "wt-broken-clone");
+    await mkdir(path.join(brokenClone, ".git"), { recursive: true });
+    const tdForceBroken = await subMgr.safeTeardown(
+      [
+        {
+          memberName: "broken-clone",
+          worktreePath: brokenClone,
+          branch: "swarm/run-b/broken-clone",
+          hasActiveAgent: false,
+        },
+      ],
+      { deleteBranches: false, force: true },
+    );
+    assert.equal(tdForceBroken.removed.length, 1);
+    assert.equal(tdForceBroken.errors.length, 0);
+
+    await subMgr.removeWorktree(brokenNonEmpty, { force: true });
+    await subMgr.deleteBranch("swarm/run-b/broken");
+  });
+});

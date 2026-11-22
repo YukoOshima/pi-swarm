@@ -9,8 +9,10 @@ import {
 } from "../constants.js";
 import type {
   BoardMessage,
+  SwarmChannelRecord,
   SwarmMemberRecord,
   SwarmRoleModelConfig,
+  SwarmRoleModels,
   SwarmRunState,
   SwarmSnapshot,
 } from "../types.js";
@@ -94,6 +96,205 @@ export interface OrchestratorPlaybookOptions {
   humanSteeringText?: string;
 }
 
+export interface OrchestratorLiveStateOptions {
+  includeRecentBoard?: boolean;
+  humanSteeringText?: string;
+}
+
+function buildOrchestratorPlaybookCore(validatorEnabled: boolean): string {
+  return [
+    "# Pi Swarm Orchestrator Playbook (Antigravity Swarm)",
+    "",
+    "## 1. Do Not Do the Technical Work Yourself",
+    `- Delegate ALL technical work (codebase research, scaffolding, coding, integration, builds/tests, verification) to named swarm members via \`${SWARM_TOOL}{action:"add"}\`.`,
+    `- Your job is orchestration: read \`#seq\` board reports, judge quality and completeness, decide the next phase, merge isolated worktrees/clones (\`${SWARM_TOOL}{action:"merge"}\`), retire finished workers (\`${SWARM_TOOL}{action:"kill"}\`), and adapt seamlessly whenever the user redirects you.`,
+    "",
+    "## 2. Dynamic Phased Collaboration & Mid-Flight User Redirection",
+    "- Adapt wave-by-wave instead of locking into a rigid upfront DAG:",
+    "  1. **Discovery**: Spawn read-only researchers/scouts first when unknowns exist → inspect their `#seq` reports.",
+    "  2. **Contract / Scaffold**: Spawn a contract/scaffold worker when shared interfaces must settle before fan-out → inspect its `#seq`.",
+    "  3. **Parallel Execution**: Spawn disjoint named authors in parallel (`workspace:\"share\"` for shared git worktrees when multiple authors edit/build simultaneously; `workspace:\"branch\"` for fully isolated git clones; `workspace:\"inherit\"` for read-only scouts; use `n` or `tasks[]` for sharded slices).",
+    ...(validatorEnabled
+      ? [
+          "  4. **Independent Read-Only Validation**: Spawn independent `role:\"validator\"` members (~1 validator per 2–4 authors) to audit code, diffs, tests, and runtime behavior. NEVER let authors self-certify!",
+          "  5. **Peer-to-Peer Bug Closure**: Let `@validator` and `@author` resolve defects directly on the board (`@author` <-> `@validator`) without waking `@orchestrator` on intermediate bounces.",
+          `  6. **Land & Complete**: Merge \`share\`/\`branch\` worktrees via \`${SWARM_TOOL}{action:"merge"}\`, kill finished members via \`${SWARM_TOOL}{action:"kill"}\`, and close the run cleanly via \`${SWARM_TOOL}{action:"done", summary}\`.`,
+        ]
+      : [
+          `  4. **Land & Complete**: Merge \`share\`/\`branch\` worktrees via \`${SWARM_TOOL}{action:"merge"}\`, kill finished members via \`${SWARM_TOOL}{action:"kill"}\`, and close the run cleanly via \`${SWARM_TOOL}{action:"done", summary}\`.`,
+        ]),
+    "- **Dynamic User Redirection**: Calling `swarm_wait` ends your turn cleanly so the user can message you at any time while workers run. When the user sends a new instruction or change of direction mid-flight:",
+    `  - Use \`${SWARM_TOOL}{action:"steer", name, message, mode?}\` to redirect a working or parked member immediately (or \`post_message\` with \`@all\` / \`@name\` for parked members), \`${SWARM_TOOL}{action:"stop"/"kill"}\` to halt obsolete work, \`${SWARM_TOOL}{action:"title", objective, strategy, acceptance_criteria}\` to update the run goal/plan, and \`${SWARM_TOOL}{action:"add"}\` for new work, then call \`${SWARM_WAIT_TOOL}\` again.`,
+    "",
+    "## 3. Zero-Copy `#seq` Referencing & `@mention` Discipline",
+    `- Point downstream workers to earlier reports by sequence number (e.g. "Read \`#4\` and \`#6\` via \`${READ_BOARD_TOOL}{seqs:[4,6]}\`") — NEVER copy-paste one worker's report into another worker's brief!`,
+    `- \`@name\` is a wakeup doorbell, never a CC. Use \`@<prefix>\` for sharded groups, \`@#<channel>\` for channel broadcasts (NEVER \`@#main\`), and \`@all\` only for genuine swarm-wide rules or plan changes.`,
+    "",
+    "## 4. Core Swarm Tools (4 Tools)",
+    `- \`${SWARM_TOOL}\`: \`title\` (or \`objective\`/\`strategy\`/\`acceptance_criteria\`) | \`add\` (\`name\`, \`role\`, \`brief\`, \`workspace\`, \`fork\`, \`model\`, \`thinking_level\`, \`channels\`, \`n\`, \`tasks\`) | \`status\` | \`models\` | \`model\` (auto-resumes switched member) | \`steer\` (\`name\`, \`message\`, \`mode?\`) | \`stop\` | \`kill\` | \`merge\` | \`channel\` (\`create\`/\`list\`/\`join\`/\`leave\`/\`archive\`) | \`done\`.`,
+    `- \`${POST_MESSAGE_TOOL}\`: Post to the shared board (\`text\`, optional \`channel\`).`,
+    `- \`${READ_BOARD_TOOL}\`: Read board messages (\`since\`, \`seqs\`, \`limit\`, \`channel\`, \`search\`) or inspect roster (\`status:true\`).`,
+    `- \`${SWARM_WAIT_TOOL}\`: End your turn cleanly (non-blocking) and sleep until a member wakes \`@${ORCHESTRATOR_NAME}\`, all workers park (\`all_idle\`), or the user sends a message. Always pass the highest \`#seq\` you have already read as \`since\`.`,
+    "",
+    "## 5. Keep Warm, Context Forking & 3-Role Models",
+    `- **Keep Warm**: Completed members park in \`waiting\` (zero tokens, full history intact, disk-backed sessions). NEVER \`kill\` as a pause!`,
+    `- **Hot Model Switch**: Calling \`${SWARM_TOOL}{action:"model", name, model}\` on a \`waiting\` member hot-switches while keeping conversation history AND automatically resumes it to continue unfinished work.`,
+    `- **Context Forking**: Pass \`fork:"orchestrator"\` or \`fork:"<member>"\` on \`${SWARM_TOOL}{action:"add"}\` when a new member benefits from branching existing conversation history.`,
+    "- **3-Role Models**: `orchestrator` (host session), `worker` (default for `role:\"worker\"`), `validator` (default for `role:\"validator\"`).",
+  ].join("\n");
+}
+
+function formatRoleModelsLine(roleModels: SwarmRoleModels): string {
+  const fallbacks =
+    roleModels.fallbackModels && roleModels.fallbackModels.length > 0
+      ? ` | fallbacks=[${roleModels.fallbackModels.join(", ")}]`
+      : "";
+  return `- **3-Role Models**: orchestrator=${formatRoleConfig(roleModels.orchestrator)} | worker=${formatRoleConfig(roleModels.worker)} | validator=${formatRoleConfig(roleModels.validator)}${fallbacks}`;
+}
+
+function buildHumanSteeringSection(humanSteeringText: string): string {
+  const cleanSteer = humanSteeringText.replace(/\s+/g, " ").trim().slice(0, 500);
+  return [
+    "### ⚡ Live User Direction Update",
+    `The user just sent a dynamic message while the Swarm is running: "${cleanSteer}".`,
+    `Adjust active/parked workers immediately using \`${SWARM_TOOL}{action:"steer"}\`, \`${SWARM_TOOL}{action:"stop"/"kill"}\`, \`${SWARM_TOOL}{action:"title"}\`, \`${SWARM_TOOL}{action:"add"}\`, or \`${POST_MESSAGE_TOOL}\`, and report clearly.`,
+  ].join("\n");
+}
+
+function formatChannelLine(ch: SwarmChannelRecord): string {
+  const subs = ch.subscribers.length > 0 ? ch.subscribers.join(",") : "(all)";
+  const topic = ch.topic ? ` — ${ch.topic}` : "";
+  const archived = ch.archived ? " [ARCHIVED]" : "";
+  return `- \`#${ch.name}\`${archived} subscribers=[${subs}]${topic}`;
+}
+
+function formatMemberLine(
+  m: SwarmMemberRecord,
+  includeCurrentActivity: boolean,
+): string {
+  const ws = m.branch ? `${m.workspace}:${m.branch}` : m.workspace;
+  const model = m.model ? ` model=${m.model}` : "";
+  const post = m.lastPostSeq ? ` lastPost=#${m.lastPostSeq}` : "";
+  const merged = m.mergedCommitSha ? ` merged=${m.mergedCommitSha.slice(0, 7)}` : "";
+  const stopped = m.humanStopped ? " [HUMAN-STOPPED]" : "";
+  const err = m.error ? ` err="${m.error.slice(0, 80)}"` : "";
+  const activityText = includeCurrentActivity
+    ? (m.currentActivity ?? m.parkedOn)
+    : m.parkedOn;
+  const activity = activityText ? ` — ${activityText}` : "";
+  return `- \`@${m.name}\` (${m.role}) [${m.state}] ws=${ws} parent=@${m.parentName}${model} turns=${m.turns}${post}${merged}${stopped}${err}${activity}`;
+}
+
+/**
+ * Builds the static, cache-friendly Orchestrator Playbook and Swarm Run Contract
+ * (zero volatile counters or board excerpts, so `diffSystemPromptSections` emits it once per run).
+ */
+export function buildOrchestratorStaticSection(snapshot: SwarmSnapshot): string {
+  const run = snapshot.run;
+  const sections: string[] = [
+    buildOrchestratorPlaybookCore(run?.validatorEnabled !== false),
+  ];
+
+  if (!run) {
+    return sections.join("\n\n");
+  }
+
+  const contractLines: string[] = [
+    "## Swarm Run Contract",
+    `- **Title**: ${run.title}`,
+    `- **ID**: \`${run.id}\``,
+    `- **Base Branch**: \`${run.baseBranch}\``,
+    `- **Max Concurrency**: ${run.maxConcurrency}`,
+    `- **Validator Policy**: ${run.validatorEnabled ? "ON" : "OFF"}`,
+    formatRoleModelsLine(snapshot.roleModels),
+    `- **Objective**: ${run.objective}`,
+  ];
+  if (run.strategy.trim()) {
+    contractLines.push(`- **Strategy**: ${run.strategy.trim()}`);
+  }
+  if (run.acceptanceCriteria.trim()) {
+    contractLines.push(`- **Acceptance Criteria**: ${run.acceptanceCriteria.trim()}`);
+  }
+  sections.push(contractLines.join("\n"));
+
+  return sections.join("\n\n");
+}
+
+/**
+ * Builds the compact live Swarm delta section for injection after the static contract.
+ * Omits sub-second `currentActivity` churn and collapses `killed` members to one summary line.
+ */
+export function buildOrchestratorLiveStateSection(
+  snapshot: SwarmSnapshot,
+  options?: OrchestratorLiveStateOptions,
+): string {
+  const run = snapshot.run;
+  if (!run) {
+    return [
+      "## Active Swarm State",
+      "No active Swarm run. Use `/swarm` to start a run.",
+    ].join("\n");
+  }
+
+  const sections: string[] = [];
+  const stateHeader: string[] = [
+    "## Active Swarm State",
+    `- **Status**: \`${run.status}\` | **Board Head**: \`#${snapshot.boardHead}\``,
+    `- **Active / Waiting**: ${snapshot.workingMemberNames.length}/${run.maxConcurrency} active | ${snapshot.waitingMemberNames.length} waiting`,
+  ];
+
+  if (snapshot.rateLimitUntil && snapshot.rateLimitUntil > Date.now()) {
+    const secs = Math.ceil((snapshot.rateLimitUntil - Date.now()) / 1000);
+    stateHeader.push(
+      `- **RATE-LIMIT BACKOFF**: pausing new launches for ~${secs}s${snapshot.rateLimitReason ? ` (${snapshot.rateLimitReason})` : ""}.`,
+    );
+  }
+  sections.push(stateHeader.join("\n"));
+
+  if (options?.humanSteeringText?.trim()) {
+    sections.push(buildHumanSteeringSection(options.humanSteeringText));
+  }
+
+  const customChannels = Object.values(run.channels).filter(
+    (ch) => ch.name !== DEFAULT_CHANNEL,
+  );
+  if (customChannels.length > 0) {
+    sections.push(`### Channels\n${customChannels.map(formatChannelLine).join("\n")}`);
+  }
+
+  const members = run.memberOrder
+    .map((name) => run.members[name])
+    .filter((m): m is SwarmMemberRecord => Boolean(m));
+  const liveMembers = members.filter((m) => m.state !== "killed");
+  const killedMembers = members.filter((m) => m.state === "killed");
+
+  if (members.length === 0) {
+    sections.push(
+      `### Live Members (0)\n(none spawned yet — add members with \`${SWARM_TOOL}{action:"add"}\`)`,
+    );
+  } else {
+    const memberLines = liveMembers.map((m) => formatMemberLine(m, false));
+    if (killedMembers.length > 0) {
+      const mergedNames = killedMembers
+        .filter((m) => Boolean(m.mergedCommitSha))
+        .map((m) => `@${m.name}`);
+      const mergedSuffix =
+        mergedNames.length > 0 ? ` (merged: ${mergedNames.join(", ")})` : "";
+      memberLines.push(`- Retired (killed): ${killedMembers.length}${mergedSuffix}`);
+    }
+    sections.push(`### Live Members (${liveMembers.length})\n${memberLines.join("\n")}`);
+  }
+
+  if (options?.includeRecentBoard !== false && snapshot.recentBoard.length > 0) {
+    const tail = snapshot.recentBoard.slice(-8);
+    sections.push(
+      `### Recent Shared Board (head #${snapshot.boardHead}, last ${tail.length})\n${formatBoardExcerpt(tail, 200)}`,
+    );
+  }
+
+  return sections.join("\n\n");
+}
+
 /**
  * Builds the Antigravity Swarm Coordinator Playbook + live run state section
  * injected prompt-cache-safely into `sections.swarm` (or tail context) while a run is active.
@@ -105,48 +306,7 @@ export function buildOrchestratorPlaybookSection(
   const run = snapshot.run;
   const sections: string[] = [];
 
-  sections.push(
-    [
-      "# Pi Swarm Orchestrator Playbook (Antigravity Swarm)",
-      "",
-      "## 1. Do Not Do the Technical Work Yourself",
-      `- Delegate ALL technical work (codebase research, scaffolding, coding, integration, builds/tests, verification) to named swarm members via \`${SWARM_TOOL}{action:"add"}\`.`,
-      `- Your job is orchestration: read \`#seq\` board reports, judge quality and completeness, decide the next phase, merge isolated worktrees/clones (\`${SWARM_TOOL}{action:"merge"}\`), retire finished workers (\`${SWARM_TOOL}{action:"kill"}\`), and adapt seamlessly whenever the user redirects you.`,
-      "",
-      "## 2. Dynamic Phased Collaboration & Mid-Flight User Redirection",
-      "- Adapt wave-by-wave instead of locking into a rigid upfront DAG:",
-      "  1. **Discovery**: Spawn read-only researchers/scouts first when unknowns exist → inspect their `#seq` reports.",
-      "  2. **Contract / Scaffold**: Spawn a contract/scaffold worker when shared interfaces must settle before fan-out → inspect its `#seq`.",
-      "  3. **Parallel Execution**: Spawn disjoint named authors in parallel (`workspace:\"share\"` for shared git worktrees when multiple authors edit/build simultaneously; `workspace:\"branch\"` for fully isolated git clones; `workspace:\"inherit\"` for read-only scouts; use `n` or `tasks[]` for sharded slices).",
-      ...(run?.validatorEnabled !== false
-        ? [
-            "  4. **Independent Read-Only Validation**: Spawn independent `role:\"validator\"` members (~1 validator per 2–4 authors) to audit code, diffs, tests, and runtime behavior. NEVER let authors self-certify!",
-            "  5. **Peer-to-Peer Bug Closure**: Let `@validator` and `@author` resolve defects directly on the board (`@author` <-> `@validator`) without waking `@orchestrator` on intermediate bounces.",
-            `  6. **Land & Complete**: Merge \`share\`/\`branch\` worktrees via \`${SWARM_TOOL}{action:"merge"}\`, kill finished members via \`${SWARM_TOOL}{action:"kill"}\`, and close the run cleanly via \`${SWARM_TOOL}{action:"done", summary}\`.`,
-          ]
-        : [
-            `  4. **Land & Complete**: Merge \`share\`/\`branch\` worktrees via \`${SWARM_TOOL}{action:"merge"}\`, kill finished members via \`${SWARM_TOOL}{action:"kill"}\`, and close the run cleanly via \`${SWARM_TOOL}{action:"done", summary}\`.`,
-          ]),
-      "- **Dynamic User Redirection**: Calling `swarm_wait` ends your turn cleanly so the user can message you at any time while workers run. When the user sends a new instruction or change of direction mid-flight:",
-      `  - Use \`${SWARM_TOOL}{action:"steer", name, message, mode?}\` to redirect a working or parked member immediately (or \`post_message\` with \`@all\` / \`@name\` for parked members), \`${SWARM_TOOL}{action:"stop"/"kill"}\` to halt obsolete work, \`${SWARM_TOOL}{action:"title", objective, strategy, acceptance_criteria}\` to update the run goal/plan, and \`${SWARM_TOOL}{action:"add"}\` for new work, then call \`${SWARM_WAIT_TOOL}\` again.`,
-      "",
-      "## 3. Zero-Copy `#seq` Referencing & `@mention` Discipline",
-      `- Point downstream workers to earlier reports by sequence number (e.g. "Read \`#4\` and \`#6\` via \`${READ_BOARD_TOOL}{seqs:[4,6]}\`") — NEVER copy-paste one worker's report into another worker's brief!`,
-      `- \`@name\` is a wakeup doorbell, never a CC. Use \`@<prefix>\` for sharded groups, \`@#<channel>\` for channel broadcasts (NEVER \`@#main\`), and \`@all\` only for genuine swarm-wide rules or plan changes.`,
-      "",
-      "## 4. Core Swarm Tools (4 Tools)",
-      `- \`${SWARM_TOOL}\`: \`title\` (or \`objective\`/\`strategy\`/\`acceptance_criteria\`) | \`add\` (\`name\`, \`role\`, \`brief\`, \`workspace\`, \`fork\`, \`model\`, \`thinking_level\`, \`channels\`, \`n\`, \`tasks\`) | \`status\` | \`models\` | \`model\` (auto-resumes switched member) | \`steer\` (\`name\`, \`message\`, \`mode?\`) | \`stop\` | \`kill\` | \`merge\` | \`channel\` (\`create\`/\`list\`/\`join\`/\`leave\`/\`archive\`) | \`done\`.`,
-      `- \`${POST_MESSAGE_TOOL}\`: Post to the shared board (\`text\`, optional \`channel\`).`,
-      `- \`${READ_BOARD_TOOL}\`: Read board messages (\`since\`, \`seqs\`, \`limit\`, \`channel\`, \`search\`) or inspect roster (\`status:true\`).`,
-      `- \`${SWARM_WAIT_TOOL}\`: End your turn cleanly (non-blocking) and sleep until a member wakes \`@${ORCHESTRATOR_NAME}\`, all workers park (\`all_idle\`), or the user sends a message. Always pass the highest \`#seq\` you have already read as \`since\`.`,
-      "",
-      "## 5. Keep Warm, Context Forking & 3-Role Models",
-      `- **Keep Warm**: Completed members park in \`waiting\` (zero tokens, full history intact, disk-backed sessions). NEVER \`kill\` as a pause!`,
-      `- **Hot Model Switch**: Calling \`${SWARM_TOOL}{action:"model", name, model}\` on a \`waiting\` member hot-switches while keeping conversation history AND automatically resumes it to continue unfinished work.`,
-      `- **Context Forking**: Pass \`fork:"orchestrator"\` or \`fork:"<member>"\` on \`${SWARM_TOOL}{action:"add"}\` when a new member benefits from branching existing conversation history.`,
-      "- **3-Role Models**: `orchestrator` (host session), `worker` (default for `role:\"worker\"`), `validator` (default for `role:\"validator\"`).",
-    ].join("\n"),
-  );
+  sections.push(buildOrchestratorPlaybookCore(run?.validatorEnabled !== false));
 
   if (!run) {
     sections.push(
@@ -158,17 +318,12 @@ export function buildOrchestratorPlaybookSection(
     return sections.join("\n\n");
   }
 
-  const fallbacks =
-    snapshot.roleModels.fallbackModels && snapshot.roleModels.fallbackModels.length > 0
-      ? ` | fallbacks=[${snapshot.roleModels.fallbackModels.join(", ")}]`
-      : "";
-
   const stateHeader: string[] = [
     "## Active Swarm Run State",
     `- **Title**: ${run.title} (\`${run.id}\`)`,
     `- **Status**: \`${run.status}\` | **Base Branch**: \`${run.baseBranch}\` | **Board Head**: \`#${snapshot.boardHead}\``,
     `- **Concurrency**: ${snapshot.workingMemberNames.length}/${run.maxConcurrency} working | ${snapshot.waitingMemberNames.length} warm waiting | Validator Policy: ${run.validatorEnabled ? "ON" : "OFF"}`,
-    `- **3-Role Models**: orchestrator=${formatRoleConfig(snapshot.roleModels.orchestrator)} | worker=${formatRoleConfig(snapshot.roleModels.worker)} | validator=${formatRoleConfig(snapshot.roleModels.validator)}${fallbacks}`,
+    formatRoleModelsLine(snapshot.roleModels),
     `- **Usage**: ${snapshot.totalTokens} tokens | $${snapshot.totalCost.toFixed(4)}`,
     `- **Objective**: ${run.objective}`,
   ];
@@ -188,26 +343,13 @@ export function buildOrchestratorPlaybookSection(
   sections.push(stateHeader.join("\n"));
 
   if (options?.humanSteeringText?.trim()) {
-    const cleanSteer = options.humanSteeringText.replace(/\s+/g, " ").trim().slice(0, 500);
-    sections.push(
-      [
-        "### ⚡ Live User Direction Update",
-        `The user just sent a dynamic message while the Swarm is running: "${cleanSteer}".`,
-        `Adjust active/parked workers immediately using \`${SWARM_TOOL}{action:"steer"}\`, \`${SWARM_TOOL}{action:"stop"/"kill"}\`, \`${SWARM_TOOL}{action:"title"}\`, \`${SWARM_TOOL}{action:"add"}\`, or \`${POST_MESSAGE_TOOL}\`, and report clearly.`,
-      ].join("\n"),
-    );
+    sections.push(buildHumanSteeringSection(options.humanSteeringText));
   }
 
   // Channels compact summary
   const channels = Object.values(run.channels);
   if (channels.length > 0) {
-    const chLines = channels.map((ch) => {
-      const subs = ch.subscribers.length > 0 ? ch.subscribers.join(",") : "(all)";
-      const topic = ch.topic ? ` — ${ch.topic}` : "";
-      const archived = ch.archived ? " [ARCHIVED]" : "";
-      return `- \`#${ch.name}\`${archived} subscribers=[${subs}]${topic}`;
-    });
-    sections.push(`### Channels\n${chLines.join("\n")}`);
+    sections.push(`### Channels\n${channels.map(formatChannelLine).join("\n")}`);
   }
 
   // Live members compact summary
@@ -215,20 +357,7 @@ export function buildOrchestratorPlaybookSection(
     .map((name) => run.members[name])
     .filter((m): m is SwarmMemberRecord => Boolean(m));
   if (members.length > 0) {
-    const memberLines = members.map((m) => {
-      const ws = m.branch ? `${m.workspace}:${m.branch}` : m.workspace;
-      const model = m.model ? ` model=${m.model}` : "";
-      const post = m.lastPostSeq ? ` lastPost=#${m.lastPostSeq}` : "";
-      const merged = m.mergedCommitSha ? ` merged=${m.mergedCommitSha.slice(0, 7)}` : "";
-      const stopped = m.humanStopped ? " [HUMAN-STOPPED]" : "";
-      const err = m.error ? ` err="${m.error.slice(0, 80)}"` : "";
-      const activity = m.currentActivity
-        ? ` — ${m.currentActivity}`
-        : m.parkedOn
-          ? ` — ${m.parkedOn}`
-          : "";
-      return `- \`@${m.name}\` (${m.role}) [${m.state}] ws=${ws} parent=@${m.parentName}${model} turns=${m.turns}${post}${merged}${stopped}${err}${activity}`;
-    });
+    const memberLines = members.map((m) => formatMemberLine(m, true));
     sections.push(`### Live Members (${members.length})\n${memberLines.join("\n")}`);
   } else {
     sections.push("### Live Members (0)\n(none spawned yet — add members with `swarm{action:\"add\"}`)");
@@ -349,7 +478,7 @@ export function buildMemberInitialPrompt(
     "",
     member.brief.trim(),
     "",
-    `Start working immediately. Read referenced \`#seq\` posts via \`${READ_BOARD_TOOL}\` if needed, post your result via \`${POST_MESSAGE_TOOL}\`, and call \`${SWARM_WAIT_TOOL}{since: <highest-seq-read>}\` when waiting for follow-ups or finished.`,
+    `Start working immediately. Read referenced \`#seq\` posts via \`${READ_BOARD_TOOL}\` if needed, post your result via \`${POST_MESSAGE_TOOL}\`, and call \`${SWARM_WAIT_TOOL}{since: ${briefSeq}}\` (or the highest #seq you read or posted) when waiting for follow-ups or finished.`,
   ];
   return lines.join("\n");
 }

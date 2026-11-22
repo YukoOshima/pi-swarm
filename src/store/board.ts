@@ -1,4 +1,4 @@
-import { appendFile, lstat, mkdir, readFile } from "node:fs/promises";
+import { appendFile, lstat, mkdir, open, readFile } from "node:fs/promises";
 import path from "node:path";
 import {
   CHANNEL_NAME_PATTERN,
@@ -17,6 +17,7 @@ import {
   type ReadBoardOptions,
   type ReadBoardResult,
 } from "../types.js";
+import { isPrototypeKey } from "./swarm-store.js";
 
 const SAFE_RUN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const DEFAULT_RECENT_LIMIT = 20;
@@ -110,7 +111,7 @@ function normalizeChannel(raw: string | undefined): string {
   if (normalized.length === 0) {
     return DEFAULT_CHANNEL;
   }
-  if (!CHANNEL_NAME_PATTERN.test(normalized)) {
+  if (!CHANNEL_NAME_PATTERN.test(normalized) || isPrototypeKey(normalized)) {
     throw new SwarmProtocolError(
       "INVALID_CHANNEL",
       `Invalid channel name: ${JSON.stringify(raw)}`,
@@ -431,6 +432,7 @@ export class SwarmBoard implements ISwarmBoard {
     messages: BoardMessage[];
     head: number;
     endsWithNewline: boolean;
+    size: number;
   }> {
     await assertNoSymlinksWithin(this.projectRoot, boardPath);
     try {
@@ -446,8 +448,67 @@ export class SwarmBoard implements ISwarmBoard {
           messages: existing.messages,
           head: existing.head,
           endsWithNewline: existing.endsWithNewline,
+          size: existing.size,
         };
       }
+
+      if (
+        existing &&
+        st.ino === existing.ino &&
+        st.size > existing.size &&
+        existing.endsWithNewline
+      ) {
+        const delta = st.size - existing.size;
+        const handle = await open(boardPath, "r");
+        let tailText = "";
+        let bytesRead = 0;
+        try {
+          const buf = Buffer.allocUnsafe(delta);
+          while (bytesRead < delta) {
+            const res = await handle.read(
+              buf,
+              bytesRead,
+              delta - bytesRead,
+              existing.size + bytesRead,
+            );
+            if (res.bytesRead === 0) {
+              break;
+            }
+            bytesRead += res.bytesRead;
+          }
+          tailText = buf.subarray(0, bytesRead).toString("utf8");
+        } finally {
+          await handle.close().catch(() => {});
+        }
+
+        if (bytesRead === delta) {
+          const appended = parseBoardLines(tailText);
+          const mergedMessages =
+            appended.length > 0
+              ? [...existing.messages, ...appended]
+              : existing.messages;
+          const head = Math.max(existing.head, computeHead(appended));
+          const endsWithNewline =
+            tailText.length === 0
+              ? existing.endsWithNewline
+              : tailText.endsWith("\n");
+          this.boardCache.set(boardPath, {
+            mtimeMs: st.mtimeMs,
+            size: st.size,
+            ino: st.ino,
+            head,
+            endsWithNewline,
+            messages: mergedMessages,
+          });
+          return {
+            messages: mergedMessages,
+            head,
+            endsWithNewline,
+            size: st.size,
+          };
+        }
+      }
+
       const raw = await readFile(boardPath, "utf8");
       const endsWithNewline = raw.length === 0 || raw.endsWith("\n");
       const messages = parseBoardLines(raw);
@@ -460,11 +521,11 @@ export class SwarmBoard implements ISwarmBoard {
         endsWithNewline,
         messages,
       });
-      return { messages, head, endsWithNewline };
+      return { messages, head, endsWithNewline, size: st.size };
     } catch (err) {
       if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
         this.boardCache.delete(boardPath);
-        return { messages: [], head: 0, endsWithNewline: true };
+        return { messages: [], head: 0, endsWithNewline: true, size: 0 };
       }
       throw err;
     }
@@ -497,8 +558,12 @@ export class SwarmBoard implements ISwarmBoard {
       await mkdir(path.dirname(boardPath), { recursive: true });
       await assertNoSymlinksWithin(this.projectRoot, boardPath);
 
-      const { messages: existingMessages, head, endsWithNewline } =
-        await this.loadCachedByPath(boardPath);
+      const {
+        messages: existingMessages,
+        head,
+        endsWithNewline,
+        size: prevSize,
+      } = await this.loadCachedByPath(boardPath);
 
       const text = typeof input.text === "string" ? input.text.trim() : "";
       const kind: BoardMessageKind =
@@ -528,19 +593,24 @@ export class SwarmBoard implements ISwarmBoard {
         timestamp: new Date().toISOString(),
       };
 
-      const line = `${endsWithNewline ? "" : "\n"}${JSON.stringify(message)}\n`;
-      await appendFile(boardPath, line, { encoding: "utf8", flag: "a" });
+      const fullPayload = `${endsWithNewline ? "" : "\n"}${JSON.stringify(message)}\n`;
+      await appendFile(boardPath, fullPayload, { encoding: "utf8", flag: "a" });
       try {
         const stAfter = await lstat(boardPath);
-        const updatedMessages = [...existingMessages, message];
-        this.boardCache.set(boardPath, {
-          mtimeMs: stAfter.mtimeMs,
-          size: stAfter.size,
-          ino: stAfter.ino,
-          head: message.seq,
-          endsWithNewline: true,
-          messages: updatedMessages,
-        });
+        const expectedSize = prevSize + Buffer.byteLength(fullPayload, "utf8");
+        if (stAfter.size === expectedSize) {
+          const updatedMessages = [...existingMessages, message];
+          this.boardCache.set(boardPath, {
+            mtimeMs: stAfter.mtimeMs,
+            size: stAfter.size,
+            ino: stAfter.ino,
+            head: message.seq,
+            endsWithNewline: true,
+            messages: updatedMessages,
+          });
+        } else {
+          this.boardCache.delete(boardPath);
+        }
       } catch {
         this.boardCache.delete(boardPath);
       }
