@@ -46,6 +46,7 @@ import {
   SWARM_SETTINGS_BOUNDS,
   SwarmStore,
   WorktreeManager,
+  assertOwnerSession,
   loadLayeredSwarmSettings,
   loadSwarmSettings,
   saveSwarmSettings,
@@ -706,7 +707,7 @@ function buildRunKickoffMessage(
 
 function buildHelpMarkdown(): string {
   return [
-    "### 🐝 Pi Swarm v0.3.4 (`/swarm`) — Dynamic Antigravity Swarm Commands",
+    "### 🐝 Pi Swarm v0.3.5 (`/swarm`) — Dynamic Antigravity Swarm Commands",
     "",
     "| Command | Description |",
     "| --- | --- |",
@@ -2548,7 +2549,7 @@ export function createPiSwarmExtension(
       rawArgs: string,
       ctx: ExtensionCommandContext,
     ): Promise<void> {
-      const { engine } = await ensureBound(ctx);
+      const { engine, store } = await ensureBound(ctx);
       const snapshot = engine.getSnapshot();
       if (!snapshot.run) {
         const msg = "No focused Swarm run to tear down.";
@@ -2564,23 +2565,32 @@ export function createPiSwarmExtension(
       const runId = snapshot.run.id;
       const sessionId = getSessionIdSafe(ctx);
 
-      if (force) {
-        const forceReason = "Force teardown via /swarm teardown --force";
-        for (const memberName of [...snapshot.workingMemberNames]) {
-          try {
-            await engine.stopMember(memberName, {
-              humanStopped: true,
-              reason: forceReason,
-              callerName: "human",
-              callerRole: "human",
-            });
-          } catch {
-            // continue stopping remaining working members
+      try {
+        const trimmedSessionId = sessionId?.trim();
+        if (trimmedSessionId) {
+          if (store.assertOwnerSession) {
+            await store.assertOwnerSession(snapshot.run, trimmedSessionId);
+          } else {
+            assertOwnerSession(snapshot.run, trimmedSessionId);
           }
         }
-      }
 
-      try {
+        if (force) {
+          const forceReason = "Force teardown via /swarm teardown --force";
+          for (const memberName of [...snapshot.workingMemberNames]) {
+            try {
+              await engine.stopMember(memberName, {
+                humanStopped: true,
+                reason: forceReason,
+                callerName: "human",
+                callerRole: "human",
+              });
+            } catch {
+              // continue stopping remaining working members
+            }
+          }
+        }
+
         const result = await engine.teardown({
           runId,
           deleteBranches,
@@ -3361,7 +3371,7 @@ export function createPiSwarmExtension(
     // ------------------------------------------------------------------------
     pi.registerCommand("swarm", {
       description:
-        "Pi Swarm v0.3.0 — Dynamic Antigravity Swarm orchestrator (shared #seq board, non-blocking swarm_wait, warm disk sessions, fork, 3-role models & git worktrees/clones)",
+        "Pi Swarm v0.3.5 — Dynamic Antigravity Swarm orchestrator (shared #seq board, non-blocking swarm_wait, warm disk sessions, fork, 3-role models & git worktrees/clones)",
       getArgumentCompletions: getSwarmCompletions,
       handler: handleSwarmCommand,
     });

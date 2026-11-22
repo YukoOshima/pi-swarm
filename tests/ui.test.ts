@@ -1872,4 +1872,63 @@ describe("swarm-overlay", () => {
     assert.equal(steerCalls[0]!.callerRole, "human");
     assert.equal(mockEngine.posted.length, 0);
   });
+
+  it("sanitizes ANSI escapes and control characters in overlay diff view while preserving indentation", async () => {
+    const snap = makeSampleSnapshot();
+    const mockEngine = createMockEngine(snap);
+    const { worktree } = createMockWorktree();
+    worktree.getDiffSummary = async () => ({
+      baseBranch: "main\x07",
+      branch: "swarm/run/wt\x1b[2J",
+      headSha: "abc",
+      commitsAhead: 1,
+      changedFiles: ["a.ts"],
+      stat: " a.ts\x1b[31m | 2 +-\x1b[0m",
+      diff: "   context line\x08\n+  added\x1b]1337;bad\x07line\n-  removed\x1b[2Jline",
+    });
+
+    const theme = createMockTheme();
+    const mockTui = createMockTUI(32, 100);
+    let capturedLines: string[] = [];
+    const customCtx = {
+      mode: "tui",
+      hasUI: true,
+      ui: {
+        theme,
+        notify() {},
+        async custom<T>(
+          factory: (
+            tui: TUI,
+            t: Theme,
+            kb: unknown,
+            done: (result: T) => void,
+          ) => Component & { dispose?(): void },
+        ): Promise<T> {
+          return new Promise<T>((resolve) => {
+            const comp = factory(mockTui.tui, theme, {}, resolve);
+            if (isFocusable(comp)) comp.focused = true;
+            void (async () => {
+              await flushAsync();
+              comp.handleInput?.("2"); // Members tab
+              comp.handleInput?.("d"); // Toggle diff view
+              await flushAsync();
+              capturedLines = comp.render(100);
+              comp.handleInput?.("q");
+            })();
+          });
+        },
+      },
+    } as unknown as ExtensionContext;
+
+    await openSwarmOverlay(customCtx, mockEngine.engine, worktree);
+    const rendered = capturedLines.join("\n");
+    assert.ok(!rendered.includes("\x1b[2J"), "Raw clear-screen escape must be stripped");
+    assert.ok(!rendered.includes("\x1b]1337"), "Raw OSC sequence must be stripped");
+    assert.ok(!rendered.includes("\x07"), "Raw BEL control char must be stripped");
+    assert.ok(!rendered.includes("\x08"), "Raw BS control char must be stripped");
+    const plain = stripTerminalSequences(rendered);
+    assert.match(plain, /   context line/);
+    assert.match(plain, /\+  addedline/);
+    assert.match(plain, /-  removedline/);
+  });
 });

@@ -1,9 +1,9 @@
-# 🐝 pi-swarm (`v0.3.0`)
+# 🐝 pi-swarm (`v0.3.5`)
 
 **`pi-swarm`** is a **Dynamic Antigravity Swarm** multi-agent orchestration extension for [Pi](https://github.com/earendil-works/pi) (`v1.5.2+`).
 面向 [Pi](https://github.com/earendil-works/pi) (`v1.5.2+`) 的**动态蜂群（Dynamic Antigravity Swarm）多 Agent 协作与编排扩展**。
 
-Instead of locking work into a rigid upfront DAG, `pi-swarm` v0.3.0 pairs **`pi-goal-x`-style upfront clarification** with **Antigravity-Swarm-grade dynamic orchestration**: non-blocking turn-ending `swarm_wait`, instant mid-flight user redirection (`swarm{action:"steer"|"stop"|"title"}`), disk-persisted member sessions (`SessionManager.create`/`open`), hot model switching with auto-resume (including self-switch deferral), Smart LLM Monitor (`@monitor`), true isolated `git clone` for `workspace:"branch"`, and 3-role model routing.
+Instead of locking work into a rigid upfront DAG, `pi-swarm` v0.3.5 pairs **`pi-goal-x`-style upfront clarification** with **Antigravity-Swarm-grade dynamic orchestration**: non-blocking turn-ending `swarm_wait`, instant mid-flight user redirection (`swarm{action:"steer"|"stop"|"title"}`), disk-persisted member sessions (`SessionManager.create`/`open`), hot model switching with auto-resume (including self-switch deferral), Smart LLM Monitor (`@monitor`), true isolated `git clone` for `workspace:"branch"`, and 3-role model routing.
 
 ---
 
@@ -109,7 +109,9 @@ Merged in order: **`DEFAULT_SWARM_SETTINGS` ← Global (`~/.pi/agent/pi-swarm-se
   "validatorEnabled": true,
   "keepWorkersWarm": true,
   "stallWatchdogEnabled": true,
+  "stallMonitorMode": "llm",
   "stallTimeoutMs": 45000,
+  "maxRetries": 2,
   "autoRebase": true,
   "autoTeardownOnComplete": false
 }

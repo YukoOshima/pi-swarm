@@ -552,11 +552,47 @@ export class WorktreeManager implements IWorktreeManager {
     };
   }
 
+  private async resolveRealWorktreePath(targetPath: string): Promise<string> {
+    const resolved = path.resolve(targetPath);
+    if (await pathExists(resolved)) {
+      return realpath(resolved).catch(() => resolved);
+    }
+    const parent = path.dirname(resolved);
+    const realParent = await realpath(parent).catch(() => parent);
+    return path.join(realParent, path.basename(resolved));
+  }
+
+  /**
+   * Ensure destructive worktree/clone removal can never target `this.repoRoot`
+   * or any path outside `<repoRoot>/.pi/swarm/worktrees/`.
+   */
+  private async assertSafeWorktreeTarget(worktreePath: string): Promise<string> {
+    const resolved = path.resolve(worktreePath);
+    const realRepo = await realpath(this.repoRoot).catch(() => path.resolve(this.repoRoot));
+    const realWorktreesRoot = path.join(realRepo, SWARM_DIR, "worktrees");
+    const realTarget = await this.resolveRealWorktreePath(resolved);
+    const rel = path.relative(realWorktreesRoot, realTarget);
+    if (
+      realTarget === realRepo ||
+      realTarget === realWorktreesRoot ||
+      rel === "" ||
+      rel.startsWith("..") ||
+      path.isAbsolute(rel)
+    ) {
+      throw new SwarmProtocolError(
+        "PERMISSION_DENIED",
+        `Refusing to remove worktree path outside ${SWARM_DIR}/worktrees: ${resolved}`,
+        { worktreePath: resolved },
+      );
+    }
+    return resolved;
+  }
+
   async removeWorktree(
     worktreePath: string,
     options?: { force?: boolean },
   ): Promise<void> {
-    const resolvedWorktree = path.resolve(worktreePath);
+    const resolvedWorktree = await this.assertSafeWorktreeTarget(worktreePath);
     const force = Boolean(options?.force);
 
     if (await this.isIsolatedClone(resolvedWorktree)) {
@@ -665,6 +701,27 @@ export class WorktreeManager implements IWorktreeManager {
     const resolved = path.resolve(worktreePath);
     if (!(await pathExists(resolved))) {
       return false;
+    }
+    const realRepo = await realpath(this.repoRoot).catch(() => path.resolve(this.repoRoot));
+    const realTarget = await realpath(resolved).catch(() => resolved);
+    if (realTarget !== realRepo) {
+      // Never walk up to repoRoot/.git when a member worktree lacks its own .git entry.
+      if (!(await pathExists(path.join(realTarget, ".git")))) {
+        return false;
+      }
+      const topRes = await this.runGit(["rev-parse", "--show-toplevel"], {
+        cwd: realTarget,
+        allowFailure: true,
+      });
+      if (!topRes.ok || !topRes.stdout.trim()) {
+        return false;
+      }
+      const realTop = await realpath(topRes.stdout.trim()).catch(() =>
+        path.resolve(topRes.stdout.trim()),
+      );
+      if (realTop !== realTarget) {
+        return false;
+      }
     }
     const res = await this.runGit(
       ["status", "--porcelain", "--untracked-files=all"],
@@ -992,6 +1049,8 @@ export class WorktreeManager implements IWorktreeManager {
           });
           continue;
         }
+
+        await this.assertSafeWorktreeTarget(resolvedPath);
 
         if (!(await pathExists(resolvedPath))) {
           if (

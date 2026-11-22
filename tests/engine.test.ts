@@ -145,6 +145,7 @@ class MockSwarmStore implements ISwarmStore {
   private readonly boards = new Map<string, BoardMessage[]>();
   readonly events: SwarmEvent[] = [];
   private seqCounter = 0;
+  assertOwnerSession?: ISwarmStore["assertOwnerSession"];
 
   async createRun(input: CreateRunInput): Promise<SwarmRunState> {
     const now = new Date().toISOString();
@@ -3609,6 +3610,297 @@ describe("SwarmEngine — v0.3.1 Hardening & Optimizations", () => {
         assert.equal(snapAfterRevive.totalTokens, 1200);
       } finally {
         await engine.dispose();
+      }
+    }
+  });
+
+  it("v0.3.5: delegates teardown ownership check to store.assertOwnerSession when provided", async () => {
+    const { engine, store, worktree } = await createTestHarness({ stallWatchdogEnabled: false });
+    try {
+      const calls: Array<{ runId: string; sessionId: string }> = [];
+      let shouldReject = false;
+
+      store.assertOwnerSession = async (runIdOrState, currentSessionId) => {
+        const runId = typeof runIdOrState === "string" ? runIdOrState : runIdOrState.id;
+        calls.push({ runId, sessionId: currentSessionId });
+        if (shouldReject) {
+          throw new SwarmProtocolError("OWNERSHIP_CONFLICT", "Denied by custom store.assertOwnerSession");
+        }
+      };
+
+      // Omitted or whitespace-only sessionId skips ownership check
+      await engine.teardown();
+      await engine.teardown({ sessionId: "   " });
+      assert.equal(calls.length, 0);
+
+      // Allows teardown when store.assertOwnerSession resolves (even for a non-owner sessionId)
+      const okRes = await engine.teardown({ sessionId: "  delegated-sess  " });
+      assert.equal(okRes.errors.length, 0);
+      assert.deepEqual(calls, [{ runId: "run-dyn", sessionId: "delegated-sess" }]);
+
+      // Rejects teardown when store.assertOwnerSession throws, without invoking safeTeardown
+      shouldReject = true;
+      let safeTeardownCalls = 0;
+      const origSafeTeardown = worktree.safeTeardown.bind(worktree);
+      worktree.safeTeardown = async (targets) => {
+        safeTeardownCalls += 1;
+        return origSafeTeardown(targets);
+      };
+      const eventsBefore = store.events.filter((e) => e.type === "teardown_completed").length;
+      await assert.rejects(
+        () => engine.teardown({ sessionId: "rejected-sess" }),
+        (err) => err instanceof SwarmProtocolError && err.code === "OWNERSHIP_CONFLICT",
+      );
+      assert.deepEqual(calls, [
+        { runId: "run-dyn", sessionId: "delegated-sess" },
+        { runId: "run-dyn", sessionId: "rejected-sess" },
+      ]);
+      assert.equal(safeTeardownCalls, 0);
+      assert.equal(
+        store.events.filter((e) => e.type === "teardown_completed").length,
+        eventsBefore,
+      );
+    } finally {
+      await engine.dispose();
+    }
+  });
+
+  it("v0.3.5: attachRun(null) disposes handles, pause() normalizes queued members, and handleTurnFinished cannot clobber stopMember", async () => {
+    // A. attachRun(null) disposes live handles and frees concurrency slots
+    {
+      const { engine, transport } = await createTestHarness({ maxConcurrency: 1 });
+      let releaseWorker!: () => void;
+      const gate = new Promise<void>((r) => {
+        releaseWorker = r;
+      });
+      transport.onMember("holder", async () => {
+        await gate;
+        return { outcome: "waiting", summary: "done" };
+      });
+      try {
+        await engine.addMembers({ name: "holder", brief: "Hold slot" });
+        await waitUntil(() => transport.handles.get("holder") !== undefined);
+        await engine.attachRun(null);
+        assert.equal(transport.handles.get("holder")?.killed, true, "attachRun(null) must kill live handles");
+        assert.equal(engine.getSnapshot().activeRunId, null);
+      } finally {
+        releaseWorker();
+        await engine.dispose();
+      }
+    }
+
+    // B. pause() cleans queued/spawning members to stopped & attachRun normalizes paused stale working members
+    {
+      const { engine, store, transport } = await createTestHarness({ maxConcurrency: 1 });
+      let releaseFirst!: () => void;
+      const gate = new Promise<void>((r) => {
+        releaseFirst = r;
+      });
+      transport.onMember("busy", async () => {
+        await gate;
+        return { outcome: "waiting", summary: "finished" };
+      });
+      try {
+        await engine.addMembers({ name: "busy", brief: "Occupy slot 1" });
+        await engine.addMembers({ name: "queued", brief: "Wait in concurrency queue" });
+        await waitUntil(() => transport.handles.get("busy") !== undefined);
+        const paused = await engine.pause(undefined, "User paused");
+        assert.equal(paused.status, "paused");
+        assert.equal(
+          paused.members.queued?.state,
+          "stopped",
+          "Queued member without running handle must transition to stopped on pause()",
+        );
+
+        // Simulate stale working member on a paused run across fresh engine attachRun
+        await store.updateMember(paused.id, "queued", { state: "working" });
+        const freshEngine = new SwarmEngine({
+          store,
+          worktree: new MockWorktreeManager(),
+          transport: new ScriptedTransport(),
+          settings: { stallWatchdogEnabled: false },
+        });
+        try {
+          const reattached = await freshEngine.attachRun(paused.id);
+          assert.equal(
+            reattached.run?.members.queued?.state,
+            "stopped",
+            "attachRun must normalize stale working members for paused runs too",
+          );
+        } finally {
+          await freshEngine.dispose();
+        }
+      } finally {
+        releaseFirst();
+        await engine.dispose();
+      }
+    }
+
+    // C. handleTurnFinished stale-read race vs stopMember during store.loadRun
+    {
+      const { engine, store, transport } = await createTestHarness();
+      let resolveTurn!: () => void;
+      const gate = new Promise<void>((r) => {
+        resolveTurn = r;
+      });
+      transport.onMember("racer", async () => {
+        await gate;
+        return { outcome: "waiting", summary: "Turn completed right before stop" };
+      });
+      try {
+        await engine.addMembers({ name: "racer", brief: "Race stopMember during loadRun" });
+        await waitUntil(() => transport.handles.get("racer") !== undefined);
+
+        let holdLoadResolve!: () => void;
+        let loadStarted!: () => void;
+        const loadStartedP = new Promise<void>((r) => {
+          loadStarted = r;
+        });
+        const origLoadRun = store.loadRun.bind(store);
+        let interceptOnce = true;
+        store.loadRun = async (runId: string) => {
+          const snap = await origLoadRun(runId);
+          if (interceptOnce && snap.members.racer?.state === "working") {
+            interceptOnce = false;
+            loadStarted();
+            await new Promise<void>((r) => {
+              holdLoadResolve = r;
+            });
+          }
+          return snap;
+        };
+
+        resolveTurn();
+        await loadStartedP;
+        // Stop member while handleTurnFinished is paused inside store.loadRun
+        await engine.stopMember("racer", { humanStopped: true, reason: "User stopped" });
+        holdLoadResolve();
+        await delay(30);
+
+        const after = engine.getSnapshot().run?.members.racer;
+        assert.equal(after?.state, "stopped", "handleTurnFinished must not overwrite stopped back to waiting");
+        assert.equal(after?.humanStopped, true);
+      } finally {
+        await engine.dispose();
+      }
+    }
+  });
+
+  it("v0.3.5: executes deferred self-switch when keepWorkersWarm=false and handles kill() during bindExtensions", async () => {
+    // A. Deferred self-switch with keepWorkersWarm=false
+    {
+      const store = new MockSwarmStore();
+      const worktree = new MockWorktreeManager();
+      const transport = new ScriptedTransport();
+      const engine = new SwarmEngine({
+        store,
+        worktree,
+        transport,
+        settings: { stallWatchdogEnabled: false, keepWorkersWarm: false },
+      });
+      const run = await store.createRun({
+        id: "run-cold-switch",
+        title: "Cold self switch",
+        objective: "Switch model even with keepWorkersWarm=false",
+        baseBranch: "main",
+        ownerSessionId: "sess-1",
+        keepWorkersWarm: false,
+      });
+      await engine.startRun(run.id);
+
+      let turnNum = 0;
+      transport.onMember("coldworker", async () => {
+        turnNum += 1;
+        if (turnNum === 1) {
+          await engine.switchModel({
+            targetName: "coldworker",
+            model: "google/gemini-2.5-pro",
+            callerName: "coldworker",
+            callerRole: "worker",
+            reason: "Need larger context",
+          });
+          return { outcome: "stopped", summary: "Ending turn 1 for deferred switch" };
+        }
+        return { outcome: "stopped", summary: "Finished turn 2 on new model" };
+      });
+
+      try {
+        await engine.addMembers({ name: "coldworker", brief: "Self-switch on cold pool" });
+        await waitUntil(() => turnNum === 2 && engine.getSnapshot().run?.members.coldworker?.state === "stopped");
+        assert.equal(engine.getSnapshot().run?.members.coldworker?.model, "google/gemini-2.5-pro");
+        assert.equal(transport.spawns.length, 2);
+        assert.equal(transport.spawns[1]?.modelOverride, "google/gemini-2.5-pro");
+      } finally {
+        await engine.dispose();
+      }
+    }
+
+    // B. InProcessPiTransport kill() during bindExtensions does not throw TypeError
+    {
+      const tmpRoot = await mkdtemp(path.join(os.tmpdir(), "pi-swarm-bind-kill-"));
+      try {
+        let triggerKill!: () => void;
+        let releaseBind!: () => void;
+        const bindStarted = new Promise<void>((r) => {
+          triggerKill = r;
+        });
+        const bindGate = new Promise<void>((r) => {
+          releaseBind = r;
+        });
+
+        const transport = new InProcessPiTransport({
+          agentDir: tmpRoot,
+          createSession: async (opts) => {
+            const fakeSession = {
+              model: opts?.model,
+              sessionManager: opts?.sessionManager,
+              extensionRunner: { hasHandlers: () => false, emit: async () => {} },
+              bindExtensions: async () => {
+                triggerKill();
+                await bindGate;
+              },
+              subscribe: () => () => {},
+              prompt: async () => {},
+              steer: async () => {},
+              followUp: async () => {},
+              setModel: async () => {},
+              setThinkingLevel: () => {},
+              abort: async () => {},
+              dispose: () => {},
+              getSessionStats: () => ({
+                tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+                cost: 0,
+              }),
+            };
+            return {
+              session: fakeSession as unknown as AgentSession,
+              extensionsResult: {} as never,
+            };
+          },
+        });
+
+        const handle = await transport.spawnMember({
+          agentId: "killbind-1",
+          name: "killbind",
+          role: "worker",
+          runId: "run-bind",
+          cwd: tmpRoot,
+          baseBranch: "main",
+          workspace: "inherit",
+          parentName: "orchestrator",
+          brief: "Test bind kill",
+          systemPrompt: "sys",
+          initialPrompt: "go",
+          keepWarm: true,
+        });
+
+        await bindStarted;
+        await handle.kill("Killed during bindExtensions");
+        releaseBind();
+        const res = await handle.currentTurn;
+        assert.equal(res.outcome, "killed");
+      } finally {
+        await rm(tmpRoot, { recursive: true, force: true });
       }
     }
   });

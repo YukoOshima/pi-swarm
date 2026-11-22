@@ -92,6 +92,17 @@ export function sanitizePlainText(text: string): string {
 }
 
 /**
+ * Strip terminal escape sequences and C0/C1 control characters from a single diff/stat line
+ * while preserving leading indentation.
+ */
+export function sanitizeDiffLine(line: string): string {
+  if (!line) return "";
+  return stripTerminalSequences(line)
+    .replace(/\t/g, "  ")
+    .replace(CONTROL_CHARS_RE, " ");
+}
+
+/**
  * Clamp a single line so that `visibleWidth(result) <= width` ALWAYS holds,
  * even with ANSI color codes, wide CJK graphemes, emojis, or very narrow widths.
  */

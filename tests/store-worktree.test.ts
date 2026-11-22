@@ -1894,4 +1894,99 @@ describe("WorktreeManager real git repository workflows", () => {
     });
     assert.equal(m4.seq, 4);
   });
+
+  it("serializes concurrent stale-lock recovery with .reap lock and rejects repoRoot/outside-worktree deletion", async () => {
+    const repoDir = await makeTempDir("pi-swarm-lock-guard-");
+    const wtMgr = new WorktreeManager(repoDir);
+    await wtMgr.ensureRepoReady("main");
+
+    // 1. Concurrent stale-lock recovery must not unlink a freshly acquired lock from a sibling recoverer
+    const storeA = new SwarmStore(repoDir, {
+      staleLockMs: 50,
+      lockRetryMs: 5,
+      lockTimeoutMs: 5_000,
+    });
+    const storeB = new SwarmStore(repoDir, {
+      staleLockMs: 50,
+      lockRetryMs: 5,
+      lockTimeoutMs: 5_000,
+    });
+    const run = await storeA.createRun({
+      id: "run-reap",
+      title: "Initial",
+      objective: "Test concurrent stale lock recovery",
+      baseBranch: "main",
+      ownerSessionId: "sess-reap",
+    });
+    await storeA.addMember(run.id, {
+      name: "alpha",
+      agentId: "a1",
+      role: "worker",
+      parentName: "orchestrator",
+      brief: "Count turns",
+      workspace: "inherit",
+      cwd: repoDir,
+    });
+
+    // Plant a dead-PID stale lockfile
+    const lockPath = path.join(repoDir, SWARM_DIR, SWARM_LOCKS_DIR, `${run.id}.lock`);
+    await writeFile(
+      lockPath,
+      JSON.stringify({
+        token: "dead-token",
+        pid: 999999,
+        hostname: os.hostname(),
+        createdAt: new Date(Date.now() - 60_000).toISOString(),
+      }),
+      "utf8",
+    );
+    const past = new Date(Date.now() - 60_000);
+    await utimes(lockPath, past, past);
+
+    // Fire 8 concurrent updates racing to recover the stale lock
+    await Promise.all(
+      Array.from({ length: 8 }, (_, idx) =>
+        (idx % 2 === 0 ? storeA : storeB).updateMember(run.id, "alpha", {
+          logLine: `concurrent-${idx}`,
+        }),
+      ),
+    );
+    const finalState = await storeA.loadRun(run.id);
+    assert.equal(finalState.members.alpha?.logTail.length, 8);
+
+    // 2. isWorktreeDirty must NOT fall back to dirty repoRoot for broken dirs without .git
+    await writeFile(path.join(repoDir, "dirty-root.txt"), "root dirty\n", "utf8");
+    const brokenWt = path.join(repoDir, SWARM_DIR, "worktrees", run.id, "wt-broken");
+    await mkdir(brokenWt, { recursive: true });
+    assert.equal(await wtMgr.isWorktreeDirty(repoDir), true);
+    assert.equal(await wtMgr.isWorktreeDirty(brokenWt), false);
+
+    // 3. removeWorktree and safeTeardown must refuse repoRoot and paths outside .pi/swarm/worktrees
+    const outsideDir = await makeTempDir("pi-swarm-outside-");
+    await writeFile(path.join(outsideDir, "keep.txt"), "precious\n", "utf8");
+    await assert.rejects(
+      () => wtMgr.removeWorktree(repoDir, { force: true }),
+      (err) => assertProtocolCode(err, "PERMISSION_DENIED"),
+    );
+    await assert.rejects(
+      () => wtMgr.removeWorktree(outsideDir, { force: true }),
+      (err) => assertProtocolCode(err, "PERMISSION_DENIED"),
+    );
+    const tdBad = await wtMgr.safeTeardown(
+      [
+        {
+          memberName: "evil",
+          worktreePath: repoDir,
+          branch: "main",
+          hasActiveAgent: false,
+        },
+      ],
+      { force: true },
+    );
+    assert.equal(tdBad.removed.length, 0);
+    assert.equal(tdBad.errors.length, 1);
+    assert.match(tdBad.errors[0]!.reason ?? "", /Refusing to remove worktree path/i);
+    assert.equal(await exists(path.join(repoDir, "dirty-root.txt")), true);
+    assert.equal(await exists(path.join(outsideDir, "keep.txt")), true);
+  });
 });

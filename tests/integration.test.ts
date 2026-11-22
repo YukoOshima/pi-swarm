@@ -1908,7 +1908,20 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
         },
       ],
     });
-    await waitFor(() => trackers.length >= 1 && workerTurnCounter === 1);
+    await waitFor(async () => {
+      if (trackers.length < 1 || workerTurnCounter !== 1) return false;
+      const statusRes = await harness.executeTool(SWARM_TOOL, { action: "status" });
+      const members =
+        (statusRes.details?.members as
+          | Array<{ name: string; state: string; currentActivity?: string }>
+          | undefined) ?? [];
+      return members.some(
+        (m) =>
+          m.name === "worker" &&
+          m.state === "working" &&
+          m.currentActivity === "working on assignment",
+      );
+    });
 
     // 2. Orchestrator parks non-blockingly via swarm_wait -> returns terminate: true immediately!
     const headBeforeWait = Number(
@@ -2114,5 +2127,99 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
 
     await harness.executeTool(SWARM_TOOL, { action: "done", summary: "Recovered cleanly" });
     await harness.emit("session_shutdown", {});
+  });
+
+  it("6. /swarm teardown --force rejects foreign session ownership BEFORE stopping working members", async () => {
+    const repoDir = await createTempGitRepo("teardown-force-owner");
+    tempDirs.push(repoDir);
+
+    let stopCount = 0;
+    let releaseWorker!: () => void;
+    const workerGate = new Promise<void>((r) => {
+      releaseWorker = r;
+    });
+
+    const mockTransport: ISwarmTransport = {
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        const tracker = createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async () => {
+            await workerGate;
+            return {
+              agentId: request.agentId,
+              name: request.name,
+              role: request.role,
+              outcome: "waiting",
+              summary: "Done",
+              tokens: 10,
+              cost: 0.0001,
+            };
+          },
+          onAbort: () => {
+            stopCount += 1;
+          },
+        });
+        return tracker.handle;
+      },
+    };
+
+    const ownerHarness = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "owner-sess-1",
+    });
+    const extOwner = createPiSwarmExtension({
+      transportFactory: () => mockTransport,
+      settingsLoader: async () => ({ ...DEFAULT_SWARM_SETTINGS, stallWatchdogEnabled: false }),
+    });
+    extOwner(ownerHarness.pi);
+    await ownerHarness.emit("session_start", {});
+
+    await ownerHarness.runCommand("swarm-direct", "Long running work");
+    await ownerHarness.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Force Teardown Guard",
+      objective: "Ensure foreign /swarm teardown --force cannot stop owner's workers",
+      strategy: "Single worker",
+      acceptance_criteria: "Ownership checked before stop",
+      base_branch: "main",
+      initial_members: [
+        { name: "worker", role: "worker", workspace: "inherit", brief: "Keep running" },
+      ],
+    });
+
+    await waitFor(async () => {
+      const statusRes = await ownerHarness.executeTool(SWARM_TOOL, { action: "status" });
+      const members =
+        (statusRes.details?.members as Array<{ name: string; currentActivity?: string }> | undefined) ??
+        [];
+      return members.some((m) => m.name === "worker" && m.currentActivity === "working on assignment");
+    });
+
+    // Foreign live session attempts `/swarm teardown --force`
+    const foreignHarness = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "foreign-sess-2",
+    });
+    const extForeign = createPiSwarmExtension({
+      transportFactory: () => mockTransport,
+      settingsLoader: async () => ({ ...DEFAULT_SWARM_SETTINGS, stallWatchdogEnabled: false }),
+    });
+    extForeign(foreignHarness.pi);
+    await foreignHarness.emit("session_start", {});
+    const statusOwner = await ownerHarness.executeTool(SWARM_TOOL, { action: "status" });
+    const runId = String(statusOwner.details?.runId ?? "");
+    await foreignHarness.runCommand("swarm", `focus ${runId}`);
+    await foreignHarness.runCommand("swarm", "teardown --force");
+
+    assert.equal(stopCount, 0, "Foreign /swarm teardown --force must NOT stop owner's active workers");
+    assert.ok(
+      foreignHarness.notifications.some(
+        (n) => n.level === "error" && /Teardown failed:.*owned by active session/i.test(n.message),
+      ),
+    );
+
+    releaseWorker();
+    await ownerHarness.executeTool(SWARM_TOOL, { action: "done", summary: "Owner completed cleanly" });
+    await foreignHarness.emit("session_shutdown", {});
+    await ownerHarness.emit("session_shutdown", {});
   });
 });

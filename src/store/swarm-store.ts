@@ -675,6 +675,40 @@ export class SwarmStore implements ISwarmStore {
   }
 
   private async tryRecoverStaleLock(lockPath: string): Promise<boolean> {
+    const reapPath = `${lockPath}.reap`;
+    const reapStaleMs = Math.max(1_000, Math.min(this.staleLockMs, 5_000));
+    let reapAcquired = false;
+
+    try {
+      const reapHandle = await open(reapPath, "wx");
+      try {
+        await reapHandle.writeFile(
+          JSON.stringify({
+            pid: process.pid,
+            hostname: os.hostname(),
+            createdAt: new Date().toISOString(),
+          }),
+          "utf8",
+        );
+      } finally {
+        await reapHandle.close();
+      }
+      reapAcquired = true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") {
+        return false;
+      }
+      try {
+        const reapStat = await lstat(reapPath);
+        if (Date.now() - reapStat.mtimeMs >= reapStaleMs) {
+          await unlink(reapPath).catch(() => {});
+        }
+      } catch {
+        // Another recoverer just finished and removed the reap lock.
+      }
+      return false;
+    }
+
     try {
       const st = await lstat(lockPath);
       if (st.isSymbolicLink()) {
@@ -686,11 +720,13 @@ export class SwarmStore implements ISwarmStore {
       }
       const ageMs = Date.now() - st.mtimeMs;
       let isStale = ageMs >= this.staleLockMs;
+      let expectedToken: string | undefined;
 
-      if (!isStale) {
-        try {
-          const raw = await readFile(lockPath, "utf8");
-          const info = JSON.parse(raw) as Partial<LockFilePayload>;
+      try {
+        const raw = await readFile(lockPath, "utf8");
+        const info = JSON.parse(raw) as Partial<LockFilePayload>;
+        expectedToken = typeof info.token === "string" ? info.token : undefined;
+        if (!isStale) {
           const createdMs = info.createdAt
             ? Date.parse(info.createdAt)
             : Number.NaN;
@@ -706,23 +742,41 @@ export class SwarmStore implements ISwarmStore {
           ) {
             isStale = true;
           }
-        } catch {
-          if (ageMs >= Math.min(this.staleLockMs, 2_000)) {
-            isStale = true;
-          }
+        }
+      } catch {
+        if (ageMs >= Math.min(this.staleLockMs, 2_000)) {
+          isStale = true;
         }
       }
 
-      if (isStale) {
-        await unlink(lockPath).catch(() => {});
-        return true;
+      if (!isStale) {
+        return false;
       }
-      return false;
+
+      // Re-verify inode/dev and token right before unlink so a concurrent release+reacquire is never deleted.
+      const currentStat = await lstat(lockPath);
+      if (currentStat.ino !== st.ino || currentStat.dev !== st.dev) {
+        return false;
+      }
+      if (expectedToken !== undefined) {
+        const currentRaw = await readFile(lockPath, "utf8");
+        const currentInfo = JSON.parse(currentRaw) as Partial<LockFilePayload>;
+        if (currentInfo.token !== expectedToken) {
+          return false;
+        }
+      }
+
+      await unlink(lockPath).catch(() => {});
+      return true;
     } catch (err) {
       if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
         return true;
       }
       throw err;
+    } finally {
+      if (reapAcquired) {
+        await unlink(reapPath).catch(() => {});
+      }
     }
   }
 
@@ -1910,9 +1964,11 @@ export class SwarmStore implements ISwarmStore {
   // --------------------------------------------------------------------------
 
   async appendEvent(event: SwarmEventInput): Promise<SwarmEvent> {
-    const eventsPath = this.getEventsPath(event.runId);
-    await assertNoSymlinksWithin(this.projectRoot, eventsPath);
-    return appendLedgerEvent(eventsPath, event);
+    return this.withRunLock(event.runId, async () => {
+      const eventsPath = this.getEventsPath(event.runId);
+      await assertNoSymlinksWithin(this.projectRoot, eventsPath);
+      return appendLedgerEvent(eventsPath, event);
+    });
   }
 
   async getRecentEvents(runId: string, limit = 50): Promise<SwarmEvent[]> {

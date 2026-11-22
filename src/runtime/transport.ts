@@ -1119,6 +1119,10 @@ export class InProcessPiTransport implements ISwarmTransport {
 
           session = created.session;
           await session.bindExtensions({});
+          if (killed || abortedByCaller || !session) {
+            await disposeSessionOnce(created.session);
+            return makeEarlyAbortResult();
+          }
           currentSessionFile = session.sessionManager?.getSessionFile?.() ?? currentSessionFile;
           try {
             const baseline = session.getSessionStats();

@@ -34,6 +34,7 @@ import {
   memberStateIcon,
   renderBox,
   renderHorizontalRule,
+  sanitizeDiffLine,
   sanitizePlainText,
   shortenModelName,
   visibleWidth,
@@ -1448,27 +1449,29 @@ class SwarmOverlayComponent implements Component, Focusable {
     const out: string[] = [];
     out.push(
       fitLine(
-        `${this.theme.fg("accent", summary.branch)} vs ${summary.baseBranch} · ${summary.commitsAhead} commit(s) ahead · ${summary.changedFiles.length} file(s)`,
+        `${this.theme.fg("accent", sanitizePlainText(summary.branch))} vs ${sanitizePlainText(summary.baseBranch)} · ${summary.commitsAhead} commit(s) ahead · ${summary.changedFiles.length} file(s)`,
         innerWidth,
       ),
     );
     if (summary.stat && out.length < budget) {
       for (const line of summary.stat.split(/\r?\n/)) {
-        if (!line.trim()) continue;
+        const cleanLine = sanitizeDiffLine(line);
+        if (!cleanLine.trim()) continue;
         if (out.length >= Math.min(budget, 4)) break;
-        out.push(fitLine(this.theme.fg("muted", line), innerWidth));
+        out.push(fitLine(this.theme.fg("muted", cleanLine), innerWidth));
       }
     }
     const rawDiffLines = summary.diff ? summary.diff.split(/\r?\n/) : [];
     for (const raw of rawDiffLines) {
       if (out.length >= budget) break;
-      const styled = raw.startsWith("+") && !raw.startsWith("+++")
-        ? this.theme.fg("toolDiffAdded", raw)
-        : raw.startsWith("-") && !raw.startsWith("---")
-          ? this.theme.fg("toolDiffRemoved", raw)
-          : raw.startsWith("@@")
-            ? this.theme.fg("accent", raw)
-            : this.theme.fg("toolDiffContext", raw);
+      const cleanRaw = sanitizeDiffLine(raw);
+      const styled = cleanRaw.startsWith("+") && !cleanRaw.startsWith("+++")
+        ? this.theme.fg("toolDiffAdded", cleanRaw)
+        : cleanRaw.startsWith("-") && !cleanRaw.startsWith("---")
+          ? this.theme.fg("toolDiffRemoved", cleanRaw)
+          : cleanRaw.startsWith("@@")
+            ? this.theme.fg("accent", cleanRaw)
+            : this.theme.fg("toolDiffContext", cleanRaw);
       out.push(fitLine(styled, innerWidth));
     }
 

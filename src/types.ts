@@ -612,6 +612,14 @@ export interface ISwarmStore {
   getRunDir(runId: string): string;
   getMemberSessionDir?(runId: string): string;
   getWorktreePath(runId: string, memberName: string): string;
+  /**
+   * Live-session ownership check helper: allows teardown only by owning session
+   * or when the owning PID is no longer alive.
+   */
+  assertOwnerSession?(
+    runIdOrState: string | SwarmRunState,
+    currentSessionId: string,
+  ): Promise<void>;
 }
 
 // ============================================================================
