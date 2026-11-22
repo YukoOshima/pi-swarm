@@ -1,9 +1,9 @@
-# 🐝 pi-swarm (`v0.3.5`)
+# 🐝 pi-swarm (`v0.3.6`)
 
 **`pi-swarm`** is a **Dynamic Antigravity Swarm** multi-agent orchestration extension for [Pi](https://github.com/earendil-works/pi) (`v1.5.2+`).
 面向 [Pi](https://github.com/earendil-works/pi) (`v1.5.2+`) 的**动态蜂群（Dynamic Antigravity Swarm）多 Agent 协作与编排扩展**。
 
-Instead of locking work into a rigid upfront DAG, `pi-swarm` v0.3.5 pairs **`pi-goal-x`-style upfront clarification** with **Antigravity-Swarm-grade dynamic orchestration**: non-blocking turn-ending `swarm_wait`, instant mid-flight user redirection (`swarm{action:"steer"|"stop"|"title"}`), disk-persisted member sessions (`SessionManager.create`/`open`), hot model switching with auto-resume (including self-switch deferral), Smart LLM Monitor (`@monitor`), true isolated `git clone` for `workspace:"branch"`, and 3-role model routing.
+Instead of locking work into a rigid upfront DAG, `pi-swarm` v0.3.6 pairs **`pi-goal-x`-style upfront clarification** with **Antigravity-Swarm-grade dynamic orchestration**: non-blocking turn-ending `swarm_wait`, instant mid-flight user redirection (`swarm{action:"steer"|"stop"|"title"}`), disk-persisted member sessions (`SessionManager.create`/`open`), hot model switching with auto-resume (including self-switch deferral), Smart LLM Monitor (`@monitor`), true isolated `git clone` for `workspace:"branch"`, and 3-role model routing.
 
 ---
 
@@ -86,8 +86,8 @@ Or skip interactive Q&A via the fast-path command:
 | Role (`角色`) | Responsibility (`职责`) | How It Applies (`生效方式`) |
 | --- | --- | --- |
 | **`orchestrator`** | Upfront Q&A, dynamic phasing, board coordination, worktree merges, completion | Applied directly to host Pi session via `pi.setModel()` / `pi.setThinkingLevel()` |
-| **`worker`** | Researchers, scaffolders, parallel authors, helpers (`role:"worker"`) | Default for spawned workers; overridable per `add` or hot-switched while `waiting` |
-| **`validator`** | Independent read-only code & test auditors (`role:"validator"`) | Default for spawned validators; overridable per `add` or hot-switched while `waiting` |
+| **`worker`** | Researchers, scaffolders, parallel authors, helpers (`role:"worker"`) | Default for spawned workers; overridable per `add` or hot-switched while `waiting` / `stopped` |
+| **`validator`** | Independent read-only code & test auditors (`role:"validator"`) | Default for spawned validators; overridable per `add` or hot-switched while `waiting` / `stopped` |
 
 ### 1) Layered Config Files / 分层配置文件
 
@@ -131,7 +131,7 @@ Merged in order: **`DEFAULT_SWARM_SETTINGS` ← Global (`~/.pi/agent/pi-swarm-se
 # Clear a role override back to host default (writes null in project layer to clear global override)
 /swarm model worker default
 
-# Hot-switch a warm `waiting` member while keeping 100% of its conversation history!
+# Hot-switch a `waiting` or `stopped` member while keeping 100% of its conversation history!
 /swarm model author google/gemini-2.5-pro high
 ```
 
@@ -180,7 +180,7 @@ Only **`/swarm`** and **`/swarm-direct`** are registered on Pi.
 | `/swarm graph` | Zero-turn ASCII/Unicode Spawn Tree & Peer `@mention` / `#channel` Interaction Graph | **No** |
 | `/swarm tasks [tab\|member\|#ch]` <br> `/swarm ui [tab\|member\|#ch]` | Open the live 4-tab Swarm Overlay (**Board** / **Members** / **Graph** / **Search**) | **No** |
 | `/swarm models` | Zero-turn overview of 3-role defaults, `fallbackModels`, and every live member's model | **No** |
-| `/swarm model <target> <model\|default> [thinking]` | Set role default (`orchestrator`/`worker`/`validator`) OR hot-switch & resume a warm `waiting` member | **No** |
+| `/swarm model <target> <model\|default> [thinking]` | Set role default (`orchestrator`/`worker`/`validator`) OR hot-switch & resume a `waiting` / `stopped` member | **No** |
 | `/swarm steer <member> <message>` | Steer a working member mid-turn or wake a parked member with new user direction | **No** |
 | `/swarm merge <member>` | Land a member's clean `share` worktree or `branch` clone onto `baseBranch` (`autoRebase` + `--no-ff`) | **No** |
 | `/swarm kill <member> [--force] [reason]` | Permanently kill a member and remove its clean worktree (`--force` overrides dirty guard) | **No** |
@@ -203,9 +203,9 @@ Only **`/swarm`** and **`/swarm-direct`** are registered on Pi.
 
 ### `/swarm tasks` (`/swarm ui`) 4-Tab Interactive Overlay
 - **`1` / `2` / `3` / `4`** or **`Tab` / `Shift+Tab`**: Switch tabs — **[1] Board** · **[2] Members** · **[3] Graph** · **[4] Search**
-- **`↑` / `↓`** or **`j` / `k`**: Navigate messages or members
+- **`↑` / `↓`** (plus **`j` / `k`** on Board / Graph / Search tabs): Navigate messages or scroll (on Members tab, **`↑` / `↓`** navigates and **`k`** kills the selected member)
 - **Board Tab `[1]`**: **`p`** post a board message (`@mention` / `@#channel`) · **`c`** cycle channel filter (`*` / `#main` / custom channels)
-- **Members Tab `[2]`**: **`w`** wake/message selected member · **`m`** hot-switch model (`waiting` member, keeps full history) · **`x`** human-stop member · **`k`** kill member · **`g`** merge `share`/`branch` worktree · **`d`** toggle member details vs Git diff summary
+- **Members Tab `[2]`**: **`w`** wake/message selected member · **`m`** hot-switch model (`waiting` or `stopped` member, keeps full history) · **`x`** human-stop member · **`k`** kill member · **`g`** merge `share`/`branch` worktree · **`d`** toggle member details vs Git diff summary
 - **Graph Tab `[3]`**: Live Spawn Tree & Peer `@mention` / `#channel` Interaction Graph (`buildSwarmGraphLines`)
 - **Search Tab `[4]`**: Live IME substring search across every `#seq` message on the board
 - **`Esc` / `q`**: Close overlay cleanly (unsubscribes engine listener & restores terminal cursor)
@@ -232,7 +232,8 @@ Only **`/swarm`** and **`/swarm-direct`** are registered on Pi.
 │       │   ├── state.json                # Authoritative v2 run, members, channels & roleModels snapshot
 │       │   ├── ROSTER.md                 # Auto-rendered human-readable Markdown roster & channel table
 │       │   ├── board.jsonl               # Append-only shared #seq Message Board (LF-only JSONL)
-│       │   └── events.jsonl              # Append-only audit event ledger (21 event types)
+│       │   ├── events.jsonl              # Append-only audit event ledger (21 event types)
+│       │   └── sessions/                 # Disk-persisted per-member SessionManager JSONL transcripts
 │       └── worktrees/<run-id>/
 │           └── wt-<member>/              # Isolated Git worktree for share/branch members
 ```

@@ -175,7 +175,7 @@ export function sanitizeSwarmSettings(
       ? (raw as Record<string, unknown>)
       : {};
 
-  const rateLimitBaseBackoffMs = clampInt(
+  let rateLimitBaseBackoffMs = clampInt(
     input.rateLimitBaseBackoffMs,
     SWARM_SETTINGS_BOUNDS.rateLimitBaseBackoffMs.min,
     SWARM_SETTINGS_BOUNDS.rateLimitBaseBackoffMs.max,
@@ -188,6 +188,17 @@ export function sanitizeSwarmSettings(
     SWARM_SETTINGS_BOUNDS.rateLimitMaxBackoffMs.max,
     base.rateLimitMaxBackoffMs,
   );
+
+  if (
+    "rateLimitMaxBackoffMs" in input &&
+    input.rateLimitMaxBackoffMs !== undefined &&
+    !(
+      "rateLimitBaseBackoffMs" in input &&
+      input.rateLimitBaseBackoffMs !== undefined
+    )
+  ) {
+    rateLimitBaseBackoffMs = Math.min(rateLimitBaseBackoffMs, rawMaxBackoff);
+  }
 
   const rateLimitMaxBackoffMs = Math.max(rateLimitBaseBackoffMs, rawMaxBackoff);
 
@@ -434,10 +445,80 @@ export function sanitizeSettingsPatch(
   return patch;
 }
 
+/** In-process per-path write queue to serialize settings read-modify-write saves. */
+const settingsWriteQueues = new Map<string, Promise<unknown>>();
+
+function enqueueSettingsWrite<T>(
+  targetPath: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const key = path.resolve(targetPath);
+  const previous = settingsWriteQueues.get(key) ?? Promise.resolve();
+  const next = previous.then(fn, fn);
+  const cleanup = next.then(
+    () => {
+      if (settingsWriteQueues.get(key) === cleanup) {
+        settingsWriteQueues.delete(key);
+      }
+    },
+    () => {
+      if (settingsWriteQueues.get(key) === cleanup) {
+        settingsWriteQueues.delete(key);
+      }
+    },
+  );
+  settingsWriteQueues.set(key, cleanup);
+  return next;
+}
+
+async function findSymlinkWithinRoot(
+  rootDir: string,
+  targetPath: string,
+): Promise<string | null> {
+  const resolvedRoot = path.resolve(rootDir);
+  const resolvedTarget = path.resolve(targetPath);
+  if (
+    resolvedTarget !== resolvedRoot &&
+    !resolvedTarget.startsWith(`${resolvedRoot}${path.sep}`)
+  ) {
+    return null;
+  }
+  const rel = path.relative(resolvedRoot, resolvedTarget);
+  if (!rel || rel === ".") {
+    return null;
+  }
+  const parts = rel.split(path.sep).filter(Boolean);
+  let curr = resolvedRoot;
+  for (const part of parts) {
+    curr = path.join(curr, part);
+    try {
+      const st = await lstat(curr);
+      if (st.isSymbolicLink()) {
+        return curr;
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+        return null;
+      }
+      throw err;
+    }
+  }
+  return null;
+}
+
 async function readSettingsLayer(
   filePath: string,
   warnings: string[],
+  projectRoot?: string,
 ): Promise<Record<string, unknown>> {
+  if (projectRoot) {
+    const sym = await findSymlinkWithinRoot(projectRoot, filePath);
+    if (sym) {
+      warnings.push(`Ignored symlinked settings path: ${sym}`);
+      return {};
+    }
+  }
+
   try {
     const st = await lstat(filePath);
     if (st.isSymbolicLink()) {
@@ -473,7 +554,19 @@ async function readSettingsLayer(
 async function writeSettingsFileAtomic(
   filePath: string,
   data: Record<string, unknown>,
+  projectRoot?: string,
 ): Promise<void> {
+  if (projectRoot) {
+    const sym = await findSymlinkWithinRoot(projectRoot, filePath);
+    if (sym) {
+      throw new SwarmProtocolError(
+        "PERMISSION_DENIED",
+        `Refusing to write settings through symlinked path: ${sym}`,
+        { path: sym },
+      );
+    }
+  }
+
   try {
     const st = await lstat(filePath);
     if (st.isSymbolicLink()) {
@@ -491,6 +584,16 @@ async function writeSettingsFileAtomic(
 
   const dir = path.dirname(filePath);
   await mkdir(dir, { recursive: true });
+  if (projectRoot) {
+    const symAfterMkdir = await findSymlinkWithinRoot(projectRoot, filePath);
+    if (symAfterMkdir) {
+      throw new SwarmProtocolError(
+        "PERMISSION_DENIED",
+        `Refusing to write settings through symlinked path: ${symAfterMkdir}`,
+        { path: symAfterMkdir },
+      );
+    }
+  }
   const tmpPath = `${filePath}.tmp.${process.pid}.${randomUUID().slice(0, 8)}`;
   const payload = `${JSON.stringify(data, null, 2)}\n`;
   try {
@@ -516,7 +619,7 @@ export async function loadLayeredSwarmSettings(
   const projectPath = getProjectSettingsPath(projectRoot, options);
 
   const globalRaw = await readSettingsLayer(globalPath, warnings);
-  const projectRaw = await readSettingsLayer(projectPath, warnings);
+  const projectRaw = await readSettingsLayer(projectPath, warnings, projectRoot);
 
   const afterGlobal = sanitizeSwarmSettings(globalRaw, DEFAULT_SWARM_SETTINGS);
   const effective = sanitizeSwarmSettings(projectRaw, afterGlobal);
@@ -568,37 +671,52 @@ export async function saveSwarmSettings(
     scope === "global"
       ? getGlobalSettingsPath(options)
       : getProjectSettingsPath(options!.projectRoot ?? ".", options);
+  const projectRootForGuard =
+    scope === "project" ? options?.projectRoot : undefined;
 
-  const warnings: string[] = [];
-  const existingLayer = options?.replace
-    ? {}
-    : await readSettingsLayer(targetPath, warnings);
-  const sanitizedPatch = sanitizeSettingsPatch(patch);
-
-  const rawPatch = patch as Record<string, unknown>;
-  const nextLayer: Record<string, unknown> = { ...existingLayer };
-  for (const [key, value] of Object.entries(sanitizedPatch)) {
-    if (value === undefined) {
-      // In project scope, explicit "" (or whitespace-only) or null clears a global override;
-      // explicit undefined removes the project override to inherit global.
-      const rawVal = rawPatch[key];
-      const isExplicitClear =
-        rawVal === null ||
-        (typeof rawVal === "string" && rawVal.trim() === "");
-      if (scope === "project" && isExplicitClear) {
-        nextLayer[key] = null;
-      } else {
-        delete nextLayer[key];
+  return enqueueSettingsWrite(targetPath, async () => {
+    if (projectRootForGuard) {
+      const sym = await findSymlinkWithinRoot(projectRootForGuard, targetPath);
+      if (sym) {
+        throw new SwarmProtocolError(
+          "PERMISSION_DENIED",
+          `Refusing to write settings through symlinked path: ${sym}`,
+          { path: sym },
+        );
       }
-    } else {
-      nextLayer[key] = value;
     }
-  }
 
-  await writeSettingsFileAtomic(targetPath, nextLayer);
+    const warnings: string[] = [];
+    const existingLayer = options?.replace
+      ? {}
+      : await readSettingsLayer(targetPath, warnings, projectRootForGuard);
+    const sanitizedPatch = sanitizeSettingsPatch(patch);
 
-  if (options?.projectRoot) {
-    return loadSwarmSettings(options.projectRoot, options);
-  }
-  return sanitizeSwarmSettings(nextLayer, DEFAULT_SWARM_SETTINGS);
+    const rawPatch = patch as Record<string, unknown>;
+    const nextLayer: Record<string, unknown> = { ...existingLayer };
+    for (const [key, value] of Object.entries(sanitizedPatch)) {
+      if (value === undefined) {
+        // In project scope, explicit "" (or whitespace-only) or null clears a global override;
+        // explicit undefined removes the project override to inherit global.
+        const rawVal = rawPatch[key];
+        const isExplicitClear =
+          rawVal === null ||
+          (typeof rawVal === "string" && rawVal.trim() === "");
+        if (scope === "project" && isExplicitClear) {
+          nextLayer[key] = null;
+        } else {
+          delete nextLayer[key];
+        }
+      } else {
+        nextLayer[key] = value;
+      }
+    }
+
+    await writeSettingsFileAtomic(targetPath, nextLayer, projectRootForGuard);
+
+    if (options?.projectRoot) {
+      return loadSwarmSettings(options.projectRoot, options);
+    }
+    return sanitizeSwarmSettings(nextLayer, DEFAULT_SWARM_SETTINGS);
+  });
 }

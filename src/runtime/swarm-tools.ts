@@ -524,7 +524,7 @@ export function createSwarmTools(deps: SwarmToolDeps): ToolDefinition[] {
                 'model is required for swarm{action:"model"}.',
               );
             }
-            const targetName = params.name?.trim();
+            const targetName = params.name?.trim().replace(/^@/, "");
             const isOrchestratorTarget =
               !targetName ||
               targetName.toLowerCase() === ORCHESTRATOR_NAME ||
@@ -601,7 +601,7 @@ export function createSwarmTools(deps: SwarmToolDeps): ToolDefinition[] {
           }
 
           case "kill": {
-            const name = params.name?.trim() ?? "";
+            const name = params.name?.trim().replace(/^@/, "") ?? "";
             if (!name) {
               throw new SwarmProtocolError(
                 "INVALID_INPUT",
@@ -621,7 +621,7 @@ export function createSwarmTools(deps: SwarmToolDeps): ToolDefinition[] {
           }
 
           case "merge": {
-            const name = params.name?.trim() ?? "";
+            const name = params.name?.trim().replace(/^@/, "") ?? "";
             if (!name) {
               throw new SwarmProtocolError(
                 "INVALID_INPUT",
@@ -650,7 +650,7 @@ export function createSwarmTools(deps: SwarmToolDeps): ToolDefinition[] {
               action: op,
               name: params.channel,
               topic: params.topic,
-              member: params.name,
+              member: params.name?.trim().replace(/^@/, ""),
               callerName,
               callerRole,
             });
@@ -820,6 +820,7 @@ export function createSwarmTools(deps: SwarmToolDeps): ToolDefinition[] {
     promptGuidelines: [
       `Call ${SWARM_WAIT_TOOL} after spawning or waking workers instead of polling ${READ_BOARD_TOOL} in a loop. It ends your turn cleanly so the user can message you anytime while workers run. Pass the highest #seq you have read as since.`,
     ],
+    executionMode: "sequential",
     parameters: Type.Object({
       since: Type.Number({
         description: "Highest sequence number you have already read (0 to wait from start).",
@@ -1032,6 +1033,7 @@ export function createMemberScopedTools(
     promptGuidelines: [
       `When you finish your work or are waiting for a peer response, post your update via ${POST_MESSAGE_TOOL} and call ${SWARM_WAIT_TOOL} to sleep cleanly with zero token cost.`,
     ],
+    executionMode: "sequential",
     parameters: Type.Object({
       since: Type.Number({
         description: "Highest sequence number you have already read.",
@@ -1150,6 +1152,11 @@ export function createMemberScopedTools(
       channel: Type.Optional(
         Type.String({ description: 'Channel name for action="channel".' }),
       ),
+      force: Type.Optional(
+        Type.Boolean({
+          description: 'For action="kill": force removal even if isolated worktree has uncommitted changes.',
+        }),
+      ),
       reason: Type.Optional(
         Type.String({ description: 'Optional reason for "model" or "kill".' }),
       ),
@@ -1214,7 +1221,7 @@ export function createMemberScopedTools(
               );
             }
             const res = await bridge.switchModel(
-              params.name?.trim() || member.name,
+              params.name?.trim().replace(/^@/, "") || member.name,
               model,
               params.thinking_level,
               params.reason,
@@ -1283,14 +1290,14 @@ export function createMemberScopedTools(
           }
 
           case "kill": {
-            const name = params.name?.trim() ?? "";
+            const name = params.name?.trim().replace(/^@/, "") ?? "";
             if (!name) {
               throw new SwarmProtocolError(
                 "INVALID_INPUT",
                 'name is required for swarm{action:"kill"}.',
               );
             }
-            await bridge.killHelper(name, params.reason);
+            await bridge.killHelper(name, params.reason, params.force);
             return okResult(`Killed helper @${name}.`, { name, killed: true });
           }
 
@@ -1299,7 +1306,7 @@ export function createMemberScopedTools(
             const res = await bridge.manageChannel({
               action: op,
               name: params.channel,
-              member: params.name?.trim() || member.name,
+              member: params.name?.trim().replace(/^@/, "") || member.name,
               callerName: member.name,
               callerRole: member.role,
             });

@@ -37,6 +37,7 @@ import {
   getSwarmToolsForMode,
   IDLE_SWARM_TOOLS,
   isDraftActive,
+  ProposeSwarmPlanParamsSchema,
   registerDraftingTools,
   rehydrateDraft,
   startDraft,
@@ -1891,5 +1892,233 @@ describe("draft-prompts: prompt builders, escapeXml & formatProposalTranscriptSu
       fullSummary,
       /\| \*\*auditor\*\* \| `validator` \| `inherit` \| Verify diffs read-only \|/,
     );
+  });
+});
+
+// ============================================================================
+// 7. v0.3.6 Audit Regression Tests (Draft Sync, Cancel, Schema, Blank Question, Prototype Keys)
+// ============================================================================
+
+describe("v0.3.6 drafting regression fixes", () => {
+  it("sets maximum: 64 on max_concurrency schema and rejects prototype keys in validateProposedSwarmPlan", () => {
+    const schemaJson = JSON.stringify(ProposeSwarmPlanParamsSchema);
+    assert.ok(!schemaJson.includes('"anyOf"'));
+    assert.ok(!schemaJson.includes('"oneOf"'));
+    const maxConcProp = ProposeSwarmPlanParamsSchema.properties
+      .max_concurrency as unknown as Record<string, unknown>;
+    assert.equal(maxConcProp.minimum, 1);
+    assert.equal(maxConcProp.maximum, 64);
+
+    const protoMemberRes = validateProposedSwarmPlan(
+      makeSamplePlanParams({
+        initial_members: [
+          { name: "constructor", role: "worker", brief: "Prototype key test" },
+        ],
+      }),
+    );
+    assert.equal(protoMemberRes.valid, false);
+    if (!protoMemberRes.valid) {
+      assert.equal(protoMemberRes.issues[0]?.code, "INVALID_NAME");
+    }
+
+    const protoChannelRes = validateProposedSwarmPlan(
+      makeSamplePlanParams({
+        initial_members: [
+          {
+            name: "parser",
+            role: "worker",
+            brief: "Valid member",
+            channels: ["constructor"],
+          },
+        ],
+      }),
+    );
+    assert.equal(protoChannelRes.valid, false);
+    if (!protoChannelRes.valid) {
+      assert.equal(protoChannelRes.issues[0]?.code, "INVALID_CHANNEL");
+    }
+  });
+
+  it("rejects blank/whitespace-only question text in swarm_questionnaire and falls back from detached HEAD to main", async () => {
+    const harness = new MockPiHarness();
+    const confirmedPlans: ProposedSwarmPlan[] = [];
+    const controller = registerDraftingTools(harness.api, {
+      worktree: createMockWorktree({ currentBranch: "HEAD" }),
+      ui: {
+        askQuestion: async () => ({ cancelled: true, isCustom: false }),
+        askQuestionnaire: async () => {
+          throw new Error("should not open modal on blank question");
+        },
+        confirmProposal: async (_ctx, plan) => ({
+          action: "confirm",
+          validatorEnabled: plan.validatorEnabled,
+          maxConcurrency: plan.maxConcurrency,
+        }),
+      },
+      getSettings: () => ({ ...DEFAULT_SWARM_SETTINGS }),
+      onPlanConfirmed: async (plan) => {
+        confirmedPlans.push(plan);
+        return createMockRun(plan);
+      },
+    });
+
+    controller.start({
+      seed: "Detached HEAD + blank question check",
+      validatorEnabled: true,
+      maxConcurrency: 4,
+    });
+
+    const ctx = harness.createContext();
+    const qnTool = harness.registeredTools.get(SWARM_QUESTIONNAIRE_TOOL);
+    const blankRes = await qnTool.execute(
+      "tc-blank",
+      {
+        questions: [
+          {
+            id: "q1",
+            question: "   \t  ",
+            options: [{ label: "Yes" }],
+          },
+        ],
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(blankRes.isError, true);
+
+    const proposeRes = await harness.registeredTools
+      .get(PROPOSE_SWARM_PLAN_TOOL)
+      .execute("tc-head-fallback", makeSamplePlanParams(), undefined, undefined, ctx);
+    assert.equal(proposeRes.isError, undefined);
+    assert.equal(confirmedPlans[0]?.baseBranch, "main");
+  });
+
+  it("rehydrates branch-local state on startOrResolve and ensureDraftSynced across branch switches without leaking stale in-memory drafts", async () => {
+    const harness = new MockPiHarness();
+    const controller = registerDraftingTools(harness.api, {
+      worktree: createMockWorktree(),
+      ui: {
+        askQuestion: async () => ({ cancelled: false, answer: "Option A", isCustom: false }),
+        askQuestionnaire: async () => ({ cancelled: true, answers: {}, items: [] }),
+        confirmProposal: async () => ({
+          action: "cancel",
+          validatorEnabled: true,
+          maxConcurrency: 3,
+        }),
+      },
+      getSettings: () => ({ ...DEFAULT_SWARM_SETTINGS }),
+      onPlanConfirmed: async (plan) => createMockRun(plan),
+    });
+
+    // Start draft on Branch A (populates controller.current)
+    controller.start({
+      seed: "Branch A only",
+      validatorEnabled: true,
+      maxConcurrency: 3,
+    });
+    assert.equal(controller.isActive(), true);
+
+    // Switch to Branch B (empty session branch -> no active draft on Branch B)
+    const branchBCtx = harness.createContext({ branch: [], hasUI: false });
+    const startB = await controller.startOrResolve(branchBCtx, {
+      seed: "Branch B fresh draft",
+      validatorEnabled: false,
+      maxConcurrency: 2,
+    });
+    // Must start cleanly instead of hitting conflict dialog from Branch A's stale this.current
+    assert.equal(startB.action, "started");
+    assert.equal(startB.draft?.seed, "Branch B fresh draft");
+
+    // Now switch to Branch C (also empty) and execute swarm_question -> must NOT echo into Branch A's draft
+    const branchCCtx = harness.createContext({ branch: [] });
+    const qTool = harness.registeredTools.get(SWARM_QUESTION_TOOL);
+    await qTool.execute(
+      "tc-branch-c",
+      { id: "q_c", question: "Pick one", options: [{ label: "Option A" }] },
+      undefined,
+      undefined,
+      branchCCtx,
+    );
+    assert.equal(controller.getDraft(), null);
+  });
+
+  it("handles tweak cancel tool profile restoration and delegates profile sync when onDraftChanged is provided", async () => {
+    // 1. Without onDraftChanged, cancelling a tweak draft restores "running" tool profile
+    const harnessTweak = new MockPiHarness();
+    const tweakCtrl = registerDraftingTools(harnessTweak.api, {
+      worktree: createMockWorktree(),
+      ui: {
+        askQuestion: async () => ({ cancelled: true, isCustom: false }),
+        askQuestionnaire: async () => ({ cancelled: true, answers: {}, items: [] }),
+        confirmProposal: async () => ({
+          action: "cancel",
+          validatorEnabled: true,
+          maxConcurrency: 3,
+        }),
+      },
+      getSettings: () => ({ ...DEFAULT_SWARM_SETTINGS }),
+      onPlanConfirmed: async (plan) => createMockRun(plan),
+    });
+    tweakCtrl.start({
+      mode: "tweak",
+      targetRunId: "run-active-1",
+      seed: "Tweak running swarm",
+      validatorEnabled: true,
+      maxConcurrency: 4,
+    });
+    await harnessTweak.registeredTools
+      .get(PROPOSE_SWARM_PLAN_TOOL)
+      .execute(
+        "tc-tweak-cancel",
+        makeSamplePlanParams(),
+        undefined,
+        undefined,
+        harnessTweak.createContext(),
+      );
+    for (const tool of SWARM_CORE_TOOLS) {
+      assert.ok(
+        harnessTweak.activeTools.includes(tool),
+        `tweak cancel must restore core tool ${tool}`,
+      );
+    }
+
+    // 2. With onDraftChanged, cancel delegates profile sync instead of calling setActiveTools directly
+    const harnessDelegated = new MockPiHarness();
+    let onDraftChangedCount = 0;
+    const delegatedCtrl = registerDraftingTools(harnessDelegated.api, {
+      worktree: createMockWorktree(),
+      ui: {
+        askQuestion: async () => ({ cancelled: true, isCustom: false }),
+        askQuestionnaire: async () => ({ cancelled: true, answers: {}, items: [] }),
+        confirmProposal: async () => ({
+          action: "cancel",
+          validatorEnabled: true,
+          maxConcurrency: 3,
+        }),
+      },
+      getSettings: () => ({ ...DEFAULT_SWARM_SETTINGS }),
+      onPlanConfirmed: async (plan) => createMockRun(plan),
+      onDraftChanged: () => {
+        onDraftChangedCount += 1;
+      },
+    });
+    delegatedCtrl.start({
+      seed: "Delegated cancel",
+      validatorEnabled: true,
+      maxConcurrency: 3,
+    });
+    const callsBeforeCancel = harnessDelegated.setActiveToolsCalls.length;
+    await harnessDelegated.registeredTools
+      .get(PROPOSE_SWARM_PLAN_TOOL)
+      .execute(
+        "tc-delegated-cancel",
+        makeSamplePlanParams(),
+        undefined,
+        undefined,
+        harnessDelegated.createContext(),
+      );
+    assert.equal(onDraftChangedCount, 1);
+    assert.equal(harnessDelegated.setActiveToolsCalls.length, callsBeforeCancel);
   });
 });

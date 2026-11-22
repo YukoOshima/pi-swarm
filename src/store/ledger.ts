@@ -90,8 +90,10 @@ export async function appendLedgerEvent(
     await assertPathNotSymlink(eventsPath);
 
     let nextSeq = 1;
+    let needsLeadingNewline = false;
     try {
       const existing = await readFile(eventsPath, "utf8");
+      needsLeadingNewline = existing.length > 0 && !existing.endsWith("\n");
       const parsed = parseEventLines(existing);
       if (parsed.length > 0) {
         const last = parsed[parsed.length - 1];
@@ -117,7 +119,7 @@ export async function appendLedgerEvent(
       ...(input.data !== undefined ? { data: input.data } : {}),
     };
 
-    const line = `${JSON.stringify(event)}\n`;
+    const line = `${needsLeadingNewline ? "\n" : ""}${JSON.stringify(event)}\n`;
     await appendFile(eventsPath, line, { encoding: "utf8", flag: "a" });
     return event;
   });

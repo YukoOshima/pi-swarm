@@ -275,6 +275,7 @@ class MockSwarmStore implements ISwarmStore {
       workspace: member.workspace,
       cwd: member.cwd,
       branch: member.branch,
+      sessionFile: member.sessionFile,
       forkedFrom: member.forkedFrom,
       channels,
       model: member.model,
@@ -323,6 +324,9 @@ class MockSwarmStore implements ISwarmStore {
     if (patch.state !== undefined) m.state = patch.state;
     if (patch.briefSeq !== undefined) m.briefSeq = patch.briefSeq;
     if (patch.branch !== undefined) m.branch = patch.branch;
+    if (patch.sessionFile !== undefined) {
+      m.sessionFile = patch.sessionFile === null ? undefined : patch.sessionFile;
+    }
     if (patch.mergedCommitSha !== undefined) m.mergedCommitSha = patch.mergedCommitSha;
     if (patch.channels !== undefined) m.channels = [...patch.channels];
     if (patch.model !== undefined) m.model = patch.model;
@@ -774,61 +778,69 @@ class ScriptedTransport implements ISwarmTransport {
       messages,
     };
 
+    let resolveAbortRace: ((res: AgentTurnResult) => void) | undefined;
     const runTurn = async (prompt: string): Promise<AgentTurnResult> => {
       turnIndex += 1;
       messages.push(makeUserMessage(prompt));
       const handler = this.resolveHandler(request.name);
-      const partial = (await handler({
-        request,
-        prompt,
-        turnIndex,
-        model,
-        thinkingLevel,
-        messages,
-        handle: record,
-      })) ?? {};
+      const abortRace = new Promise<AgentTurnResult>((resolve) => {
+        resolveAbortRace = resolve;
+      });
+      const turnExecution = (async (): Promise<AgentTurnResult> => {
+        const partial = (await handler({
+          request,
+          prompt,
+          turnIndex,
+          model,
+          thinkingLevel,
+          messages,
+          handle: record,
+        })) ?? {};
 
-      if (record.killed) {
-        state = "killed";
+        if (record.killed) {
+          state = "killed";
+          return {
+            agentId: request.agentId,
+            name: request.name,
+            role: request.role,
+            outcome: "killed",
+            summary: "killed",
+            model,
+            thinkingLevel,
+            tokens: 100,
+            cost: 0.001,
+          };
+        }
+
+        const outcome = partial.outcome ?? "waiting";
+        const summary = partial.summary ?? `${request.name} turn ${turnIndex}`;
+        messages.push(makeAssistantTextMessage(summary));
+
+        if (outcome === "waiting" || outcome === "rate_limited" || outcome === "failed") {
+          state = request.keepWarm ? "waiting" : "stopped";
+        } else if (outcome === "stopped") {
+          state = "stopped";
+        } else {
+          state = "killed";
+        }
+
         return {
           agentId: request.agentId,
           name: request.name,
           role: request.role,
-          outcome: "killed",
-          summary: "killed",
-          model,
-          thinkingLevel,
-          tokens: 100,
-          cost: 0.001,
+          outcome,
+          summary,
+          model: partial.model ?? model,
+          thinkingLevel: partial.thinkingLevel ?? thinkingLevel,
+          tokens: partial.tokens ?? turnIndex * 100,
+          cost: partial.cost ?? turnIndex * 0.002,
+          error: partial.error,
+          stopReason: partial.stopReason,
+          retryAfterMs: partial.retryAfterMs,
         };
-      }
+      })();
 
-      const outcome = partial.outcome ?? "waiting";
-      const summary = partial.summary ?? `${request.name} turn ${turnIndex}`;
-      messages.push(makeAssistantTextMessage(summary));
-
-      if (outcome === "waiting" || outcome === "rate_limited" || outcome === "failed") {
-        state = request.keepWarm ? "waiting" : "stopped";
-      } else if (outcome === "stopped") {
-        state = "stopped";
-      } else {
-        state = "killed";
-      }
-
-      return {
-        agentId: request.agentId,
-        name: request.name,
-        role: request.role,
-        outcome,
-        summary,
-        model: partial.model ?? model,
-        thinkingLevel: partial.thinkingLevel ?? thinkingLevel,
-        tokens: partial.tokens ?? turnIndex * 100,
-        cost: partial.cost ?? turnIndex * 0.002,
-        error: partial.error,
-        stopReason: partial.stopReason,
-        retryAfterMs: partial.retryAfterMs,
-      };
+      return Promise.race([turnExecution, abortRace]);
     };
 
     let currentTurnPromise = runTurn(request.initialPrompt);
@@ -840,6 +852,7 @@ class ScriptedTransport implements ISwarmTransport {
       getState: () => state,
       getModel: () => model,
       getThinkingLevel: () => thinkingLevel,
+      getSessionFile: () => request.sessionFile,
       getConversationMessages: () => structuredClone(messages),
       wake: async (prompt: string) => {
         if (state === "killed") {
@@ -875,11 +888,33 @@ class ScriptedTransport implements ISwarmTransport {
         record.aborted = true;
         if (state !== "killed") {
           state = "stopped";
+          resolveAbortRace?.({
+            agentId: request.agentId,
+            name: request.name,
+            role: request.role,
+            outcome: "stopped",
+            summary: "aborted",
+            model,
+            thinkingLevel,
+            tokens: 0,
+            cost: 0,
+          });
         }
       },
       kill: async () => {
         record.killed = true;
         state = "killed";
+        resolveAbortRace?.({
+          agentId: request.agentId,
+          name: request.name,
+          role: request.role,
+          outcome: "killed",
+          summary: "killed",
+          model,
+          thinkingLevel,
+          tokens: 0,
+          cost: 0,
+        });
       },
       get currentTurn() {
         return currentTurnPromise;
@@ -3901,6 +3936,697 @@ describe("SwarmEngine — v0.3.1 Hardening & Optimizations", () => {
         assert.equal(res.outcome, "killed");
       } finally {
         await rm(tmpRoot, { recursive: true, force: true });
+      }
+    }
+  });
+});
+
+// ============================================================================
+// 15. v0.3.6 Runtime, Transport, Tools & Stall Monitor Fixes
+// ============================================================================
+
+describe("SwarmEngine & Runtime — v0.3.6 Fixes", () => {
+  it("1. persists member.sessionFile eagerly in InProcessPiTransport and across handleTurnFinished / revive", async () => {
+    const tmpRoot = await mkdtemp(path.join(os.tmpdir(), "pi-swarm-v036-sess-"));
+    try {
+      const sessionDir = path.join(tmpRoot, "sessions");
+      let releaseTurn!: () => void;
+      const turnGate = new Promise<void>((r) => {
+        releaseTurn = r;
+      });
+      const seenSessionFiles: Array<string | undefined> = [];
+
+      const transport = new InProcessPiTransport({
+        agentDir: tmpRoot,
+        createSession: async (opts) => {
+          seenSessionFiles.push(opts?.sessionManager?.getSessionFile?.());
+          const fakeSession = {
+            model: opts?.model,
+            sessionManager: opts?.sessionManager,
+            extensionRunner: { hasHandlers: () => false, emit: async () => {} },
+            bindExtensions: async () => {},
+            subscribe: () => () => {},
+            prompt: async () => {
+              await turnGate;
+            },
+            steer: async () => {},
+            followUp: async () => {},
+            setModel: async () => {},
+            setThinkingLevel: () => {},
+            abort: async () => {},
+            dispose: () => {},
+            getSessionStats: () => ({
+              tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+              cost: 0,
+            }),
+          };
+          return {
+            session: fakeSession as unknown as AgentSession,
+            extensionsResult: {} as never,
+          };
+        },
+      });
+
+      const handle = await transport.spawnMember({
+        agentId: "eager-1",
+        name: "eager",
+        role: "worker",
+        runId: "run-eager",
+        cwd: tmpRoot,
+        baseBranch: "main",
+        workspace: "inherit",
+        parentName: "orchestrator",
+        brief: "Check eager sessionFile",
+        systemPrompt: "sys",
+        initialPrompt: "go",
+        keepWarm: true,
+        sessionDir,
+      });
+
+      const eagerFile = handle.getSessionFile?.();
+      assert.ok(eagerFile && eagerFile.startsWith(sessionDir), "spawnMember must expose sessionFile eagerly before turn finishes");
+      releaseTurn();
+      await handle.currentTurn;
+      assert.equal(seenSessionFiles.length, 1);
+      assert.equal(seenSessionFiles[0], eagerFile);
+      assert.equal(handle.getSessionFile?.(), eagerFile);
+      await handle.kill("done");
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+
+    // Engine persists sessionFile in handleTurnFinished (waiting/stopped) & reviveMemberWithPendingWakes
+    const { engine, transport, store } = await createTestHarness({ stallWatchdogEnabled: false });
+    const origSpawn = transport.spawnMember.bind(transport);
+    let spawnIdx = 0;
+    transport.spawnMember = async (req) => {
+      spawnIdx += 1;
+      const sf = req.sessionFile ?? `/tmp/sess-${req.name}-${spawnIdx}.jsonl`;
+      const h = await origSpawn({ ...req, sessionFile: sf });
+      return {
+        ...h,
+        getSessionFile: () => sf,
+        get currentTurn() {
+          return h.currentTurn;
+        },
+      };
+    };
+
+    try {
+      await engine.addMembers({ name: "persist-w", brief: "Persist sessionFile" });
+      await waitUntil(() => engine.getSnapshot().run?.members["persist-w"]?.state === "waiting");
+      assert.equal(
+        engine.getSnapshot().run?.members["persist-w"]?.sessionFile,
+        "/tmp/sess-persist-w-1.jsonl",
+      );
+
+      // Force cold stop and revive -> sessionFile stays persisted
+      await engine.stopMember("persist-w", { humanStopped: false, reason: "restart" });
+      await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        text: "@persist-w revive and report",
+      });
+      await waitUntil(
+        () =>
+          engine.getSnapshot().run?.members["persist-w"]?.turns === 2 &&
+          engine.getSnapshot().run?.members["persist-w"]?.state === "waiting",
+      );
+      const loaded = await store.loadRun("run-dyn");
+      assert.equal(loaded.members["persist-w"]?.sessionFile, "/tmp/sess-persist-w-1.jsonl");
+    } finally {
+      await engine.dispose();
+    }
+  });
+
+  it("2. rejects terminal runs in pause/resume/completeRun, isolates non-focused pause(), disposes working handles on pause(), and revives stopped in drainMemberPendingWakes", async () => {
+    const { engine, store, transport } = await createTestHarness({ stallWatchdogEnabled: false });
+    let releaseWorker!: () => void;
+    const workerGate = new Promise<void>((r) => {
+      releaseWorker = r;
+    });
+
+    try {
+      // A. Non-focused run pause() does not mutate active run's liveMembers/cachedRun
+      const otherRun = await store.createRun({
+        id: "run-other",
+        title: "Other Run",
+        objective: "Background run",
+        baseBranch: "main",
+        ownerSessionId: "sess-2",
+      });
+      await store.addMember(otherRun.id, {
+        name: "other-w",
+        agentId: "other-w-1",
+        role: "worker",
+        parentName: ORCHESTRATOR_NAME,
+        brief: "Work in other run",
+        workspace: "inherit",
+        cwd: "/repo",
+        state: "working",
+      });
+
+      let activeWCalls = 0;
+      transport.onMember("active-w", async () => {
+        activeWCalls += 1;
+        if (activeWCalls === 1) {
+          await workerGate;
+        }
+        return { outcome: "waiting", summary: "done" };
+      });
+      await engine.addMembers({ name: "active-w", brief: "Keep working in focused run" });
+      await waitUntil(() => transport.handles.get("active-w") !== undefined);
+
+      const pausedOther = await engine.pause("run-other", "Pause background run");
+      assert.equal(pausedOther.status, "paused");
+      assert.equal(pausedOther.members["other-w"]?.state, "stopped");
+      assert.equal(engine.getSnapshot().activeRunId, "run-dyn");
+      assert.equal(engine.getSnapshot().run?.status, "active");
+      assert.equal(transport.handles.get("active-w")?.aborted, false);
+
+      // B. Focused pause() aborts and kills working handle so handle is never left waiting
+      const pausedActive = await engine.pause(undefined, "Pause focused run");
+      assert.equal(pausedActive.status, "paused");
+      assert.equal(pausedActive.members["active-w"]?.state, "stopped");
+      assert.equal(transport.handles.get("active-w")?.aborted, true);
+      assert.equal(transport.handles.get("active-w")?.killed, true);
+
+      // C. Resume -> cold stopped (non-humanStopped) member wakes cleanly even if drainMemberPendingWakes is entered
+      await engine.resume();
+      await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        text: "@active-w continue after pause",
+      });
+      await waitUntil(() => engine.getSnapshot().run?.members["active-w"]?.state === "waiting");
+
+      // D. Terminal runs reject pause(), resume(), and completeRun()
+      await engine.completeRun({ summary: "All finished" });
+      await assert.rejects(
+        () => engine.pause("run-dyn", "Cannot pause completed"),
+        (err) => err instanceof SwarmProtocolError && err.code === "INVALID_INPUT",
+      );
+      await assert.rejects(
+        () => engine.resume("run-dyn"),
+        (err) => err instanceof SwarmProtocolError && err.code === "INVALID_INPUT",
+      );
+      await assert.rejects(
+        () => engine.completeRun({ summary: "Double complete" }),
+        (err) => err instanceof SwarmProtocolError && err.code === "INVALID_INPUT",
+      );
+    } finally {
+      releaseWorker?.();
+      await engine.dispose();
+    }
+  });
+
+  it("3. auto-revives cold-parked 'waiting' members on switchModel after detach/reattach", async () => {
+    const { engine, transport } = await createTestHarness({ stallWatchdogEnabled: false });
+    try {
+      await engine.addMembers({ name: "cold-waiter", brief: "Park warm then detach" });
+      await waitUntil(() => engine.getSnapshot().run?.members["cold-waiter"]?.state === "waiting");
+      const spawnsBeforeDetach = transport.spawns.length;
+
+      // Detach and reattach -> member is persisted as state="waiting" with NO live handle in memory
+      await engine.attachRun(null);
+      const snap = await engine.attachRun("run-dyn");
+      assert.equal(snap.run?.members["cold-waiter"]?.state, "waiting");
+
+      const sw = await engine.switchModel({
+        targetName: "cold-waiter",
+        model: "google/gemini-2.5-pro",
+        reason: "Cold waiter upgrade",
+      });
+      assert.equal(sw.model, "google/gemini-2.5-pro");
+      assert.equal(sw.resumed, true);
+
+      await waitUntil(
+        () =>
+          transport.spawns.length === spawnsBeforeDetach + 1 &&
+          engine.getSnapshot().run?.members["cold-waiter"]?.state === "waiting",
+      );
+      const revived = transport.spawns[transport.spawns.length - 1]!;
+      assert.equal(revived.name, "cold-waiter");
+      assert.equal(revived.modelOverride, "google/gemini-2.5-pro");
+    } finally {
+      await engine.dispose();
+    }
+  });
+
+  it("4. guards handleTurnFinished against pause/stop during mentions_only:false scan, internal switch, and 429 retry scheduling", async () => {
+    // A. Stop during mentions_only:false board scan does not wake stopped member
+    {
+      const { engine, store, transport } = await createTestHarness({ stallWatchdogEnabled: false });
+      transport.onMember("scanner", async ({ request }) => {
+        request.onTelemetry?.({
+          agentId: request.agentId,
+          name: request.name,
+          role: request.role,
+          runId: request.runId,
+          type: "waiting",
+          timestamp: new Date().toISOString(),
+          logLine: "swarm_wait since=#0 mentions_only=false",
+        });
+        return { outcome: "waiting", summary: "waiting" };
+      });
+      try {
+        const origReadBoard = store.readBoard.bind(store);
+        let readEntered!: () => void;
+        let releaseRead!: () => void;
+        const readEnteredP = new Promise<void>((r) => {
+          readEntered = r;
+        });
+        let intercept = false;
+        store.readBoard = async (id, opts) => {
+          if (intercept && opts?.since === 0 && opts?.memberChannels) {
+            intercept = false;
+            readEntered();
+            await new Promise<void>((r) => {
+              releaseRead = r;
+            });
+          }
+          return origReadBoard(id, opts);
+        };
+
+        intercept = true;
+        await engine.addMembers({ name: "scanner", brief: "Scan board" });
+        await readEnteredP;
+        await engine.stopMember("scanner", { humanStopped: true, reason: "Stopped mid-scan" });
+        releaseRead();
+        await delay(30);
+        assert.equal(engine.getSnapshot().run?.members.scanner?.state, "stopped");
+        assert.equal(transport.handles.get("scanner")?.wakePrompts.length, 0);
+      } finally {
+        await engine.dispose();
+      }
+    }
+
+    // B. Pause during 429 retry scheduling prevents arming retryTimer
+    {
+      const { engine, store, transport } = await createTestHarness({
+        stallWatchdogEnabled: false,
+        fallbackModels: [],
+        maxRetries: 2,
+        rateLimitBaseBackoffMs: 30,
+        rateLimitMaxBackoffMs: 50,
+      });
+      let turns = 0;
+      transport.onMember("rl-racer", async () => {
+        turns += 1;
+        return { outcome: "rate_limited", error: "HTTP 429" };
+      });
+      try {
+        const origUpdateMember = store.updateMember.bind(store);
+        let parkedUpdateEntered!: () => void;
+        let releaseParkedUpdate!: () => void;
+        const enteredP = new Promise<void>((r) => {
+          parkedUpdateEntered = r;
+        });
+        store.updateMember = async (runId, name, patch) => {
+          if (name === "rl-racer" && typeof patch.parkedOn === "string" && patch.parkedOn.includes("auto-retry")) {
+            parkedUpdateEntered();
+            await new Promise<void>((r) => {
+              releaseParkedUpdate = r;
+            });
+          }
+          return origUpdateMember(runId, name, patch);
+        };
+
+        await engine.addMembers({ name: "rl-racer", brief: "Hit 429" });
+        await enteredP;
+        await engine.pause("run-dyn", "Pause during retry scheduling");
+        releaseParkedUpdate();
+        await delay(80);
+        assert.equal(turns, 1, "Paused member must not execute scheduled 429 retry");
+        assert.equal(engine.getSnapshot().run?.status, "paused");
+      } finally {
+        await engine.dispose();
+      }
+    }
+  });
+
+  it("5. ConcurrencyGate.acquire wakes next waiter on abort during backoff and parseRetryAfterMs handles retry-after-ms", async () => {
+    assert.equal(
+      parseRetryAfterMs({ headers: { "retry-after-ms": "250" } }),
+      250,
+    );
+    assert.equal(
+      parseRetryAfterMs({ response: { headers: { "Retry-After-Ms": 150 } } }),
+      150,
+    );
+    assert.equal(
+      parseRetryAfterMs({ headers: { "retry-after": "2" } }),
+      2000,
+    );
+
+    const breaker = new RateLimitBreaker({ baseBackoffMs: 200, maxBackoffMs: 500, jitterRatio: 0 });
+    const gate = new ConcurrencyGate(1, breaker);
+    const r1 = await gate.acquire();
+
+    const ac1 = new AbortController();
+    const w1 = gate.acquire(ac1.signal);
+    const w2 = gate.acquire();
+
+    // Put breaker into backoff, then release r1 so w1 wakes, enters waitIfBackedOff, and aborts!
+    breaker.recordRateLimit(150, "429");
+    r1();
+    await delay(10);
+    ac1.abort();
+    await assert.rejects(() => w1, /aborted/i);
+
+    // Wait for backoff to expire; w2 must be woken and acquire the slot instead of starving!
+    const r2 = await w2;
+    assert.equal(gate.getActiveCount(), 1);
+    r2();
+    assert.equal(gate.getActiveCount(), 0);
+  });
+
+  it("6. Smart LLM Monitor cancels on activity, rewrites invalid targets to @orchestrator, and escalates unadvanced worker nudges", async () => {
+    let monitorTurnMode: "ghost" | "nudge_worker" | "slow_stale" = "ghost";
+    let releaseSlowMonitor!: () => void;
+    let slowMonitorPostedResult: unknown;
+
+    const { engine, transport } = await createTestHarness({
+      stallWatchdogEnabled: true,
+      stallMonitorMode: "llm",
+      stallTimeoutMs: 25,
+    });
+
+    const origSpawn = transport.spawnMember.bind(transport);
+    transport.spawnMember = async (req: SpawnMemberRequest) => {
+      if (req.isMonitor) {
+        const turnPromise = (async (): Promise<AgentTurnResult> => {
+          if (monitorTurnMode === "ghost") {
+            await req.engineApi!.postMessage({
+              text: "@nonexistent [stall] Please check status.",
+            });
+            return { agentId: req.agentId, name: req.name, role: req.role, outcome: "waiting", summary: "nudged", tokens: 10, cost: 0 };
+          }
+          if (monitorTurnMode === "nudge_worker") {
+            await req.engineApi!.postMessage({
+              text: "@worker-a [stall] You parked without posting [done].",
+            });
+            return { agentId: req.agentId, name: req.name, role: req.role, outcome: "waiting", summary: "nudged worker-a", tokens: 10, cost: 0 };
+          }
+          // slow_stale: wait for activity to resume, then attempt stale post
+          await new Promise<void>((r) => {
+            releaseSlowMonitor = r;
+          });
+          try {
+            await req.engineApi!.postMessage({
+              text: "@orchestrator [stall] Stale alert",
+            });
+            slowMonitorPostedResult = "posted";
+          } catch (err) {
+            slowMonitorPostedResult = err;
+          }
+          return { agentId: req.agentId, name: req.name, role: req.role, outcome: "waiting", summary: "done", tokens: 10, cost: 0 };
+        })();
+
+        return {
+          agentId: req.agentId,
+          name: req.name,
+          role: req.role,
+          getState: () => "waiting",
+          getModel: () => req.modelOverride,
+          getThinkingLevel: () => req.thinkingLevel,
+          getConversationMessages: () => [],
+          wake: async () => turnPromise,
+          steer: async () => {},
+          followUp: async () => {},
+          switchModel: async (m, t) => ({ model: m, thinkingLevel: t }),
+          abort: async () => {},
+          kill: async () => {
+            releaseSlowMonitor?.();
+          },
+          currentTurn: turnPromise,
+        };
+      }
+      return origSpawn(req);
+    };
+
+    try {
+      // worker-a parks without posting anything on either initial turn or nudge wakeup
+      await engine.addMembers({ name: "worker-a", brief: "Stay quiet" });
+      await waitUntil(() => engine.getSnapshot().run?.members["worker-a"]?.state === "waiting");
+
+      // Part A: @monitor names @nonexistent -> rewritten & routed to @orchestrator!
+      await waitUntil(() =>
+        engine.getSnapshot().recentBoard.some((m) => m.kind === "stall" && m.mentions.includes(ORCHESTRATOR_NAME)),
+      );
+
+      // Part B: Nudge worker-a; worker-a wakes and parks again without advancing board -> next stall tick escalates to @orchestrator!
+      monitorTurnMode = "nudge_worker";
+      await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        text: "Advance board head",
+        kind: "update",
+      });
+      await waitUntil(
+        () =>
+          engine.getSnapshot().recentBoard.some(
+            (m) => m.kind === "stall" && m.mentions.includes("worker-a"),
+          ),
+        2000,
+      );
+      await waitUntil(
+        () =>
+          engine.getSnapshot().recentBoard.some(
+            (m) => m.kind === "stall" && m.text.includes("Nudged worker parked again"),
+          ),
+        2000,
+      );
+
+      // Part C: Activity resuming cancels active monitor and rejects stale [stall] post
+      monitorTurnMode = "slow_stale";
+      await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        text: "Trigger slow monitor",
+        kind: "update",
+      });
+      await waitUntil(() => Boolean(releaseSlowMonitor), 2000);
+      const stallCountBefore = engine.getSnapshot().recentBoard.filter((m) => m.kind === "stall").length;
+      await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        text: "Resumed activity",
+      });
+      await delay(30);
+      const stallCountAfter = engine.getSnapshot().recentBoard.filter((m) => m.kind === "stall").length;
+      assert.equal(stallCountAfter, stallCountBefore, "Superseded monitor must not post [stall] or fall back deterministically");
+      assert.ok(slowMonitorPostedResult instanceof Error);
+    } finally {
+      releaseSlowMonitor?.();
+      await engine.dispose();
+    }
+  });
+
+  it("7. validates v0.3.6 tool/guard/sanitizer/bridge/playbook/roleModels P2 & P3 fixes", async () => {
+    // A. Validator bash guard catches \n, \r, (, `, $(
+    assert.equal(isReadOnlyValidationCommand("echo ok\nrm -rf /tmp/x").allowed, false);
+    assert.equal(isReadOnlyValidationCommand("echo ok\rrm -rf /tmp/x").allowed, false);
+    assert.equal(isReadOnlyValidationCommand("(rm -rf /tmp/x)").allowed, false);
+    assert.equal(isReadOnlyValidationCommand("echo `rm -rf /tmp/x`").allowed, false);
+    assert.equal(isReadOnlyValidationCommand("echo $(rm -rf /tmp/x)").allowed, false);
+
+    // B. Worker guard enforces write/edit containment even for inherit AND checkout guard when isIsolatedWorktree/branch
+    {
+      let handler!: (ev: any) => any;
+      const fakePi = { on: (_: string, fn: (ev: any) => any) => { handler = fn; } };
+      createWorkerGuardExtensionFactory(
+        {
+          agentId: "a-1",
+          name: "a",
+          role: "worker",
+          runId: "r-1",
+          cwd: "/repo/wt",
+          workspace: "inherit",
+          isIsolatedWorktree: true,
+          parentName: "parent",
+          brief: "help",
+          systemPrompt: "s",
+          initialPrompt: "p",
+          keepWarm: true,
+        },
+        "main",
+      )(fakePi as any);
+
+      assert.equal(handler({ toolName: "write", input: { path: "../outside.ts" } })?.block, true);
+      assert.equal(handler({ toolName: "bash", input: { command: "git checkout main" } })?.block, true);
+    }
+
+    // C. sanitizeForkSeedMessages strips thinking & sets stopReason="stop" on dangling toolCall and drops empty assistant msgs
+    {
+      const sanitized = sanitizeForkSeedMessages([
+        makeUserMessage("Go"),
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "secret thought" },
+            { type: "toolCall", id: "dangling-1", name: "bash", arguments: {} },
+          ],
+          stopReason: "toolUse",
+          timestamp: Date.now(),
+        } as unknown as AgentMessage,
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "partial" },
+            { type: "text", text: "Kept text" },
+            { type: "toolCall", id: "dangling-2", name: "bash", arguments: {} },
+          ],
+          stopReason: "toolUse",
+          timestamp: Date.now(),
+        } as unknown as AgentMessage,
+      ]);
+      assert.equal(sanitized.length, 2, "Assistant message with no kept text or toolCall must be skipped");
+      const kept = sanitized[1] as unknown as { content: Array<{ type: string }>; stopReason: string };
+      assert.equal(kept.stopReason, "stop");
+      assert.deepEqual(kept.content.map((p) => p.type), ["text"]);
+    }
+
+    // D. Tool schemas: swarm_wait sequential in both orchestrator & member tools, force in scopedSwarmTool, zero anyOf/oneOf
+    {
+      const { engine } = await createTestHarness({ stallWatchdogEnabled: false });
+      try {
+        const orchTools = createSwarmTools({ engine });
+        const orchWait = orchTools.find((t) => t.name === SWARM_WAIT_TOOL)!;
+        assert.equal((orchWait as unknown as { executionMode?: string }).executionMode, "sequential");
+
+        let killedArgs: Array<{ name: string; force?: boolean }> = [];
+        const memberTools = createMemberScopedTools(
+          {
+            postMessage: async () => { throw new Error("unused"); },
+            readBoard: async () => ({ messages: [], head: 0 }),
+            getStatus: async () => ({ runId: "r", title: "t", status: "active", baseBranch: "main", boardHead: 0, members: [], channels: [] }),
+            listModels: async () => [],
+            addHelper: async () => [],
+            killHelper: async (name, _reason, force) => {
+              killedArgs.push({ name, force });
+            },
+            switchModel: async () => ({ targetName: "x", model: "m" }),
+            manageChannel: async () => ({ action: "list", summary: "ok" }),
+          },
+          { name: "lead", role: "worker", runId: "run-dyn" },
+        );
+        const memberWait = memberTools.find((t) => t.name === SWARM_WAIT_TOOL)!;
+        assert.equal((memberWait as unknown as { executionMode?: string }).executionMode, "sequential");
+
+        const scopedSwarm = memberTools.find((t) => t.name === SWARM_TOOL)!;
+        for (const t of [...orchTools, ...memberTools]) {
+          const schemaText = JSON.stringify(t.parameters);
+          assert.ok(!schemaText.includes("anyOf") && !schemaText.includes("oneOf"), `${t.name} must not use anyOf/oneOf`);
+        }
+
+        await scopedSwarm.execute("tc-1", { action: "kill", name: "@helper", force: true }, undefined, undefined, {} as ExtensionToolContext);
+        assert.deepEqual(killedArgs, [{ name: "helper", force: true }]);
+      } finally {
+        await engine.dispose();
+      }
+    }
+
+    // E. Prototype keys rejected, validatorEnabled=false hides validator playbook steps, orchestrator switchModel not shadowed, completeRun checks sessionId, bridge rejects after kill
+    {
+      const { engine, store, transport } = await createTestHarness({
+        stallWatchdogEnabled: false,
+        orchestratorModel: "openai/gpt-5",
+      });
+      try {
+        await assert.rejects(
+          () => engine.addMembers({ name: "constructor", brief: "Invalid proto key" }),
+          (err) => err instanceof SwarmProtocolError && err.code === "INVALID_NAME",
+        );
+
+        await engine.switchModel({
+          targetName: "orchestrator",
+          model: "anthropic/claude-opus-4-6",
+        });
+        assert.equal(
+          engine.getSnapshot().roleModels.orchestrator?.model,
+          "anthropic/claude-opus-4-6",
+          "Run-scoped orchestrator switchModel must not be shadowed by settings.orchestratorModel",
+        );
+
+        const noValRun = await store.createRun({
+          id: "run-noval",
+          title: "No Validator",
+          objective: "Fast path",
+          baseBranch: "main",
+          ownerSessionId: "sess-1",
+          validatorEnabled: false,
+        });
+        await engine.startRun(noValRun.id);
+        const playbook = buildOrchestratorPlaybookSection(engine.getSnapshot());
+        assert.ok(!playbook.includes("Independent Read-Only Validation"));
+        assert.ok(playbook.includes("4. **Land & Complete**"));
+
+        // Member bridge guards after kill & leading @ stripping in kill/merge/model
+        let capturedBridge: SpawnMemberRequest["engineApi"] | undefined;
+        transport.onMember("bridged", async ({ request }) => {
+          capturedBridge = request.engineApi;
+        });
+        await engine.addMembers({ name: "bridged", brief: "Capture bridge" });
+        await waitUntil(() => engine.getSnapshot().run?.members.bridged?.state === "waiting");
+        await engine.killMember("@bridged");
+        await assert.rejects(
+          () => capturedBridge!.postMessage({ text: "late post" }),
+          (err) => err instanceof SwarmProtocolError && err.code === "MEMBER_KILLED",
+        );
+
+        // completeRun enforces sessionId ownership
+        await assert.rejects(
+          () => engine.completeRun({ summary: "Foreign complete", sessionId: "foreign-sess" }),
+          (err) => err instanceof SwarmProtocolError && err.code === "OWNERSHIP_CONFLICT",
+        );
+      } finally {
+        await engine.dispose();
+      }
+    }
+
+    // F. steerMember when handle.getState()==='waiting' during post-turn turnActive delivers via board post ("woken"), NOT handle.steer()
+    {
+      const { engine, store, transport } = await createTestHarness({ stallWatchdogEnabled: false });
+      const origLoadRun = store.loadRun.bind(store);
+      let enteredPostTurnLoad!: () => void;
+      let releasePostTurnLoad!: () => void;
+      const enteredP = new Promise<void>((r) => {
+        enteredPostTurnLoad = r;
+      });
+      let interceptPostTurn = false;
+      store.loadRun = async (runId) => {
+        const res = await origLoadRun(runId);
+        if (interceptPostTurn && res.members["steerable"]?.state === "working") {
+          interceptPostTurn = false;
+          enteredPostTurnLoad();
+          await new Promise<void>((r) => {
+            releasePostTurnLoad = r;
+          });
+        }
+        return res;
+      };
+      try {
+        await engine.addMembers({ name: "steerable", brief: "Finish turn 1" });
+        await waitUntil(() => engine.getSnapshot().run?.members.steerable?.state === "waiting");
+
+        // Trigger a wake whose turn completes while handle.getState()==='waiting' and pauses inside handleTurnFinished's loadRun
+        interceptPostTurn = true;
+        await engine.postMessage({
+          from: ORCHESTRATOR_NAME,
+          fromRole: "orchestrator",
+          text: "@steerable Turn 2",
+        });
+        await enteredP;
+        // Now handle.getState() === 'waiting' while live.turnActive === true
+        const steerRes = await engine.steerMember("steerable", "Post-turn redirect");
+        assert.equal(steerRes.delivery, "woken");
+        assert.equal(transport.handles.get("steerable")?.steers.length, 0);
+        releasePostTurnLoad();
+        await waitUntil(() => transport.handles.get("steerable")!.wakePrompts.length === 2);
+      } finally {
+        releasePostTurnLoad?.();
+        await engine.dispose();
       }
     }
   });

@@ -58,6 +58,7 @@ import {
 } from "../types.js";
 import { SwarmBoard } from "./board.js";
 import { appendLedgerEvent, readRecentLedgerEvents } from "./ledger.js";
+import { SWARM_SETTINGS_BOUNDS } from "./settings.js";
 
 // ============================================================================
 // Constants & Validation Tables
@@ -93,6 +94,26 @@ const DEFAULT_LOCK_RETRY_MS = 20;
 // Pure Protocol Helpers
 // ============================================================================
 
+/** Return true for prototype-polluting keys (`__proto__`, `prototype`, `constructor`, or `Object.prototype` keys). */
+export function isPrototypeKey(k: string): boolean {
+  return (
+    k === "__proto__" ||
+    k === "prototype" ||
+    k === "constructor" ||
+    k in Object.prototype
+  );
+}
+
+function getOwnRecord<T>(
+  map: Record<string, T> | undefined,
+  key: string,
+): T | undefined {
+  if (!map || isPrototypeKey(key) || !Object.hasOwn(map, key)) {
+    return undefined;
+  }
+  return map[key];
+}
+
 /** Validate a dynamic member name against `MEMBER_NAME_PATTERN` and `RESERVED_MEMBER_NAMES`. */
 export function validateMemberName(name: string): string {
   if (typeof name !== "string" || name.length === 0 || name !== name.trim()) {
@@ -106,6 +127,13 @@ export function validateMemberName(name: string): string {
     throw new SwarmProtocolError(
       "INVALID_NAME",
       `Invalid member name "${name}": must be 1–32 lowercase alphanumeric/hyphen characters starting with a letter.`,
+      { name },
+    );
+  }
+  if (isPrototypeKey(name)) {
+    throw new SwarmProtocolError(
+      "INVALID_NAME",
+      `Member name "${name}" is forbidden.`,
       { name },
     );
   }
@@ -132,6 +160,13 @@ export function validateChannelName(name: string): string {
     throw new SwarmProtocolError(
       "INVALID_CHANNEL",
       `Invalid channel name "${name}": must be 1–32 lowercase alphanumeric/hyphen characters starting with a letter.`,
+      { channel: name },
+    );
+  }
+  if (isPrototypeKey(name)) {
+    throw new SwarmProtocolError(
+      "INVALID_CHANNEL",
+      `Channel name "${name}" is forbidden.`,
       { channel: name },
     );
   }
@@ -331,10 +366,20 @@ function cloneRoleModels(roleModels: SwarmRoleModels | undefined): SwarmRoleMode
 }
 
 function ensureMainChannel(state: SwarmRunState): void {
-  if (!state.channels || typeof state.channels !== "object") {
+  if (
+    !state.channels ||
+    typeof state.channels !== "object" ||
+    Array.isArray(state.channels)
+  ) {
     state.channels = {};
+  } else {
+    for (const key of Object.keys(state.channels)) {
+      if (isPrototypeKey(key)) {
+        delete state.channels[key];
+      }
+    }
   }
-  if (!state.channels[DEFAULT_CHANNEL]) {
+  if (!Object.hasOwn(state.channels, DEFAULT_CHANNEL)) {
     state.channels[DEFAULT_CHANNEL] = {
       name: DEFAULT_CHANNEL,
       topic: "Primary swarm coordination channel",
@@ -371,13 +416,26 @@ function backfillRunState(state: SwarmRunState): SwarmRunState {
   ) {
     state.maxConcurrency = DEFAULT_SWARM_SETTINGS.maxConcurrency;
   } else {
-    state.maxConcurrency = Math.floor(raw.maxConcurrency);
+    state.maxConcurrency = Math.min(
+      SWARM_SETTINGS_BOUNDS.maxConcurrency.max,
+      Math.floor(raw.maxConcurrency),
+    );
   }
   if (!raw.roleModels || typeof raw.roleModels !== "object") {
     state.roleModels = {};
   }
-  if (!raw.members || typeof raw.members !== "object") {
+  if (
+    !raw.members ||
+    typeof raw.members !== "object" ||
+    Array.isArray(raw.members)
+  ) {
     state.members = {};
+  } else {
+    for (const key of Object.keys(state.members)) {
+      if (isPrototypeKey(key)) {
+        delete state.members[key];
+      }
+    }
   }
   if (!Array.isArray(raw.memberOrder)) {
     state.memberOrder = Object.keys(state.members);
@@ -451,7 +509,7 @@ function resolveMemberChannels(
   if (Array.isArray(rawChannels)) {
     for (const raw of rawChannels) {
       const ch = validateChannelName(raw);
-      const record = state.channels[ch];
+      const record = getOwnRecord(state.channels, ch);
       if (!record) {
         throw new SwarmProtocolError(
           "INVALID_CHANNEL",
@@ -637,13 +695,23 @@ export class SwarmStore implements ISwarmStore {
     const deadline = Date.now() + this.lockTimeoutMs;
 
     let acquired = false;
+    let acquiredIno: number | undefined;
+    let acquiredDev: number | undefined;
     while (!acquired) {
       try {
         const handle = await open(lockPath, "wx");
+        let setupOk = false;
         try {
           await handle.writeFile(JSON.stringify(payload), "utf8");
+          const st = await handle.stat();
+          acquiredIno = st.ino;
+          acquiredDev = st.dev;
+          setupOk = true;
         } finally {
-          await handle.close();
+          await handle.close().catch(() => {});
+          if (!setupOk) {
+            await unlink(lockPath).catch(() => {});
+          }
         }
         acquired = true;
       } catch (err) {
@@ -670,28 +738,43 @@ export class SwarmStore implements ISwarmStore {
     try {
       return await fn();
     } finally {
-      await this.releaseFileLock(lockPath, token);
+      await this.releaseFileLock(lockPath, token, acquiredIno, acquiredDev);
     }
   }
 
   private async tryRecoverStaleLock(lockPath: string): Promise<boolean> {
     const reapPath = `${lockPath}.reap`;
-    const reapStaleMs = Math.max(1_000, Math.min(this.staleLockMs, 5_000));
+    const reapStaleMs = Math.max(
+      200,
+      Math.min(this.staleLockMs, Math.floor(this.lockTimeoutMs / 2), 5_000),
+    );
+    const reapToken = randomUUID();
     let reapAcquired = false;
+    let reapIno = 0;
+    let reapDev = 0;
 
     try {
       const reapHandle = await open(reapPath, "wx");
+      let setupOk = false;
       try {
         await reapHandle.writeFile(
           JSON.stringify({
+            token: reapToken,
             pid: process.pid,
             hostname: os.hostname(),
             createdAt: new Date().toISOString(),
           }),
           "utf8",
         );
+        const reapStat = await reapHandle.stat();
+        reapIno = reapStat.ino;
+        reapDev = reapStat.dev;
+        setupOk = true;
       } finally {
-        await reapHandle.close();
+        await reapHandle.close().catch(() => {});
+        if (!setupOk) {
+          await unlink(reapPath).catch(() => {});
+        }
       }
       reapAcquired = true;
     } catch (err) {
@@ -700,8 +783,53 @@ export class SwarmStore implements ISwarmStore {
       }
       try {
         const reapStat = await lstat(reapPath);
-        if (Date.now() - reapStat.mtimeMs >= reapStaleMs) {
-          await unlink(reapPath).catch(() => {});
+        if (reapStat.isSymbolicLink()) {
+          return false;
+        }
+        let reapInfo: Partial<LockFilePayload> = {};
+        let reapParsed = false;
+        try {
+          const reapRaw = await readFile(reapPath, "utf8");
+          const parsed = JSON.parse(reapRaw) as Partial<LockFilePayload>;
+          if (parsed && typeof parsed === "object") {
+            reapInfo = parsed;
+            reapParsed = true;
+          }
+        } catch {
+          // Malformed or empty .reap file; fall back to mtime staleness check.
+        }
+
+        const isReapStale =
+          Date.now() - reapStat.mtimeMs >= reapStaleMs ||
+          (typeof reapInfo.pid === "number" &&
+            (!reapInfo.hostname || reapInfo.hostname === os.hostname()) &&
+            !this.checkPidAlive(reapInfo.pid));
+
+        if (isReapStale) {
+          const confirmStat = await lstat(reapPath);
+          if (
+            !confirmStat.isSymbolicLink() &&
+            confirmStat.ino === reapStat.ino &&
+            confirmStat.dev === reapStat.dev
+          ) {
+            let tokenMatches = true;
+            if (reapParsed && typeof reapInfo.token === "string") {
+              try {
+                const confirmRaw = await readFile(reapPath, "utf8");
+                const confirmInfo = JSON.parse(
+                  confirmRaw,
+                ) as Partial<LockFilePayload>;
+                if (confirmInfo.token !== reapInfo.token) {
+                  tokenMatches = false;
+                }
+              } catch {
+                tokenMatches = false;
+              }
+            }
+            if (tokenMatches) {
+              await unlink(reapPath).catch(() => {});
+            }
+          }
         }
       } catch {
         // Another recoverer just finished and removed the reap lock.
@@ -766,6 +894,16 @@ export class SwarmStore implements ISwarmStore {
         }
       }
 
+      // Confirm we still hold the .reap lock right before unlinking lockPath.
+      try {
+        const reapCheck = await lstat(reapPath);
+        if (reapCheck.ino !== reapIno || reapCheck.dev !== reapDev) {
+          return false;
+        }
+      } catch {
+        return false;
+      }
+
       await unlink(lockPath).catch(() => {});
       return true;
     } catch (err) {
@@ -775,18 +913,49 @@ export class SwarmStore implements ISwarmStore {
       throw err;
     } finally {
       if (reapAcquired) {
-        await unlink(reapPath).catch(() => {});
+        try {
+          const reapCheck = await lstat(reapPath);
+          if (reapCheck.ino === reapIno && reapCheck.dev === reapDev) {
+            await unlink(reapPath).catch(() => {});
+          }
+        } catch {
+          // .reap already removed or inaccessible.
+        }
       }
     }
   }
 
-  private async releaseFileLock(lockPath: string, token: string): Promise<void> {
+  private async releaseFileLock(
+    lockPath: string,
+    token: string,
+    expectedIno?: number,
+    expectedDev?: number,
+  ): Promise<void> {
     try {
+      const stBefore = await lstat(lockPath);
+      if (stBefore.isSymbolicLink()) {
+        return;
+      }
+      if (
+        (expectedIno !== undefined && stBefore.ino !== expectedIno) ||
+        (expectedDev !== undefined && stBefore.dev !== expectedDev)
+      ) {
+        return;
+      }
       const raw = await readFile(lockPath, "utf8");
       const info = JSON.parse(raw) as Partial<LockFilePayload>;
-      if (info.token === token) {
-        await unlink(lockPath).catch(() => {});
+      if (info.token !== token) {
+        return;
       }
+      const stAfter = await lstat(lockPath);
+      if (
+        stAfter.isSymbolicLink() ||
+        stAfter.ino !== stBefore.ino ||
+        stAfter.dev !== stBefore.dev
+      ) {
+        return;
+      }
+      await unlink(lockPath).catch(() => {});
     } catch {
       // Lock already removed or unreadable; nothing left to release.
     }
@@ -815,6 +984,13 @@ export class SwarmStore implements ISwarmStore {
         throw new SwarmProtocolError(
           "NOT_FOUND",
           `Swarm run "${runId}" not found`,
+          { runId },
+        );
+      }
+      if (err instanceof SyntaxError) {
+        throw new SwarmProtocolError(
+          "NOT_FOUND",
+          `Corrupted run state for "${runId}"`,
           { runId },
         );
       }
@@ -917,11 +1093,14 @@ export class SwarmStore implements ISwarmStore {
       }
 
       const now = new Date().toISOString();
-      const maxConcurrency = Math.max(
-        1,
-        Math.floor(
-          input.maxConcurrency ?? DEFAULT_SWARM_SETTINGS.maxConcurrency,
-        ),
+      const rawConcurrency =
+        typeof input.maxConcurrency === "number" &&
+        Number.isFinite(input.maxConcurrency)
+          ? input.maxConcurrency
+          : DEFAULT_SWARM_SETTINGS.maxConcurrency;
+      const maxConcurrency = Math.min(
+        SWARM_SETTINGS_BOUNDS.maxConcurrency.max,
+        Math.max(1, Math.floor(rawConcurrency)),
       );
 
       const channels: Record<string, SwarmChannelRecord> = {
@@ -1109,8 +1288,15 @@ export class SwarmStore implements ISwarmStore {
       if (patch.status !== undefined) {
         state.status = patch.status;
       }
-      if (patch.maxConcurrency !== undefined) {
-        state.maxConcurrency = Math.max(1, Math.floor(patch.maxConcurrency));
+      if (
+        patch.maxConcurrency !== undefined &&
+        typeof patch.maxConcurrency === "number" &&
+        Number.isFinite(patch.maxConcurrency)
+      ) {
+        state.maxConcurrency = Math.min(
+          SWARM_SETTINGS_BOUNDS.maxConcurrency.max,
+          Math.max(1, Math.floor(patch.maxConcurrency)),
+        );
       }
       if (patch.validatorEnabled !== undefined) {
         state.validatorEnabled = patch.validatorEnabled;
@@ -1254,7 +1440,7 @@ export class SwarmStore implements ISwarmStore {
       const state = await this.readStateUnlocked(runId);
       this.checkExpectedRevision(state, options?.expectedRevision);
 
-      if (name in state.members) {
+      if (Object.hasOwn(state.members, name)) {
         throw new SwarmProtocolError(
           "DUPLICATE_MEMBER",
           `Member "${name}" already exists in run "${runId}".`,
@@ -1308,7 +1494,7 @@ export class SwarmStore implements ISwarmStore {
       state.memberOrder.push(name);
 
       for (const ch of channels) {
-        const channelRecord = state.channels[ch];
+        const channelRecord = getOwnRecord(state.channels, ch);
         if (channelRecord && !channelRecord.subscribers.includes(name)) {
           channelRecord.subscribers.push(name);
         }
@@ -1349,7 +1535,7 @@ export class SwarmStore implements ISwarmStore {
       const state = await this.readStateUnlocked(runId);
       this.checkExpectedRevision(state, patch.expectedRevision);
 
-      const record = state.members[memberName];
+      const record = getOwnRecord(state.members, memberName);
       if (!record) {
         throw new SwarmProtocolError(
           "MEMBER_NOT_FOUND",
@@ -1593,7 +1779,7 @@ export class SwarmStore implements ISwarmStore {
     return this.withRunLock(runId, async () => {
       const state = await this.readStateUnlocked(runId);
 
-      const existing = state.channels[name];
+      const existing = getOwnRecord(state.channels, name);
       if (existing) {
         if (existing.archived) {
           throw new SwarmProtocolError(
@@ -1615,7 +1801,7 @@ export class SwarmStore implements ISwarmStore {
         for (const rawSub of input.subscribers) {
           const sub = typeof rawSub === "string" ? rawSub.trim() : "";
           if (!sub || seen.has(sub)) continue;
-          const member = state.members[sub];
+          const member = getOwnRecord(state.members, sub);
           if (!member) {
             throw new SwarmProtocolError(
               "MEMBER_NOT_FOUND",
@@ -1648,7 +1834,7 @@ export class SwarmStore implements ISwarmStore {
 
       state.channels[name] = channelRecord;
       for (const sub of subscribers) {
-        const member = state.members[sub];
+        const member = getOwnRecord(state.members, sub);
         if (member && !member.channels.includes(name)) {
           member.channels.push(name);
           member.updatedAt = now;
@@ -1684,7 +1870,7 @@ export class SwarmStore implements ISwarmStore {
 
     return this.withRunLock(runId, async () => {
       const state = await this.readStateUnlocked(runId);
-      const record = state.channels[channel];
+      const record = getOwnRecord(state.channels, channel);
       if (!record) {
         throw new SwarmProtocolError(
           "INVALID_CHANNEL",
@@ -1700,7 +1886,7 @@ export class SwarmStore implements ISwarmStore {
         );
       }
 
-      const member = state.members[memberName];
+      const member = getOwnRecord(state.members, memberName);
       if (!member) {
         throw new SwarmProtocolError(
           "MEMBER_NOT_FOUND",
@@ -1761,7 +1947,7 @@ export class SwarmStore implements ISwarmStore {
 
     return this.withRunLock(runId, async () => {
       const state = await this.readStateUnlocked(runId);
-      const record = state.channels[channel];
+      const record = getOwnRecord(state.channels, channel);
       if (!record) {
         throw new SwarmProtocolError(
           "INVALID_CHANNEL",
@@ -1770,7 +1956,7 @@ export class SwarmStore implements ISwarmStore {
         );
       }
 
-      const member = state.members[memberName];
+      const member = getOwnRecord(state.members, memberName);
       if (!member) {
         throw new SwarmProtocolError(
           "MEMBER_NOT_FOUND",
@@ -1823,7 +2009,7 @@ export class SwarmStore implements ISwarmStore {
 
     return this.withRunLock(runId, async () => {
       const state = await this.readStateUnlocked(runId);
-      const record = state.channels[channel];
+      const record = getOwnRecord(state.channels, channel);
       if (!record) {
         throw new SwarmProtocolError(
           "INVALID_CHANNEL",
@@ -1884,7 +2070,7 @@ export class SwarmStore implements ISwarmStore {
 
     return this.withRunLock(runId, async () => {
       const state = await this.readStateUnlocked(runId);
-      const channelRecord = state.channels[targetChannel];
+      const channelRecord = getOwnRecord(state.channels, targetChannel);
       if (!channelRecord) {
         throw new SwarmProtocolError(
           "INVALID_CHANNEL",
@@ -1903,10 +2089,11 @@ export class SwarmStore implements ISwarmStore {
       const message = await this.board.post(runId, {
         ...input,
         channel: targetChannel,
+        minSeq: state.boardHead + 1,
       });
 
       state.boardHead = Math.max(state.boardHead, message.seq);
-      const senderMember = state.members[message.from];
+      const senderMember = getOwnRecord(state.members, message.from);
       if (senderMember) {
         senderMember.lastPostSeq = message.seq;
         senderMember.lastPostTime = message.timestamp;
@@ -2020,7 +2207,7 @@ export class SwarmStore implements ISwarmStore {
       return a.localeCompare(b);
     });
     for (const chName of channelNames) {
-      const ch = state.channels[chName];
+      const ch = getOwnRecord(state.channels, chName);
       if (!ch) continue;
       const status = ch.archived ? "archived" : "active";
       const topic = ch.topic ? escapeMarkdownCell(ch.topic) : "-";
@@ -2046,7 +2233,7 @@ export class SwarmStore implements ISwarmStore {
         ? state.memberOrder
         : Object.keys(state.members);
     for (const name of orderedNames) {
-      const m = state.members[name];
+      const m = getOwnRecord(state.members, name);
       if (!m) continue;
       const modelCell = m.model
         ? `\`${escapeMarkdownCell(m.model)}\`${m.thinkingLevel ? ` (${m.thinkingLevel})` : ""}`

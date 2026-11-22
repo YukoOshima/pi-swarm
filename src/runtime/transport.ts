@@ -250,7 +250,7 @@ const VALIDATOR_FORBIDDEN_PATTERNS: ReadonlyArray<{ pattern: RegExp; reason: str
     reason: "In-place `perl -i` is blocked in read-only validator sessions.",
   },
   {
-    pattern: /(?:^|[;&|]\s*)(?:rm|rmdir|mv|cp|mkdir|touch|chmod|chown|ln|truncate|dd|install|patch)\b/,
+    pattern: /(?:^|(?:[;&|\r\n(]|`|\$\()\s*)(?:rm|rmdir|mv|cp|mkdir|touch|chmod|chown|ln|truncate|dd|install|patch)\b/,
     reason: "Filesystem mutation commands are blocked in read-only validator sessions.",
   },
   {
@@ -423,10 +423,12 @@ export function sanitizeForkSeedMessages(messages: readonly AgentMessage[]): Age
 
   for (const msg of cloned) {
     if (isAssistantMessage(msg) && Array.isArray(msg.content)) {
-      const filteredContent = msg.content.filter((part) => {
+      let strippedAnyToolCall = false;
+      let filteredContent = msg.content.filter((part) => {
         if (part && typeof part === "object" && part.type === "toolCall") {
           const id = typeof part.id === "string" ? part.id : "";
           if (!id || !resolvedToolCallIds.has(id)) {
+            strippedAnyToolCall = true;
             return false;
           }
           keptToolCallIds.add(id);
@@ -434,10 +436,31 @@ export function sanitizeForkSeedMessages(messages: readonly AgentMessage[]): Age
         }
         return true;
       });
-      if (filteredContent.length === 0) {
+      if (strippedAnyToolCall) {
+        filteredContent = filteredContent.filter(
+          (part) => !(part && typeof part === "object" && part.type === "thinking"),
+        );
+      }
+      const hasKeptToolCallOrText = filteredContent.some((part) => {
+        if (!part || typeof part !== "object") {
+          return false;
+        }
+        if (part.type === "toolCall") {
+          return true;
+        }
+        if (part.type === "text" && typeof part.text === "string" && part.text.trim().length > 0) {
+          return true;
+        }
+        return false;
+      });
+      if (!hasKeptToolCallOrText) {
         continue;
       }
-      intermediate.push({ ...msg, content: filteredContent });
+      intermediate.push({
+        ...msg,
+        content: filteredContent,
+        ...(strippedAnyToolCall ? { stopReason: "stop" } : {}),
+      });
       continue;
     }
     intermediate.push(msg);
@@ -575,13 +598,13 @@ export function createWorkerGuardExtensionFactory(
       if (isToolCallEventType("write", event) || isToolCallEventType("edit", event)) {
         const rawPath = event.input.path;
         const rel = resolveWorktreeRelativePath(request.cwd, rawPath);
-        if (request.workspace !== "inherit" && rel === null) {
+        if (rel === null) {
           return {
             block: true,
             reason: `Path "${rawPath}" escapes worktree root "${request.cwd}".`,
           };
         }
-        if ((rel !== null && isProtectedSwarmPath(rel)) || pathTargetsProtectedDir(rawPath)) {
+        if (isProtectedSwarmPath(rel) || pathTargetsProtectedDir(rawPath)) {
           return {
             block: true,
             reason: `Workers are forbidden from editing protected path "${rel ?? rawPath}" (${SWARM_DIR}/, .swarm/, or .git/).`,
@@ -591,9 +614,13 @@ export function createWorkerGuardExtensionFactory(
       }
 
       if (isToolCallEventType("bash", event) || isToolCallEventType("powershell", event)) {
+        const enforceBaseBranchGuard =
+          request.workspace !== "inherit" ||
+          Boolean(request.isIsolatedWorktree) ||
+          Boolean(request.branch);
         const check = isForbiddenWorkerBashCommand(
           event.input.command,
-          request.workspace !== "inherit" ? (baseBranch ?? "") : "",
+          enforceBaseBranchGuard ? (baseBranch ?? "") : "",
         );
         if (!check.allowed) {
           return { block: true, reason: check.reason };
@@ -867,7 +894,9 @@ export class InProcessPiTransport implements ISwarmTransport {
     let currentModelId: string | undefined =
       request.modelOverride?.trim() || formatModelId(request.hostContext?.model);
     let currentThinkingLevel: ThinkingLevel | undefined = request.thinkingLevel;
-    let currentSessionFile: string | undefined = request.sessionFile;
+    const initialSessionManager = await openOrCreateMemberSessionManager(request);
+    let currentSessionFile: string | undefined =
+      initialSessionManager.getSessionFile() ?? request.sessionFile;
     let cachedMessages: AgentMessage[] = request.seedMessages
       ? sanitizeForkSeedMessages(request.seedMessages)
       : [];
@@ -1061,7 +1090,7 @@ export class InProcessPiTransport implements ISwarmTransport {
           const agentDir = this.agentDirOverride ?? getAgentDir();
           modelRuntime = await this.resolveModelRuntime(request.hostContext, agentDir);
           const settingsManager = SettingsManager.create(request.cwd, agentDir);
-          const sessionManager = await openOrCreateMemberSessionManager(request);
+          const sessionManager = initialSessionManager;
           currentSessionFile = sessionManager.getSessionFile() ?? currentSessionFile;
 
           let resolvedModel = request.hostContext?.model;

@@ -8,6 +8,7 @@ import {
   matchesKey,
   type TUI,
 } from "@earendil-works/pi-tui";
+import { SWARM_SETTINGS_BOUNDS } from "../store/index.js";
 import type {
   InitialMemberProposal,
   IQuestionnaireUI,
@@ -48,7 +49,7 @@ interface NormalizedOption {
 
 const CUSTOM_OPTION_LABEL = "Custom answer…";
 const MIN_CONCURRENCY = 1;
-const MAX_CONCURRENCY = 12;
+const MAX_CONCURRENCY = SWARM_SETTINGS_BOUNDS.maxConcurrency.max;
 
 function decodePrintableChar(data: string): string | undefined {
   const kitty = decodeKittyPrintable(data);
@@ -287,7 +288,7 @@ async function confirmProposalBasic(
         ? "Swarm Plan Confirmation (Revision)"
         : "Swarm Plan Confirmation",
       planTitle ? `${planTitle}` : sanitizePlainText(plan.objective),
-      `base:${plan.baseBranch}${membersNote}`,
+      `base:${sanitizePlainText(plan.baseBranch)}${membersNote}`,
       `Models: ${modelsLine}`,
       `Independent Validator Policy: ${validatorEnabled ? "ON" : "OFF"} · Max Concurrency: ${maxConcurrency}`,
     ].join(" — ");
@@ -1550,20 +1551,27 @@ export function createQuestionnaireUI(
 
       return withModalGuard(opts, async () => {
         if (ctx.mode === "tui") {
-          return ctx.ui.custom<{
-            cancelled: boolean;
-            answer?: string;
-            isCustom: boolean;
-          }>(
-            (tui, theme, _kb, done) =>
-              new SingleQuestionComponent(tui, theme, spec, done, signal),
-            {
-              blocked: {
-                kind: "question",
-                message: sanitizePlainText(spec.question) || "Swarm question",
+          let component: SingleQuestionComponent | undefined;
+          try {
+            return await ctx.ui.custom<{
+              cancelled: boolean;
+              answer?: string;
+              isCustom: boolean;
+            }>(
+              (tui, theme, _kb, done) => {
+                component = new SingleQuestionComponent(tui, theme, spec, done, signal);
+                return component;
               },
-            },
-          );
+              {
+                blocked: {
+                  kind: "question",
+                  message: sanitizePlainText(spec.question) || "Swarm question",
+                },
+              },
+            );
+          } finally {
+            component?.dispose();
+          }
         }
         return askQuestionBasic(ctx, spec, signal);
       });
@@ -1579,16 +1587,23 @@ export function createQuestionnaireUI(
 
       return withModalGuard(opts, async () => {
         if (ctx.mode === "tui") {
-          return ctx.ui.custom<QuestionnaireResult>(
-            (tui, theme, _kb, done) =>
-              new MultiQuestionComponent(tui, theme, questions, done, signal),
-            {
-              blocked: {
-                kind: "question",
-                message: `Swarm questionnaire (${questions.length} questions)`,
+          let component: MultiQuestionComponent | undefined;
+          try {
+            return await ctx.ui.custom<QuestionnaireResult>(
+              (tui, theme, _kb, done) => {
+                component = new MultiQuestionComponent(tui, theme, questions, done, signal);
+                return component;
               },
-            },
-          );
+              {
+                blocked: {
+                  kind: "question",
+                  message: `Swarm questionnaire (${questions.length} questions)`,
+                },
+              },
+            );
+          } finally {
+            component?.dispose();
+          }
         }
 
         const answers: Record<string, string> = {};
@@ -1638,19 +1653,26 @@ export function createQuestionnaireUI(
 
       return withModalGuard(opts, async () => {
         if (ctx.mode === "tui") {
-          return ctx.ui.custom<ProposalDialogOutcome>(
-            (tui, theme, _kb, done) =>
-              new ConfirmProposalComponent(tui, theme, plan, options, done),
-            {
-              blocked: {
-                kind: "question",
-                message:
-                  options?.mode === "tweak"
-                    ? "Confirm Swarm plan revision"
-                    : "Confirm dynamic Swarm plan",
+          let component: ConfirmProposalComponent | undefined;
+          try {
+            return await ctx.ui.custom<ProposalDialogOutcome>(
+              (tui, theme, _kb, done) => {
+                component = new ConfirmProposalComponent(tui, theme, plan, options, done);
+                return component;
               },
-            },
-          );
+              {
+                blocked: {
+                  kind: "question",
+                  message:
+                    options?.mode === "tweak"
+                      ? "Confirm Swarm plan revision"
+                      : "Confirm dynamic Swarm plan",
+                },
+              },
+            );
+          } finally {
+            component?.dispose();
+          }
         }
         return confirmProposalBasic(ctx, plan, options);
       });

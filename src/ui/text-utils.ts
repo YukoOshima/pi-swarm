@@ -83,11 +83,28 @@ export function normalizeSingleLine(text: string): string {
 }
 
 /**
+ * Strip all ECMA-48 terminal escape sequences (OSC/DCS/SOS/PM/APC, CSI, 2-byte ESC,
+ * and residual lone ESC) before delegating to `pi-tui`'s `stripTerminalSequences`
+ * so truncated or private-mode sequences never swallow visible text.
+ */
+export function stripAllTerminalEscapes(text: string): string {
+  if (!text) return "";
+  return text
+    .replace(
+      /(?:\x1b[\]PX^_]|[\u0090\u0098\u009d\u009e\u009f])[\s\S]*?(?:\x07|\x1b\\|\u009c)/g,
+      "",
+    )
+    .replace(/(?:\x1b\[|\u009b)[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]/g, "")
+    .replace(/\x1b[\x20-\x2f]*[\x30-\x7e]/g, "")
+    .replace(/\x1b/g, "");
+}
+
+/**
  * Strip terminal escape sequences and control characters from untrusted external text.
  */
 export function sanitizePlainText(text: string): string {
   if (!text) return "";
-  const stripped = stripTerminalSequences(text);
+  const stripped = stripTerminalSequences(stripAllTerminalEscapes(text));
   return stripped.replace(CONTROL_CHARS_RE, " ").replace(/\s+/g, " ").trim();
 }
 
@@ -97,7 +114,7 @@ export function sanitizePlainText(text: string): string {
  */
 export function sanitizeDiffLine(line: string): string {
   if (!line) return "";
-  return stripTerminalSequences(line)
+  return stripTerminalSequences(stripAllTerminalEscapes(line))
     .replace(/\t/g, "  ")
     .replace(CONTROL_CHARS_RE, " ");
 }

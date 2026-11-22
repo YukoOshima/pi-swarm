@@ -231,6 +231,7 @@ class SwarmOverlayComponent implements Component, Focusable {
   private feedback: FeedbackMessage | undefined;
   private unsubscribe: (() => void) | undefined;
   private closed = false;
+  private currentRunId: string | null;
   private readonly hostModel?: string;
 
   constructor(
@@ -246,6 +247,7 @@ class SwarmOverlayComponent implements Component, Focusable {
     this.activeTab = options?.initialTab ?? "board";
     this.channelFilter = options?.initialChannel ?? "*";
     this.snapshot = engine.getSnapshot();
+    this.currentRunId = this.snapshot.activeRunId ?? this.snapshot.run?.id ?? null;
     this.mergeBoardMessages(this.snapshot.recentBoard);
 
     const initialFiltered = this.getFilteredBoardMessages();
@@ -281,6 +283,22 @@ class SwarmOverlayComponent implements Component, Focusable {
       const prevFilteredLen = this.getFilteredBoardMessages().length;
       const wasAtLatest =
         prevFilteredLen === 0 || this.boardSelectedIndex >= prevFilteredLen - 1;
+
+      const nextRunId = ev.snapshot.activeRunId ?? ev.snapshot.run?.id ?? null;
+      if (nextRunId !== this.currentRunId) {
+        this.currentRunId = nextRunId;
+        this.boardMessages = [];
+        this.diffState = null;
+        this.diffRequestId += 1;
+        this.boardSelectedIndex = 0;
+        this.searchSelectedIndex = 0;
+      }
+
+      if (!ev.snapshot.run) {
+        this.inlineMode = undefined;
+        this.searchFocused = false;
+        this.syncInputFocus();
+      }
 
       this.snapshot = ev.snapshot;
       this.mergeBoardMessages(ev.snapshot.recentBoard);
@@ -411,10 +429,11 @@ class SwarmOverlayComponent implements Component, Focusable {
   }
 
   private async refreshFullBoard(): Promise<void> {
-    if (this.closed || !this.snapshot.run) return;
+    const runId = this.snapshot.run?.id;
+    if (this.closed || !runId) return;
     try {
       const res = await this.engine.readBoard({ channel: "*", limit: 500 });
-      if (this.closed) return;
+      if (this.closed || this.snapshot.run?.id !== runId) return;
       const prevLen = this.getFilteredBoardMessages().length;
       const wasAtLatest = prevLen === 0 || this.boardSelectedIndex >= prevLen - 1;
       this.mergeBoardMessages(res.messages);
@@ -1433,7 +1452,7 @@ class SwarmOverlayComponent implements Component, Focusable {
     if (!ds || ds.memberName !== member.name || ds.loading) {
       return [
         fitLine(
-          this.theme.fg("muted", `Loading git diff for ${member.branch ?? member.name}…`),
+          this.theme.fg("muted", `Loading git diff for ${sanitizePlainText(member.branch ?? member.name)}…`),
           innerWidth,
         ),
       ];
@@ -1709,7 +1728,7 @@ class SwarmOverlayComponent implements Component, Focusable {
         includeThinking: false,
       },
     );
-    const runLeft = `[${statusBadge}] ${titleStr} · base:${run.baseBranch}`;
+    const runLeft = `[${statusBadge}] ${titleStr} · base:${sanitizePlainText(run.baseBranch)}`;
     body.push(
       innerWidth >= 68
         ? joinColumns(runLeft, modelsLine, innerWidth)
@@ -1978,7 +1997,7 @@ async function openSwarmBasicMenu(
           cwd: member.cwd || undefined,
         });
         ctx.ui.notify(
-          `${member.name} (${member.branch}): ${diff.commitsAhead} commit(s) ahead, ${diff.changedFiles.length} file(s) changed`,
+          `${member.name} (${sanitizePlainText(member.branch)}): ${diff.commitsAhead} commit(s) ahead, ${diff.changedFiles.length} file(s) changed`,
           "info",
         );
       }

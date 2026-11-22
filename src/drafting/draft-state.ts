@@ -529,9 +529,7 @@ export class DraftStateController {
     options: StartDraftOptions,
     opts?: StartDraftExecutionOptions,
   ): Promise<StartOrResumeDraftResult> {
-    if (!this.current) {
-      this.current = rehydrateDraft(ctx);
-    }
+    this.rehydrate(ctx, { syncToolProfile: false });
     const result = await startOrResolveDraft(
       this.pi,
       ctx,

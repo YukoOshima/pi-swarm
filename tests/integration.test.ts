@@ -44,11 +44,12 @@ import {
   createPiSwarmExtension,
   parseSwarmCommand,
 } from "../src/index.js";
-import { WorktreeManager } from "../src/store/index.js";
+import { SwarmStore, WorktreeManager } from "../src/store/index.js";
 import {
   type AgentTurnResult,
   type IQuestionnaireUI,
   type ISwarmTransport,
+  type IWorktreeManager,
   type ModelSwitchResult,
   type PersistentAgentHandle,
   type SpawnMemberRequest,
@@ -1947,9 +1948,19 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     });
     assert.equal((inputRes as Array<{ action?: string }>)?.[0]?.action, "continue");
 
-    // `before_agent_start` injects live user direction highlight into `sections.swarm` once
+    // Background custom wakeup `before_agent_start` must NOT consume `latestHumanDirection`
+    const customWakeupSections: Record<string, string> = {};
+    await harness.emit("before_agent_start", {
+      messageType: "custom",
+      systemPromptOptions: { sections: customWakeupSections },
+    });
+    assert.ok(!(customWakeupSections.swarm ?? "").includes("Live User Direction Update"));
+
+    // User `before_agent_start` injects live user direction highlight into `sections.swarm` once
     const sectionsObj: Record<string, string> = {};
     await harness.emit("before_agent_start", {
+      messageType: "user",
+      prompt: "Change direction: switch API to v2 with streaming support",
       systemPromptOptions: { sections: sectionsObj },
     });
     assert.match(sectionsObj.swarm ?? "", /Live User Direction Update/);
@@ -1958,25 +1969,11 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     // Subsequent turn does not repeat stale humanSteeringText notice
     const sectionsObj2: Record<string, string> = {};
     await harness.emit("before_agent_start", {
+      messageType: "user",
+      prompt: "Continue",
       systemPromptOptions: { sections: sectionsObj2 },
     });
     assert.ok(!(sectionsObj2.swarm ?? "").includes("Live User Direction Update"));
-
-    // Verify `/swarm pause` -> `/swarm resume` clears unconsumed `latestHumanDirection` so stale direction doesn't leak
-    await harness.emit("input", {
-      source: "interactive",
-      text: "Stale direction sent right before pause",
-    });
-    await harness.runCommand("swarm", "pause");
-    await harness.runCommand("swarm", "resume");
-    const sectionsAfterPause: Record<string, string> = {};
-    await harness.emit("before_agent_start", {
-      systemPromptOptions: { sections: sectionsAfterPause },
-    });
-    assert.ok(
-      !(sectionsAfterPause.swarm ?? "").includes("Stale direction sent right before pause"),
-      "latestHumanDirection must be cleared on /swarm pause",
-    );
 
     // 4. Orchestrator updates objective + steers working worker directly + `/swarm steer` slash command
     const updTitle = await harness.executeTool(SWARM_TOOL, {
@@ -2023,6 +2020,24 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     });
     assert.equal(stopRes.isError, undefined);
     assert.equal(stopRes.details?.stopped, true);
+
+    // Verify `/swarm pause` -> `/swarm resume` clears unconsumed `latestHumanDirection` so stale direction doesn't leak
+    await harness.emit("input", {
+      source: "interactive",
+      text: "Stale direction sent right before pause",
+    });
+    await harness.runCommand("swarm", "pause");
+    await harness.runCommand("swarm", "resume");
+    const sectionsAfterPause: Record<string, string> = {};
+    await harness.emit("before_agent_start", {
+      messageType: "user",
+      prompt: "After resume",
+      systemPromptOptions: { sections: sectionsAfterPause },
+    });
+    assert.ok(
+      !(sectionsAfterPause.swarm ?? "").includes("Stale direction sent right before pause"),
+      "latestHumanDirection must be cleared on /swarm pause",
+    );
 
     await harness.executeTool(SWARM_TOOL, { action: "done", summary: "API v2 shipped" });
     await harness.emit("session_shutdown", {});
@@ -2221,5 +2236,440 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     await ownerHarness.executeTool(SWARM_TOOL, { action: "done", summary: "Owner completed cleanly" });
     await foreignHarness.emit("session_shutdown", {});
     await ownerHarness.emit("session_shutdown", {});
+  });
+
+  it("7. enforces ownership across /fork /resume /shutdown, rejects unknown teardown flags & terminal run actions, syncs gitTimeoutMs, and sanitizes /swarm runs", async () => {
+    const repoDir = await createTempGitRepo("v036-ownership-terminal");
+    tempDirs.push(repoDir);
+
+    let workerGateResolve!: () => void;
+    const workerGate = new Promise<void>((r) => {
+      workerGateResolve = r;
+    });
+
+    const mockTransport: ISwarmTransport = {
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        const tracker = createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async () => {
+            await workerGate;
+            return {
+              agentId: request.agentId,
+              name: request.name,
+              role: request.role,
+              outcome: "waiting",
+              summary: "Finished",
+              tokens: 5,
+              cost: 0.0001,
+            };
+          },
+        });
+        return tracker.handle;
+      },
+    };
+
+    const gitTimeoutsSeen: number[] = [];
+    const wtMgr: IWorktreeManager = new WorktreeManager(repoDir);
+    wtMgr.setGitTimeoutMs = (ms: number) => {
+      gitTimeoutsSeen.push(ms);
+    };
+
+    let currentSettings: SwarmSettings = {
+      ...DEFAULT_SWARM_SETTINGS,
+      stallWatchdogEnabled: false,
+      gitTimeoutMs: 42_000,
+    };
+
+    const ownerHarness = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "owner-v036",
+    });
+    const extOwner = createPiSwarmExtension({
+      transportFactory: () => mockTransport,
+      worktreeFactory: () => wtMgr,
+      settingsLoader: async () => currentSettings,
+      settingsSaver: async (_scope, patch) => {
+        currentSettings = { ...currentSettings, ...patch };
+        return currentSettings;
+      },
+    });
+    extOwner(ownerHarness.pi);
+    await ownerHarness.emit("session_start", { reason: "startup" });
+    assert.ok(gitTimeoutsSeen.includes(42_000), "reloadSettings must sync gitTimeoutMs");
+
+    // Launch run with validatorEnabled: false and special chars in title for /swarm runs sanitization
+    await ownerHarness.runCommand("swarm-direct", "Run with validator off");
+    await ownerHarness.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Pipe | Title \x1b[31mRed\x1b[0m\nLine2",
+      objective: "Verify v0.3.6 ownership & terminal guards",
+      strategy: "Single worker",
+      acceptance_criteria: "All guards hold",
+      base_branch: "main",
+      validator_enabled: false,
+      initial_members: [
+        { name: "worker", role: "worker", workspace: "inherit", brief: "Work" },
+      ],
+    });
+    await waitFor(() =>
+      ownerHarness.sentMessages.some((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE),
+    );
+    const kickoffMsg = ownerHarness.sentMessages
+      .filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE)
+      .pop()!;
+    assert.ok(
+      !String(kickoffMsg.message.content).includes("validate independently"),
+      "Kickoff must omit validator prompt when validatorEnabled=false",
+    );
+
+    const statusRes = await ownerHarness.executeTool(SWARM_TOOL, { action: "status" });
+    const runId = String(statusRes.details?.runId ?? "");
+    assert.ok(runId);
+
+    // Foreign session tries destructive commands + unknown teardown flag
+    const foreignHarness = createMockPiHarness(repoDir, {
+      mode: "rpc",
+      sessionId: "foreign-v036",
+    });
+    const extForeign = createPiSwarmExtension({
+      transportFactory: () => mockTransport,
+      settingsLoader: async () => ({ ...DEFAULT_SWARM_SETTINGS, stallWatchdogEnabled: false }),
+    });
+    extForeign(foreignHarness.pi);
+    await foreignHarness.emit("session_start", { reason: "startup" });
+    await foreignHarness.runCommand("swarm", `focus ${runId}`);
+
+    await foreignHarness.runCommand("swarm", "teardown --bogus");
+    assert.ok(
+      foreignHarness.notifications.some((n) =>
+        /Usage: \/swarm teardown \[--force\] \[--delete-branches\]/.test(n.message),
+      ),
+    );
+
+    for (const cmd of [
+      "pause",
+      "resume",
+      "done summary",
+      "cancel",
+      "kill worker",
+      "merge worker",
+      "teardown",
+    ]) {
+      const notifBefore = foreignHarness.notifications.length;
+      await foreignHarness.runCommand("swarm", cmd);
+      const newNotifs = foreignHarness.notifications.slice(notifBefore);
+      assert.ok(
+        newNotifs.some((n) => n.level === "error" && /OWNERSHIP_CONFLICT|owned by active session/i.test(n.message)),
+        `Foreign /swarm ${cmd} must fail with OWNERSHIP_CONFLICT`,
+      );
+    }
+
+    // Reload shutdown keeps ownerPid = process.pid; quit shutdown sets ownerPid = 0
+    const store = new SwarmStore(repoDir);
+    await ownerHarness.emit("session_shutdown", { reason: "reload" });
+    assert.equal((await store.loadRun(runId)).ownerPid, process.pid);
+
+    await ownerHarness.emit("session_start", { reason: "reload" });
+    await ownerHarness.emit("session_shutdown", { reason: "quit" });
+    assert.equal((await store.loadRun(runId)).ownerPid, 0);
+
+    // Resuming in a new session claims ownership cleanly because ownerPid === 0
+    const resumedHarness = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "resumed-v036",
+    });
+    resumedHarness.branch.push(...ownerHarness.branch);
+    const extResumed = createPiSwarmExtension({
+      transportFactory: () => mockTransport,
+      settingsLoader: async () => currentSettings,
+    });
+    extResumed(resumedHarness.pi);
+    await resumedHarness.emit("session_start", { reason: "resume" });
+    const afterResume = await store.loadRun(runId);
+    assert.equal(afterResume.ownerSessionId, "resumed-v036");
+    assert.equal(afterResume.ownerPid, process.pid);
+
+    // Forking in-process claims ownership cleanly without self-lockout
+    const forkedHarness = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "forked-v036",
+    });
+    forkedHarness.branch.push(...resumedHarness.branch);
+    const extForked = createPiSwarmExtension({
+      transportFactory: () => mockTransport,
+      settingsLoader: async () => currentSettings,
+    });
+    extForked(forkedHarness.pi);
+    await forkedHarness.emit("session_start", { reason: "fork" });
+    const afterFork = await store.loadRun(runId);
+    assert.equal(afterFork.ownerSessionId, "forked-v036");
+    assert.equal(afterFork.ownerPid, process.pid);
+
+    // Verify /swarm runs sanitizes pipe and ANSI escapes in table
+    await forkedHarness.runCommand("swarm", "runs");
+    const runsMsg = forkedHarness.sentMessages
+      .filter((m) => m.message.customType === SWARM_STATUS_CUSTOM_TYPE)
+      .pop()!;
+    assert.ok(!String(runsMsg.message.content).includes("\x1b[31m"));
+    assert.match(String(runsMsg.message.content), /Pipe \\\| Title Red Line2/);
+
+    // Verify headless /swarm settings surfaces gitTimeoutMs & rateLimit* bounds
+    const headlessHarness = createMockPiHarness(repoDir, {
+      mode: "rpc",
+      sessionId: "headless-v036",
+    });
+    (headlessHarness.ctx as { hasUI: boolean }).hasUI = false;
+    const extHeadless = createPiSwarmExtension({
+      transportFactory: () => mockTransport,
+      settingsLoader: async () => currentSettings,
+    });
+    extHeadless(headlessHarness.pi);
+    await headlessHarness.emit("session_start", { reason: "startup" });
+    await headlessHarness.runCommand("swarm", "settings");
+    const settingsMsg = headlessHarness.sentMessages
+      .filter((m) => m.message.customType === SWARM_STATUS_CUSTOM_TYPE)
+      .pop()!;
+    assert.match(String(settingsMsg.message.content), /gitTimeoutMs/);
+    assert.match(String(settingsMsg.message.content), /rateLimitBaseBackoffMs/);
+    assert.match(String(settingsMsg.message.content), /rateLimitMaxBackoffMs/);
+
+    // Complete run & verify terminal run guards + bare menu hiding pause/resume/done
+    workerGateResolve();
+    await forkedHarness.runCommand("swarm", "done All finished");
+    assert.equal((await store.loadRun(runId)).status, "completed");
+
+    for (const cmd of ["pause", "resume", "done extra", "cancel"]) {
+      const before = forkedHarness.notifications.length;
+      await forkedHarness.runCommand("swarm", cmd);
+      const after = forkedHarness.notifications.slice(before);
+      assert.ok(
+        after.some((n) => /already completed/i.test(n.message)),
+        `/swarm ${cmd} must reject terminal run cleanly`,
+      );
+    }
+
+    let bareChoices: string[] = [];
+    forkedHarness.setSelectHandler((_title, choices) => {
+      bareChoices = choices;
+      return undefined;
+    });
+    await forkedHarness.runCommand("swarm", "");
+    assert.ok(!bareChoices.some((c) => c.startsWith("Pause") || c.startsWith("Resume")));
+    assert.ok(!bareChoices.some((c) => c.startsWith("Complete Swarm")));
+
+    await headlessHarness.emit("session_shutdown", { reason: "quit" });
+    await foreignHarness.emit("session_shutdown", { reason: "quit" });
+    await resumedHarness.emit("session_shutdown", { reason: "quit" });
+    await forkedHarness.emit("session_shutdown", { reason: "quit" });
+  });
+
+  it("8. deduplicates read_board/swarm_wait wakeups, prevents double wakeupInFlight, handles session_compact & turn_start multi-tool batches, and respects userPromptPreflight", async () => {
+    const repoDir = await createTempGitRepo("v036-wakeup-dedup");
+    tempDirs.push(repoDir);
+
+    let spawnedRequest: SpawnMemberRequest | undefined;
+    const mockTransport: ISwarmTransport = {
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        spawnedRequest = request;
+        const tracker = createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async () => ({
+            agentId: request.agentId,
+            name: request.name,
+            role: request.role,
+            outcome: "waiting",
+            summary: "Standing by",
+            tokens: 5,
+            cost: 0.0001,
+          }),
+        });
+        return tracker.handle;
+      },
+    };
+
+    const harness = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "wakeup-sess-1",
+    });
+    const ext = createPiSwarmExtension({
+      transportFactory: () => mockTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: false,
+      }),
+    });
+    ext(harness.pi);
+    await harness.emit("session_start", { reason: "startup" });
+
+    // 1. Multi-tool batch [propose_swarm_plan, ...] -> activeRunSections updated + turn_start(turnIndex > 0) drops kickoff!
+    await harness.runCommand("swarm-direct", "Multi-tool batch test");
+    const draftSections: Record<string, string> = {};
+    await harness.emit("before_agent_start", {
+      messageType: "user",
+      prompt: "Plan",
+      systemPromptOptions: { sections: draftSections },
+    });
+    assert.match(draftSections.swarm ?? "", /swarm_drafting_active/);
+
+    harness.setIdle(false);
+    const planRes = await harness.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Dedup Run",
+      objective: "Verify wakeup dedup and multi-tool turn handling",
+      strategy: "Single worker",
+      acceptance_criteria: "No duplicate wakeups",
+      base_branch: "main",
+      initial_members: [
+        { name: "worker", role: "worker", workspace: "inherit", brief: "Stand by" },
+      ],
+    });
+    assert.equal(planRes.isError, undefined);
+    assert.match(
+      draftSections.swarm ?? "",
+      /Pi Swarm Orchestrator Playbook/,
+      "handlePlanConfirmed must update activeRunSections.swarm for multi-tool Turn 2",
+    );
+
+    // Simulate Turn 2 inside the same agent run -> drops pending kickoff wakeup
+    await harness.emit("turn_start", { turnIndex: 1, timestamp: Date.now() });
+    harness.setIdle(true);
+    await harness.emit("agent_settled", { aborted: false });
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(
+      harness.sentMessages.filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE).length,
+      0,
+      "turn_start(turnIndex > 0) must drop queued kickoff wakeup",
+    );
+
+    // 2. read_board & parkOrchestratorWait deduplicate pending wakeups already read in-turn
+    await waitFor(() => Boolean(spawnedRequest));
+    harness.setIdle(false);
+    await spawnedRequest!.engineApi!.postMessage({
+      text: "@orchestrator report A",
+      kind: "update",
+    });
+    await spawnedRequest!.engineApi!.postMessage({
+      text: "@orchestrator report B",
+      kind: "update",
+    });
+    await harness.executeTool(READ_BOARD_TOOL, { since: 1 });
+    harness.setIdle(true);
+    await harness.emit("agent_settled", { aborted: false });
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(
+      harness.sentMessages.filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE).length,
+      0,
+      "read_board must prune already-read wakeup_needed items",
+    );
+
+    // Same for swarm_wait (parkOrchestratorWait) returning immediately with unread messages
+    harness.setIdle(false);
+    await spawnedRequest!.engineApi!.postMessage({
+      text: "@orchestrator report C",
+      kind: "update",
+    });
+    const waitRes = await harness.executeTool(SWARM_WAIT_TOOL, { since: 2 });
+    assert.equal(waitRes.details?.parked, false);
+    harness.setIdle(true);
+    await harness.emit("agent_settled", { aborted: false });
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(
+      harness.sentMessages.filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE).length,
+      0,
+      "parkOrchestratorWait must prune wakeups up to seenSeq",
+    );
+
+    // 3. wakeupInFlight prevents double-dispatch across overlapping agent_settled before before_agent_start
+    harness.setIdle(false);
+    await spawnedRequest!.engineApi!.postMessage({
+      text: "@orchestrator first batch",
+      kind: "update",
+    });
+    harness.setIdle(true);
+    await harness.emit("agent_settled", { aborted: false });
+    const sentCountAfterFirst = harness.sentMessages.filter(
+      (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
+    ).length;
+    assert.equal(sentCountAfterFirst, 1);
+
+    // Enqueue another message immediately while wakeupInFlight=true -> second agent_settled must NOT double-send!
+    await spawnedRequest!.engineApi!.postMessage({
+      text: "@orchestrator second batch during in-flight",
+      kind: "update",
+    });
+    await harness.emit("agent_settled", { aborted: false });
+    assert.equal(
+      harness.sentMessages.filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE).length,
+      1,
+      "wakeupInFlight must prevent duplicate sendMessage before before_agent_start",
+    );
+    // Once before_agent_start + agent_settled complete, the queued wakeup flushes cleanly
+    await harness.emit("before_agent_start", {
+      messageType: "custom",
+      systemPromptOptions: { sections: {} },
+    });
+    await harness.emit("agent_settled", { aborted: false });
+    assert.equal(
+      harness.sentMessages.filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE).length,
+      2,
+    );
+
+    // 4. session_compact / session_compact_failed respect willRetry
+    harness.setIdle(false);
+    await spawnedRequest!.engineApi!.postMessage({
+      text: "@orchestrator queued across compact",
+      kind: "update",
+    });
+    harness.setIdle(true);
+    await harness.emit("session_compact_failed", { willRetry: true, aborted: false });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(
+      harness.sentMessages.filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE).length,
+      2,
+      "willRetry: true must NOT flush wakeups",
+    );
+    await harness.emit("session_compact", { willRetry: false });
+    await waitFor(
+      () =>
+        harness.sentMessages.filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE)
+          .length === 3,
+    );
+
+    // Wait for safety timer or clear via before_agent_start
+    await harness.emit("before_agent_start", {
+      messageType: "custom",
+      systemPromptOptions: { sections: {} },
+    });
+    await harness.emit("agent_settled", { aborted: false });
+
+    // 5. userPromptPreflight blocks flushPendingWakeups between idle `input` and `before_agent_start`
+    harness.setIdle(false);
+    await spawnedRequest!.engineApi!.postMessage({
+      text: "@orchestrator arrives during preflight",
+      kind: "update",
+    });
+    harness.setIdle(true);
+    await harness.emit("input", {
+      source: "interactive",
+      text: "Hold on, let me redirect first",
+    });
+    await harness.emit("session_compact", { willRetry: false });
+    await Promise.resolve();
+    assert.equal(
+      harness.sentMessages.filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE).length,
+      3,
+      "userPromptPreflight must prevent wakeup from racing ahead of idle user prompt",
+    );
+    await harness.emit("before_agent_start", {
+      messageType: "user",
+      prompt: "Hold on, let me redirect first",
+      systemPromptOptions: { sections: {} },
+    });
+    await harness.emit("agent_settled", { aborted: false });
+    assert.equal(
+      harness.sentMessages.filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE).length,
+      4,
+    );
+
+    await harness.executeTool(SWARM_TOOL, { action: "done", summary: "Dedup verified" });
+    await harness.emit("session_shutdown", { reason: "quit" });
   });
 });

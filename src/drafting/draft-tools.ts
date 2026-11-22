@@ -18,6 +18,7 @@ import {
   SWARM_QUESTION_TOOL,
   type ReservedMemberName,
 } from "../constants.js";
+import { isPrototypeKey } from "../store/swarm-store.js";
 import {
   isSwarmProtocolError,
   type InitialMemberProposal,
@@ -212,6 +213,7 @@ export const ProposeSwarmPlanParamsSchema = Type.Object({
   max_concurrency: Type.Optional(
     Type.Integer({
       minimum: 1,
+      maximum: 64,
       description: "Maximum parallel working Swarm members (defaults to draft/settings).",
     }),
   ),
@@ -446,6 +448,13 @@ export function validateProposedSwarmPlan(
         memberName: memberTag,
         message: `Initial member name "${name}" is invalid — must match ${MEMBER_NAME_PATTERN.source} (lowercase letters, digits, hyphens; 1–32 chars starting with a–z).`,
       });
+    } else if (isPrototypeKey(name)) {
+      issues.push({
+        code: "INVALID_NAME",
+        field: "initial_members",
+        memberName: name,
+        message: `Initial member name "${name}" is forbidden (prototype key).`,
+      });
     } else if (isReservedMemberName(name)) {
       issues.push({
         code: "INVALID_NAME",
@@ -506,7 +515,7 @@ export function validateProposedSwarmPlan(
         const seenChannels = new Set<string>();
         for (const ch of raw.channels) {
           const trimmedCh = typeof ch === "string" ? ch.trim() : "";
-          if (!trimmedCh || !CHANNEL_NAME_PATTERN.test(trimmedCh)) {
+          if (!trimmedCh || !CHANNEL_NAME_PATTERN.test(trimmedCh) || isPrototypeKey(trimmedCh)) {
             issues.push({
               code: "INVALID_CHANNEL",
               field: "channels",
@@ -571,8 +580,9 @@ async function resolveBaseBranch(
   if (worktree) {
     try {
       const current = await worktree.getCurrentBranch(cwd);
-      if (current.trim()) {
-        return current.trim();
+      const trimmed = current.trim();
+      if (trimmed && trimmed !== "HEAD") {
+        return trimmed;
       }
     } catch {
       // Repo may not be initialized yet during upfront drafting; fall back cleanly.
@@ -610,7 +620,7 @@ function ensureDraftSynced(
   controller: DraftStateController,
   ctx: ExtensionContext,
 ): SwarmDraftState | null {
-  return controller.getDraft() ?? controller.rehydrate(ctx);
+  return controller.rehydrate(ctx, { syncToolProfile: false });
 }
 
 // ============================================================================
@@ -829,6 +839,27 @@ export function createSwarmQuestionnaireTool(
             questionCount: 0,
             answers: {},
             error: "empty_questions",
+          } satisfies SwarmQuestionnaireToolDetails,
+        };
+      }
+
+      const blankIndex = params.questions.findIndex(
+        (q) => typeof q.question !== "string" || q.question.trim().length === 0,
+      );
+      if (blankIndex !== -1) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `Question #${blankIndex + 1} text must not be empty.`,
+            },
+          ],
+          details: {
+            cancelled: true,
+            questionCount: params.questions.length,
+            answers: {},
+            error: "empty_question_text",
           } satisfies SwarmQuestionnaireToolDetails,
         };
       }
@@ -1160,7 +1191,13 @@ export function createProposeSwarmPlanTool(
       }
 
       if (outcome.action === "cancel") {
-        draftController.clear("idle");
+        draftController.clear(
+          deps.onDraftChanged
+            ? undefined
+            : currentDraft?.mode === "tweak" || currentDraft?.targetRunId
+              ? "running"
+              : "idle",
+        );
         deps.onDraftChanged?.(null, ctx);
 
         const summary = formatProposalTranscriptSummary(proposedPlan);

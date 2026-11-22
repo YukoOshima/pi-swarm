@@ -118,9 +118,15 @@ export function buildOrchestratorPlaybookSection(
       "  1. **Discovery**: Spawn read-only researchers/scouts first when unknowns exist → inspect their `#seq` reports.",
       "  2. **Contract / Scaffold**: Spawn a contract/scaffold worker when shared interfaces must settle before fan-out → inspect its `#seq`.",
       "  3. **Parallel Execution**: Spawn disjoint named authors in parallel (`workspace:\"share\"` for shared git worktrees when multiple authors edit/build simultaneously; `workspace:\"branch\"` for fully isolated git clones; `workspace:\"inherit\"` for read-only scouts; use `n` or `tasks[]` for sharded slices).",
-      "  4. **Independent Read-Only Validation**: Spawn independent `role:\"validator\"` members (~1 validator per 2–4 authors) to audit code, diffs, tests, and runtime behavior. NEVER let authors self-certify!",
-      "  5. **Peer-to-Peer Bug Closure**: Let `@validator` and `@author` resolve defects directly on the board (`@author` <-> `@validator`) without waking `@orchestrator` on intermediate bounces.",
-      `  6. **Land & Complete**: Merge \`share\`/\`branch\` worktrees via \`${SWARM_TOOL}{action:"merge"}\`, kill finished members via \`${SWARM_TOOL}{action:"kill"}\`, and close the run cleanly via \`${SWARM_TOOL}{action:"done", summary}\`.`,
+      ...(run?.validatorEnabled !== false
+        ? [
+            "  4. **Independent Read-Only Validation**: Spawn independent `role:\"validator\"` members (~1 validator per 2–4 authors) to audit code, diffs, tests, and runtime behavior. NEVER let authors self-certify!",
+            "  5. **Peer-to-Peer Bug Closure**: Let `@validator` and `@author` resolve defects directly on the board (`@author` <-> `@validator`) without waking `@orchestrator` on intermediate bounces.",
+            `  6. **Land & Complete**: Merge \`share\`/\`branch\` worktrees via \`${SWARM_TOOL}{action:"merge"}\`, kill finished members via \`${SWARM_TOOL}{action:"kill"}\`, and close the run cleanly via \`${SWARM_TOOL}{action:"done", summary}\`.`,
+          ]
+        : [
+            `  4. **Land & Complete**: Merge \`share\`/\`branch\` worktrees via \`${SWARM_TOOL}{action:"merge"}\`, kill finished members via \`${SWARM_TOOL}{action:"kill"}\`, and close the run cleanly via \`${SWARM_TOOL}{action:"done", summary}\`.`,
+          ]),
       "- **Dynamic User Redirection**: Calling `swarm_wait` ends your turn cleanly so the user can message you at any time while workers run. When the user sends a new instruction or change of direction mid-flight:",
       `  - Use \`${SWARM_TOOL}{action:"steer", name, message, mode?}\` to redirect a working or parked member immediately (or \`post_message\` with \`@all\` / \`@name\` for parked members), \`${SWARM_TOOL}{action:"stop"/"kill"}\` to halt obsolete work, \`${SWARM_TOOL}{action:"title", objective, strategy, acceptance_criteria}\` to update the run goal/plan, and \`${SWARM_TOOL}{action:"add"}\` for new work, then call \`${SWARM_WAIT_TOOL}\` again.`,
       "",

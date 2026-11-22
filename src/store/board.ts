@@ -405,6 +405,7 @@ interface BoardCacheEntry {
   size: number;
   ino: number;
   head: number;
+  endsWithNewline: boolean;
   messages: BoardMessage[];
 }
 
@@ -429,6 +430,7 @@ export class SwarmBoard implements ISwarmBoard {
   private async loadCachedByPath(boardPath: string): Promise<{
     messages: BoardMessage[];
     head: number;
+    endsWithNewline: boolean;
   }> {
     await assertNoSymlinksWithin(this.projectRoot, boardPath);
     try {
@@ -443,9 +445,11 @@ export class SwarmBoard implements ISwarmBoard {
         return {
           messages: existing.messages,
           head: existing.head,
+          endsWithNewline: existing.endsWithNewline,
         };
       }
       const raw = await readFile(boardPath, "utf8");
+      const endsWithNewline = raw.length === 0 || raw.endsWith("\n");
       const messages = parseBoardLines(raw);
       const head = computeHead(messages);
       this.boardCache.set(boardPath, {
@@ -453,13 +457,14 @@ export class SwarmBoard implements ISwarmBoard {
         size: st.size,
         ino: st.ino,
         head,
+        endsWithNewline,
         messages,
       });
-      return { messages, head };
+      return { messages, head, endsWithNewline };
     } catch (err) {
       if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
         this.boardCache.delete(boardPath);
-        return { messages: [], head: 0 };
+        return { messages: [], head: 0, endsWithNewline: true };
       }
       throw err;
     }
@@ -492,7 +497,7 @@ export class SwarmBoard implements ISwarmBoard {
       await mkdir(path.dirname(boardPath), { recursive: true });
       await assertNoSymlinksWithin(this.projectRoot, boardPath);
 
-      const { messages: existingMessages, head } =
+      const { messages: existingMessages, head, endsWithNewline } =
         await this.loadCachedByPath(boardPath);
 
       const text = typeof input.text === "string" ? input.text.trim() : "";
@@ -504,8 +509,14 @@ export class SwarmBoard implements ISwarmBoard {
       const mentions = mergeMentions(text, input.mentions);
       const channelMentions = mergeChannelMentions(text, input.channelMentions);
 
+      const minSeq =
+        typeof input.minSeq === "number" && Number.isFinite(input.minSeq)
+          ? Math.floor(input.minSeq)
+          : 1;
+      const seq = Math.max(head + 1, minSeq);
+
       const message: BoardMessage = {
-        seq: head + 1,
+        seq,
         runId: safeRunId,
         channel,
         from,
@@ -517,7 +528,7 @@ export class SwarmBoard implements ISwarmBoard {
         timestamp: new Date().toISOString(),
       };
 
-      const line = `${JSON.stringify(message)}\n`;
+      const line = `${endsWithNewline ? "" : "\n"}${JSON.stringify(message)}\n`;
       await appendFile(boardPath, line, { encoding: "utf8", flag: "a" });
       try {
         const stAfter = await lstat(boardPath);
@@ -527,6 +538,7 @@ export class SwarmBoard implements ISwarmBoard {
           size: stAfter.size,
           ino: stAfter.ino,
           head: message.seq,
+          endsWithNewline: true,
           messages: updatedMessages,
         });
       } catch {
@@ -553,7 +565,7 @@ export class SwarmBoard implements ISwarmBoard {
     const explicitChannel =
       rawExplicitChannel === "*"
         ? "*"
-        : rawExplicitChannel.replace(/^#/, "");
+        : rawExplicitChannel.replace(/^@?#?/, "");
     if (explicitChannel.length > 0) {
       if (explicitChannel !== "*") {
         scoped = scoped.filter((m) => m.channel === explicitChannel);
@@ -562,7 +574,7 @@ export class SwarmBoard implements ISwarmBoard {
       const allowed = new Set<string>([DEFAULT_CHANNEL]);
       for (const ch of options.memberChannels) {
         if (typeof ch === "string" && ch.trim().length > 0) {
-          allowed.add(ch.trim().toLowerCase().replace(/^#/, ""));
+          allowed.add(ch.trim().toLowerCase().replace(/^@?#?/, ""));
         }
       }
       scoped = scoped.filter(

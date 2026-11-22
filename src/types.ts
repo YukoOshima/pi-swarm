@@ -196,6 +196,8 @@ export interface PostBoardMessageInput {
   kind?: BoardMessageKind;
   mentions?: string[];
   channelMentions?: string[];
+  /** Optional minimum sequence floor (e.g. state.boardHead + 1) to preserve monotonicity after crash-truncated board recovery. */
+  minSeq?: number;
 }
 
 export interface ReadBoardOptions {
@@ -744,6 +746,8 @@ export interface IWorktreeManager {
     targets: SafeTeardownTarget[],
     options?: { deleteBranches?: boolean; force?: boolean },
   ): Promise<SafeTeardownResult>;
+  /** Optional runtime timeout updater when settings reload. */
+  setGitTimeoutMs?(timeoutMs: number): void;
 }
 
 // ============================================================================
@@ -920,7 +924,7 @@ export interface MemberEngineBridge {
   getStatus(): Promise<SwarmRosterStatus>;
   listModels(options?: { all?: boolean }): Promise<AvailableModelInfo[]>;
   addHelper(input: AddHelperInput): Promise<SwarmMemberRecord[]>;
-  killHelper(name: string, reason?: string): Promise<void>;
+  killHelper(name: string, reason?: string, force?: boolean): Promise<void>;
   stopHelper?(name: string, reason?: string): Promise<void>;
   steerHelper?(
     name: string,
@@ -946,6 +950,8 @@ export interface SpawnMemberRequest {
   branch?: string;
   baseBranch?: string;
   workspace: SwarmWorkspaceMode;
+  /** True when cwd is inside an isolated share/branch worktree (including inherit helpers of isolated parents). */
+  isIsolatedWorktree?: boolean;
   parentName: string;
   brief: string;
   systemPrompt: string;
@@ -1060,6 +1066,8 @@ export interface CompleteRunOptions {
   deleteBranches?: boolean;
   callerRole?: CallerRole;
   actor?: string;
+  /** Optional caller sessionId for ownership verification before auto-teardown. */
+  sessionId?: string;
 }
 
 export interface TeardownOptions {

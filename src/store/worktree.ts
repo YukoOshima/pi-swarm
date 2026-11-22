@@ -143,7 +143,7 @@ function parsePorcelainUnmergedPaths(output: string): string[] {
 
 export class WorktreeManager implements IWorktreeManager {
   readonly repoRoot: string;
-  private readonly gitTimeoutMs: number;
+  private gitTimeoutMs: number;
 
   constructor(repoRoot: string, options?: WorktreeManagerOptions) {
     this.repoRoot = path.resolve(repoRoot);
@@ -151,6 +151,12 @@ export class WorktreeManager implements IWorktreeManager {
       1_000,
       Math.floor(options?.gitTimeoutMs ?? DEFAULT_SWARM_SETTINGS.gitTimeoutMs),
     );
+  }
+
+  setGitTimeoutMs(timeoutMs: number): void {
+    if (typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0) {
+      this.gitTimeoutMs = Math.max(1, Math.floor(timeoutMs));
+    }
   }
 
   private async runGit(
@@ -288,6 +294,15 @@ export class WorktreeManager implements IWorktreeManager {
   }
 
   async ensureRepoReady(preferredBaseBranch?: string): Promise<RepoReadyResult> {
+    const trimmedPreferred = preferredBaseBranch?.trim();
+    if (trimmedPreferred === "HEAD") {
+      throw new SwarmProtocolError(
+        "WRONG_BRANCH",
+        'Cannot use detached "HEAD" as base branch; check out or specify a named local branch (e.g. "main").',
+        { preferredBaseBranch: trimmedPreferred },
+      );
+    }
+
     await mkdir(this.repoRoot, { recursive: true });
 
     let initializedRepo = false;
@@ -344,6 +359,13 @@ export class WorktreeManager implements IWorktreeManager {
     let baseBranch: string;
     if (preferredBaseBranch?.trim()) {
       const target = preferredBaseBranch.trim();
+      if (target === "HEAD") {
+        throw new SwarmProtocolError(
+          "WRONG_BRANCH",
+          'Cannot use detached "HEAD" as base branch; check out or specify a named local branch (e.g. "main").',
+          { preferredBaseBranch: target },
+        );
+      }
       const exists = await this.branchExists(target, effectiveRoot);
       if (!exists) {
         throw new SwarmProtocolError(
@@ -355,6 +377,13 @@ export class WorktreeManager implements IWorktreeManager {
       baseBranch = target;
     } else {
       baseBranch = await this.getCurrentBranch(effectiveRoot);
+      if (!baseBranch || baseBranch === "HEAD") {
+        throw new SwarmProtocolError(
+          "WRONG_BRANCH",
+          'Repository is in detached HEAD state; check out a named local branch (e.g. "main") or pass an explicit baseBranch.',
+          { currentBranch: baseBranch || "HEAD" },
+        );
+      }
     }
 
     const headShaRes = await this.runGit(["rev-parse", `refs/heads/${baseBranch}`], {
@@ -406,7 +435,9 @@ export class WorktreeManager implements IWorktreeManager {
     reuseExistingBranch?: boolean;
     mode?: "share" | "branch";
   }): Promise<CreateWorktreeResult> {
-    const resolvedWorktree = path.resolve(options.worktreePath);
+    const resolvedWorktree = await this.assertSafeWorktreeTarget(
+      options.worktreePath,
+    );
     await mkdir(path.dirname(resolvedWorktree), { recursive: true });
 
     const baseShaRes = await this.runGit([
@@ -462,11 +493,13 @@ export class WorktreeManager implements IWorktreeManager {
         await removeDirectoryWithRetry(resolvedWorktree);
       }
 
+      const cloneBranch =
+        exists && options.reuseExistingBranch ? options.branch : options.baseBranch;
       await this.runGit([
         "clone",
         "--no-hardlinks",
         "--branch",
-        options.baseBranch,
+        cloneBranch,
         this.repoRoot,
         resolvedWorktree,
       ]);
@@ -480,9 +513,20 @@ export class WorktreeManager implements IWorktreeManager {
           cwd: resolvedWorktree,
         });
       } else {
-        await this.runGit(["checkout", "-b", options.branch], {
-          cwd: resolvedWorktree,
-        });
+        const remoteRef = `refs/remotes/origin/${options.branch}`;
+        const remoteExistsRes = await this.runGit(
+          ["show-ref", "--verify", "--quiet", remoteRef],
+          { cwd: resolvedWorktree, allowFailure: true },
+        );
+        if (remoteExistsRes.ok) {
+          await this.runGit(["checkout", "-B", options.branch, remoteRef], {
+            cwd: resolvedWorktree,
+          });
+        } else {
+          await this.runGit(["checkout", "-b", options.branch], {
+            cwd: resolvedWorktree,
+          });
+        }
       }
 
       return {
@@ -554,12 +598,20 @@ export class WorktreeManager implements IWorktreeManager {
 
   private async resolveRealWorktreePath(targetPath: string): Promise<string> {
     const resolved = path.resolve(targetPath);
-    if (await pathExists(resolved)) {
-      return realpath(resolved).catch(() => resolved);
+    const missingSegments: string[] = [];
+    let curr = resolved;
+    while (!(await pathExists(curr))) {
+      const parent = path.dirname(curr);
+      if (parent === curr) {
+        break;
+      }
+      missingSegments.unshift(path.basename(curr));
+      curr = parent;
     }
-    const parent = path.dirname(resolved);
-    const realParent = await realpath(parent).catch(() => parent);
-    return path.join(realParent, path.basename(resolved));
+    const realAncestor = await realpath(curr).catch(() => curr);
+    return missingSegments.length > 0
+      ? path.join(realAncestor, ...missingSegments)
+      : realAncestor;
   }
 
   /**
@@ -567,8 +619,9 @@ export class WorktreeManager implements IWorktreeManager {
    * or any path outside `<repoRoot>/.pi/swarm/worktrees/`.
    */
   private async assertSafeWorktreeTarget(worktreePath: string): Promise<string> {
+    const resolvedRepo = path.resolve(this.repoRoot);
     const resolved = path.resolve(worktreePath);
-    const realRepo = await realpath(this.repoRoot).catch(() => path.resolve(this.repoRoot));
+    const realRepo = await realpath(this.repoRoot).catch(() => resolvedRepo);
     const realWorktreesRoot = path.join(realRepo, SWARM_DIR, "worktrees");
     const realTarget = await this.resolveRealWorktreePath(resolved);
     const rel = path.relative(realWorktreesRoot, realTarget);
@@ -585,6 +638,36 @@ export class WorktreeManager implements IWorktreeManager {
         { worktreePath: resolved },
       );
     }
+
+    // Walk every path component strictly inside repoRoot (from .pi down through resolved)
+    // so symlinks inside .pi/swarm/worktrees or resolved itself are rejected.
+    let curr = resolved;
+    while (curr !== resolvedRepo && curr !== realRepo) {
+      const parent = path.dirname(curr);
+      if (parent === curr) {
+        break;
+      }
+      try {
+        const st = await lstat(curr);
+        if (st.isSymbolicLink()) {
+          throw new SwarmProtocolError(
+            "PERMISSION_DENIED",
+            `Refusing to traverse symlinked worktree path: ${curr}`,
+            { worktreePath: resolved, symlinkPath: curr },
+          );
+        }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+          throw err;
+        }
+      }
+      const realParent = await realpath(parent).catch(() => parent);
+      if (realParent === realRepo) {
+        break;
+      }
+      curr = parent;
+    }
+
     return resolved;
   }
 
@@ -714,13 +797,13 @@ export class WorktreeManager implements IWorktreeManager {
         allowFailure: true,
       });
       if (!topRes.ok || !topRes.stdout.trim()) {
-        return false;
+        return true;
       }
       const realTop = await realpath(topRes.stdout.trim()).catch(() =>
         path.resolve(topRes.stdout.trim()),
       );
       if (realTop !== realTarget) {
-        return false;
+        return true;
       }
     }
     const res = await this.runGit(
@@ -1058,9 +1141,22 @@ export class WorktreeManager implements IWorktreeManager {
             target.branch &&
             (await this.branchExists(target.branch))
           ) {
-            await this.runGit(["branch", "-D", target.branch], {
-              allowFailure: true,
-            });
+            const delRes = await this.runGit(
+              ["branch", "-D", "--", target.branch],
+              { allowFailure: true },
+            );
+            if (!delRes.ok && (await this.branchExists(target.branch))) {
+              errors.push({
+                memberName: target.memberName,
+                worktreePath: resolvedPath,
+                branch: target.branch,
+                action: "error",
+                reason:
+                  (delRes.stderr || delRes.stdout).trim() ||
+                  `Failed to delete branch "${target.branch}".`,
+              });
+              continue;
+            }
             removed.push({
               memberName: target.memberName,
               worktreePath: resolvedPath,
@@ -1106,9 +1202,22 @@ export class WorktreeManager implements IWorktreeManager {
         await this.removeWorktree(resolvedPath, { force: true });
 
         if (deleteBranches && target.branch) {
-          await this.runGit(["branch", "-D", target.branch], {
-            allowFailure: true,
-          });
+          const delRes = await this.runGit(
+            ["branch", "-D", "--", target.branch],
+            { allowFailure: true },
+          );
+          if (!delRes.ok && (await this.branchExists(target.branch))) {
+            errors.push({
+              memberName: target.memberName,
+              worktreePath: resolvedPath,
+              branch: target.branch,
+              action: "error",
+              reason:
+                (delRes.stderr || delRes.stdout).trim() ||
+                `Worktree removed, but failed to delete branch "${target.branch}".`,
+            });
+            continue;
+          }
         }
 
         removed.push({

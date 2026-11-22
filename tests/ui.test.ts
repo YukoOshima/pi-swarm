@@ -63,8 +63,10 @@ import {
   renderBox,
   renderHorizontalRule,
   renderTable,
+  sanitizeDiffLine,
   sanitizePlainText,
   shortenModelName,
+  stripAllTerminalEscapes,
   wrapLines,
 } from "../src/ui/index.js";
 
@@ -1930,5 +1932,325 @@ describe("swarm-overlay", () => {
     assert.match(plain, /   context line/);
     assert.match(plain, /\+  addedline/);
     assert.match(plain, /-  removedline/);
+  });
+
+  it("v0.3.6: sanitizes branch/baseBranch in overlay header & loading diff and clears stale state on run switch/null", async () => {
+    const dirtySnap = makeSampleSnapshot();
+    dirtySnap.run!.baseBranch = "main\x1b[?25l\x1b]0;evil\x07";
+    dirtySnap.run!.members["worker-1"]!.branch = "swarm/dyn/wt\x1b[2J\x07";
+    const mockEngine = createMockEngine(dirtySnap);
+    const { worktree } = createMockWorktree();
+    let resolveDiff!: (v: DiffSummary) => void;
+    worktree.getDiffSummary = () =>
+      new Promise<DiffSummary>((r) => {
+        resolveDiff = r;
+      });
+    const mockTui = createMockTUI(32, 100);
+    let overlayLines: string[] = [];
+    const tuiCtx = {
+      mode: "tui",
+      hasUI: true,
+      ui: {
+        theme: createMockTheme(),
+        notify() {},
+        async custom<T>(
+          factory: (
+            tui: TUI,
+            theme: Theme,
+            kb: unknown,
+            done: (r: T) => void,
+          ) => Component & { dispose?(): void },
+        ): Promise<T> {
+          return new Promise<T>((resolve) => {
+            const comp = factory(mockTui.tui, createMockTheme(), {}, resolve);
+            if (isFocusable(comp)) comp.focused = true;
+            void (async () => {
+              await flushAsync();
+              comp.handleInput?.("2"); // Members
+              comp.handleInput?.("d"); // Trigger diff loading
+              overlayLines = comp.render(100);
+              comp.handleInput?.("q");
+              resolveDiff({
+                baseBranch: "main",
+                branch: "swarm/dyn/wt",
+                headSha: "abc",
+                commitsAhead: 0,
+                changedFiles: [],
+                stat: "",
+                diff: "",
+              });
+            })();
+          });
+        },
+      },
+    } as unknown as ExtensionContext;
+    await openSwarmOverlay(tuiCtx, mockEngine.engine, worktree);
+    const joined = overlayLines.join("\n");
+    assert.ok(!joined.includes("\x1b[?25l"));
+    assert.ok(!joined.includes("\x1b[2J"));
+    assert.ok(!joined.includes("\x07"));
+
+    // Run change / null run clears boardMessages, inlineMode, searchFocused, and discards stale refreshFullBoard
+    const snap1 = makeSampleSnapshot();
+    const mockEngine2 = createMockEngine(snap1);
+    let resolveStaleBoard!: (res: { messages: BoardMessage[]; head: number }) => void;
+    let boardCallCount = 0;
+    mockEngine2.engine.readBoard = async () => {
+      boardCallCount += 1;
+      if (boardCallCount === 1) {
+        return new Promise((resolve) => {
+          resolveStaleBoard = resolve;
+        });
+      }
+      return { messages: [], head: 0 };
+    };
+    const mockTui2 = createMockTUI(32, 100);
+    let capturedWhenNull = "";
+    const ctx2 = {
+      mode: "tui",
+      hasUI: true,
+      ui: {
+        theme: createMockTheme(),
+        notify() {},
+        async custom<T>(
+          factory: (
+            tui: TUI,
+            t: Theme,
+            kb: unknown,
+            done: (r: T) => void,
+          ) => Component & { dispose?(): void },
+        ): Promise<T> {
+          return new Promise<T>((resolve) => {
+            const comp = factory(mockTui2.tui, createMockTheme(), {}, resolve);
+            if (isFocusable(comp)) comp.focused = true;
+            void (async () => {
+              await flushAsync();
+              comp.handleInput?.("p");
+              assert.equal(mockTui2.getHardwareCursor(), true);
+
+              mockEngine2.emit({
+                type: "snapshot_changed",
+                runId: null,
+                summary: "Detached",
+                snapshot: makeSampleSnapshot({ empty: true }),
+              });
+              resolveStaleBoard({
+                messages: [
+                  {
+                    seq: 99,
+                    runId: snap1.run!.id,
+                    timestamp: "2026-11-20T18:00:00.000Z",
+                    from: "stale",
+                    fromRole: "worker",
+                    channel: "main",
+                    kind: "chat",
+                    mentions: [],
+                    channelMentions: [],
+                    text: "Stale message from old run",
+                  },
+                ],
+                head: 99,
+              });
+              await flushAsync();
+              assert.equal(mockTui2.getHardwareCursor(), false);
+              capturedWhenNull = stripTerminalSequences(comp.render(100).join("\n"));
+
+              const snap2 = makeSampleSnapshot({ boardHead: 0, recentBoard: [] });
+              snap2.run!.id = "run-2";
+              snap2.activeRunId = "run-2";
+              mockEngine2.emit({
+                type: "snapshot_changed",
+                runId: "run-2",
+                summary: "Switched to run-2",
+                snapshot: snap2,
+              });
+              await flushAsync();
+              const run2Rendered = stripTerminalSequences(comp.render(100).join("\n"));
+              assert.ok(!run2Rendered.includes("Stale message from old run"));
+              comp.handleInput?.("q");
+            })();
+          });
+        },
+      },
+    } as unknown as ExtensionContext;
+
+    await openSwarmOverlay(ctx2, mockEngine2.engine, null);
+    assert.match(capturedWhenNull, /No active Swarm run/);
+  });
+});
+
+describe("v0.3.6 UI hardening regressions", () => {
+  it("strips all ECMA-48 escape sequences (CSI, OSC, DCS, SOS, PM, APC, C1, 2-byte ESC, lone ESC) without eating diff code", () => {
+    assert.equal(
+      sanitizeDiffLine("\x1b[?25l+  const message = 1"),
+      "+  const message = 1",
+    );
+    assert.equal(
+      sanitizeDiffLine("\x1bP1$r0m\x1b\\+  const x = \x1bXpayload\x1b\\\x1b^pm\x1b\\\x1b_apc\x1b\\42"),
+      "+  const x = 42",
+    );
+    assert.equal(
+      sanitizePlainText("\u0090dcs\u009c\u009b31mHello\u009dosc\u009c \x1bMWorld\x1b"),
+      "Hello World",
+    );
+    assert.equal(
+      stripAllTerminalEscapes("\x1b]0;bad title\x07ok\x1b[200~paste\x1b[201~"),
+      "okpaste",
+    );
+  });
+
+  it("sanitizes branch and baseBranch in dashboard-widget and questionnaire basic confirm", async () => {
+    const dirtySnap = makeSampleSnapshot();
+    dirtySnap.run!.baseBranch = "main\x1b[?25l\x1b]0;evil\x07";
+    dirtySnap.run!.members["worker-1"]!.branch = "swarm/dyn/wt\x1b[2J\x07";
+
+    const mockTui = createMockTUI(32, 100);
+    const widgetState = createSwarmWidgetState({ expanded: true });
+    const widget = createSwarmWidget(() => dirtySnap, widgetState)(
+      mockTui.tui,
+      createMockTheme(),
+    );
+    const expandedOut = widget.render(100).join("\n");
+    assert.ok(!expandedOut.includes("\x1b[?25l"));
+    assert.ok(!expandedOut.includes("\x1b]0;evil"));
+    assert.match(stripTerminalSequences(expandedOut), /base:main/);
+    widget.dispose();
+
+    const statusMd = formatZeroTurnStatusDashboard(dirtySnap);
+    assert.ok(!statusMd.includes("\x1b[?25l"));
+    assert.ok(!statusMd.includes("\x1b]0;evil"));
+    assert.match(statusMd, /\*\*Base Branch:\*\* `main`/);
+
+    const qUi = createQuestionnaireUI();
+    let capturedPrompt = "";
+    const basicCtx = {
+      mode: "rpc",
+      hasUI: true,
+      ui: {
+        async select(title: string) {
+          capturedPrompt = title;
+          return "Confirm — launch dynamic Swarm (recommended)";
+        },
+        async input() {
+          return undefined;
+        },
+      },
+    } as unknown as ExtensionContext;
+    await qUi.confirmProposal(basicCtx, {
+      title: "Test",
+      objective: "Obj",
+      strategy: "Strat",
+      acceptanceCriteria: "Done",
+      baseBranch: "main\x1b[?25l\x07",
+      maxConcurrency: 4,
+      validatorEnabled: true,
+    });
+    assert.ok(!capturedPrompt.includes("\x1b[?25l"));
+    assert.ok(!capturedPrompt.includes("\x07"));
+    assert.match(capturedPrompt, /base:main/);
+  });
+
+  it("questionnaire supports MAX_CONCURRENCY up to 64 and disposes TUI components in finally on external abort", async () => {
+    const qUi = createQuestionnaireUI();
+    const mockTui = createMockTUI(30, 100);
+    const theme = createMockTheme();
+
+    const selectCtx = {
+      mode: "rpc",
+      hasUI: true,
+      ui: {
+        async select(_t: string, choices: string[]) {
+          const inc = choices.find((c) => c.startsWith("Increase Max Concurrency"));
+          assert.ok(inc, "Concurrency 24 < 64 should still allow incrementing");
+          return "Confirm — launch dynamic Swarm (recommended)";
+        },
+        async input() {
+          return undefined;
+        },
+      },
+    } as unknown as ExtensionContext;
+    const outcome = await qUi.confirmProposal(selectCtx, {
+      title: "High Concurrency",
+      objective: "Obj",
+      strategy: "Strat",
+      acceptanceCriteria: "Done",
+      baseBranch: "main",
+      maxConcurrency: 24,
+      validatorEnabled: true,
+    });
+    assert.equal(outcome.maxConcurrency, 24);
+
+    const runExternalThrow = async (
+      fn: (ctx: ExtensionContext) => Promise<unknown>,
+    ) => {
+      mockTui.tui.setShowHardwareCursor(false);
+      const ctx = {
+        mode: "tui",
+        hasUI: true,
+        ui: {
+          theme,
+          async custom<T>(
+            factory: (
+              tui: TUI,
+              t: Theme,
+              kb: unknown,
+              done: (r: T) => void,
+            ) => Component & { dispose?(): void },
+          ): Promise<T> {
+            const comp = factory(mockTui.tui, theme, {}, () => {});
+            comp.render(100);
+            throw new Error("simulated external cancel");
+          },
+        },
+      } as unknown as ExtensionContext;
+      await assert.rejects(() => fn(ctx), /simulated external cancel/);
+      assert.equal(mockTui.getHardwareCursor(), false);
+    };
+
+    await runExternalThrow((c) =>
+      qUi.askQuestion(c, { id: "q1", question: "Q?", options: [] }),
+    );
+    await runExternalThrow((c) =>
+      qUi.askQuestionnaire(c, [
+        { id: "q1", question: "Q1?", options: [{ label: "A" }] },
+      ]),
+    );
+    await runExternalThrow((c) =>
+      qUi.confirmProposal(c, {
+        title: "T",
+        objective: "O",
+        strategy: "S",
+        acceptanceCriteria: "A",
+        baseBranch: "main",
+        maxConcurrency: 4,
+        validatorEnabled: true,
+      }),
+    );
+  });
+
+  it("dashboard-widget uses dynamic getHostModel getter across renders", () => {
+    let dynamicModel = "anthropic/claude-sonnet-4-5";
+    const snap = makeSampleSnapshot({
+      roleModels: {
+        orchestrator: {},
+        worker: {},
+        validator: {},
+        fallbackModels: [],
+      },
+    });
+    const mockTui = createMockTUI(32, 120);
+    const state = createSwarmWidgetState({ expanded: true });
+    const widget = createSwarmWidget(() => snap, state, {
+      hostModel: "static/ignored",
+      getHostModel: () => dynamicModel,
+    })(mockTui.tui, createMockTheme());
+
+    const first = stripTerminalSequences(widget.render(120).join("\n"));
+    assert.match(first, /claude-sonnet-4-5/);
+
+    dynamicModel = "openai/gpt-5.4";
+    const second = stripTerminalSequences(widget.render(120).join("\n"));
+    assert.match(second, /gpt-5\.4/);
+    widget.dispose();
   });
 });

@@ -54,6 +54,7 @@ import {
   validateChannelName,
   validateMemberName,
 } from "../src/store/index.js";
+import { isPrototypeKey } from "../src/store/swarm-store.js";
 import {
   isSwarmProtocolError,
   type BoardMessage,
@@ -1988,5 +1989,428 @@ describe("WorktreeManager real git repository workflows", () => {
     assert.match(tdBad.errors[0]!.reason ?? "", /Refusing to remove worktree path/i);
     assert.equal(await exists(path.join(repoDir, "dirty-root.txt")), true);
     assert.equal(await exists(path.join(outsideDir, "keep.txt")), true);
+  });
+});
+
+// ============================================================================
+// 6. v0.3.6 Audit Regression Tests (Locks, Prototype Keys, Worktrees, Crash Recovery, Settings)
+// ============================================================================
+
+describe("v0.3.6 store, board, ledger, settings & worktree regression fixes", () => {
+  it("wraps corrupted state.json SyntaxError as NOT_FOUND, clamps maxConcurrency to 1..64, and recovers stale .reap & 0-byte locks", async () => {
+    const root = await makeTempDir("pi-swarm-v036-lock-");
+    const store = new SwarmStore(root, {
+      staleLockMs: 50,
+      lockTimeoutMs: 600,
+      lockRetryMs: 10,
+    });
+
+    // Corrupted state.json -> SwarmProtocolError("NOT_FOUND")
+    const corruptDir = path.join(root, SWARM_DIR, SWARM_RUNS_DIR, "run-corrupt");
+    await mkdir(corruptDir, { recursive: true });
+    await writeFile(path.join(corruptDir, SWARM_STATE_FILE), "{corrupted-json", "utf8");
+    await assert.rejects(
+      () => store.loadRun("run-corrupt"),
+      (err) =>
+        assertProtocolCode(err, "NOT_FOUND") &&
+        /Corrupted run state/.test((err as Error).message),
+    );
+
+    // maxConcurrency clamping and Number.isFinite guard in createRun & updateRun
+    const createdHigh = await store.createRun({
+      id: "run-conc-high",
+      title: "High conc",
+      objective: "Clamp concurrency",
+      baseBranch: "main",
+      ownerSessionId: "sess-1",
+      maxConcurrency: 999,
+    });
+    assert.equal(createdHigh.maxConcurrency, 64);
+
+    const createdNaN = await store.createRun({
+      id: "run-conc-nan",
+      title: "NaN conc",
+      objective: "Guard NaN concurrency",
+      baseBranch: "main",
+      ownerSessionId: "sess-1",
+      maxConcurrency: Number.NaN,
+    });
+    assert.equal(createdNaN.maxConcurrency, DEFAULT_SWARM_SETTINGS.maxConcurrency);
+
+    const updatedLow = await store.updateRun("run-conc-high", { maxConcurrency: 0 });
+    assert.equal(updatedLow.maxConcurrency, 1);
+    const updatedInf = await store.updateRun("run-conc-high", {
+      maxConcurrency: Number.POSITIVE_INFINITY,
+    });
+    assert.equal(updatedInf.maxConcurrency, 1);
+    const updatedMax = await store.updateRun("run-conc-high", { maxConcurrency: 200 });
+    assert.equal(updatedMax.maxConcurrency, 64);
+
+    // Stale .reap with dead PID + 0-byte .lock are both recovered cleanly
+    const lockPath = path.join(root, SWARM_DIR, SWARM_LOCKS_DIR, "run-conc-high.lock");
+    const reapPath = `${lockPath}.reap`;
+    await writeFile(lockPath, "", "utf8");
+    const past = new Date(Date.now() - 10_000);
+    await utimes(lockPath, past, past);
+    await writeFile(
+      reapPath,
+      JSON.stringify({
+        token: "dead-reap-token",
+        pid: 999_999_999,
+        hostname: os.hostname(),
+        createdAt: new Date().toISOString(),
+      }),
+      "utf8",
+    );
+
+    const afterReap = await store.updateRun("run-conc-high", { title: "Recovered" });
+    assert.equal(afterReap.title, "Recovered");
+    assert.equal(await exists(lockPath), false);
+    assert.equal(await exists(reapPath), false);
+
+    // Stale .reap by mtime (reapStaleMs <= lockTimeoutMs / 2 = 300ms) is also recovered
+    await writeFile(lockPath, "", "utf8");
+    await utimes(lockPath, past, past);
+    await writeFile(
+      reapPath,
+      JSON.stringify({
+        token: "old-reap-token",
+        pid: process.pid,
+        hostname: os.hostname(),
+        createdAt: new Date(Date.now() - 10_000).toISOString(),
+      }),
+      "utf8",
+    );
+    await utimes(reapPath, past, past);
+
+    const afterTimeReap = await store.updateRun("run-conc-high", {
+      title: "Recovered by mtime",
+    });
+    assert.equal(afterTimeReap.title, "Recovered by mtime");
+  });
+
+  it("defends against Object.prototype key collisions in member/channel validation and store lookups", async () => {
+    const root = await makeTempDir("pi-swarm-v036-proto-");
+    const store = new SwarmStore(root);
+
+    for (const key of ["__proto__", "prototype", "constructor", "toString", "valueOf", "hasOwnProperty"]) {
+      assert.equal(isPrototypeKey(key), true, `expected ${key} to be prototype key`);
+    }
+    assert.equal(isPrototypeKey("parser"), false);
+    assert.equal(isPrototypeKey("backend"), false);
+
+    for (const protoName of ["constructor", "prototype", "toString", "__proto__"]) {
+      assert.throws(
+        () => validateMemberName(protoName),
+        (err) => assertProtocolCode(err, "INVALID_NAME"),
+      );
+      assert.throws(
+        () => validateChannelName(protoName),
+        (err) => assertProtocolCode(err, "INVALID_CHANNEL"),
+      );
+    }
+
+    await store.createRun({
+      id: "run-proto",
+      title: "Prototype Defense",
+      objective: "Verify Object.hasOwn lookups",
+      baseBranch: "main",
+      ownerSessionId: "sess-proto",
+    });
+
+    await assert.rejects(
+      () =>
+        store.addMember("run-proto", {
+          name: "constructor",
+          agentId: "a1",
+          role: "worker",
+          parentName: "orchestrator",
+          brief: "bad",
+          workspace: "inherit",
+          cwd: root,
+        }),
+      (err) => assertProtocolCode(err, "INVALID_NAME"),
+    );
+
+    await assert.rejects(
+      () =>
+        store.createChannel("run-proto", {
+          name: "constructor",
+          createdBy: "orchestrator",
+        }),
+      (err) => assertProtocolCode(err, "INVALID_CHANNEL"),
+    );
+
+    await assert.rejects(
+      () => store.updateMember("run-proto", "toString", { state: "waiting" }),
+      (err) => assertProtocolCode(err, "MEMBER_NOT_FOUND"),
+    );
+
+    await assert.rejects(
+      () => store.subscribeChannel("run-proto", "main", "constructor"),
+      (err) => assertProtocolCode(err, "MEMBER_NOT_FOUND"),
+    );
+
+    // Posting with sender "toString" must not hit Object.prototype.toString
+    const msg = await store.postBoardMessage("run-proto", {
+      from: "toString",
+      fromRole: "human",
+      text: "Safe message",
+    });
+    assert.equal(msg.from, "toString");
+    assert.equal(typeof ({} as Record<string, unknown>).toString, "function");
+  });
+
+  it("handles crash-truncated board.jsonl and events.jsonl, minSeq floor, and @#channel read normalization", async () => {
+    const root = await makeTempDir("pi-swarm-v036-crash-");
+    const store = new SwarmStore(root);
+    const board = new SwarmBoard(root);
+
+    await store.createRun({
+      id: "run-crash",
+      title: "Crash Recovery",
+      objective: "Recover truncated JSONL without corrupting new lines",
+      baseBranch: "main",
+      ownerSessionId: "sess-crash",
+    });
+    await store.createChannel("run-crash", {
+      name: "backend",
+      createdBy: "orchestrator",
+    });
+
+    const m1 = await store.postBoardMessage("run-crash", {
+      from: "orchestrator",
+      fromRole: "orchestrator",
+      channel: "backend",
+      text: "Message 1",
+    });
+    assert.equal(m1.seq, 1);
+
+    // Simulate crash leaving partial JSON WITHOUT trailing newline
+    const boardPath = board.getBoardPath("run-crash");
+    const rawBoard = await readFile(boardPath, "utf8");
+    await writeFile(boardPath, `${rawBoard}{"seq":2,"truncated":`, "utf8");
+
+    // Direct board.post with minSeq: 5 prepends "\n" and advances seq to 5
+    const m5 = await board.post("run-crash", {
+      from: "orchestrator",
+      fromRole: "orchestrator",
+      channel: "backend",
+      text: "Message 5",
+      minSeq: 5,
+    });
+    assert.equal(m5.seq, 5);
+
+    const readAfter = await board.read("run-crash", { channel: "@#backend" });
+    assert.deepEqual(
+      readAfter.messages.map((m) => m.seq),
+      [1, 5],
+    );
+
+    const readMemberCh = await board.read("run-crash", {
+      memberChannels: ["@#backend"],
+    });
+    assert.deepEqual(
+      readMemberCh.messages.map((m) => m.seq),
+      [1, 5],
+    );
+
+    // store.postBoardMessage preserves state.boardHead + 1 floor even if board.jsonl lost tail
+    await store.updateRun("run-crash", {}); // no-op revision bump
+    // Simulate board.jsonl truncated back to only seq 1 while state.boardHead is higher
+    await writeFile(boardPath, rawBoard, "utf8");
+    const statePath = path.join(root, SWARM_DIR, SWARM_RUNS_DIR, "run-crash", SWARM_STATE_FILE);
+    const stJson = JSON.parse(await readFile(statePath, "utf8")) as Record<string, unknown>;
+    stJson.boardHead = 10;
+    await writeFile(statePath, `${JSON.stringify(stJson, null, 2)}\n`, "utf8");
+
+    const m11 = await store.postBoardMessage("run-crash", {
+      from: "orchestrator",
+      fromRole: "orchestrator",
+      text: "Message after head floor",
+    });
+    assert.equal(m11.seq, 11);
+
+    // Crash-truncated events.jsonl without trailing newline
+    const eventsPath = path.join(root, SWARM_DIR, SWARM_RUNS_DIR, "run-crash", SWARM_EVENTS_FILE);
+    const ledger = new SwarmLedger(eventsPath);
+    const rawEvents = await readFile(eventsPath, "utf8");
+    await writeFile(eventsPath, `${rawEvents}{"id":"partial-evt"`, "utf8");
+
+    const appendedEvt = await ledger.append({
+      runId: "run-crash",
+      type: "stall_detected",
+      summary: "Recovered after crash",
+    });
+    assert.ok(appendedEvt.seq && appendedEvt.seq > 1);
+    const allEvts = await ledger.readAll();
+    assert.equal(allEvts[allEvts.length - 1]?.summary, "Recovered after crash");
+  });
+
+  it("defends symlinked .pi settings dir, serializes concurrent saveSwarmSettings, and clamps rateLimitBaseBackoffMs", async () => {
+    const tmp = await makeTempDir("pi-swarm-v036-settings-");
+    const globalDir = path.join(tmp, "global");
+    const projectRoot = path.join(tmp, "proj-sym");
+    const outsideDir = path.join(tmp, "outside-pi");
+    await mkdir(globalDir, { recursive: true });
+    await mkdir(projectRoot, { recursive: true });
+    await mkdir(outsideDir, { recursive: true });
+    await writeFile(
+      path.join(outsideDir, SWARM_SETTINGS_FILE),
+      JSON.stringify({ maxConcurrency: 12 }),
+      "utf8",
+    );
+    await symlink(outsideDir, path.join(projectRoot, ".pi"));
+
+    const loaded = await loadLayeredSwarmSettings(projectRoot, { globalDir });
+    assert.ok(loaded.warnings.length > 0);
+    assert.equal(loaded.settings.maxConcurrency, DEFAULT_SWARM_SETTINGS.maxConcurrency);
+
+    await assert.rejects(
+      () =>
+        saveSwarmSettings(
+          "project",
+          { maxConcurrency: 4 },
+          { globalDir, projectRoot },
+        ),
+      (err) => assertProtocolCode(err, "PERMISSION_DENIED"),
+    );
+
+    // Concurrent saveSwarmSettings serialize cleanly without lost updates
+    const concProject = path.join(tmp, "proj-conc");
+    await mkdir(concProject, { recursive: true });
+    await Promise.all([
+      saveSwarmSettings("project", { maxConcurrency: 4 }, { globalDir, projectRoot: concProject }),
+      saveSwarmSettings("project", { autoRebase: false }, { globalDir, projectRoot: concProject }),
+      saveSwarmSettings("project", { workerModel: "openai/gpt-5" }, { globalDir, projectRoot: concProject }),
+    ]);
+    const finalSettings = await loadSwarmSettings(concProject, { globalDir });
+    assert.equal(finalSettings.maxConcurrency, 4);
+    assert.equal(finalSettings.autoRebase, false);
+    assert.equal(finalSettings.workerModel, "openai/gpt-5");
+
+    // sanitizeSwarmSettings clamps base backoff down when only rateLimitMaxBackoffMs is provided
+    const clampedBackoff = sanitizeSwarmSettings({ rateLimitMaxBackoffMs: 2_000 });
+    assert.equal(clampedBackoff.rateLimitBaseBackoffMs, 2_000);
+    assert.equal(clampedBackoff.rateLimitMaxBackoffMs, 2_000);
+  });
+
+  it("handles symlinked ancestor repoRoot, symlinked .pi/swarm/worktrees rejection, mode:'branch' reuse, detached HEAD, broken .git, setGitTimeoutMs, and safeTeardown branch errors", async () => {
+    const tmp = await makeTempDir("pi-swarm-v036-wt-");
+    const realParent = path.join(tmp, "real-parent");
+    const linkParent = path.join(tmp, "link-parent");
+    await mkdir(realParent, { recursive: true });
+    await symlink(realParent, linkParent);
+
+    // Create repo through symlinked ancestor (like macOS /var -> /private/var)
+    const repoDir = path.join(linkParent, "repo");
+    const wtMgr = new WorktreeManager(repoDir);
+    wtMgr.setGitTimeoutMs(15_000);
+    assert.equal((wtMgr as unknown as { gitTimeoutMs: number }).gitTimeoutMs, 15_000);
+    wtMgr.setGitTimeoutMs(0);
+    wtMgr.setGitTimeoutMs(-50);
+    wtMgr.setGitTimeoutMs(Number.NaN);
+    assert.equal((wtMgr as unknown as { gitTimeoutMs: number }).gitTimeoutMs, 15_000);
+
+    await wtMgr.ensureRepoReady("main");
+    await commitFile(repoDir, "README.md", "# v0.3.6\n", "init");
+
+    // Creating a worktree when .pi/swarm/worktrees does NOT exist yet under symlinked parent must succeed
+    const branchWtPath = path.join(
+      repoDir,
+      SWARM_DIR,
+      "worktrees",
+      "run-anc",
+      "wt-branch",
+    );
+    const branchName = "swarm/run-anc/worker";
+    await wtMgr.createWorktree({
+      branch: branchName,
+      baseBranch: "main",
+      worktreePath: branchWtPath,
+      mode: "branch",
+    });
+    const workerCommitSha = await commitFile(
+      branchWtPath,
+      "worker.txt",
+      "preserved commit\n",
+      "worker commit",
+    );
+    await wtMgr.fetchBranchFromClone(branchWtPath, branchName);
+    await wtMgr.removeWorktree(branchWtPath, { force: false });
+    assert.equal(await exists(branchWtPath), false);
+
+    // Re-creating mode:"branch" with reuseExistingBranch: true preserves existing commits on branchName
+    await wtMgr.createWorktree({
+      branch: branchName,
+      baseBranch: "main",
+      worktreePath: branchWtPath,
+      mode: "branch",
+      reuseExistingBranch: true,
+    });
+    assert.equal(await wtMgr.getHeadSha(branchWtPath), workerCommitSha);
+    assert.equal(
+      await readFile(path.join(branchWtPath, "worker.txt"), "utf8"),
+      "preserved commit\n",
+    );
+    await wtMgr.removeWorktree(branchWtPath, { force: true });
+
+    // Detached HEAD rejected in ensureRepoReady
+    await assert.rejects(
+      () => wtMgr.ensureRepoReady("HEAD"),
+      (err) => assertProtocolCode(err, "WRONG_BRANCH"),
+    );
+    await git(repoDir, ["checkout", "--detach", "HEAD"]);
+    await assert.rejects(
+      () => wtMgr.ensureRepoReady(),
+      (err) => assertProtocolCode(err, "WRONG_BRANCH"),
+    );
+    await git(repoDir, ["checkout", "main"]);
+
+    // Broken .git file inside worktree directory is treated as dirty (not clean)
+    const brokenGitWt = path.join(repoDir, SWARM_DIR, "worktrees", "run-anc", "wt-broken-git");
+    await mkdir(brokenGitWt, { recursive: true });
+    await writeFile(path.join(brokenGitWt, ".git"), "gitdir: /nonexistent/gitdir\n", "utf8");
+    assert.equal(await wtMgr.isWorktreeDirty(brokenGitWt), true);
+
+    // safeTeardown records error when branch deletion fails (e.g. checked-out "main" branch)
+    const missingMainPath = path.join(
+      repoDir,
+      SWARM_DIR,
+      "worktrees",
+      "run-anc",
+      "wt-main-err",
+    );
+    const tdBranchErr = await wtMgr.safeTeardown(
+      [
+        {
+          memberName: "main-holder",
+          worktreePath: missingMainPath,
+          branch: "main",
+          hasActiveAgent: false,
+        },
+      ],
+      { deleteBranches: true },
+    );
+    assert.equal(tdBranchErr.removed.length, 0);
+    assert.equal(tdBranchErr.errors.length, 1);
+    assert.equal(tdBranchErr.errors[0]?.action, "error");
+
+    // Symlink inside .pi/swarm/worktrees (even pointing inside repo) rejected with PERMISSION_DENIED
+    const symTarget = path.join(repoDir, SWARM_DIR, "worktrees", "run-anc", "wt-sym");
+    await symlink(brokenGitWt, symTarget);
+    await assert.rejects(
+      () =>
+        wtMgr.createWorktree({
+          branch: "swarm/run-anc/sym",
+          baseBranch: "main",
+          worktreePath: symTarget,
+        }),
+      (err) => assertProtocolCode(err, "PERMISSION_DENIED"),
+    );
+    await assert.rejects(
+      () => wtMgr.removeWorktree(symTarget, { force: true }),
+      (err) => assertProtocolCode(err, "PERMISSION_DENIED"),
+    );
   });
 });

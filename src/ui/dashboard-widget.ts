@@ -62,6 +62,8 @@ export interface SwarmWidgetOptions {
   maxRecentBoard?: number;
   /** Optional host session model fallback for 3-role display. */
   hostModel?: string;
+  /** Optional dynamic host session model getter (takes precedence over static hostModel). */
+  getHostModel?: () => string | undefined;
   /** Clock override for deterministic tests. */
   now?: () => number;
 }
@@ -285,6 +287,7 @@ class SwarmDashboardComponent implements Component {
   private readonly maxCompactWorkers: number;
   private readonly maxRecentBoard: number;
   private readonly hostModel?: string;
+  private readonly getHostModel?: () => string | undefined;
   private readonly now: () => number;
 
   constructor(
@@ -298,7 +301,12 @@ class SwarmDashboardComponent implements Component {
     this.maxCompactWorkers = Math.max(1, options?.maxCompactWorkers ?? 4);
     this.maxRecentBoard = Math.max(1, options?.maxRecentBoard ?? 5);
     this.hostModel = options?.hostModel;
+    this.getHostModel = options?.getHostModel;
     this.now = options?.now ?? (() => Date.now());
+  }
+
+  private resolveHostModel(): string {
+    return this.getHostModel?.() ?? this.hostModel ?? "default";
   }
 
   private syncSpinnerTimer(hasWorkingMembers: boolean): void {
@@ -423,7 +431,7 @@ class SwarmDashboardComponent implements Component {
       lines.push(fitLine(joinColumns(left, right, width), width));
       const modelsPill = formatRoleModelsLine(
         roleModels,
-        this.hostModel ?? "default",
+        this.resolveHostModel(),
         {
           maxWidth: Math.max(1, width - 2),
           theme: this.theme,
@@ -439,7 +447,7 @@ class SwarmDashboardComponent implements Component {
       const modelsBudget = Math.max(12, width - visibleWidth("[Ctrl+Shift+T · /swarm tasks]") - 4);
       const modelsPill = formatRoleModelsLine(
         roleModels,
-        this.hostModel ?? "default",
+        this.resolveHostModel(),
         {
           maxWidth: modelsBudget,
           theme: this.theme,
@@ -456,7 +464,7 @@ class SwarmDashboardComponent implements Component {
       if (modelsBudget >= 24) {
         const modelsPill = formatRoleModelsLine(
           roleModels,
-          this.hostModel ?? "default",
+          this.resolveHostModel(),
           {
             maxWidth: modelsBudget,
             theme: this.theme,
@@ -473,7 +481,7 @@ class SwarmDashboardComponent implements Component {
         lines.push(fitLine(joinColumns(lead, shortcutTag, width), width));
         const modelsPill = formatRoleModelsLine(
           roleModels,
-          this.hostModel ?? "default",
+          this.resolveHostModel(),
           {
             maxWidth: Math.max(1, width - 2),
             theme: this.theme,
@@ -552,7 +560,7 @@ class SwarmDashboardComponent implements Component {
     const roleModels = resolveEffectiveRoleModels(snapshot, run);
 
     const summaryLeft = `[${statusBadge}] ${sanitizePlainText(run.objective || titleText)}`;
-    const summaryRight = `base:${run.baseBranch} · Board:#${snapshot.boardHead} · ${workingCount}w/${waitingCount}wait · ${formatTokens(snapshot.totalTokens)} ${formatCost(snapshot.totalCost)}`;
+    const summaryRight = `base:${sanitizePlainText(run.baseBranch)} · Board:#${snapshot.boardHead} · ${workingCount}w/${waitingCount}wait · ${formatTokens(snapshot.totalTokens)} ${formatCost(snapshot.totalCost)}`;
     body.push(
       innerWidth >= 72
         ? joinColumns(summaryLeft, summaryRight, innerWidth)
@@ -567,7 +575,7 @@ class SwarmDashboardComponent implements Component {
     const modelsBudget = Math.max(1, innerWidth - visibleWidth("Models: "));
     const modelsLine = formatRoleModelsLine(
       roleModels,
-      this.hostModel ?? "default",
+      this.resolveHostModel(),
       {
         maxWidth: modelsBudget,
         theme: this.theme,
@@ -879,7 +887,7 @@ export function formatZeroTurnStatusDashboard(
     );
   }
   out.push(
-    `- **Base Branch:** \`${run.baseBranch}\` · **Roster:** ${workingCount} working · ${waitingCount} waiting / ${members.length} total (max ${run.maxConcurrency}) · **Board:** #${snapshot.boardHead}`,
+    `- **Base Branch:** \`${sanitizePlainText(run.baseBranch)}\` · **Roster:** ${workingCount} working · ${waitingCount} waiting / ${members.length} total (max ${run.maxConcurrency}) · **Board:** #${snapshot.boardHead}`,
   );
   out.push(
     `- **Validator Policy:** ${run.validatorEnabled ? "ON" : "OFF"} · **Keep Warm:** ${run.keepWorkersWarm ? "ON" : "OFF"} · **Usage:** ${formatTokens(snapshot.totalTokens)} tokens (${formatCost(snapshot.totalCost)})`,

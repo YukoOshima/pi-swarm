@@ -109,7 +109,17 @@ export function parseRetryAfterMs(error: unknown, nowMs: number = Date.now()): n
     const headers = obj.headers ?? (obj.response as Record<string, unknown> | undefined)?.headers;
     if (headers && typeof headers === "object") {
       const h = headers as Record<string, unknown>;
-      const raw = h["retry-after"] ?? h["Retry-After"] ?? h["retry-after-ms"];
+      const rawMs = h["retry-after-ms"] ?? h["Retry-After-Ms"];
+      if (typeof rawMs === "number" && Number.isFinite(rawMs) && rawMs > 0) {
+        return Math.round(rawMs);
+      }
+      if (typeof rawMs === "string" && rawMs.trim()) {
+        const parsedMs = Number(rawMs.trim());
+        if (Number.isFinite(parsedMs) && parsedMs > 0) {
+          return Math.round(parsedMs);
+        }
+      }
+      const raw = h["retry-after"] ?? h["Retry-After"];
       if (typeof raw === "string") {
         const parsed = parseRetryAfterHeaderValue(raw, nowMs);
         if (parsed !== undefined) {
@@ -463,19 +473,24 @@ export class ConcurrencyGate {
    * Returns an idempotent `release()` callback.
    */
   async acquire(signal?: AbortSignal): Promise<() => void> {
-    while (true) {
-      if (signal?.aborted) {
-        throw createAbortError();
+    try {
+      while (true) {
+        if (signal?.aborted) {
+          throw createAbortError();
+        }
+        if (this.breaker?.isBackedOff()) {
+          await this.breaker.waitIfBackedOff(signal);
+          continue;
+        }
+        if (!this.paused && this.activeCount < this.maxConcurrency) {
+          this.activeCount += 1;
+          return this.createRelease();
+        }
+        await this.waitForSignal(signal);
       }
-      if (this.breaker?.isBackedOff()) {
-        await this.breaker.waitIfBackedOff(signal);
-        continue;
-      }
-      if (!this.paused && this.activeCount < this.maxConcurrency) {
-        this.activeCount += 1;
-        return this.createRelease();
-      }
-      await this.waitForSignal(signal);
+    } catch (err) {
+      this.drainWaiters();
+      throw err;
     }
   }
 
