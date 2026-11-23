@@ -6,6 +6,7 @@ import {
   DEFAULT_SWARM_SETTINGS,
   SWARM_DIR,
   SWARM_MAX_DIFF_BYTES,
+  SWARM_SETTINGS_FILE,
 } from "../constants.js";
 import {
   SwarmProtocolError,
@@ -27,6 +28,7 @@ const execFileAsync = promisify(execFile);
 const DEFAULT_MAX_BUFFER = 16 * 1024 * 1024;
 const RM_RETRY_CODES = new Set(["ENOTEMPTY", "EBUSY", "EPERM", "EACCES"]);
 const UNMERGED_STATUS_CODES = new Set(["DD", "AU", "UD", "UA", "DU", "AA", "UU"]);
+const SWARM_PROJECT_SETTINGS_REL_PATH = `.pi/${SWARM_SETTINGS_FILE}`;
 
 export interface WorktreeManagerOptions {
   gitTimeoutMs?: number;
@@ -91,11 +93,18 @@ function truncateUtf8Bytes(text: string, maxBytes: number): string {
   return `${buf.subarray(0, end).toString("utf8")}${suffix}`;
 }
 
+interface PorcelainZEntry {
+  xy: string;
+  path: string;
+  origPath?: string;
+}
+
 /**
- * Parse `git status --porcelain=v1 -z -uall` output into normalized repo-relative paths.
+ * Parse `git status --porcelain=v1 -z -uall` output into entries containing
+ * the 2-character status code (`xy`) and normalized repo-relative path(s).
  */
-function parsePorcelainZPaths(output: string): string[] {
-  const files: string[] = [];
+function parsePorcelainZEntries(output: string): PorcelainZEntry[] {
+  const entries: PorcelainZEntry[] = [];
   const tokens = output.split("\0");
   let i = 0;
   while (i < tokens.length) {
@@ -106,21 +115,50 @@ function parsePorcelainZPaths(output: string): string[] {
     }
     const x = token[0];
     const y = token[1];
+    const xy = `${x}${y}`;
     const rawPath = token.slice(3);
     const normalized = normalizeRelativeRepoPath(rawPath);
-    if (normalized) {
-      files.push(normalized);
-    }
+    let origPath: string | undefined;
     // Rename ('R') or Copy ('C') entries emit a second NUL-terminated original path.
     if (x === "R" || x === "C" || y === "R" || y === "C") {
-      const origPath = tokens[i];
+      const rawOrig = tokens[i];
       i += 1;
-      if (origPath) {
-        const normalizedOrig = normalizeRelativeRepoPath(origPath);
-        if (normalizedOrig) {
-          files.push(normalizedOrig);
-        }
+      if (rawOrig) {
+        origPath = normalizeRelativeRepoPath(rawOrig) ?? undefined;
       }
+    }
+    if (normalized) {
+      entries.push({ xy, path: normalized, ...(origPath ? { origPath } : {}) });
+    }
+  }
+  return entries;
+}
+
+/**
+ * Return true for untracked (`??`) runtime state paths created by `pi-swarm`
+ * itself inside `repoRoot` (`.pi/swarm/...` and `.pi/pi-swarm-settings.json`).
+ * Tracked/staged/modified changes to any file remain dirty.
+ */
+function isIgnoredSwarmRuntimeEntry(entry: PorcelainZEntry): boolean {
+  if (entry.xy !== "??") {
+    return false;
+  }
+  return (
+    entry.path === SWARM_DIR ||
+    entry.path.startsWith(`${SWARM_DIR}/`) ||
+    entry.path === SWARM_PROJECT_SETTINGS_REL_PATH
+  );
+}
+
+/**
+ * Parse `git status --porcelain=v1 -z -uall` output into normalized repo-relative paths.
+ */
+function parsePorcelainZPaths(output: string): string[] {
+  const files: string[] = [];
+  for (const entry of parsePorcelainZEntries(output)) {
+    files.push(entry.path);
+    if (entry.origPath) {
+      files.push(entry.origPath);
     }
   }
   return files;
@@ -920,6 +958,20 @@ export class WorktreeManager implements IWorktreeManager {
         return true;
       }
     }
+    if (realTarget === realRepo) {
+      const res = await this.runGit(
+        ["status", "--porcelain=v1", "-z", "-uall"],
+        { cwd: resolved },
+      );
+      if (res.stdout.length === 0) {
+        return false;
+      }
+      const entries = parsePorcelainZEntries(res.stdout);
+      if (entries.length === 0) {
+        return res.stdout.trim().length > 0;
+      }
+      return entries.some((entry) => !isIgnoredSwarmRuntimeEntry(entry));
+    }
     const res = await this.runGit(
       ["status", "--porcelain", "--untracked-files=all"],
       { cwd: resolved },
@@ -961,6 +1013,13 @@ export class WorktreeManager implements IWorktreeManager {
     baseBranch: string,
   ): Promise<AutoRebaseResult> {
     const resolved = path.resolve(worktreePath);
+
+    if (!(await pathExists(resolved))) {
+      return {
+        status: "missing_worktree",
+        message: `Worktree "${resolved}" does not exist; skipping auto-rebase.`,
+      };
+    }
 
     if (await this.isWorktreeDirty(resolved)) {
       return {

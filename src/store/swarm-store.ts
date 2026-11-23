@@ -52,6 +52,7 @@ import {
   type SwarmMemberRecord,
   type SwarmMemberRole,
   type SwarmMemberState,
+  type SwarmMilestone,
   type SwarmRoleModels,
   type SwarmRunState,
   type SwarmRunStatus,
@@ -86,6 +87,9 @@ const VALID_MEMBER_STATES: ReadonlySet<SwarmMemberState> =
 
 const VALID_WORKSPACE_MODES: ReadonlySet<SwarmWorkspaceMode> =
   new Set<SwarmWorkspaceMode>(["inherit", "share", "branch"]);
+
+const VALID_MILESTONE_STATUSES: ReadonlySet<SwarmMilestone["status"]> =
+  new Set<SwarmMilestone["status"]>(["pending", "in_progress", "done", "blocked"]);
 
 const DEFAULT_STALE_LOCK_MS = 30_000;
 const DEFAULT_LOCK_TIMEOUT_MS = 10_000;
@@ -415,6 +419,50 @@ function ensureMainChannel(state: SwarmRunState): void {
   }
 }
 
+function normalizeOptionalNonEmptyString(raw: unknown): string | undefined {
+  if (typeof raw !== "string") {
+    return undefined;
+  }
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function normalizeOptionalNonNegativeInt(raw: unknown): number | undefined {
+  if (typeof raw !== "number" || !Number.isFinite(raw) || raw < 0) {
+    return undefined;
+  }
+  return Math.floor(raw);
+}
+
+function normalizeMilestones(raw: unknown): SwarmMilestone[] | undefined {
+  if (!Array.isArray(raw)) {
+    return undefined;
+  }
+  const normalized: SwarmMilestone[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      continue;
+    }
+    const candidate = item as Record<string, unknown>;
+    const label = normalizeOptionalNonEmptyString(candidate.label);
+    const status = candidate.status;
+    if (
+      !label ||
+      typeof status !== "string" ||
+      !VALID_MILESTONE_STATUSES.has(status as SwarmMilestone["status"])
+    ) {
+      continue;
+    }
+    const owner = normalizeOptionalNonEmptyString(candidate.owner);
+    normalized.push({
+      label,
+      status: status as SwarmMilestone["status"],
+      ...(owner !== undefined ? { owner } : {}),
+    });
+  }
+  return normalized;
+}
+
 function backfillRunState(state: SwarmRunState): SwarmRunState {
   const raw = state as unknown as Record<string, unknown>;
   state.version = SWARM_STATE_VERSION;
@@ -473,8 +521,25 @@ function backfillRunState(state: SwarmRunState): SwarmRunState {
   } else {
     state.boardHead = Math.floor(raw.boardHead);
   }
+  if (raw.phase !== undefined) {
+    const normalizedPhase = normalizeOptionalNonEmptyString(raw.phase);
+    if (normalizedPhase !== undefined) {
+      state.phase = normalizedPhase;
+    } else {
+      delete state.phase;
+    }
+  }
+  if (raw.milestones !== undefined) {
+    const normalizedMilestones = normalizeMilestones(raw.milestones);
+    if (normalizedMilestones !== undefined) {
+      state.milestones = normalizedMilestones;
+    } else {
+      delete state.milestones;
+    }
+  }
   ensureMainChannel(state);
   for (const member of Object.values(state.members)) {
+    const rawMember = member as unknown as Record<string, unknown>;
     if (!Array.isArray(member.channels) || member.channels.length === 0) {
       member.channels = [DEFAULT_CHANNEL];
     } else if (!member.channels.includes(DEFAULT_CHANNEL)) {
@@ -488,6 +553,24 @@ function backfillRunState(state: SwarmRunState): SwarmRunState {
     }
     if (typeof member.turns !== "number" || !Number.isFinite(member.turns)) {
       member.turns = 0;
+    }
+    if (rawMember.llmTurns !== undefined) {
+      const normalizedLlmTurns = normalizeOptionalNonNegativeInt(rawMember.llmTurns);
+      if (normalizedLlmTurns !== undefined) {
+        member.llmTurns = normalizedLlmTurns;
+      } else {
+        delete member.llmTurns;
+      }
+    }
+    if (rawMember.turnStartedAt !== undefined) {
+      const normalizedTurnStartedAt = normalizeOptionalNonEmptyString(
+        rawMember.turnStartedAt,
+      );
+      if (normalizedTurnStartedAt !== undefined) {
+        member.turnStartedAt = normalizedTurnStartedAt;
+      } else {
+        delete member.turnStartedAt;
+      }
     }
     if (typeof member.tokens !== "number" || !Number.isFinite(member.tokens)) {
       member.tokens = 0;
@@ -1275,6 +1358,8 @@ export class SwarmStore implements ISwarmStore {
         },
       };
 
+      const initialPhase = normalizeOptionalNonEmptyString(input.phase);
+      const initialMilestones = normalizeMilestones(input.milestones);
       const state: SwarmRunState = {
         version: SWARM_STATE_VERSION,
         id: runId,
@@ -1286,6 +1371,10 @@ export class SwarmStore implements ISwarmStore {
         ownerSessionId,
         ownerPid: input.ownerPid ?? process.pid,
         status: "active",
+        ...(initialPhase !== undefined ? { phase: initialPhase } : {}),
+        ...(initialMilestones !== undefined
+          ? { milestones: initialMilestones }
+          : {}),
         maxConcurrency,
         validatorEnabled:
           input.validatorEnabled ?? DEFAULT_SWARM_SETTINGS.validatorEnabled,
@@ -1485,6 +1574,26 @@ export class SwarmStore implements ISwarmStore {
       if (patch.ownerPid !== undefined) {
         state.ownerPid = patch.ownerPid;
       }
+      if (patch.phase === null) {
+        delete state.phase;
+      } else if (patch.phase !== undefined) {
+        const normalizedPhase = normalizeOptionalNonEmptyString(patch.phase);
+        if (normalizedPhase !== undefined) {
+          state.phase = normalizedPhase;
+        } else {
+          delete state.phase;
+        }
+      }
+      if (patch.milestones === null) {
+        delete state.milestones;
+      } else if (patch.milestones !== undefined) {
+        const normalizedMilestones = normalizeMilestones(patch.milestones);
+        if (normalizedMilestones !== undefined) {
+          state.milestones = normalizedMilestones;
+        } else {
+          delete state.milestones;
+        }
+      }
       if (patch.completionSummary !== undefined) {
         state.completionSummary = patch.completionSummary;
       }
@@ -1623,6 +1732,11 @@ export class SwarmStore implements ISwarmStore {
       const channels = resolveMemberChannels(state, member.channels, runId);
       const now = member.createdAt ?? new Date().toISOString();
 
+      const initialTurnStartedAt = normalizeOptionalNonEmptyString(
+        member.turnStartedAt,
+      );
+      const initialLlmTurns = normalizeOptionalNonNegativeInt(member.llmTurns);
+
       const record: SwarmMemberRecord = {
         name,
         agentId,
@@ -1657,6 +1771,10 @@ export class SwarmStore implements ISwarmStore {
             ? Math.max(0, Math.floor(member.lastReadSeq))
             : 0,
         turns: 0,
+        ...(initialLlmTurns !== undefined ? { llmTurns: initialLlmTurns } : {}),
+        ...(initialTurnStartedAt !== undefined
+          ? { turnStartedAt: initialTurnStartedAt }
+          : {}),
         tokens: 0,
         cost: 0,
         humanStopped: false,
@@ -1808,6 +1926,21 @@ export class SwarmStore implements ISwarmStore {
       }
       if (patch.turns !== undefined && Number.isFinite(patch.turns)) {
         record.turns = Math.max(0, Math.floor(patch.turns));
+      }
+      if (patch.llmTurns !== undefined && Number.isFinite(patch.llmTurns)) {
+        record.llmTurns = Math.max(0, Math.floor(patch.llmTurns));
+      }
+      if (patch.turnStartedAt === null) {
+        delete record.turnStartedAt;
+      } else if (patch.turnStartedAt !== undefined) {
+        const normalizedTurnStartedAt = normalizeOptionalNonEmptyString(
+          patch.turnStartedAt,
+        );
+        if (normalizedTurnStartedAt !== undefined) {
+          record.turnStartedAt = normalizedTurnStartedAt;
+        } else {
+          delete record.turnStartedAt;
+        }
       }
       if (patch.tokens !== undefined && Number.isFinite(patch.tokens)) {
         record.tokens = Math.max(0, Math.floor(patch.tokens));

@@ -1,8 +1,10 @@
 import { appendFile, lstat, mkdir, open, readFile } from "node:fs/promises";
 import path from "node:path";
 import {
+  ALL_MENTION_NAME,
   CHANNEL_NAME_PATTERN,
   DEFAULT_CHANNEL,
+  ORCHESTRATOR_NAME,
   SWARM_BOARD_FILE,
   SWARM_DIR,
   SWARM_RUNS_DIR,
@@ -249,9 +251,15 @@ function computeHead(messages: readonly BoardMessage[]): number {
   return max;
 }
 
+const ALWAYS_ALLOWED_MENTIONS: ReadonlySet<string> = new Set<string>([
+  ALL_MENTION_NAME,
+  ORCHESTRATOR_NAME,
+]);
+
 function mergeMentions(
   text: string,
   explicit?: readonly string[],
+  knownMembers?: Iterable<string>,
 ): string[] {
   const seen = new Set<string>();
   const result: string[] = [];
@@ -277,7 +285,9 @@ function mergeMentions(
     }
   }
 
-  return result;
+  return knownMembers === undefined
+    ? result
+    : filterMentions(result, knownMembers);
 }
 
 function mergeChannelMentions(
@@ -314,11 +324,59 @@ function mergeChannelMentions(
 // ============================================================================
 
 /**
+ * Filter a list of `@mention` handles against a known roster (`knownMembers`),
+ * always preserving `"all"` and `"orchestrator"` (case-insensitive) while
+ * dropping arbitrary prose tokens like `@mention`, `@param`, or `@type`.
+ *
+ * When `knownMembers` is omitted (`undefined`), returns mentions deduplicated
+ * case-insensitively without filtering for full backward compatibility.
+ */
+export function filterMentions(
+  mentions: readonly string[],
+  knownMembers?: Iterable<string>,
+): string[] {
+  let allowed: Set<string> | undefined;
+  if (knownMembers !== undefined) {
+    allowed = new Set<string>(ALWAYS_ALLOWED_MENTIONS);
+    for (const raw of knownMembers) {
+      if (typeof raw !== "string") continue;
+      const cleaned = raw.trim().replace(/^@+/, "").toLowerCase();
+      if (cleaned.length > 0 && !cleaned.startsWith("#")) {
+        allowed.add(cleaned);
+      }
+    }
+  }
+
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const raw of mentions) {
+    if (typeof raw !== "string") continue;
+    const cleaned = raw.trim().replace(/^@+/, "");
+    if (!cleaned || cleaned.startsWith("#")) continue;
+    const key = cleaned.toLowerCase();
+    if (allowed !== undefined && !allowed.has(key)) {
+      continue;
+    }
+    if (!seen.has(key)) {
+      seen.add(key);
+      result.push(cleaned);
+    }
+  }
+  return result;
+}
+
+/**
  * Extract unique `@<name>` board handles from freeform text (preserving first-seen casing),
  * ignoring email addresses like `foo@bar.com`, channel mentions like `@#backend`,
  * and trailing punctuation like `@M1.`.
+ *
+ * When `knownMembers` is supplied, filters extracted handles to `"all"`, `"orchestrator"`,
+ * and members present in `knownMembers` (case-insensitive).
  */
-export function parseMentions(text: string): string[] {
+export function parseMentions(
+  text: string,
+  knownMembers?: Iterable<string>,
+): string[] {
   if (typeof text !== "string" || text.length === 0) {
     return [];
   }
@@ -334,7 +392,9 @@ export function parseMentions(text: string): string[] {
       mentions.push(handle);
     }
   }
-  return mentions;
+  return knownMembers === undefined
+    ? mentions
+    : filterMentions(mentions, knownMembers);
 }
 
 /**
@@ -572,7 +632,7 @@ export class SwarmBoard implements ISwarmBoard {
       const fromRole: CallerRole = VALID_CALLER_ROLES.has(input.fromRole)
         ? input.fromRole
         : "orchestrator";
-      const mentions = mergeMentions(text, input.mentions);
+      const mentions = mergeMentions(text, input.mentions, input.knownMembers);
       const channelMentions = mergeChannelMentions(text, input.channelMentions);
 
       const minSeq =

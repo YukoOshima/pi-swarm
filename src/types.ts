@@ -152,6 +152,10 @@ export interface SwarmMemberRecord {
   /** Brief hint of what the member is waiting on or its last completion summary. */
   parkedOn?: string;
   turns: number;
+  /** Real assistant/LLM turns counted from turn_end events (distinct from wakeups in `turns`). */
+  llmTurns?: number;
+  /** ISO timestamp when the member's currently active turn started. */
+  turnStartedAt?: string;
   tokens: number;
   tokenBreakdown?: TokenUsage;
   cost: number;
@@ -200,6 +204,8 @@ export interface PostBoardMessageInput {
   kind?: BoardMessageKind;
   mentions?: string[];
   channelMentions?: string[];
+  /** Optional roster of valid member handles (and group prefixes) used to filter `@mentions` while preserving `"all"` and `"orchestrator"`. */
+  knownMembers?: Iterable<string>;
   /** Optional minimum sequence floor (e.g. state.boardHead + 1) to preserve monotonicity after crash-truncated board recovery. */
   minSeq?: number;
 }
@@ -282,6 +288,12 @@ export interface SwarmEventInput {
 // Run State
 // ============================================================================
 
+export interface SwarmMilestone {
+  label: string;
+  status: "pending" | "in_progress" | "done" | "blocked";
+  owner?: string;
+}
+
 export interface SwarmRunState {
   version: 2;
   id: string;
@@ -293,6 +305,8 @@ export interface SwarmRunState {
   ownerSessionId: string;
   ownerPid: number;
   status: SwarmRunStatus;
+  phase?: string;
+  milestones?: SwarmMilestone[];
   maxConcurrency: number;
   validatorEnabled: boolean;
   keepWorkersWarm: boolean;
@@ -486,6 +500,8 @@ export interface CreateRunInput {
   validatorEnabled?: boolean;
   keepWorkersWarm?: boolean;
   roleModels?: SwarmRoleModels;
+  phase?: string;
+  milestones?: SwarmMilestone[];
 }
 
 export interface RunSummary {
@@ -517,6 +533,8 @@ export interface RunUpdateInput {
   roleModels?: SwarmRoleModels;
   ownerSessionId?: string;
   ownerPid?: number;
+  phase?: string | null;
+  milestones?: SwarmMilestone[] | null;
   completionSummary?: string;
   expectedRevision?: number;
   actor?: string;
@@ -541,6 +559,8 @@ export interface RegisterMemberInput {
   thinkingLevel?: ThinkingLevel;
   modelExplicit?: boolean;
   lastReadSeq?: number;
+  turnStartedAt?: string;
+  llmTurns?: number;
   createdAt?: string;
 }
 
@@ -559,6 +579,8 @@ export interface MemberUpdateInput {
   lastPostTime?: string;
   parkedOn?: string | null;
   turns?: number;
+  llmTurns?: number;
+  turnStartedAt?: string | null;
   tokens?: number;
   tokenBreakdown?: TokenUsage;
   cost?: number;
@@ -667,7 +689,7 @@ export interface BaseBranchCleanCheck {
 }
 
 export interface AutoRebaseResult {
-  status: "up-to-date" | "rebased" | "conflict" | "skipped_dirty";
+  status: "up-to-date" | "rebased" | "conflict" | "skipped_dirty" | "missing_worktree";
   newHeadSha?: string;
   conflictFiles?: string[];
   message?: string;
@@ -845,6 +867,10 @@ export interface SwarmMemberStatusEntry {
   lastPostSeq?: number;
   lastPostTime?: string;
   turns: number;
+  /** Real assistant/LLM turns counted from turn_end events (distinct from wakeups in `turns`). */
+  llmTurns?: number;
+  /** ISO timestamp when the member's currently active turn started. */
+  turnStartedAt?: string;
   tokens: number;
   cost: number;
 }
