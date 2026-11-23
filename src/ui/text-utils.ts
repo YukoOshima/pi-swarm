@@ -723,14 +723,22 @@ export function formatOriginBadge(
   return theme.fg("dim", label);
 }
 
-export function formatClock(isoTimestamp: string): string {
-  const ms = Date.parse(isoTimestamp);
+/**
+ * Format an ISO timestamp in local time (`HH:MM:SS`) for consistent clock display
+ * across Mission Control, Dashboard, and zero-turn status/board outputs.
+ */
+export function formatLocalClock(iso: string): string {
+  const ms = Date.parse(iso);
   if (!Number.isFinite(ms)) return "--:--:--";
   const d = new Date(ms);
   const hh = String(d.getHours()).padStart(2, "0");
   const mm = String(d.getMinutes()).padStart(2, "0");
   const ss = String(d.getSeconds()).padStart(2, "0");
   return `${hh}:${mm}:${ss}`;
+}
+
+export function formatClock(isoTimestamp: string): string {
+  return formatLocalClock(isoTimestamp);
 }
 
 export function formatBoardTargets(
@@ -742,8 +750,8 @@ export function formatBoardTargets(
     if (clean) parts.push(clean.startsWith("@") ? clean : `@${clean}`);
   }
   for (const c of msg.channelMentions ?? []) {
-    const clean = sanitizePlainText(c).replace(/^@#?/, "");
-    if (clean) parts.push(`@#${clean}`);
+    const clean = sanitizePlainText(c).replace(/^@?#?/, "");
+    if (clean) parts.push(`#${clean}`);
   }
   return parts.length > 0 ? ` -> ${parts.join(", ")}` : "";
 }
@@ -1342,7 +1350,7 @@ export function buildSwarmGraphLines(
     }
 
     for (const rawCh of msg.channelMentions ?? []) {
-      const ch = sanitizePlainText(rawCh).replace(/^@#?/, "").toLowerCase();
+      const ch = sanitizePlainText(rawCh).replace(/^@?#?/, "").toLowerCase();
       if (!ch) continue;
       const key = `${sender}\0#${ch}`;
       channelCounts.set(key, (channelCounts.get(key) ?? 0) + 1);

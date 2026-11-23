@@ -219,6 +219,23 @@ function computeTerminalRows(tui: TUI): number {
   return 28;
 }
 
+function computeOverlayMaxBoxLines(tui: TUI): number {
+  const termRows = computeTerminalRows(tui);
+  const overlayCap = Math.max(3, Math.floor(termRows * 0.86));
+  const rawMax =
+    termRows >= 10
+      ? Math.min(termRows - 1, Math.max(9, Math.min(30, Math.floor(termRows * 0.85))))
+      : Math.max(4, termRows);
+  return Math.min(rawMax, overlayCap);
+}
+
+function formatInheritedHostLabel(hostModel?: string, maxShortLen?: number): string {
+  const cleanHost = sanitizePlainText(hostModel ?? "");
+  if (!cleanHost) return "host:default";
+  const short = shortenModelName(cleanHost, maxShortLen);
+  return short ? `host:${short}` : "host:default";
+}
+
 function formatContextWindow(tokens?: number): string {
   if (typeof tokens !== "number" || !Number.isFinite(tokens) || tokens <= 0) {
     return "";
@@ -241,9 +258,13 @@ function formatRoleSummaryCell(
   theme: Theme,
   compact = false,
 ): string {
-  const raw = sanitizePlainText(model ?? "") || sanitizePlainText(hostModel ?? "") || "session default";
-  const label = compact ? shortenModelName(raw) : raw;
-  const styledModel = model ? theme.fg("accent", label) : theme.fg("dim", label);
+  const cleanModel = sanitizePlainText(model ?? "");
+  const label = cleanModel
+    ? compact
+      ? shortenModelName(cleanModel)
+      : cleanModel
+    : formatInheritedHostLabel(hostModel);
+  const styledModel = cleanModel ? theme.fg("accent", label) : theme.fg("dim", label);
   const thinkPart = thinking ? theme.fg("borderAccent", ` · ${thinking}`) : "";
   const origStr = formatOriginBadge(origin, theme);
   const origPart = origStr ? ` ${origStr}` : "";
@@ -388,6 +409,7 @@ type ModelListRow =
       kind: "model";
       info: AvailableModelInfo;
       isCustomEntry?: boolean;
+      isPinned?: boolean;
       selectable: true;
     };
 
@@ -564,12 +586,15 @@ export class SwarmModelPickerView implements Component, Focusable {
     const rows: ModelListRow[] = [];
 
     if (this.mode === "roles" && this.activeTab !== "fallbacks") {
-      const hostHint = sanitizePlainText(this.state.hostModel ?? "") || "session default";
-      const inheritText = `inherit host session default ${hostHint}`.toLowerCase();
+      const cleanHost = sanitizePlainText(this.state.hostModel ?? "");
+      const hostDisplay = formatInheritedHostLabel(cleanHost);
+      const inheritText = `inherit host session default ${cleanHost} ${hostDisplay}`.toLowerCase();
       if (!query || inheritText.includes(query)) {
         rows.push({
           kind: "inherit",
-          label: `Inherit host session model (${hostHint})`,
+          label: cleanHost
+            ? `Inherit host model (${hostDisplay})`
+            : "Inherit host session model",
           selectable: true,
         });
       }
@@ -597,8 +622,35 @@ export class SwarmModelPickerView implements Component, Focusable {
       return fuzzyMatch(query, m.fullId).matches || (m.name ? fuzzyMatch(query, m.name).matches : false);
     });
 
+    const currentTarget = this.getTargetCurrentModel();
+    const hostModel = sanitizePlainText(this.state.hostModel ?? "");
+    const pinned: AvailableModelInfo[] = [];
+    const pinnedIds = new Set<string>();
+    const pinIfMatch = (target: string | undefined) => {
+      if (!target) return;
+      const found = filtered.find(
+        (m) =>
+          !pinnedIds.has(m.fullId.toLowerCase()) &&
+          (matchModelId(m.fullId, target) || matchModelId(m.id, target)),
+      );
+      if (found) {
+        pinned.push(found);
+        pinnedIds.add(found.fullId.toLowerCase());
+      }
+    };
+    pinIfMatch(currentTarget);
+    pinIfMatch(hostModel);
+
+    if (pinned.length > 0) {
+      rows.push({ kind: "header", provider: "* Current / Host", selectable: false });
+      for (const info of pinned) {
+        rows.push({ kind: "model", info, isPinned: true, selectable: true });
+      }
+    }
+
     const byProvider = new Map<string, AvailableModelInfo[]>();
     for (const m of filtered) {
+      if (pinnedIds.has(m.fullId.toLowerCase())) continue;
       const prov = m.provider || "other";
       const bucket = byProvider.get(prov) ?? [];
       bucket.push(m);
@@ -959,6 +1011,12 @@ export class SwarmModelPickerView implements Component, Focusable {
 
     // Step 1: Model / Fallback List
     if (isEscapeKey(data)) {
+      if (this.searchQuery.length > 0) {
+        this.setSearchQuery("");
+        this.rebuildRows(true);
+        this.tui.requestRender();
+        return;
+      }
       this.closePicker();
       return;
     }
@@ -1177,8 +1235,12 @@ export class SwarmModelPickerView implements Component, Focusable {
         const role = roles[i]!;
         const cfg = this.getCurrentRoleConfig(role);
         const explicit = sanitizePlainText(cfg.model ?? "");
-        const raw = explicit || sanitizePlainText(this.state.hostModel ?? "") || "default";
-        nicks[i] = compactTabModelNickname(raw);
+        const cleanHost = sanitizePlainText(this.state.hostModel ?? "");
+        nicks[i] = explicit
+          ? compactTabModelNickname(explicit)
+          : cleanHost
+            ? `host:${compactTabModelNickname(cleanHost)}`
+            : "host:default";
         effs[i] = cfg.thinkingLevel ? `(${cfg.thinkingLevel})` : "";
         explicits[i] = Boolean(explicit);
       }
@@ -1323,7 +1385,6 @@ export class SwarmModelPickerView implements Component, Focusable {
     const cfg = this.getCurrentRoleConfig(this.activeTab);
     const explicitModel = sanitizePlainText(cfg.model ?? "");
     const hostModel = sanitizePlainText(this.state.hostModel ?? "");
-    const effectiveModel = explicitModel || hostModel || "session default";
     const effortText = cfg.thinkingLevel ?? "default";
     const origin: RoleModelOrigin =
       this.state.origins?.[this.activeTab] ??
@@ -1364,7 +1425,9 @@ export class SwarmModelPickerView implements Component, Focusable {
       ? Math.max(1, innerWidth - visibleWidth(rightHint) - 2)
       : innerWidth;
     const modelBudget = Math.max(4, leftBudget - fixedLeftCols);
-    const fittedModel = shortenModelName(effectiveModel, modelBudget) || "default";
+    const fittedModel = explicitModel
+      ? shortenModelName(explicitModel, modelBudget) || "default"
+      : formatInheritedHostLabel(hostModel, Math.max(4, modelBudget - 5));
 
     const modelStyled = explicitModel
       ? this.theme.fg("accent", this.theme.bold(fittedModel))
@@ -1382,12 +1445,8 @@ export class SwarmModelPickerView implements Component, Focusable {
   render(width: number): string[] {
     const safeWidth = Math.max(1, Math.floor(width));
     const innerWidth = computeBoxInnerWidth(safeWidth);
-    const maxRows = computeTerminalRows(this.tui);
-    const maxBoxLines =
-      maxRows >= 10
-        ? Math.min(maxRows - 1, Math.max(9, Math.min(30, Math.floor(maxRows * 0.85))))
-        : Math.max(4, maxRows);
-    const maxInnerLines = Math.max(4, maxBoxLines - 2);
+    const maxBoxLines = computeOverlayMaxBoxLines(this.tui);
+    const maxInnerLines = Math.max(2, maxBoxLines - 2);
     const compact = innerWidth < 72;
     const ultraCompact = innerWidth < 46;
 
@@ -1404,7 +1463,8 @@ export class SwarmModelPickerView implements Component, Focusable {
         );
       }
     } else if (this.member) {
-      const curModel = sanitizePlainText(this.lastAppliedModel ?? this.member.model ?? "") || "default";
+      const rawMemberModel = sanitizePlainText(this.lastAppliedModel ?? this.member.model ?? "");
+      const curModel = rawMemberModel || formatInheritedHostLabel(this.state.hostModel);
       const curThink = this.lastAppliedThinking ?? this.member.thinkingLevel;
       body.push(
         fitLine(
@@ -1444,7 +1504,8 @@ export class SwarmModelPickerView implements Component, Focusable {
         ),
       );
 
-      const effortViewport = Math.max(1, maxInnerLines - body.length - 2);
+      const effFooterLines = maxInnerLines - body.length >= 4 ? 2 : 1;
+      const effortViewport = Math.max(1, maxInnerLines - body.length - effFooterLines);
       let effStart = Math.max(
         0,
         this.effortIndex - Math.floor(effortViewport / 2),
@@ -1470,21 +1531,25 @@ export class SwarmModelPickerView implements Component, Focusable {
         const label = isSel
           ? this.theme.fg("accent", this.theme.bold(opt.label))
           : opt.label;
-        const badge = opt.recommended ? ` ${this.theme.fg("success", "★")}` : "";
+        const badge = opt.recommended ? ` ${this.theme.fg("success", "*")}` : "";
         const desc = compact ? "" : ` — ${this.theme.fg("dim", opt.description)}`;
         body.push(fitLine(`${ptr}${check}${num}${label}${badge}${desc}`, innerWidth));
       }
 
-      body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
-      const effHint = compact
-        ? "↑↓/1-8 Select · Enter Save · Esc Back"
-        : "↑/↓ Navigate · 1-8 Jump · Enter Apply & Save · Esc Back to Models";
+      if (effFooterLines === 2) {
+        body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
+      }
+      const effHint = ultraCompact
+        ? "↑↓/1-8 · Enter Save · Esc Back"
+        : compact
+          ? "↑↓/1-8 Select · Enter Save · Esc Back"
+          : "↑/↓ Navigate · 1-8 Jump · Enter Apply & Save · Esc Back to Models";
       body.push(fitLine(this.theme.fg("dim", effHint), innerWidth));
 
       const title =
         this.mode === "member" && this.member
-          ? `🎛 Reasoning Effort — @${this.member.name}`
-          : `🎛 Reasoning Effort — ${TAB_LABELS[this.activeTab]}`;
+          ? `◆ Reasoning Effort — @${this.member.name}`
+          : `◆ Reasoning Effort — ${TAB_LABELS[this.activeTab]}`;
       return renderBox(body.slice(0, maxInnerLines), safeWidth, {
         title: this.theme.fg("accent", this.theme.bold(title)),
         borderColor: (t) => this.theme.fg("borderAccent", t),
@@ -1552,9 +1617,21 @@ export class SwarmModelPickerView implements Component, Focusable {
                   (matchModelId(targetModel, info.fullId) ||
                     matchModelId(targetModel, info.id)),
               );
-        const check = isCurrentTarget ? this.theme.fg("success", "✓ ") : "  ";
+        const isHostModel = Boolean(
+          this.state.hostModel &&
+            (matchModelId(this.state.hostModel, info.fullId) ||
+              matchModelId(this.state.hostModel, info.id)),
+        );
+        const check = isCurrentTarget
+          ? this.theme.fg("success", "✓ ")
+          : row.isPinned || isHostModel
+            ? this.theme.fg("accent", "* ")
+            : "  ";
 
         const badges: string[] = [];
+        if (isHostModel) {
+          badges.push("[host]");
+        }
         if (
           matchModelId(this.state.settings.orchestratorModel, info.fullId) ||
           matchModelId(this.state.settings.orchestratorModel, info.id)
@@ -1576,6 +1653,9 @@ export class SwarmModelPickerView implements Component, Focusable {
         if (fbIndex >= 0) {
           badges.push(`#${fbIndex + 1}`);
         }
+        if (row.isPinned && isCurrentTarget) {
+          badges.push("*");
+        }
         const ctxStr = formatContextWindow(info.contextWindow);
         const rightMeta = [
           isCurrentTarget && targetThinking && this.activeTab !== "fallbacks"
@@ -1587,12 +1667,17 @@ export class SwarmModelPickerView implements Component, Focusable {
           .filter(Boolean)
           .join(" ");
 
+        const cleanName = info.name?.trim();
+        const showFriendlyName =
+          Boolean(cleanName) &&
+          cleanName!.toLowerCase() !== info.id.toLowerCase() &&
+          cleanName!.toLowerCase() !== info.fullId.toLowerCase();
         const primaryLabel = row.isCustomEntry
           ? info.name ?? info.fullId
           : compact
             ? info.fullId
-            : info.name && info.name !== info.id
-              ? `${info.fullId} (${info.name})`
+            : showFriendlyName
+              ? `${info.fullId} (${cleanName})`
               : info.fullId;
         const styledPrimary = isSel
           ? this.theme.fg("accent", this.theme.bold(primaryLabel))
@@ -1612,30 +1697,37 @@ export class SwarmModelPickerView implements Component, Focusable {
     if (footerLinesCount === 2) {
       body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
     }
+    const escAction = this.searchQuery.length > 0 ? "Esc Clear" : "Esc";
     const hints =
       this.mode === "member"
-        ? compact
-          ? "↑↓ Select · Enter Effort · ^E Effort · Esc"
-          : "↑/↓ Select · Enter Effort · Ctrl+E Effort · Esc Back"
+        ? ultraCompact
+          ? `Enter · ^E Effort · ${escAction}`
+          : compact
+            ? `↑↓ · Enter Select · ^E Effort · ${escAction}`
+            : `↑/↓ Select · Enter Effort · Ctrl+E Effort · ${this.searchQuery.length > 0 ? "Esc Clear" : "Esc Back"}`
         : this.activeTab === "fallbacks"
           ? ultraCompact
-            ? "Space Toggle · [/] · ^S Scope · Tab"
-            : compact
-              ? "Space Toggle · [/] Move · ^S Scope · Tab/Alt+1-4 · Esc"
-              : innerWidth < 86
-                ? "↑/↓ Select · Space Toggle · [/] Move · ^S Scope · Tab/Alt+1-4 · Esc"
-                : "↑/↓ Select · Space Toggle · [/] Move · ^S Scope · Tab / Alt+1-4 Role · Esc Close"
+            ? `Space · [/] · ^S · Tab · ${escAction}`
+            : innerWidth < 58
+              ? `Space · [/] · ^S Scope · Tab · ${escAction}`
+              : compact
+                ? `Space Toggle · [/] · ^S Scope · Tab · ${escAction}`
+                : innerWidth < 86
+                  ? `↑/↓ Select · Space Toggle · [/] Move · ^S Scope · Tab · ${escAction}`
+                  : `↑/↓ Select · Space Toggle · [/] Move · ^S Scope · Tab/Alt+1-4 · ${this.searchQuery.length > 0 ? "Esc Clear" : "Esc Close"}`
           : ultraCompact
-            ? "Enter Effort · ^E · ^S Scope · Tab"
-            : compact
-              ? "Enter Effort · ^E · ^X Inherit · ^S Scope · Tab/Alt+1-4"
-              : innerWidth < 86
-                ? "↑/↓ Select · Enter Effort · ^E · ^X Inherit · ^S Scope · Tab/Alt+1-4 · Esc"
-                : "↑/↓ Select · Enter Effort · ^E Effort · ^X Inherit · ^S Scope · Tab / Alt+1-4 · Esc";
+            ? `Enter · ^E · ^S · Tab · ${escAction}`
+            : innerWidth < 58
+              ? `Enter Select · ^E · ^S Scope · Tab · ${escAction}`
+              : compact
+                ? `Enter Select · ^E Effort · ^X · ^S Scope · Tab · ${escAction}`
+                : innerWidth < 86
+                  ? `↑/↓ · Enter Select · ^E Effort · ^X Inherit · ^S Scope · Tab · ${escAction}`
+                  : `↑/↓ Select · Enter Select · ^E Effort · ^X Inherit · ^S Scope · Tab/Alt+1-4 · ${escAction}`;
     body.push(fitLine(this.theme.fg("dim", hints), innerWidth));
 
     if (this.mode === "member" && this.member) {
-      const memberTitle = `🎛 Switch Model — @${this.member.name}`;
+      const memberTitle = `◆ Switch Model — @${this.member.name}`;
       return renderBox(body.slice(0, maxInnerLines), safeWidth, {
         title: this.theme.fg("accent", this.theme.bold(memberTitle)),
         borderColor: (t) => this.theme.fg("borderAccent", t),
@@ -1644,7 +1736,7 @@ export class SwarmModelPickerView implements Component, Focusable {
 
     const baseTitle = this.theme.fg(
       "accent",
-      this.theme.bold("🎛 Swarm Mission Models"),
+      this.theme.bold("◆ Swarm Mission Models"),
     );
     const scopeTitle =
       innerWidth >= 46
@@ -1674,15 +1766,26 @@ export async function openSwarmModelPicker(
   }
   let component: SwarmModelPickerView | undefined;
   try {
-    return await ctx.ui.custom((tui, theme, _kb, done) => {
-      component = new SwarmModelPickerView(tui, theme, {
-        ...options,
-        onClose: (res) => {
-          done(res ?? { changed: false, state: options.state });
+    return await ctx.ui.custom(
+      (tui, theme, _kb, done) => {
+        component = new SwarmModelPickerView(tui, theme, {
+          ...options,
+          onClose: (res) => {
+            done(res ?? { changed: false, state: options.state });
+          },
+        });
+        return component;
+      },
+      {
+        overlay: true,
+        overlayOptions: {
+          width: "90%",
+          minWidth: 44,
+          maxHeight: "86%",
+          anchor: "center",
         },
-      });
-      return component;
-    });
+      },
+    );
   } finally {
     component?.dispose();
   }
@@ -1809,24 +1912,24 @@ export class SwarmHubView implements Component, Focusable {
         this.snapshot.workingMemberNames.length === 0 &&
         this.options.activatedRun === false;
       items.push(
-        { id: "ui", label: "🖥 Open Mission Control (4-Tab UI)" },
-        { id: "models", label: "🎛 Configure Mission Models & Effort [Alt+M / ^M]" },
-        { id: "tweak", label: "✏ Tweak Plan / Add Members" },
+        { id: "ui", label: "◆ Open Mission Control (4-Tab UI)" },
+        { id: "models", label: "◇ Configure Mission Models & Effort [Alt+M]" },
+        { id: "tweak", label: "▸ Tweak Plan / Add Members" },
         run.status === "paused" || isCrashRecoveredUnstarted
-          ? { id: "resume", label: "▶ Resume & Continue Mission", runId: run.id }
-          : { id: "pause", label: "⏸ Pause Swarm" },
+          ? { id: "resume", label: "[>] Resume & Continue Mission", runId: run.id }
+          : { id: "pause", label: "[||] Pause Swarm" },
         { id: "done", label: "✓ Complete Swarm (/swarm done)" },
-        { id: "draft", label: "➕ Start New Swarm…" },
+        { id: "draft", label: "+ Start New Swarm…" },
       );
       if (this.runs.length > 0) {
         items.push({
           id: "runs",
-          label: `📂 Switch Focused Run (${this.runs.length})`,
+          label: `◇ Switch Focused Run (${this.runs.length})`,
         });
       }
       items.push(
-        { id: "settings", label: "⚙ Runtime Settings" },
-        { id: "teardown", label: "🧹 Teardown Clean Worktrees" },
+        { id: "settings", label: "* Runtime Settings" },
+        { id: "teardown", label: "✗ Teardown Clean Worktrees" },
       );
     } else {
       const unfinished = this.getResumableUnfinishedRun();
@@ -1834,28 +1937,28 @@ export class SwarmHubView implements Component, Focusable {
         const title = sanitizePlainText(unfinished.title || unfinished.objective || unfinished.id);
         items.push({
           id: "resume_unfinished",
-          label: `🔄 Resume Mission: ${title.slice(0, 36)} (${unfinished.id})`,
+          label: `[>] Resume Mission: ${title.slice(0, 36)} (${unfinished.id})`,
           runId: unfinished.id,
         });
       }
       items.push(
-        { id: "draft", label: "▶ Start Interactive Swarm — clarify & plan" },
-        { id: "direct", label: "⚡ Start Direct Swarm — fast-path, skip Q&A" },
-        { id: "models", label: "🎛 Configure Mission Models & Effort [Alt+M / ^M]" },
+        { id: "draft", label: "▸ Start Interactive Swarm — clarify & plan" },
+        { id: "direct", label: "◆ Start Direct Swarm — fast-path, skip Q&A" },
+        { id: "models", label: "◇ Configure Mission Models & Effort [Alt+M]" },
       );
       if (run) {
-        items.push({ id: "ui", label: "🖥 Inspect Run (4-Tab UI)" });
-        items.push({ id: "teardown", label: "🧹 Teardown Clean Worktrees" });
+        items.push({ id: "ui", label: "◆ Inspect Run (4-Tab UI)" });
+        items.push({ id: "teardown", label: "✗ Teardown Clean Worktrees" });
       }
       if (this.runs.length > 0) {
         items.push({
           id: "runs",
-          label: `📂 Browse / Focus Previous Runs (${this.runs.length})`,
+          label: `◇ Browse / Focus Previous Runs (${this.runs.length})`,
         });
       }
       items.push({
         id: "settings",
-        label: "⚙ Runtime Settings (concurrency, watchdog, git)",
+        label: "* Runtime Settings (concurrency, watchdog, git)",
       });
     }
     this.menuItems = items;
@@ -2122,12 +2225,8 @@ export class SwarmHubView implements Component, Focusable {
     const compact = innerWidth < 68;
     const body: string[] = [];
 
-    const termRows = computeTerminalRows(this.tui);
-    const maxBoxLines =
-      termRows >= 10
-        ? Math.min(termRows - 1, Math.max(9, Math.min(30, Math.floor(termRows * 0.85))))
-        : Math.max(4, termRows);
-    const maxInner = Math.max(4, maxBoxLines - 2);
+    const maxBoxLines = computeOverlayMaxBoxLines(this.tui);
+    const maxInner = Math.max(2, maxBoxLines - 2);
     if (this.subView === "runs") {
       body.push(
         fitLine(
@@ -2138,7 +2237,8 @@ export class SwarmHubView implements Component, Focusable {
       body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
       const hasDetachRow = Boolean(this.snapshot.activeRunId);
       const totalRunRows = this.runs.length + (hasDetachRow ? 1 : 0);
-      const maxRows = Math.max(1, maxInner - body.length - 2);
+      const runsFooterLines = maxInner - body.length >= 4 ? 2 : 1;
+      const maxRows = Math.max(1, maxInner - body.length - runsFooterLines);
       let runStart = Math.max(0, this.runSelectedIndex - Math.floor(maxRows / 2));
       if (runStart + maxRows > totalRunRows) {
         runStart = Math.max(0, totalRunRows - maxRows);
@@ -2169,7 +2269,9 @@ export class SwarmHubView implements Component, Focusable {
           : label;
         body.push(joinColumns(`${ptr}${tag}${styledLeft}`, this.theme.fg("dim", right), innerWidth));
       }
-      body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
+      if (runsFooterLines === 2) {
+        body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
+      }
       body.push(
         fitLine(
           this.theme.fg("dim", "↑/↓ Navigate · Enter Focus Run · Esc Back"),
@@ -2177,7 +2279,7 @@ export class SwarmHubView implements Component, Focusable {
         ),
       );
       return renderBox(body.slice(0, maxInner), safeWidth, {
-        title: this.theme.fg("accent", this.theme.bold("📂 Swarm Runs")),
+        title: this.theme.fg("accent", this.theme.bold("◆ Swarm Runs")),
         borderColor: (t) => this.theme.fg("borderAccent", t),
       });
     }
@@ -2283,7 +2385,7 @@ export class SwarmHubView implements Component, Focusable {
       body.push(
         formatRoleModelsLine(
           buildRoleModelsFromPickerState(this.state),
-          this.state.hostModel ?? "default",
+          formatInheritedHostLabel(this.state.hostModel),
           {
             maxWidth: innerWidth,
             theme: this.theme,
@@ -2361,15 +2463,26 @@ export class SwarmHubView implements Component, Focusable {
       body.push(fitLine(this.theme.fg("warning", this.hubFeedback), innerWidth));
     }
 
-    body.push(renderHorizontalRule(innerWidth, "Actions", this.theme));
-
-    const footerLines = maxInner - body.length >= 4 ? 2 : 1;
-    const menuViewport = Math.max(1, maxInner - body.length - footerLines);
+    const footerLines = maxInner - (body.length + 1) >= 4 ? 2 : 1;
+    const rawMenuSlots = Math.max(1, maxInner - (body.length + 1) - footerLines);
+    const needsScroll = this.menuItems.length > rawMenuSlots;
+    const inlineScrollIndicator = needsScroll && rawMenuSlots >= 2;
+    const menuViewport = inlineScrollIndicator ? rawMenuSlots - 1 : rawMenuSlots;
     let menuStart = Math.max(0, this.selectedIndex - Math.floor(menuViewport / 2));
     if (menuStart + menuViewport > this.menuItems.length) {
       menuStart = Math.max(0, this.menuItems.length - menuViewport);
     }
     const menuEnd = Math.min(this.menuItems.length, menuStart + menuViewport);
+    const hiddenAbove = menuStart;
+    const hiddenBelow = Math.max(0, this.menuItems.length - menuEnd);
+
+    const actionsRuleLabel =
+      needsScroll && !inlineScrollIndicator
+        ? hiddenBelow > 0
+          ? `Actions · ↓ +${hiddenBelow} more`
+          : `Actions · ↑ +${hiddenAbove} above`
+        : "Actions";
+    body.push(renderHorizontalRule(innerWidth, actionsRuleLabel, this.theme));
 
     for (let i = menuStart; i < menuEnd; i++) {
       const item = this.menuItems[i]!;
@@ -2386,6 +2499,20 @@ export class SwarmHubView implements Component, Focusable {
       body.push(fitLine(`${ptr}${badge}${label}`, innerWidth));
     }
 
+    if (inlineScrollIndicator) {
+      const scrollParts: string[] = [];
+      if (hiddenAbove > 0) scrollParts.push(`↑ +${hiddenAbove} above`);
+      if (hiddenBelow > 0) scrollParts.push(`↓ +${hiddenBelow} more`);
+      if (scrollParts.length > 0) {
+        body.push(
+          fitLine(
+            this.theme.fg("dim", `  ${scrollParts.join(" · ")}`),
+            innerWidth,
+          ),
+        );
+      }
+    }
+
     if (footerLines === 2) {
       body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
     }
@@ -2393,19 +2520,23 @@ export class SwarmHubView implements Component, Focusable {
       ? innerWidth < 46
         ? "1-9/↑↓ · Enter · m/Alt+M · Esc"
         : compact
-          ? "1-9/↑↓ Select · Enter · m/Alt+M Models · Esc"
-          : "1-9 / ↑/↓/j/k Navigate · Enter Select · m / Alt+M / ^M Models · Esc Close"
+          ? "1-9/↑↓ · Enter · m/Alt+M Models · Esc"
+          : innerWidth < 76
+            ? "1-9/↑↓/jk · Enter · m/Alt+M Models · Esc Close"
+            : "1-9 / ↑/↓/j/k Navigate · Enter Select · m / Alt+M Models · Esc Close"
       : innerWidth < 46
-        ? "Goal · Enter · Alt+Enter Direct"
-        : compact
-          ? "Goal · ↑↓ Action · Enter · Alt+Enter Direct · Alt+M/^M"
-          : innerWidth < 86
-            ? "Type Goal · ↑/↓ Action · Enter · Alt+Enter Direct · Alt+M/^M Models · Esc"
-            : "Type Goal · ↑/↓ Action · Enter Launch · Alt+Enter Direct · Alt+M / Ctrl+M Models · Esc";
+        ? "Goal · Enter · Alt+M · Esc"
+        : innerWidth < 50
+          ? "Goal · Enter · Alt+Enter Direct · Alt+M · Esc"
+          : compact
+            ? "Goal · ↑↓ · Enter · Alt+Enter Direct · Alt+M · Esc"
+            : innerWidth < 86
+              ? "Type Goal · ↑/↓ · Enter · Alt+Enter Direct · Alt+M Models · Esc"
+              : "Type Goal · ↑/↓ Action · Enter Launch · Alt+Enter Direct · Alt+M Models · Esc";
     body.push(fitLine(this.theme.fg("dim", hint), innerWidth));
 
     return renderBox(body.slice(0, maxInner), safeWidth, {
-      title: this.theme.fg("accent", this.theme.bold("🐝 Pi Swarm Mission Hub")),
+      title: this.theme.fg("accent", this.theme.bold("◆ Pi Swarm Mission Hub")),
       borderColor: (t) => this.theme.fg("borderAccent", t),
     });
   }
@@ -2420,13 +2551,24 @@ export async function openSwarmHub(
   }
   let component: SwarmHubView | undefined;
   try {
-    return await ctx.ui.custom<SwarmHubAction>((tui, theme, _kb, done) => {
-      component = new SwarmHubView(tui, theme, {
-        ...options,
-        onComplete: (action) => done(action),
-      });
-      return component;
-    });
+    return await ctx.ui.custom<SwarmHubAction>(
+      (tui, theme, _kb, done) => {
+        component = new SwarmHubView(tui, theme, {
+          ...options,
+          onComplete: (action) => done(action),
+        });
+        return component;
+      },
+      {
+        overlay: true,
+        overlayOptions: {
+          width: "90%",
+          minWidth: 44,
+          maxHeight: "86%",
+          anchor: "center",
+        },
+      },
+    );
   } finally {
     component?.dispose();
   }
