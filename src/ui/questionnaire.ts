@@ -597,7 +597,7 @@ class SingleQuestionComponent implements Component, Focusable {
     body.push(...tailLines);
 
     return renderBox(body.slice(0, maxInnerLines), targetWidth, {
-      title: this.theme.fg("accent", this.theme.bold("🐝 Swarm Question")),
+      title: this.theme.fg("accent", this.theme.bold("◆ Swarm Question")),
       borderColor: (s) => this.theme.fg("borderAccent", s),
     });
   }
@@ -657,7 +657,7 @@ function renderOptionListWindow(
         ? theme.fg("muted", opt.label)
         : opt.label;
     const recBadge = opt.isRecommended
-      ? " " + theme.fg("success", "★ recommended")
+      ? " " + theme.fg("success", "* recommended")
       : "";
     const pickedBadge = isPicked ? " " + theme.fg("accent", "✓") : "";
 
@@ -1209,7 +1209,7 @@ class MultiQuestionComponent implements Component, Focusable {
     const title = this.theme.fg(
       "accent",
       this.theme.bold(
-        `🐝 Swarm Questionnaire (${this.answers.size}/${this.questions.length})`,
+        `◆ Swarm Questionnaire (${this.answers.size}/${this.questions.length})`,
       ),
     );
     return renderBox(body.slice(0, maxInnerLines), targetWidth, {
@@ -1720,7 +1720,7 @@ class ConfirmProposalComponent implements Component, Focusable {
         ? this.theme.fg("accent", this.theme.bold(choice.label))
         : choice.label;
       const badge = choice.recommended
-        ? " " + this.theme.fg("success", "★")
+        ? " " + this.theme.fg("success", "*")
         : choice.hint
           ? " " + this.theme.fg("dim", `[${choice.hint}]`)
           : "";
@@ -1731,8 +1731,8 @@ class ConfirmProposalComponent implements Component, Focusable {
 
     const titleText =
       this.options?.mode === "tweak"
-        ? "🐝 Swarm Plan Confirmation (Revision)"
-        : "🐝 Swarm Plan Confirmation";
+        ? "◆ Swarm Plan Confirmation (Revision)"
+        : "◆ Swarm Plan Confirmation";
 
     return renderBox(body.slice(0, maxInnerLines), targetWidth, {
       title: this.theme.fg("accent", this.theme.bold(titleText)),
