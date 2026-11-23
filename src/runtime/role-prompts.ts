@@ -131,10 +131,9 @@ function buildOrchestratorPlaybookCore(validatorEnabled: boolean): string {
     `- \`@name\` is a wakeup doorbell, never a CC. Use \`@<prefix>\` for sharded groups, \`@#<channel>\` for channel broadcasts (NEVER \`@#main\`), and \`@all\` only for genuine swarm-wide rules or plan changes.`,
     "",
     "## 4. Core Swarm Tools (4 Tools)",
-    `- \`${SWARM_TOOL}\`: \`title\` (or \`objective\`/\`strategy\`/\`acceptance_criteria\`) | \`add\` (\`name\`, \`role\`, \`brief\`, \`workspace\`, \`fork\`, \`model\`, \`thinking_level\`, \`channels\`, \`n\`, \`tasks\`) | \`status\` | \`models\` | \`model\` (auto-resumes switched member) | \`steer\` (\`name\`, \`message\`, \`mode?\`) | \`stop\` | \`kill\` | \`merge\` | \`channel\` (\`create\`/\`list\`/\`join\`/\`leave\`/\`archive\`) | \`done\`.`,
-    `- \`${POST_MESSAGE_TOOL}\`: Post to the shared board (\`text\`, optional \`channel\`).`,
-    `- \`${READ_BOARD_TOOL}\`: Read board messages (\`since\`, \`seqs\`, \`limit\`, \`channel\`, \`search\`) or inspect roster (\`status:true\`).`,
-    `- \`${SWARM_WAIT_TOOL}\`: End your turn cleanly (non-blocking) and sleep until a member wakes \`@${ORCHESTRATOR_NAME}\`, all workers park (\`all_idle\`), or the user sends a message. Always pass the highest \`#seq\` you have already read as \`since\`.`,
+    `- \`${SWARM_TOOL}\`: \`title\`, \`add\`, \`status\`, \`models\`, \`model\` (auto-resumes switched member), \`steer\`, \`stop\`, \`kill\`, \`merge\`, \`channel\`, \`done\`.`,
+    `- \`${POST_MESSAGE_TOOL}\` / \`${READ_BOARD_TOOL}\`: Post to the shared board, read messages (\`#seq\`/\`since\`/\`channel\`/\`search\`), or inspect roster (\`status:true\`).`,
+    `- \`${SWARM_WAIT_TOOL}\`: End your turn cleanly (non-blocking) and sleep until woken by a member, \`all_idle\`, or user input. Always pass the highest read \`#seq\` as \`since\`.`,
     "",
     "## 5. Keep Warm, Context Forking & 3-Role Models",
     `- **Keep Warm**: Completed members park in \`waiting\` (zero tokens, full history intact, disk-backed sessions). NEVER \`kill\` as a pause!`,
@@ -206,7 +205,6 @@ export function buildOrchestratorStaticSection(snapshot: SwarmSnapshot): string 
     `- **Base Branch**: \`${run.baseBranch}\``,
     `- **Max Concurrency**: ${run.maxConcurrency}`,
     `- **Validator Policy**: ${run.validatorEnabled ? "ON" : "OFF"}`,
-    formatRoleModelsLine(snapshot.roleModels),
     `- **Objective**: ${run.objective}`,
   ];
   if (run.strategy.trim()) {
@@ -241,6 +239,7 @@ export function buildOrchestratorLiveStateSection(
     "## Active Swarm State",
     `- **Status**: \`${run.status}\` | **Board Head**: \`#${snapshot.boardHead}\``,
     `- **Active / Waiting**: ${snapshot.workingMemberNames.length}/${run.maxConcurrency} active | ${snapshot.waitingMemberNames.length} waiting`,
+    formatRoleModelsLine(snapshot.roleModels),
   ];
 
   if (snapshot.rateLimitUntil && snapshot.rateLimitUntil > Date.now()) {

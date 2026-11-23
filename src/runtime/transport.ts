@@ -1,3 +1,4 @@
+import { lstatSync, readlinkSync, realpathSync } from "node:fs";
 import { access, mkdir } from "node:fs/promises";
 import path from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
@@ -117,6 +118,7 @@ export function normalizeRepoPath(filePath: string): string {
 
 /**
  * Resolves `targetPath` relative to `worktreePath`.
+ * Verifies symlink-safe containment using `realpathSync` on `root` and the deepest existing ancestor.
  * Returns `null` if `targetPath` escapes outside `worktreePath`.
  */
 export function resolveWorktreeRelativePath(worktreePath: string, targetPath: string): string | null {
@@ -129,7 +131,69 @@ export function resolveWorktreeRelativePath(worktreePath: string, targetPath: st
   if (rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) {
     return null;
   }
-  return normalizeRepoPath(rel);
+
+  let realRoot: string;
+  try {
+    realRoot = realpathSync(root);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      return normalizeRepoPath(rel);
+    }
+    return null;
+  }
+
+  let hops = 0;
+  let probe = resolved;
+  const missingSegments: string[] = [];
+  while (true) {
+    try {
+      const realProbe = realpathSync(probe);
+      const realResolved =
+        missingSegments.length > 0
+          ? path.resolve(realProbe, ...missingSegments.reverse())
+          : realProbe;
+      const realRel = path.relative(realRoot, realResolved);
+      if (realRel === "") {
+        return ".";
+      }
+      if (
+        realRel === ".." ||
+        realRel.startsWith(`..${path.sep}`) ||
+        path.isAbsolute(realRel)
+      ) {
+        return null;
+      }
+      return normalizeRepoPath(realRel);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") {
+        return null;
+      }
+      // Check dangling symlinks so they cannot point outside `realRoot` or into protected paths.
+      try {
+        const stat = lstatSync(probe);
+        if (stat.isSymbolicLink()) {
+          if (++hops > 20) {
+            return null;
+          }
+          const linkTarget = readlinkSync(probe);
+          const parentReal = realpathSync(path.dirname(probe));
+          probe = path.resolve(parentReal, linkTarget);
+          continue;
+        }
+      } catch {
+        // Not a symlink entry; continue walking up to parent
+      }
+
+      const parent = path.dirname(probe);
+      if (parent === probe) {
+        return null;
+      }
+      missingSegments.push(path.basename(probe));
+      probe = parent;
+    }
+  }
 }
 
 /**
@@ -140,7 +204,13 @@ export function isProtectedSwarmPath(relPath: string): boolean {
   if (!norm || norm === ".") {
     return false;
   }
-  return PROTECTED_PREFIXES.some((prefix) => norm === prefix || norm.startsWith(`${prefix}/`));
+  const candidate =
+    process.platform === "darwin" || process.platform === "win32"
+      ? norm.toLowerCase()
+      : norm;
+  return PROTECTED_PREFIXES.some(
+    (prefix) => candidate === prefix || candidate.startsWith(`${prefix}/`),
+  );
 }
 
 function globToRegExp(pattern: string): RegExp {
@@ -235,7 +305,26 @@ export interface CommandGuardResult {
 
 const MUTATING_REDIRECTION_RE = /(?<![=\->&])(?:[0-9]?>{1,2}|&>|<>)\s*(?!\/dev\/null\b|&\d\b)\S/;
 
-const CMD_PREFIX_RE = /(?:^|(?:[;&|\r\n"']|`|\$\(|\b(?:xargs|env|command|sudo)\s+)\s*)(?:\(\s*)*/.source;
+const WRAPPER_ARG_RE =
+  /(?:[A-Za-z_][A-Za-z0-9_]*=\S*|\d+(?:\.\d+)?[smhd]?|-(?:n|P|L|I|d|E|s|k|u|g)\s+[^\s;&|)\r\n]+|-[^\s;&|)\r\n]+)/.source;
+const WRAPPER_CHAIN_RE =
+  `(?:(?:xargs|env|command|sudo|timeout|time|nice|nohup|(?:sh|bash|zsh|dash|ksh|fish)\\s+-[A-Za-z]*c[A-Za-z]*|eval)(?:\\s+${WRAPPER_ARG_RE})*\\s+)*`;
+const CMD_BOUNDARY_RE = /(?:^|(?:[;&|\r\n"'`{(]|\$\()\s*)/.source;
+const CMD_PATH_PREFIX_RE = /(?:(?:\/|\.\.?\/)[^\s;&|()"'`]*\/)?/.source;
+const CMD_PREFIX_RE = `${CMD_BOUNDARY_RE}(?:[({]\\s*)*${WRAPPER_CHAIN_RE}${CMD_PATH_PREFIX_RE}`;
+
+const SHELL_EVAL_CMD_RE = new RegExp(
+  `${CMD_BOUNDARY_RE}(?:[({]\\s*)*${WRAPPER_CHAIN_RE}(?:${CMD_PATH_PREFIX_RE}(?:sh|bash|zsh|dash|ksh|fish)|eval)(?=\\s|$|[;&|)\\r\\n])`,
+);
+
+const GIT_GLOBAL_FLAG_RE =
+  /(?:(?:-[Cc]|--(?:git-dir|work-tree|namespace|super-prefix|config-env|exec-path))\s+[^\s;&|)\r\n]+|--(?:git-dir|work-tree|namespace|super-prefix|config-env|exec-path)=[^\s;&|)\r\n]+|--(?:no-pager|paginate|bare|no-replace-objects|literal-pathspecs|glob-pathspecs|noglob-pathspecs|icase-pathspecs|no-optional-locks|no-lazy-fetch|no-advice|html-path|man-path|info-path)|-[pP])/.source;
+const GIT_PREFIX_RE = `\\bgit\\b(?:\\s+${GIT_GLOBAL_FLAG_RE})*`;
+
+const PKG_PRE_FLAG_RE =
+  /(?:(?:--(?:prefix|cwd|workspace|filter|dir)|-[Cw])\s+[^\s;&|)\r\n]+|-[^\s;&|)\r\n]+)/.source;
+
+const SIMPLE_TOKEN_RE = /^[A-Za-z0-9_./:-]+$/;
 
 const VALIDATOR_FORBIDDEN_PATTERNS: ReadonlyArray<{ pattern: RegExp; reason: string }> = [
   {
@@ -265,93 +354,191 @@ const VALIDATOR_FORBIDDEN_PATTERNS: ReadonlyArray<{ pattern: RegExp; reason: str
     reason: "Filesystem mutation commands are blocked in read-only validator sessions.",
   },
   {
-    pattern:
-      /\bgit\b(?:\s+-[^\s]+(?:\s+[^\s]+)?)*\s+(?:add|commit|rm|mv|checkout|switch|reset|rebase|merge|cherry-pick|clean|stash|push|pull|fetch|tag|apply|am|restore|worktree)(?=\s|$|[;&|)\r\n`"'])/,
+    pattern: new RegExp(
+      `${GIT_PREFIX_RE}\\s+(?:add|commit|rm|mv|checkout|switch|reset|rebase|merge|cherry-pick|clean|stash|push|pull|fetch|tag|apply|am|restore|worktree)(?=\\s|$|[;&|)\\r\\n\`"'])`,
+    ),
     reason: "Mutating git subcommands are blocked in read-only validator sessions.",
   },
   {
-    pattern: /\bgit\b[^\n;|&]*\bbranch\b[^\n;|&]*\s-(?:d|D|m|M|c|C|f)\b/,
+    pattern: new RegExp(
+      `${GIT_PREFIX_RE}\\s+branch\\b[^\\n;|&]*\\s(?:-[dDmMcCf]+\\b|--(?:delete|move|copy|force)(?=\\s|$|[;&|)]))`,
+    ),
     reason: "Mutating `git branch` flags are blocked in read-only validator sessions.",
   },
   {
-    pattern: /\b(?:npm|pnpm|yarn|bun)\b\s+(?:install|i|add|remove|uninstall|rm|update|upgrade|publish|link)\b/,
+    pattern: new RegExp(
+      `\\b(?:npm|pnpm|yarn|bun)\\b(?:\\s+${PKG_PRE_FLAG_RE})*\\s+(?:install|i|add|remove|uninstall|rm|update|upgrade|publish|link)\\b`,
+    ),
     reason: "Package-mutating commands are blocked in read-only validator sessions.",
   },
 ];
 
-function maskQuotedShellLiterals(command: string): string {
+function unquoteSimpleTokens(command: string): string {
   let out = "";
   let i = 0;
   while (i < command.length) {
     const ch = command[i]!;
     if (ch === "\\" && i + 1 < command.length) {
-      out += ch + command[i + 1]!;
+      const next = command[i + 1]!;
+      if (/[A-Za-z0-9_./:-]/.test(next)) {
+        out += next;
+        i += 2;
+        continue;
+      }
+      out += ch + next;
       i += 2;
       continue;
     }
-    if (ch === "'") {
-      out += "'";
-      i += 1;
+    if (ch === "'" || (ch === "$" && command[i + 1] === "'")) {
+      const isAnsi = ch === "$";
+      const startQuote = i;
+      i += isAnsi ? 2 : 1;
+      let inner = "";
       while (i < command.length && command[i] !== "'") {
-        i += 1;
-      }
-      if (i < command.length) {
-        out += "'";
-        i += 1;
-      }
-      continue;
-    }
-    if (ch === '"') {
-      out += '"';
-      i += 1;
-      while (i < command.length && command[i] !== '"') {
-        const inner = command[i]!;
-        if (inner === "\\" && i + 1 < command.length) {
+        if (isAnsi && command[i] === "\\" && i + 1 < command.length) {
+          inner += command[i + 1]!;
           i += 2;
           continue;
         }
-        if (inner === "`") {
-          out += "`";
-          i += 1;
-          while (i < command.length && command[i] !== "`") {
-            out += command[i]!;
-            i += 1;
-          }
-          if (i < command.length) {
-            out += "`";
-            i += 1;
-          }
-          continue;
-        }
-        if (inner === "$" && command[i + 1] === "(") {
-          out += "$(";
-          i += 2;
-          let depth = 1;
-          while (i < command.length && depth > 0) {
-            const sub = command[i]!;
-            if (sub === "(") depth += 1;
-            else if (sub === ")") depth -= 1;
-            out += sub;
-            i += 1;
-          }
-          continue;
-        }
+        inner += command[i]!;
         i += 1;
       }
-      if (i < command.length) {
-        out += '"';
-        i += 1;
+      const closed = i < command.length;
+      if (closed) i += 1;
+      if (closed && SIMPLE_TOKEN_RE.test(inner)) {
+        out += inner;
+      } else {
+        out += command.slice(startQuote, i);
       }
       continue;
     }
     out += ch;
     i += 1;
   }
-  // Preserve shell-eval invocations (`sh -c`, `/bin/bash -c`, `eval`) unmasked when invoked OUTSIDE quotes.
-  if (/(?:^|[;&|\r\n(]\s*|[\s\/])(?:sh|bash|zsh|dash|ksh|fish|eval)\b/.test(out)) {
-    return command;
-  }
   return out;
+}
+
+function scanMaskedShellSegment(
+  command: string,
+  startIndex: number,
+  endChar?: ")" | "`",
+): { masked: string; nextIndex: number } {
+  let out = "";
+  let i = startIndex;
+  let parenDepth = 0;
+
+  while (i < command.length) {
+    const ch = command[i]!;
+    if (endChar === ")" && ch === "(") {
+      parenDepth += 1;
+      out += "(";
+      i += 1;
+      continue;
+    }
+    if (endChar === ")" && ch === ")") {
+      if (parenDepth === 0) {
+        return { masked: out, nextIndex: i + 1 };
+      }
+      parenDepth -= 1;
+      out += ")";
+      i += 1;
+      continue;
+    }
+    if (endChar === "`" && ch === "`") {
+      return { masked: out, nextIndex: i + 1 };
+    }
+
+    if (ch === "\\" && i + 1 < command.length) {
+      const next = command[i + 1]!;
+      if (/[A-Za-z0-9_./:-]/.test(next)) {
+        out += next;
+      } else {
+        out += ch + next;
+      }
+      i += 2;
+      continue;
+    }
+
+    if (ch === "'" || (ch === "$" && command[i + 1] === "'")) {
+      const isAnsi = ch === "$";
+      i += isAnsi ? 2 : 1;
+      let inner = "";
+      while (i < command.length && command[i] !== "'") {
+        if (isAnsi && command[i] === "\\" && i + 1 < command.length) {
+          inner += command[i + 1]!;
+          i += 2;
+          continue;
+        }
+        inner += command[i]!;
+        i += 1;
+      }
+      const closed = i < command.length;
+      if (closed) {
+        i += 1;
+      }
+      if (closed && SIMPLE_TOKEN_RE.test(inner)) {
+        out += inner;
+      } else {
+        out += closed ? "''" : "'";
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      i += 1;
+      let literalInner = "";
+      let hasCmdSub = false;
+      let subOut = '"';
+      while (i < command.length && command[i] !== '"') {
+        const inner = command[i]!;
+        if (inner === "\\" && i + 1 < command.length) {
+          hasCmdSub = true; // Force masking unless simple unescaped token
+          i += 2;
+          continue;
+        }
+        if (inner === "`") {
+          hasCmdSub = true;
+          const nested = scanMaskedShellSegment(command, i + 1, "`");
+          subOut += `\`${nested.masked}\``;
+          i = nested.nextIndex;
+          continue;
+        }
+        if (inner === "$" && command[i + 1] === "(") {
+          hasCmdSub = true;
+          const nested = scanMaskedShellSegment(command, i + 2, ")");
+          subOut += `$(${nested.masked})`;
+          i = nested.nextIndex;
+          continue;
+        }
+        literalInner += inner;
+        i += 1;
+      }
+      const closed = i < command.length;
+      if (closed) {
+        i += 1;
+      }
+      if (closed && !hasCmdSub && SIMPLE_TOKEN_RE.test(literalInner)) {
+        out += literalInner;
+      } else {
+        out += closed ? `${subOut}"` : subOut;
+      }
+      continue;
+    }
+
+    out += ch;
+    i += 1;
+  }
+
+  return { masked: out, nextIndex: i };
+}
+
+function maskQuotedShellLiterals(command: string): string {
+  const { masked } = scanMaskedShellSegment(command, 0);
+  // Preserve shell-eval invocations (`sh -c`, `/bin/bash -c`, `eval`) when invoked at command position.
+  if (SHELL_EVAL_CMD_RE.test(masked)) {
+    return unquoteSimpleTokens(command);
+  }
+  return masked;
 }
 
 /**
@@ -411,7 +598,10 @@ export function isForbiddenWorkerBashCommand(
   }
 
   const masked = maskQuotedShellLiterals(trimmed);
-  if (/\bgit\b(?:\s+-[^\s]+(?:\s+[^\s]+)?)*\s+(?:merge|push|worktree)(?=\s|$|[;&|)\r\n`"'])/.test(masked)) {
+  const workerGitRe = new RegExp(
+    `${GIT_PREFIX_RE}\\s+(?:merge|push|worktree)(?=\\s|$|[;&|)\\r\\n\`"'])`,
+  );
+  if (workerGitRe.test(masked)) {
     return {
       allowed: false,
       reason:
@@ -422,7 +612,7 @@ export function isForbiddenWorkerBashCommand(
   if (baseBranch) {
     const escapedBase = baseBranch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const checkoutBaseRe = new RegExp(
-      `\\bgit\\b(?:\\s+-[^\\s]+(?:\\s+[^\\s]+)?)*\\s+(?:checkout|switch)\\s+(?:-f\\s+)?${escapedBase}(?:\\s|$|[;&|])`,
+      `${GIT_PREFIX_RE}\\s+(?:checkout|switch)(?:\\s+(?:-[fFbBcC]+|--(?:force|create|force-create|discard-changes|guess|no-guess|merge|detach)))*\\s+${escapedBase}(?:\\s|$|[;&|)])`,
     );
     if (checkoutBaseRe.test(masked)) {
       return {
@@ -940,7 +1130,11 @@ export class InProcessPiTransport implements ISwarmTransport {
       );
     }
     const resolvedId = formatModelId(cliRes.model) ?? (parsed.model || trimmed);
-    const effectiveThinking = cliThinking ?? cliRes.thinkingLevel;
+    const rawThinking = cliThinking ?? cliRes.thinkingLevel;
+    const effectiveThinking =
+      cliRes.model.reasoning === false
+        ? (rawThinking !== undefined ? "off" : undefined)
+        : rawThinking;
     return {
       model: resolvedId,
       ...(effectiveThinking ? { thinkingLevel: effectiveThinking } : {}),

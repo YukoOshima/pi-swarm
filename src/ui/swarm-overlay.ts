@@ -42,6 +42,7 @@ import {
   formatTokens,
   formatWorkspaceBadge,
   getOrderedMembers,
+  HardwareCursorController,
   isEscapeKey,
   isKeyReleaseSafe,
   isTabKey,
@@ -169,6 +170,16 @@ class SwarmOverlayComponent implements Component, Focusable {
 
   // Graph tab state
   private graphScrollOffset = 0;
+  private graphCache:
+    | {
+        runId: string;
+        revision: number;
+        boardLen: number;
+        lastSeq: number;
+        width: number;
+        lines: string[];
+      }
+    | undefined;
 
   // Search tab state
   private searchQuery = "";
@@ -187,7 +198,7 @@ class SwarmOverlayComponent implements Component, Focusable {
   private inlineMode: InlineInputMode | undefined;
   private inlineInput: Input;
 
-  private prevHardwareCursor: boolean | null = null;
+  private readonly hwCursor = new HardwareCursorController();
   private feedback: FeedbackMessage | undefined;
   private subComponent: (Component & Partial<Focusable> & { dispose?(): void }) | null = null;
   private showHelp = false;
@@ -197,6 +208,8 @@ class SwarmOverlayComponent implements Component, Focusable {
   private readonly hostModel?: string;
   private boardRefreshInFlight = false;
   private boardRefreshPending = false;
+  private lastBoardRefreshRunId: string | null = null;
+  private lastBoardRefreshHead: number | null = null;
 
   constructor(
     private readonly tui: TUI,
@@ -260,6 +273,9 @@ class SwarmOverlayComponent implements Component, Focusable {
         this.memberDetailScrollOffset = 0;
         this.pendingKillConfirm = undefined;
         this.expandedPost = null;
+        this.graphCache = undefined;
+        this.lastBoardRefreshRunId = null;
+        this.lastBoardRefreshHead = null;
       }
 
       if (!ev.snapshot.run) {
@@ -293,9 +309,16 @@ class SwarmOverlayComponent implements Component, Focusable {
         ev.snapshot.recentBoard.length > 0
           ? ev.snapshot.recentBoard[0]!.seq
           : Infinity;
+      const alreadyRefreshedHead =
+        this.lastBoardRefreshRunId === nextRunId &&
+        this.lastBoardRefreshHead !== null &&
+        ev.snapshot.boardHead <= this.lastBoardRefreshHead;
+      const hasHeadBehind =
+        !alreadyRefreshedHead &&
+        (ev.snapshot.boardHead > maxLoadedSeq ||
+          (prevBoardLen === 0 && ev.snapshot.boardHead > ev.snapshot.recentBoard.length));
       const hasSeqGap =
-        ev.snapshot.boardHead > maxLoadedSeq ||
-        (prevBoardLen === 0 && ev.snapshot.boardHead > ev.snapshot.recentBoard.length) ||
+        hasHeadBehind ||
         (prevMaxSeq > 0 && minRecentSeq > prevMaxSeq + 1);
       if (runSwitched || hasSeqGap) {
         void this.refreshFullBoard();
@@ -347,15 +370,7 @@ class SwarmOverlayComponent implements Component, Focusable {
     this.searchInput.focused = this._focused && searchActive;
 
     const wantsCursor = inlineActive || searchActive;
-    if (wantsCursor) {
-      if (this.prevHardwareCursor === null) {
-        this.prevHardwareCursor = this.tui.getShowHardwareCursor();
-      }
-      this.tui.setShowHardwareCursor(true);
-    } else if (this.prevHardwareCursor !== null) {
-      this.tui.setShowHardwareCursor(this.prevHardwareCursor);
-      this.prevHardwareCursor = null;
-    }
+    this.hwCursor.sync(this.tui, this._focused && wantsCursor);
   }
 
   private enterInlineMode(
@@ -436,6 +451,11 @@ class SwarmOverlayComponent implements Component, Focusable {
     try {
       const res = await this.engine.readBoard({ channel: "*", limit: 500 });
       if (this.closed || this.snapshot.run?.id !== runId) return;
+      this.lastBoardRefreshRunId = runId;
+      this.lastBoardRefreshHead = Math.max(
+        res.head ?? 0,
+        this.snapshot.boardHead,
+      );
       const prevLen = this.getFilteredBoardMessages().length;
       const wasAtLatest = prevLen === 0 || this.boardSelectedIndex >= prevLen - 1;
       const changed = this.mergeBoardMessages(res.messages);
@@ -559,10 +579,7 @@ class SwarmOverlayComponent implements Component, Focusable {
     this.expandedPost = null;
     this.inlineInput.focused = false;
     this.searchInput.focused = false;
-    if (this.prevHardwareCursor !== null) {
-      this.tui.setShowHardwareCursor(this.prevHardwareCursor);
-      this.prevHardwareCursor = null;
-    }
+    this.hwCursor.restore(this.tui);
     if (this.unsubscribe) {
       this.unsubscribe();
       this.unsubscribe = undefined;
@@ -570,6 +587,7 @@ class SwarmOverlayComponent implements Component, Focusable {
   }
 
   invalidate(): void {
+    this.graphCache = undefined;
     this.inlineInput.invalidate();
     this.searchInput.invalidate();
     this.subComponent?.invalidate();
@@ -603,6 +621,7 @@ class SwarmOverlayComponent implements Component, Focusable {
   }
 
   private async runBoardPost(text: string, channel: string): Promise<void> {
+    const expectedRunId = this.currentRunId;
     try {
       const posted = await this.engine.postMessage({
         from: ORCHESTRATOR_NAME,
@@ -611,7 +630,7 @@ class SwarmOverlayComponent implements Component, Focusable {
         channel,
         kind: "chat",
       });
-      if (this.closed) return;
+      if (this.closed || this.currentRunId !== expectedRunId) return;
       this.snapshot = this.engine.getSnapshot();
       this.mergeBoardMessages([posted]);
       const filtered = this.getFilteredBoardMessages();
@@ -619,6 +638,7 @@ class SwarmOverlayComponent implements Component, Focusable {
       if (idx >= 0) this.boardSelectedIndex = idx;
       this.setFeedback("success", `Posted #${posted.seq} to #${posted.channel}.`);
     } catch (err) {
+      if (this.closed || this.currentRunId !== expectedRunId) return;
       this.setFeedback("error", `Board post failed: ${formatErrorMessage(err)}`);
     }
   }
@@ -627,13 +647,14 @@ class SwarmOverlayComponent implements Component, Focusable {
     member: SwarmMemberRecord,
     message: string,
   ): Promise<void> {
+    const expectedRunId = this.currentRunId;
     try {
       if (typeof this.engine.steerMember === "function") {
         const res = await this.engine.steerMember(member.name, message, "steer", {
           callerName: ORCHESTRATOR_NAME,
           callerRole: "human",
         });
-        if (this.closed) return;
+        if (this.closed || this.currentRunId !== expectedRunId) return;
         this.snapshot = this.engine.getSnapshot();
         this.mergeBoardMessages(this.snapshot.recentBoard);
         if (res.delivery === "steered") {
@@ -661,7 +682,7 @@ class SwarmOverlayComponent implements Component, Focusable {
         channel,
         kind: "chat",
       });
-      if (this.closed) return;
+      if (this.closed || this.currentRunId !== expectedRunId) return;
       this.snapshot = this.engine.getSnapshot();
       this.mergeBoardMessages([posted]);
       this.setFeedback(
@@ -669,6 +690,7 @@ class SwarmOverlayComponent implements Component, Focusable {
         `Sent #${posted.seq} to @${member.name} on #${posted.channel}.`,
       );
     } catch (err) {
+      if (this.closed || this.currentRunId !== expectedRunId) return;
       this.setFeedback(
         "error",
         `Failed to message @${member.name}: ${formatErrorMessage(err)}`,
@@ -679,21 +701,23 @@ class SwarmOverlayComponent implements Component, Focusable {
   private async runTogglePauseResume(): Promise<void> {
     const run = this.snapshot.run;
     if (!run) return;
+    const expectedRunId = this.currentRunId;
     try {
       if (run.status === "paused") {
         await this.engine.resume(run.id, this.ctx);
-        if (this.closed) return;
+        if (this.closed || this.currentRunId !== expectedRunId) return;
         this.snapshot = this.engine.getSnapshot();
         this.setFeedback("success", `Resumed Swarm ${run.id}.`);
       } else if (run.status === "active") {
         await this.engine.pause(run.id, "Paused by user via Mission Control");
-        if (this.closed) return;
+        if (this.closed || this.currentRunId !== expectedRunId) return;
         this.snapshot = this.engine.getSnapshot();
         this.setFeedback("warning", `Paused Swarm ${run.id}.`);
       } else {
         this.setFeedback("info", `Swarm ${run.id} is already ${run.status}.`);
       }
     } catch (err) {
+      if (this.closed || this.currentRunId !== expectedRunId) return;
       this.setFeedback("error", `Pause/resume failed: ${formatErrorMessage(err)}`);
     }
   }
@@ -754,6 +778,7 @@ class SwarmOverlayComponent implements Component, Focusable {
       state: baseState,
       availableModels: this.options?.availableModels ?? [],
       onApplyMember: async (sel) => {
+        const expectedRunId = this.currentRunId;
         const result = await this.engine.switchModel({
           targetName: sel.memberName,
           model: sel.model,
@@ -765,7 +790,7 @@ class SwarmOverlayComponent implements Component, Focusable {
           autoResume: false,
           hostContext: this.ctx,
         });
-        if (!this.closed) {
+        if (!this.closed && this.currentRunId === expectedRunId) {
           this.snapshot = this.engine.getSnapshot();
           const suffix = result.thinkingLevel ? ` (${result.thinkingLevel})` : "";
           const actionMsg = result.deferred
@@ -791,6 +816,7 @@ class SwarmOverlayComponent implements Component, Focusable {
     rawInput: string,
   ): Promise<void> {
     const { model, thinkingLevel } = parseModelAndThinking(rawInput);
+    const expectedRunId = this.currentRunId;
     try {
       const result = await this.engine.switchModel({
         targetName: member.name,
@@ -799,17 +825,19 @@ class SwarmOverlayComponent implements Component, Focusable {
         reason: "Hot-switched by user via Swarm overlay",
         callerName: ORCHESTRATOR_NAME,
         callerRole: "human",
+        deferIfWorking: true,
         autoResume: false,
         hostContext: this.ctx,
       });
-      if (this.closed) return;
+      if (this.closed || this.currentRunId !== expectedRunId) return;
       this.snapshot = this.engine.getSnapshot();
       const suffix = result.thinkingLevel ? ` (${result.thinkingLevel})` : "";
-      this.setFeedback(
-        "success",
-        `Switched ${member.name} to ${result.model}${suffix}.`,
-      );
+      const actionMsg = result.deferred
+        ? `Queued switch for ${member.name} -> ${result.model}${suffix} at turn end.`
+        : `Switched ${member.name} to ${result.model}${suffix}.`;
+      this.setFeedback("success", actionMsg);
     } catch (err) {
+      if (this.closed || this.currentRunId !== expectedRunId) return;
       this.setFeedback(
         "error",
         `Model switch failed for ${member.name}: ${formatErrorMessage(err)}`,
@@ -822,6 +850,7 @@ class SwarmOverlayComponent implements Component, Focusable {
       this.setFeedback("warning", `${member.name} is already killed.`);
       return;
     }
+    const expectedRunId = this.currentRunId;
     try {
       await this.engine.stopMember(member.name, {
         humanStopped: true,
@@ -829,10 +858,11 @@ class SwarmOverlayComponent implements Component, Focusable {
         callerName: ORCHESTRATOR_NAME,
         callerRole: "human",
       });
-      if (this.closed) return;
+      if (this.closed || this.currentRunId !== expectedRunId) return;
       this.snapshot = this.engine.getSnapshot();
       this.setFeedback("warning", `Stopped ${member.name} (human-stopped).`);
     } catch (err) {
+      if (this.closed || this.currentRunId !== expectedRunId) return;
       this.setFeedback(
         "error",
         `Stop failed for ${member.name}: ${formatErrorMessage(err)}`,
@@ -848,6 +878,7 @@ class SwarmOverlayComponent implements Component, Focusable {
       this.setFeedback("warning", `${member.name} is already killed.`);
       return;
     }
+    const expectedRunId = this.currentRunId;
     try {
       await this.engine.killMember(member.name, {
         force,
@@ -855,13 +886,14 @@ class SwarmOverlayComponent implements Component, Focusable {
         callerName: ORCHESTRATOR_NAME,
         callerRole: "human",
       });
-      if (this.closed) return;
+      if (this.closed || this.currentRunId !== expectedRunId) return;
       this.snapshot = this.engine.getSnapshot();
       this.setFeedback(
         "warning",
         `Killed ${member.name} permanently${force ? " (force)" : ""}.`,
       );
     } catch (err) {
+      if (this.closed || this.currentRunId !== expectedRunId) return;
       this.setFeedback(
         "error",
         `Kill failed for ${member.name}: ${formatErrorMessage(err)}`,
@@ -877,12 +909,13 @@ class SwarmOverlayComponent implements Component, Focusable {
       );
       return;
     }
+    const expectedRunId = this.currentRunId;
     try {
       const merged = await this.engine.mergeMember(member.name, {
         callerName: ORCHESTRATOR_NAME,
         callerRole: "human",
       });
-      if (this.closed) return;
+      if (this.closed || this.currentRunId !== expectedRunId) return;
       this.snapshot = this.engine.getSnapshot();
       if (merged) {
         this.setFeedback(
@@ -893,6 +926,7 @@ class SwarmOverlayComponent implements Component, Focusable {
         this.setFeedback("info", `Nothing to merge for ${member.name}.`);
       }
     } catch (err) {
+      if (this.closed || this.currentRunId !== expectedRunId) return;
       this.setFeedback(
         "error",
         `Merge failed for ${member.name}: ${formatErrorMessage(err)}`,
@@ -1182,7 +1216,7 @@ class SwarmOverlayComponent implements Component, Focusable {
       this.tui.requestRender();
       return;
     }
-    if (matchesKey(data, Key.tab)) {
+    if (isTabKey(data)) {
       this.cycleTab(1);
       this.tui.requestRender();
       return;
@@ -1303,6 +1337,7 @@ class SwarmOverlayComponent implements Component, Focusable {
           (this.memberSelectedIndex - 1 + members.length) % members.length;
         this.memberDetailMode = "info";
         this.memberDetailScrollOffset = 0;
+        this.diffRequestId += 1;
         this.feedback = undefined;
         this.tui.requestRender();
       }
@@ -1314,6 +1349,7 @@ class SwarmOverlayComponent implements Component, Focusable {
           (this.memberSelectedIndex + 1) % members.length;
         this.memberDetailMode = "info";
         this.memberDetailScrollOffset = 0;
+        this.diffRequestId += 1;
         this.feedback = undefined;
         this.tui.requestRender();
       }
@@ -1483,25 +1519,33 @@ class SwarmOverlayComponent implements Component, Focusable {
       members.filter((m) => m.state === "working").length,
     );
 
-    const compact = innerWidth < 56;
-    const tabs: { id: SwarmOverlayTab; label: string }[] = compact
+    const ultraCompact = innerWidth < 46;
+    const compact = innerWidth < 64;
+    const tabs: { id: SwarmOverlayTab; label: string }[] = ultraCompact
       ? [
-          { id: "board", label: `[1]Board(#${boardCount})` },
-          { id: "members", label: `[2]Mem(${workingCount}/${members.length})` },
-          { id: "graph", label: "[3]Graph" },
+          { id: "board", label: "[1]Brd" },
+          { id: "members", label: "[2]Mem" },
+          { id: "graph", label: "[3]Grp" },
           { id: "search", label: "[4]Find" },
         ]
-      : [
-          { id: "board", label: `[1] Board (#${boardCount})` },
-          {
-            id: "members",
-            label: `[2] Members (${workingCount}/${members.length})`,
-          },
-          { id: "graph", label: "[3] Graph" },
-          { id: "search", label: "[4] Search" },
-        ];
+      : compact
+        ? [
+            { id: "board", label: `[1]Board(#${boardCount})` },
+            { id: "members", label: `[2]Mem(${workingCount}/${members.length})` },
+            { id: "graph", label: "[3]Graph" },
+            { id: "search", label: "[4]Find" },
+          ]
+        : [
+            { id: "board", label: `[1] Board (#${boardCount})` },
+            {
+              id: "members",
+              label: `[2] Members (${workingCount}/${members.length})`,
+            },
+            { id: "graph", label: "[3] Graph" },
+            { id: "search", label: "[4] Search" },
+          ];
 
-    const sep = this.theme.fg("borderMuted", compact ? "|" : " | ");
+    const sep = this.theme.fg("borderMuted", ultraCompact ? " " : compact ? "|" : " | ");
     const rendered = tabs
       .map((t) =>
         t.id === this.activeTab
@@ -2043,9 +2087,34 @@ class SwarmOverlayComponent implements Component, Focusable {
     innerWidth: number,
     budget: number,
   ): string[] {
-    const allLines = buildSwarmGraphLines(run, this.boardMessages, innerWidth, {
-      theme: this.theme,
-    });
+    const lastSeq =
+      this.boardMessages.length > 0
+        ? this.boardMessages[this.boardMessages.length - 1]!.seq
+        : 0;
+    const cached = this.graphCache;
+    let allLines: string[];
+    if (
+      cached &&
+      cached.runId === run.id &&
+      cached.revision === run.revision &&
+      cached.boardLen === this.boardMessages.length &&
+      cached.lastSeq === lastSeq &&
+      cached.width === innerWidth
+    ) {
+      allLines = cached.lines;
+    } else {
+      allLines = buildSwarmGraphLines(run, this.boardMessages, innerWidth, {
+        theme: this.theme,
+      });
+      this.graphCache = {
+        runId: run.id,
+        revision: run.revision,
+        boardLen: this.boardMessages.length,
+        lastSeq,
+        width: innerWidth,
+        lines: allLines,
+      };
+    }
     const maxOffset = Math.max(0, allLines.length - budget);
     if (this.graphScrollOffset > maxOffset) {
       this.graphScrollOffset = maxOffset;

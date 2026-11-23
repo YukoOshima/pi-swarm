@@ -361,7 +361,7 @@ class SingleQuestionComponent implements Component, Focusable {
   private readonly options: NormalizedOption[];
   private readonly hasPresetOptions: boolean;
   private readonly input: Input;
-  private prevHardwareCursor: boolean | null = null;
+  private readonly hwCursor = new HardwareCursorController();
   private validationHint: string | undefined;
   private settled = false;
   private readonly onAbort?: () => void;
@@ -430,24 +430,13 @@ class SingleQuestionComponent implements Component, Focusable {
   set focused(value: boolean) {
     this._focused = value;
     this.input.focused = value && this.inCustomInput;
+    this.hwCursor.sync(this.tui, value && this.inCustomInput);
   }
 
   private setCustomInputMode(active: boolean): void {
-    if (active) {
-      if (this.prevHardwareCursor === null) {
-        this.prevHardwareCursor = this.tui.getShowHardwareCursor();
-      }
-      this.inCustomInput = true;
-      this.input.focused = this._focused;
-      this.tui.setShowHardwareCursor(true);
-    } else {
-      this.inCustomInput = false;
-      this.input.focused = false;
-      if (this.prevHardwareCursor !== null) {
-        this.tui.setShowHardwareCursor(this.prevHardwareCursor);
-        this.prevHardwareCursor = null;
-      }
-    }
+    this.inCustomInput = active;
+    this.input.focused = this._focused && active;
+    this.hwCursor.sync(this.tui, this._focused && active);
   }
 
   private finish(result: {
@@ -466,6 +455,7 @@ class SingleQuestionComponent implements Component, Focusable {
       this.signal.removeEventListener("abort", this.onAbort);
     }
     this.setCustomInputMode(false);
+    this.hwCursor.restore(this.tui);
   }
 
   invalidate(): void {
@@ -710,7 +700,7 @@ class MultiQuestionComponent implements Component, Focusable {
   private submitCursor = 0;
   private inCustomInput = false;
   private readonly input: Input;
-  private prevHardwareCursor: boolean | null = null;
+  private readonly hwCursor = new HardwareCursorController();
   private validationHint: string | undefined;
   private settled = false;
   private readonly onAbort?: () => void;
@@ -775,6 +765,7 @@ class MultiQuestionComponent implements Component, Focusable {
   set focused(value: boolean) {
     this._focused = value;
     this.input.focused = value && this.inCustomInput;
+    this.hwCursor.sync(this.tui, value && this.inCustomInput);
   }
 
   private get submitTabIndex(): number {
@@ -787,21 +778,11 @@ class MultiQuestionComponent implements Component, Focusable {
 
   private setCustomInputMode(active: boolean, initialValue?: string): void {
     if (active) {
-      if (this.prevHardwareCursor === null) {
-        this.prevHardwareCursor = this.tui.getShowHardwareCursor();
-      }
       this.input.setValue(initialValue ?? "");
-      this.inCustomInput = true;
-      this.input.focused = this._focused;
-      this.tui.setShowHardwareCursor(true);
-    } else {
-      this.inCustomInput = false;
-      this.input.focused = false;
-      if (this.prevHardwareCursor !== null) {
-        this.tui.setShowHardwareCursor(this.prevHardwareCursor);
-        this.prevHardwareCursor = null;
-      }
     }
+    this.inCustomInput = active;
+    this.input.focused = this._focused && active;
+    this.hwCursor.sync(this.tui, this._focused && active);
   }
 
   private advanceAfterAnswer(): void {
@@ -843,6 +824,7 @@ class MultiQuestionComponent implements Component, Focusable {
       this.signal.removeEventListener("abort", this.onAbort);
     }
     this.setCustomInputMode(false);
+    this.hwCursor.restore(this.tui);
   }
 
   invalidate(): void {
@@ -1086,10 +1068,14 @@ class MultiQuestionComponent implements Component, Focusable {
       );
 
       const actions = this.getSubmitActions();
-      const summaryBudget = Math.max(
-        1,
-        maxInnerLines - body.length - actions.length - 3,
+      const baseSummaryBudget = Math.max(
+        0,
+        maxInnerLines - body.length - actions.length - 2,
       );
+      const summaryBudget =
+        this.questions.length > baseSummaryBudget
+          ? Math.max(0, maxInnerLines - body.length - actions.length - 3)
+          : baseSummaryBudget;
 
       const shownQuestions = this.questions.slice(0, summaryBudget);
       for (let i = 0; i < shownQuestions.length; i++) {
@@ -1340,7 +1326,7 @@ class ConfirmProposalComponent implements Component, Focusable {
       this.commentInput.setValue(this.commentText);
     }
     this.commentInput.focused = this._focused && active;
-    this.hwCursor.sync(this.tui, active);
+    this.hwCursor.sync(this.tui, this._focused && active);
   }
 
   private finish(action: ProposalDialogAction): void {

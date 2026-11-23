@@ -444,6 +444,7 @@ export class SwarmBoard implements ISwarmBoard {
         existing.size === st.size &&
         existing.ino === st.ino
       ) {
+        this.setBoardCacheEntry(boardPath, existing);
         return {
           messages: existing.messages,
           head: existing.head,
@@ -483,9 +484,10 @@ export class SwarmBoard implements ISwarmBoard {
 
         if (bytesRead === delta) {
           const appended = parseBoardLines(tailText);
-          if (appended.length > 0) {
-            existing.messages.push(...appended);
-          }
+          const nextMessages =
+            appended.length > 0
+              ? [...existing.messages, ...appended]
+              : existing.messages;
           const head = Math.max(existing.head, computeHead(appended));
           const endsWithNewline =
             tailText.length === 0
@@ -497,10 +499,10 @@ export class SwarmBoard implements ISwarmBoard {
             ino: st.ino,
             head,
             endsWithNewline,
-            messages: existing.messages,
+            messages: nextMessages,
           });
           return {
-            messages: existing.messages,
+            messages: nextMessages,
             head,
             endsWithNewline,
             size: st.size,
@@ -598,14 +600,14 @@ export class SwarmBoard implements ISwarmBoard {
         const stAfter = await lstat(boardPath);
         const expectedSize = prevSize + Buffer.byteLength(fullPayload, "utf8");
         if (stAfter.size === expectedSize) {
-          existingMessages.push(message);
+          const nextMessages = [...existingMessages, message];
           this.setBoardCacheEntry(boardPath, {
             mtimeMs: stAfter.mtimeMs,
             size: stAfter.size,
             ino: stAfter.ino,
             head: message.seq,
             endsWithNewline: true,
-            messages: existingMessages,
+            messages: nextMessages,
           });
         } else {
           this.boardCache.delete(boardPath);
@@ -715,7 +717,7 @@ export class SwarmBoard implements ISwarmBoard {
         ? Math.floor(options.since)
         : 0;
       const limit =
-        options.limit !== undefined
+        typeof options.limit === "number" && Number.isFinite(options.limit)
           ? Math.floor(options.limit)
           : DEFAULT_SINCE_LIMIT;
       if (limit <= 0) {
@@ -729,7 +731,7 @@ export class SwarmBoard implements ISwarmBoard {
     }
 
     const limit =
-      options?.limit !== undefined
+      typeof options?.limit === "number" && Number.isFinite(options.limit)
         ? Math.floor(options.limit)
         : DEFAULT_RECENT_LIMIT;
     if (limit <= 0) {

@@ -33,6 +33,7 @@ import type {
   SwitchModelOptions,
 } from "../src/types.js";
 import {
+  HardwareCursorController,
   SwarmHubView,
   SwarmModelPickerView,
   type ModelPickerSettingsState,
@@ -42,6 +43,7 @@ import {
   createQuestionnaireUI,
   createSwarmWidget,
   createSwarmWidgetState,
+  decodeModifyOtherKeysPrintable,
   fitLine,
   fitLines,
   formatBoardKindBadge,
@@ -3281,5 +3283,416 @@ describe("v0.5.0 TUI Protocol, Responsive Bounds & Mission Hub Resume", () => {
       ],
     );
     assert.equal(qOutcome.cancelled, false);
+  });
+});
+
+describe("v0.5.1 UI protocol, cursor, responsive bounds & overlay hardening", () => {
+  it("HardwareCursorController preserves prior true host cursor and Questionnaire handles blur/focus", async () => {
+    const mockTui = createMockTUI(24, 90);
+    mockTui.tui.setShowHardwareCursor(true);
+    const ctrl = new HardwareCursorController();
+
+    // Skipping no-op sync(false) when prev === null must not clobber pre-existing true state
+    ctrl.sync(mockTui.tui, false);
+    assert.equal(mockTui.getHardwareCursor(), true);
+
+    // Transition to true captures prior true state, then sync(false) and restore() restore true
+    ctrl.sync(mockTui.tui, true);
+    assert.equal(mockTui.getHardwareCursor(), true);
+    ctrl.sync(mockTui.tui, false);
+    assert.equal(mockTui.getHardwareCursor(), true);
+    ctrl.sync(mockTui.tui, true);
+    ctrl.restore(mockTui.tui);
+    assert.equal(mockTui.getHardwareCursor(), true);
+
+    // SingleQuestionComponent freeform blur/focus preserves prior cursor state
+    const theme = createMockTheme();
+    const qUi = createQuestionnaireUI();
+    mockTui.tui.setShowHardwareCursor(true);
+    let blurCheckOk = false;
+    await qUi.askQuestion(
+      {
+        mode: "tui",
+        hasUI: true,
+        ui: {
+          theme,
+          notify() {},
+          async custom<T>(
+            factory: (
+              t: TUI,
+              th: Theme,
+              kb: unknown,
+              done: (r: T) => void,
+            ) => Component & { dispose?(): void },
+          ): Promise<T> {
+            return new Promise<T>((resolve) => {
+              const comp = factory(mockTui.tui, theme, {}, resolve);
+              if (isFocusable(comp)) {
+                comp.focused = true;
+                assert.equal(mockTui.getHardwareCursor(), true);
+                comp.focused = false;
+                assert.equal(mockTui.getHardwareCursor(), true);
+                comp.focused = true;
+                blurCheckOk = true;
+              }
+              comp.handleInput?.("h");
+              comp.handleInput?.("\r");
+            });
+          },
+        },
+      } as unknown as ExtensionContext,
+      { id: "free", question: "Freeform?", options: [], allowCustom: true },
+    );
+    assert.equal(blurCheckOk, true);
+    assert.equal(mockTui.getHardwareCursor(), true);
+  });
+
+  it("decodeModifyOtherKeysPrintable accepts CapsLock/NumLock modifier masks and rejects Ctrl/Alt", () => {
+    assert.equal(decodeModifyOtherKeysPrintable("\x1b[27;1;97~"), "a");
+    assert.equal(decodeModifyOtherKeysPrintable("\x1b[27;2;65~"), "A");
+    assert.equal(decodeModifyOtherKeysPrintable("\x1b[27;65;97~"), "a"); // CapsLock (1+64)
+    assert.equal(decodeModifyOtherKeysPrintable("\x1b[27;66;65~"), "A"); // Shift+CapsLock (2+64)
+    assert.equal(decodeModifyOtherKeysPrintable("\x1b[27;129;98~"), "b"); // NumLock (1+128)
+    assert.equal(decodeModifyOtherKeysPrintable("\x1b[27;193;99~"), "c"); // Caps+NumLock (1+64+128)
+    assert.equal(decodeModifyOtherKeysPrintable("\x1b[27;5;97~"), undefined); // Ctrl+a
+    assert.equal(decodeModifyOtherKeysPrintable("\x1b[27;3;97~"), undefined); // Alt+a
+  });
+
+  it("SwarmHubView gates unfinished runs by live PID, shows Resume CTA for crash-recovered active run, and fits tight rows", () => {
+    const theme = createMockTheme();
+    const { tui } = createMockTUI(12, 60);
+    const completedSnap = makeSampleSnapshot();
+    completedSnap.run!.status = "completed";
+
+    const hub1 = new SwarmHubView(tui, theme, {
+      snapshot: completedSnap,
+      currentSessionId: "sess-b",
+      runs: [
+        {
+          id: "run-live-other",
+          title: "Other Live Session",
+          objective: "Should be hidden",
+          baseBranch: "main",
+          status: "active",
+          memberCount: 1,
+          workingCount: 1,
+          waitingCount: 0,
+          boardHead: 3,
+          ownerSessionId: "sess-a",
+          ownerPid: process.pid,
+          createdAt: "2026-11-22T00:00:00.000Z",
+          updatedAt: "2026-11-22T02:00:00.000Z",
+        },
+        {
+          id: "run-resumable-dead",
+          title: "Dead PID Resumable",
+          objective: "Should appear",
+          baseBranch: "main",
+          status: "paused",
+          memberCount: 1,
+          workingCount: 0,
+          waitingCount: 1,
+          boardHead: 5,
+          ownerSessionId: "sess-old",
+          ownerPid: 999999,
+          createdAt: "2026-11-22T00:00:00.000Z",
+          updatedAt: "2026-11-22T01:00:00.000Z",
+        },
+      ],
+      availableModels: [],
+      state: {
+        settings: { ...DEFAULT_SWARM_SETTINGS },
+        origins: { orchestrator: "host", worker: "host", validator: "host" },
+      },
+      onComplete: () => {},
+    });
+
+    try {
+      const rendered1 = hub1.render(60);
+      assert.ok(rendered1.length <= 12, `Hub height ${rendered1.length} must fit 12 rows`);
+      const plain1 = stripTerminalSequences(rendered1.join("\n"));
+      assert.match(plain1, /Dead PID Resumable/);
+      assert.ok(!plain1.includes("run-live-other"));
+      assert.match(plain1, /Alt\+Enter Direct/); // footer hint not clipped
+    } finally {
+      hub1.dispose();
+    }
+
+    // Crash-recovered active run with 0 working members and activatedRun=false shows Resume CTA
+    const recoveredSnap = makeSampleSnapshot({
+      members: [makeSampleMember({ name: "worker-1", state: "stopped" })],
+    });
+    recoveredSnap.run!.status = "active";
+    let resumeAction: unknown;
+    const { tui: tui24 } = createMockTUI(24, 80);
+    const hub2 = new SwarmHubView(tui24, theme, {
+      snapshot: recoveredSnap,
+      activatedRun: false,
+      currentSessionId: "sess-b",
+      runs: [],
+      availableModels: [],
+      state: {
+        settings: { ...DEFAULT_SWARM_SETTINGS },
+        origins: { orchestrator: "host", worker: "host", validator: "host" },
+      },
+      onComplete: (a) => {
+        resumeAction = a;
+      },
+    });
+    try {
+      const plain2 = stripTerminalSequences(hub2.render(80).join("\n"));
+      assert.match(plain2, /Resume & Continue Mission/);
+      hub2.handleInput("4"); // jump to item #4 (Resume & Continue Mission)
+      hub2.handleInput("\r");
+      assert.deepEqual(resumeAction, {
+        kind: "resume",
+        runId: recoveredSnap.run!.id,
+        kickoff: true,
+      });
+    } finally {
+      hub2.dispose();
+    }
+  });
+
+  it("SwarmDashboardComponent.renderExpanded and MultiQuestionComponent Submit tab fit 16 rows cleanly", async () => {
+    const theme = createMockTheme();
+    const { tui } = createMockTUI(16, 76);
+    const snap = makeSampleSnapshot();
+    const widget = createSwarmWidget(() => snap, {
+      expanded: true,
+      modalDepth: 0,
+      draftActive: false,
+    })(tui, theme);
+    try {
+      const lines = widget.render(76);
+      assert.ok(
+        lines.length <= 14,
+        `renderExpanded at 16 rows must leave margin (got ${lines.length})`,
+      );
+      assertAllLinesFit(lines, 76, "expanded@16x76");
+    } finally {
+      widget.dispose();
+    }
+
+    // MultiQuestionComponent Submit tab at 16 rows with > 2 questions preserves bottom hint line
+    const qUi = createQuestionnaireUI();
+    const questions: QuestionSpec[] = [
+      { id: "q1", question: "Q1?", options: [{ label: "A" }] },
+      { id: "q2", question: "Q2?", options: [{ label: "B" }] },
+      { id: "q3", question: "Q3?", options: [{ label: "C" }] },
+      { id: "q4", question: "Q4?", options: [{ label: "D" }] },
+    ];
+    let submitTabPlain = "";
+    let submitTabLines = 0;
+    await qUi.askQuestionnaire(
+      {
+        mode: "tui",
+        hasUI: true,
+        ui: {
+          theme,
+          notify() {},
+          async custom<T>(
+            factory: (
+              t: TUI,
+              th: Theme,
+              kb: unknown,
+              done: (r: T) => void,
+            ) => Component & { dispose?(): void },
+          ): Promise<T> {
+            return new Promise<T>((resolve) => {
+              const comp = factory(tui, theme, {}, resolve);
+              if (isFocusable(comp)) comp.focused = true;
+              comp.handleInput?.("\x1b[Z"); // Shift+Tab directly to Submit tab
+              const rendered = comp.render(72);
+              submitTabLines = rendered.length;
+              submitTabPlain = stripTerminalSequences(rendered.join("\n"));
+              comp.handleInput?.("\x1b");
+            });
+          },
+        },
+      } as unknown as ExtensionContext,
+      questions,
+    );
+    assert.ok(submitTabLines <= 12, `Submit tab height ${submitTabLines} must fit 16-row dialog`);
+    assert.match(submitTabPlain, /… \+\d+ more/);
+    assert.match(submitTabPlain, /\[Enter\] confirm · \[Esc\] cancel/);
+  });
+
+  it("SwarmOverlayComponent supports ultraCompact 40/60 cols tabs, isTabKey, bounded board refresh, deferIfWorking, and diffRequestId bump", async () => {
+    const theme = createMockTheme();
+    const { tui } = createMockTUI(24, 60);
+    const snap = makeSampleSnapshot({ boardHead: 10 });
+    let readBoardCalls = 0;
+    const switchCalls: SwitchModelOptions[] = [];
+    let resolveFirstDiff: ((d: DiffSummary) => void) | undefined;
+    const listeners = new Set<(ev: SwarmEngineEvent) => void>();
+
+    const fakeEngine: ISwarmEngine = {
+      startRun: async () => snap.run!,
+      attachRun: async () => snap,
+      setTitle: async () => snap.run!,
+      updateDirection: async () => snap.run!,
+      addMembers: async () => [],
+      postMessage: async () => snap.recentBoard[0]!,
+      readBoard: async () => {
+        readBoardCalls += 1;
+        return { messages: [], head: 10 }; // empty read with boardHead=10
+      },
+      waitForBoard: async () => ({ wokeBy: "timeout", messages: [], head: 10, summary: "" }),
+      parkOrchestratorWait: async () => ({
+        parked: false,
+        messages: [],
+        head: 10,
+        activeMembers: [],
+        summary: "",
+      }),
+      clearOrchestratorWait: () => {},
+      steerMember: async () => ({ delivery: "steered" }),
+      switchModel: async (opts) => {
+        switchCalls.push(opts);
+        return {
+          targetName: opts.targetName ?? "worker-1",
+          model: opts.model ?? "",
+          thinkingLevel: opts.thinkingLevel,
+          deferred: true,
+        };
+      },
+      stopMember: async () => {},
+      killMember: async () => {},
+      mergeMember: async () => null,
+      manageChannel: async () => ({
+        action: "create",
+        name: "main",
+        topic: "",
+        createdBy: ORCHESTRATOR_NAME,
+        createdAt: "",
+        subscribers: [],
+        archived: false,
+        summary: "ok",
+      }),
+      completeRun: async () => snap.run!,
+      pause: async () => snap.run!,
+      resume: async () => snap.run!,
+      teardown: async () => ({ removed: [], skipped: [], errors: [] }),
+      listModels: async () => [],
+      getSnapshot: () => snap,
+      subscribe: (fn) => {
+        listeners.add(fn);
+        return () => listeners.delete(fn);
+      },
+      dispose: async () => {},
+    };
+
+    const fakeWorktree = {
+      getDiffSummary: (_base: string, ref: string) =>
+        new Promise<DiffSummary>((resolve) => {
+          if (ref === "swarm/dyn/worker-1") {
+            resolveFirstDiff = resolve;
+          } else {
+            resolve({
+              baseBranch: "main",
+              branch: ref,
+              headSha: "abc1234",
+              commitsAhead: 0,
+              changedFiles: [],
+              stat: "",
+              diff: "",
+            });
+          }
+        }),
+    } as unknown as IWorktreeManager;
+
+    let closed = false;
+    await openSwarmOverlay(
+      {
+        mode: "tui",
+        hasUI: true,
+        ui: {
+          theme,
+          notify() {},
+          async custom<T>(
+            factory: (
+              t: TUI,
+              th: Theme,
+              kb: unknown,
+              done: (r: T) => void,
+            ) => Component & { dispose?(): void },
+          ): Promise<T> {
+            return new Promise<T>((resolve) => {
+              const comp = factory(tui, theme, {}, (val) => {
+                closed = true;
+                resolve(val);
+              });
+              if (isFocusable(comp)) comp.focused = true;
+              void (async () => {
+                await flushAsync();
+                assert.equal(readBoardCalls, 1);
+
+                // Subsequent subscribe ticks at same boardHead=10 must NOT trigger repeated refreshFullBoard loops
+                for (const fn of listeners) {
+                  fn({
+                    type: "snapshot_changed",
+                    runId: snap.run!.id,
+                    summary: "tick",
+                    snapshot: snap,
+                  });
+                }
+                await flushAsync();
+                assert.equal(
+                  readBoardCalls,
+                  1,
+                  "Empty read must not cause infinite refreshFullBoard loop",
+                );
+
+                // Tab bar at 40 and 60 cols keeps all 4 tabs visible without clipping [4]Find
+                const at40 = stripTerminalSequences(comp.render(40).join("\n"));
+                assert.match(at40, /\[1\]Brd/);
+                assert.match(at40, /\[4\]Find/);
+                const at60 = stripTerminalSequences(comp.render(60).join("\n"));
+                assert.match(at60, /\[4\]Find/);
+
+                // modifyOtherKeys Tab sequence switches to Members tab via isTabKey
+                comp.handleInput?.("\x1b[27;1;9~");
+                const memView = stripTerminalSequences(comp.render(80).join("\n"));
+                assert.match(memView, /\[2\] Members/);
+
+                // Start diff load for worker-1, then switch to next member mid-load; resolving stale diff must not clobber
+                comp.handleInput?.("d");
+                comp.handleInput?.("\x1b[B"); // Down to next member -> bumps diffRequestId
+                resolveFirstDiff?.({
+                  baseBranch: "main",
+                  branch: "swarm/dyn/worker-1",
+                  headSha: "abc1234",
+                  commitsAhead: 1,
+                  changedFiles: ["stale.ts"],
+                  stat: "",
+                  diff: "+stale",
+                });
+                await flushAsync();
+                const afterSwitch = stripTerminalSequences(comp.render(80).join("\n"));
+                assert.ok(!afterSwitch.includes("stale.ts"));
+
+                // Inline [m] on waiting member passes deferIfWorking: true
+                comp.handleInput?.("\x1b[A"); // back to worker-1
+                snap.run!.members["worker-1"]!.state = "waiting";
+                comp.handleInput?.("m");
+                for (const ch of "openai/gpt-5:high") comp.handleInput?.(ch);
+                comp.handleInput?.("\r");
+                await flushAsync();
+                assert.equal(switchCalls.length, 1);
+                assert.equal(switchCalls[0]!.deferIfWorking, true);
+                const afterSwitchMsg = stripTerminalSequences(comp.render(80).join("\n"));
+                assert.match(afterSwitchMsg, /Queued switch for worker-1/);
+
+                comp.handleInput?.("q");
+              })();
+            });
+          },
+        },
+      } as unknown as ExtensionContext,
+      fakeEngine,
+      fakeWorktree,
+    );
+    assert.equal(closed, true);
   });
 });

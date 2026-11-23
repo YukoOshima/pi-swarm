@@ -127,6 +127,7 @@ async function loadCachedLedger(eventsPath: string): Promise<{
       existing.size === st.size &&
       existing.mtimeMs === st.mtimeMs
     ) {
+      setLedgerCacheEntry(key, existing);
       return {
         events: existing.events,
         lastSeq: existing.lastSeq,
@@ -166,12 +167,16 @@ async function loadCachedLedger(eventsPath: string): Promise<{
 
       if (bytesRead === delta) {
         const appended = parseEventLines(tailText);
-        if (appended.length > 0) {
-          existing.events.push(...appended);
-        }
+        const nextEvents =
+          appended.length > 0
+            ? [...existing.events, ...appended]
+            : existing.events;
         const lastSeq =
           appended.length > 0
-            ? computeLastSeq(appended, existing.events.length - appended.length)
+            ? Math.max(
+                existing.lastSeq,
+                computeLastSeq(appended, existing.events.length),
+              )
             : existing.lastSeq;
         const endsWithNewline =
           tailText.length === 0 ? existing.endsWithNewline : tailText.endsWith("\n");
@@ -181,9 +186,9 @@ async function loadCachedLedger(eventsPath: string): Promise<{
           mtimeMs: st.mtimeMs,
           lastSeq,
           endsWithNewline,
-          events: existing.events,
+          events: nextEvents,
         });
-        return { events: existing.events, lastSeq, endsWithNewline, size: st.size };
+        return { events: nextEvents, lastSeq, endsWithNewline, size: st.size };
       }
     }
 
@@ -252,14 +257,14 @@ export async function appendLedgerEvent(
       const stAfter = await lstat(key);
       const expectedSize = prevSize + Buffer.byteLength(fullPayload, "utf8");
       if (stAfter.size === expectedSize) {
-        existingEvents.push(event);
+        const nextEvents = [...existingEvents, event];
         setLedgerCacheEntry(key, {
           ino: stAfter.ino,
           size: stAfter.size,
           mtimeMs: stAfter.mtimeMs,
           lastSeq: nextSeq,
           endsWithNewline: true,
-          events: existingEvents,
+          events: nextEvents,
         });
       } else {
         ledgerCache.delete(key);
@@ -284,14 +289,18 @@ export async function readRecentLedgerEvents(
   eventsPath: string,
   limit = 50,
 ): Promise<SwarmEvent[]> {
-  if (limit <= 0) {
+  const normalizedLimit =
+    typeof limit === "number" && Number.isFinite(limit)
+      ? Math.floor(limit)
+      : 50;
+  if (normalizedLimit <= 0) {
     return [];
   }
   const { events } = await loadCachedLedger(eventsPath);
-  if (events.length <= limit) {
+  if (events.length <= normalizedLimit) {
     return [...events];
   }
-  return events.slice(events.length - limit);
+  return events.slice(events.length - normalizedLimit);
 }
 
 function formatShortTime(isoTimestamp: string): string {

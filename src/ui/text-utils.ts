@@ -740,7 +740,10 @@ export function decodeModifyOtherKeysPrintable(data: string): string | undefined
   if (!m) return undefined;
   const mod = Number.parseInt(m[1]!, 10);
   const cp = Number.parseInt(m[2]!, 10);
-  if (mod !== 1 && mod !== 2) return undefined;
+  if (!Number.isFinite(mod) || mod < 1) return undefined;
+  // Mask out CapsLock (64) and NumLock (128) modifier bits.
+  const effective = (mod - 1) & ~192;
+  if (effective !== 0 && effective !== 1) return undefined;
   if (!Number.isFinite(cp) || cp < 0x20 || cp === 0x7f || cp > 0x10ffff) {
     return undefined;
   }
@@ -774,25 +777,39 @@ export function normalizeEditorInput(data: string): string {
 
 export class HardwareCursorController {
   private prev: boolean | null = null;
+  private enabled = false;
 
   sync(tui: TUI | undefined, show: boolean): void {
     if (!tui || typeof tui.setShowHardwareCursor !== "function") {
       return;
     }
-    if (this.prev !== show) {
-      this.prev = show;
-      tui.setShowHardwareCursor(show);
+    if (this.prev === null && !show) {
+      return;
+    }
+    if (show) {
+      if (!this.enabled) {
+        this.prev =
+          typeof tui.getShowHardwareCursor === "function"
+            ? Boolean(tui.getShowHardwareCursor())
+            : false;
+        this.enabled = true;
+        tui.setShowHardwareCursor(true);
+      }
+      return;
+    }
+    if (this.enabled) {
+      const prior = this.prev ?? false;
+      this.enabled = false;
+      this.prev = null;
+      tui.setShowHardwareCursor(prior);
     }
   }
 
   restore(tui: TUI | undefined): void {
-    if (!tui || typeof tui.setShowHardwareCursor !== "function") {
-      this.prev = null;
-      return;
+    if (this.enabled && tui && typeof tui.setShowHardwareCursor === "function") {
+      tui.setShowHardwareCursor(this.prev ?? false);
     }
-    if (this.prev === true) {
-      tui.setShowHardwareCursor(false);
-    }
+    this.enabled = false;
     this.prev = null;
   }
 }

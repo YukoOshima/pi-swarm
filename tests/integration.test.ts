@@ -3463,4 +3463,284 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     await s3.executeTool(SWARM_TOOL, { action: "done", summary: "Resumed and completed" });
     await s3.emit("session_shutdown", { reason: "quit" });
   });
+
+  it("13. v0.5.1: persists resume ownership, clears active draft on resume, restores/clears thinking, wakes crash-recovered active runs, releases on session_start switch, and supports effort-only orchestrator switch", async () => {
+    const repoDir = await createTempGitRepo("v051-resume-ownership");
+    tempDirs.push(repoDir);
+    const store = new SwarmStore(repoDir);
+
+    const makeTransport = (): ISwarmTransport => ({
+      async listAvailableModels() {
+        return DEFAULT_TEST_MODELS.map((m) => ({
+          id: m.id,
+          provider: m.provider,
+          fullId: `${m.provider}/${m.id}`,
+          name: m.name,
+        }));
+      },
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        const tracker = createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async () => ({
+            agentId: request.agentId,
+            name: request.name,
+            role: request.role,
+            outcome: "waiting",
+            summary: `${request.name} ready`,
+            tokens: 10,
+            cost: 0.0001,
+          }),
+        });
+        return tracker.handle;
+      },
+    });
+
+    // Seed a paused run owned by a dead PID with orchestrator model (no thinkingLevel -> must clear host thinking!)
+    const deadRun = await store.createRun({
+      title: "Dead PID Run",
+      objective: "Verify ownership claim and clearThinking",
+      strategy: "Single worker",
+      acceptanceCriteria: "Tests green",
+      baseBranch: "main",
+      ownerSessionId: "dead-sess-1",
+      ownerPid: 999999,
+      maxConcurrency: 4,
+      validatorEnabled: true,
+      roleModels: {
+        orchestrator: { model: "anthropic/claude-opus-4-6" },
+      },
+    });
+    await store.updateRun(deadRun.id, { status: "paused", actor: "human" });
+
+    // Session A starts with an active draft and host thinking="high", then runs `/swarm resume`
+    const sA = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-a-v051",
+      initialHostModel: DEFAULT_TEST_MODELS[2],
+    });
+    sA.pi.setThinkingLevel("high");
+    sA.thinkingLevelCalls.length = 0;
+    createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsLoader: async () => ({ ...DEFAULT_SWARM_SETTINGS, stallWatchdogEnabled: false }),
+    })(sA.pi);
+
+    await sA.emit("session_start", { reason: "startup" });
+    await sA.runCommand("swarm", "New unrelated goal draft");
+    assert.ok(sA.pi.getActiveTools().includes(PROPOSE_SWARM_PLAN_TOOL));
+
+    await sA.runCommand("swarm", `resume ${deadRun.id}`);
+    // 1. Dead-PID ownership must be persisted with current sessionId + process.pid
+    const claimed = await store.loadRun(deadRun.id);
+    assert.equal(claimed.ownerSessionId, "sess-a-v051");
+    assert.equal(claimed.ownerPid, process.pid);
+
+    // 2. Active planning draft must be cleared so "running" tools + wakeup turn fire cleanly
+    assert.ok(!sA.pi.getActiveTools().includes(PROPOSE_SWARM_PLAN_TOOL));
+    assert.ok(sA.pi.getActiveTools().includes(POST_MESSAGE_TOOL));
+    await waitFor(
+      () => sA.sentMessages.some((m) => m.options?.triggerTurn === true),
+      2000,
+    );
+
+    // 3. Orchestrator model applied with clearThinking=true (restores host default "medium")
+    assert.ok(
+      sA.setModelCalls.some((m) => `${m.provider}/${m.id}` === "anthropic/claude-opus-4-6"),
+    );
+    assert.ok(sA.thinkingLevelCalls.includes("medium"));
+
+    // 4. Effort-only orchestrator switch on Inherit (unset orchestratorModel) updates thinking cleanly
+    const switchRes = await sA.executeTool(SWARM_TOOL, {
+      action: "model",
+      thinking_level: "xhigh",
+      reason: "Deep analysis",
+    });
+    assert.equal(switchRes.isError, undefined);
+    assert.ok(sA.thinkingLevelCalls.includes("xhigh"));
+    assert.match(String(switchRes.content[0].text), /xhigh/);
+
+    // 5. In-process session_start (reason: "new") without prior session_shutdown releases ownership
+    (sA.ctx.sessionManager as { getSessionId: () => string }).getSessionId = () => "sess-b-v051";
+    sA.branch.length = 0; // `/new` starts with a fresh empty session branch
+    await sA.emit("session_start", { reason: "new" });
+    const afterSwitch = await store.loadRun(deadRun.id);
+    assert.equal(afterSwitch.ownerPid, 0, "session_start switch must release previous run ownership before disposeRuntime");
+
+    // New session in same process can now resume without OWNERSHIP_CONFLICT
+    await sA.runCommand("swarm", `resume --quiet ${deadRun.id}`);
+    const afterNewResume = await store.loadRun(deadRun.id);
+    assert.equal(afterNewResume.ownerSessionId, "sess-b-v051");
+    assert.equal(afterNewResume.ownerPid, process.pid);
+
+    // 6. Crash-recovered focused `active` run with 0 live turns wakes Orchestrator on `/swarm resume`
+    await sA.emit("session_shutdown", { reason: "quit" });
+    await store.updateRun(deadRun.id, {
+      status: "active",
+      ownerSessionId: "crashed-sess-v051",
+      ownerPid: 999999,
+      roleModels: {
+        orchestrator: { thinkingLevel: "high" }, // thinking-only Inherit orchestrator config
+      },
+    });
+    const sCrash = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-crash-recover-v051",
+    });
+    sCrash.branch.push(...sA.branch);
+    createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsLoader: async () => ({ ...DEFAULT_SWARM_SETTINGS, stallWatchdogEnabled: false }),
+    })(sCrash.pi);
+    await sCrash.emit("session_start", { reason: "resume" });
+    // After crash recovery, focused run is active & owned, but not yet activated in this process
+    assert.equal(sCrash.sentMessages.filter((m) => m.options?.triggerTurn === true).length, 0);
+    await sCrash.runCommand("swarm", "resume");
+    await waitFor(
+      () => sCrash.sentMessages.some((m) => m.options?.triggerTurn === true),
+      2000,
+    );
+    assert.ok(
+      sCrash.thinkingLevelCalls.includes("high"),
+      "Crash-recovered resume must apply thinking-only Inherit orchestrator config",
+    );
+    await sCrash.executeTool(SWARM_TOOL, { action: "done", summary: "Crash recovery done" });
+    await sCrash.emit("session_shutdown", { reason: "quit" });
+  });
+
+  it("14. v0.5.1: foreign focus/fork never corrupts working members, live-owned runs stay hidden in startup/completions, input skips / and ! commands, model completions handle --global, and tweak guards non-tweak drafts", async () => {
+    const repoDir = await createTempGitRepo("v051-focus-guard");
+    tempDirs.push(repoDir);
+    const store = new SwarmStore(repoDir);
+
+    let workerGateResolve!: () => void;
+    const workerGate = new Promise<void>((r) => {
+      workerGateResolve = r;
+    });
+
+    const makeTransport = (): ISwarmTransport => ({
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        const tracker = createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async () => {
+            await workerGate;
+            return {
+              agentId: request.agentId,
+              name: request.name,
+              role: request.role,
+              outcome: "waiting",
+              summary: "done",
+              tokens: 5,
+              cost: 0.0001,
+            };
+          },
+        });
+        return tracker.handle;
+      },
+    });
+
+    const owner = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "owner-live-v051",
+    });
+    createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsLoader: async () => ({ ...DEFAULT_SWARM_SETTINGS, stallWatchdogEnabled: false }),
+    })(owner.pi);
+    await owner.emit("session_start", { reason: "startup" });
+    await owner.runCommand("swarm-direct", "Keep worker working");
+    await owner.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Live Worker Run",
+      objective: "Verify foreign focus/fork safety",
+      strategy: "Single working worker",
+      acceptance_criteria: "No corruption",
+      base_branch: "main",
+      initial_members: [
+        {
+          name: "worker-live",
+          role: "worker",
+          workspace: "inherit",
+          brief: "Hold working state",
+        },
+      ],
+    });
+    await waitFor(async () => {
+      const runs = await store.listRuns();
+      return runs.length === 1 && runs[0]!.workingCount === 1;
+    });
+    const liveRunId = (await store.listRuns())[0]!.id;
+
+    // 1. Foreign session startup does NOT advertise live-owned run, and completions exclude it
+    const observer = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "observer-live-v051",
+    });
+    createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsLoader: async () => ({ ...DEFAULT_SWARM_SETTINGS, stallWatchdogEnabled: false }),
+    })(observer.pi);
+    await observer.emit("session_start", { reason: "startup" });
+    assert.ok(
+      !observer.notifications.some((n) => /Unfinished Swarm Mission/i.test(n.message)),
+      "Startup must not advertise runs live-owned by another session",
+    );
+    const resumeCompletions = (await observer.commands
+      .get("swarm")
+      ?.getArgumentCompletions?.("resume ")) as Array<{ value: string }> | null;
+    assert.ok(
+      !(resumeCompletions ?? []).some((c) => c.value.includes(liveRunId)),
+      "Resume completions must exclude runs live-owned by another session",
+    );
+
+    // 2. Foreign `/swarm focus <liveRunId>` keeps `worker-live` in state === "working" on disk!
+    await observer.runCommand("swarm", `focus ${liveRunId}`);
+    const afterObserverFocus = await store.loadRun(liveRunId);
+    assert.equal(
+      afterObserverFocus.members["worker-live"]?.state,
+      "working",
+      "Foreign focus must never overwrite owner's working member to stopped",
+    );
+    assert.ok(!observer.pi.getActiveTools().includes(POST_MESSAGE_TOOL));
+
+    // 3. Built-in `/` and `!` commands do not set userPromptPreflight or latestHumanDirection
+    owner.setIdle(true);
+    await owner.emit("input", { source: "interactive", text: "/compact" });
+    await owner.emit("input", { source: "interactive", text: "!git status" });
+    const preflightSections: Record<string, string> = {};
+    await owner.emit("before_agent_start", {
+      messageType: "user",
+      prompt: "Continue",
+      systemPromptOptions: { sections: preflightSections },
+    });
+    assert.ok(!(preflightSections.swarm_state ?? "").includes("Live User Direction Update"));
+
+    // 4. `getSwarmCompletions` handles `--global` before target in `/swarm model --global `
+    const modelCompletions = (await owner.commands
+      .get("swarm")
+      ?.getArgumentCompletions?.("model --global w")) as Array<{ value: string; label: string }> | null;
+    assert.ok(
+      (modelCompletions ?? []).some((c) => c.label === "worker" && c.value === "model --global worker"),
+      "model completions must preserve --global and complete role target",
+    );
+
+    // 5. `/swarm tweak` resuming an existing non-tweak "swarm" draft sends a "swarm" prompt (not "tweak")
+    await owner.runCommand("swarm", "New feature draft");
+    owner.sentUserMessages.length = 0;
+    owner.setSelectHandler((_title, choices) =>
+      choices.find((c) => /Resume/i.test(c)) ?? choices[0],
+    );
+    await owner.runCommand("swarm", "tweak Modify live run");
+    assert.ok(
+      owner.sentUserMessages.some((m) => String(m.content).includes('mode="swarm"')),
+      "Resuming a non-tweak draft inside /swarm tweak must keep mode=swarm",
+    );
+    assert.ok(
+      !owner.sentUserMessages.some((m) => String(m.content).includes('mode="tweak"')),
+    );
+    await owner.runCommand("swarm", "cancel"); // cancel active draft cleanly
+
+    workerGateResolve();
+    await owner.executeTool(SWARM_TOOL, { action: "done", summary: "Verified v0.5.1" });
+    await observer.emit("session_shutdown", { reason: "quit" });
+    await owner.emit("session_shutdown", { reason: "quit" });
+  });
 });

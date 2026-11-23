@@ -220,11 +220,24 @@ export class WorktreeManager implements IWorktreeManager {
     }
   }
 
+  private setIdentityOverrideCacheEntry(key: string, args: string[]): void {
+    if (this.identityOverrideCache.has(key)) {
+      this.identityOverrideCache.delete(key);
+    } else if (this.identityOverrideCache.size >= 32) {
+      const oldest = this.identityOverrideCache.keys().next().value;
+      if (oldest !== undefined) {
+        this.identityOverrideCache.delete(oldest);
+      }
+    }
+    this.identityOverrideCache.set(key, args);
+  }
+
   private async getIdentityOverrideArgs(cwd: string): Promise<string[]> {
     const cacheKey = path.resolve(cwd);
     const cached = this.identityOverrideCache.get(cacheKey);
     if (cached) {
-      return cached;
+      this.setIdentityOverrideCacheEntry(cacheKey, cached);
+      return [...cached];
     }
     const [nameRes, emailRes] = await Promise.all([
       this.runGit(["config", "--get", "user.name"], {
@@ -243,8 +256,8 @@ export class WorktreeManager implements IWorktreeManager {
     if (!emailRes.ok || !emailRes.stdout.trim()) {
       extra.push("-c", "user.email=pi-swarm@local");
     }
-    this.identityOverrideCache.set(cacheKey, extra);
-    return extra;
+    this.setIdentityOverrideCacheEntry(cacheKey, extra);
+    return [...extra];
   }
 
   private async branchExists(branch: string, cwd?: string): Promise<boolean> {
@@ -270,12 +283,39 @@ export class WorktreeManager implements IWorktreeManager {
    * isolated `branch` clones have their own standalone `.git` directory.
    */
   private async isIsolatedClone(dirPath: string): Promise<boolean> {
+    const resolved = path.resolve(dirPath);
+    if (resolved === this.repoRoot) {
+      return false;
+    }
     try {
-      const st = await lstat(path.join(path.resolve(dirPath), ".git"));
+      const [realTarget, realRepo] = await Promise.all([
+        realpath(resolved).catch(() => resolved),
+        realpath(this.repoRoot).catch(() => this.repoRoot),
+      ]);
+      if (realTarget === realRepo) {
+        return false;
+      }
+      const st = await lstat(path.join(resolved, ".git"));
       return st.isDirectory();
     } catch {
       return false;
     }
+  }
+
+  private async fetchBaseBranchForClone(
+    cloneCwd: string,
+    baseBranch: string,
+  ): Promise<string> {
+    const refspec = `+refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`;
+    const repoRes = await this.runGit(["fetch", this.repoRoot, refspec], {
+      cwd: cloneCwd,
+      allowFailure: true,
+    });
+    if (repoRes.ok) {
+      return `origin/${baseBranch}`;
+    }
+    await this.runGit(["fetch", "origin", refspec], { cwd: cloneCwd });
+    return `origin/${baseBranch}`;
   }
 
   private async ensureSwarmExcluded(effectiveRepoRoot: string): Promise<void> {
@@ -739,6 +779,8 @@ export class WorktreeManager implements IWorktreeManager {
       );
     }
 
+    this.identityOverrideCache.delete(resolvedWorktree);
+
     if (await this.isIsolatedClone(resolvedWorktree)) {
       await removeDirectoryWithRetry(resolvedWorktree);
       await rmdir(path.dirname(resolvedWorktree)).catch(() => {});
@@ -782,13 +824,11 @@ export class WorktreeManager implements IWorktreeManager {
     return Number.isFinite(parsed) ? parsed : 0;
   }
 
-  async getChangedFiles(
+  private async getCommittedChangedFiles(
     baseBranch: string,
     targetRef: string,
     cwd?: string,
   ): Promise<string[]> {
-    const files = new Set<string>();
-
     // Committed changes between merge-base(baseBranch, targetRef) and targetRef.
     const diffRes = await this.runGit(
       ["diff", "--name-only", `${baseBranch}...${targetRef}`],
@@ -803,37 +843,54 @@ export class WorktreeManager implements IWorktreeManager {
           )
         ).stdout;
 
+    const files: string[] = [];
     for (const rawLine of committedOutput.split(/\r?\n/)) {
       const normalized = normalizeRelativeRepoPath(rawLine);
       if (normalized) {
-        files.add(normalized);
+        files.push(normalized);
       }
     }
+    return files;
+  }
 
-    // When inspecting an explicit worktree directory at HEAD (or its checked-out branch),
-    // also include uncommitted modified/staged/untracked files.
-    if (cwd) {
-      let includeWorkingTree = targetRef === "HEAD";
-      if (!includeWorkingTree) {
-        const currentBranch = await this.getCurrentBranch(cwd).catch(() => "");
-        if (currentBranch && currentBranch === targetRef) {
-          includeWorkingTree = true;
-        }
-      }
-      if (includeWorkingTree) {
-        const statusRes = await this.runGit(
-          ["status", "--porcelain=v1", "-z", "-uall"],
-          { cwd, allowFailure: true },
-        );
-        if (statusRes.ok && statusRes.stdout.length > 0) {
-          for (const dirtyPath of parsePorcelainZPaths(statusRes.stdout)) {
-            files.add(dirtyPath);
-          }
-        }
-      }
+  private async isWorkingTreeTarget(
+    targetRef: string,
+    cwd?: string,
+  ): Promise<boolean> {
+    if (!cwd) {
+      return false;
     }
+    if (targetRef === "HEAD") {
+      return true;
+    }
+    const currentBranch = await this.getCurrentBranch(cwd).catch(() => "");
+    return Boolean(currentBranch && currentBranch === targetRef);
+  }
 
-    return [...files].sort();
+  private async getDirtyWorkingTreeFiles(cwd: string): Promise<string[]> {
+    const statusRes = await this.runGit(
+      ["status", "--porcelain=v1", "-z", "-uall"],
+      { cwd, allowFailure: true },
+    );
+    return statusRes.ok && statusRes.stdout.length > 0
+      ? parsePorcelainZPaths(statusRes.stdout)
+      : [];
+  }
+
+  async getChangedFiles(
+    baseBranch: string,
+    targetRef: string,
+    cwd?: string,
+  ): Promise<string[]> {
+    const includeWorkingTreePromise = this.isWorkingTreeTarget(targetRef, cwd);
+    const [committedFiles, dirtyFiles] = await Promise.all([
+      this.getCommittedChangedFiles(baseBranch, targetRef, cwd),
+      includeWorkingTreePromise.then((includeWT) =>
+        cwd && includeWT ? this.getDirtyWorkingTreeFiles(cwd) : [],
+      ),
+    ]);
+
+    return [...new Set([...committedFiles, ...dirtyFiles])].sort();
   }
 
   async isWorktreeDirty(worktreePath: string): Promise<boolean> {
@@ -914,13 +971,7 @@ export class WorktreeManager implements IWorktreeManager {
 
     let rebaseTarget = baseBranch;
     if (await this.isIsolatedClone(resolved)) {
-      const fetchRes = await this.runGit(
-        ["fetch", "origin", `+refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`],
-        { cwd: resolved, allowFailure: true },
-      );
-      if (fetchRes.ok) {
-        rebaseTarget = `origin/${baseBranch}`;
-      }
+      rebaseTarget = await this.fetchBaseBranchForClone(resolved, baseBranch);
     }
 
     // Check if rebaseTarget is already an ancestor of HEAD.
@@ -1114,58 +1165,62 @@ export class WorktreeManager implements IWorktreeManager {
     options?: { maxDiffBytes?: number; cwd?: string },
   ): Promise<DiffSummary> {
     const requestedCwd = options?.cwd ? path.resolve(options.cwd) : undefined;
-    const cwd =
-      requestedCwd && (await pathExists(requestedCwd)) ? requestedCwd : undefined;
+    let cwd: string | undefined;
+    if (requestedCwd) {
+      if (await pathExists(requestedCwd)) {
+        cwd = requestedCwd;
+      } else if (/^(?:HEAD(?:[~^].*)?|@)$/.test(targetRef.trim())) {
+        throw new SwarmProtocolError(
+          "NOT_FOUND",
+          `Worktree directory "${requestedCwd}" does not exist.`,
+          { cwd: requestedCwd, targetRef },
+        );
+      }
+    }
     const maxDiffBytes = options?.maxDiffBytes ?? SWARM_MAX_DIFF_BYTES;
 
     let compareBase = baseBranch;
     if (cwd && (await this.isIsolatedClone(cwd))) {
-      const fetchRes = await this.runGit(
-        ["fetch", "origin", `+refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`],
-        { cwd, allowFailure: true },
-      );
-      if (fetchRes.ok) {
-        compareBase = `origin/${baseBranch}`;
-      }
+      compareBase = await this.fetchBaseBranchForClone(cwd, baseBranch);
     }
 
-    const headSha = (
-      await this.runGit(["rev-parse", targetRef], { cwd })
-    ).stdout.trim();
-    const commitsAhead = await this.getCommitCountAhead(
-      compareBase,
-      targetRef,
-      cwd,
-    );
-    const changedFiles = await this.getChangedFiles(compareBase, targetRef, cwd);
-
-    let diffRange = `${compareBase}...${targetRef}`;
-    if (cwd) {
-      const currentBranch = await this.getCurrentBranch(cwd).catch(() => "");
-      if (targetRef === "HEAD" || (currentBranch && currentBranch === targetRef)) {
-        const mbRes = await this.runGit(["merge-base", compareBase, "HEAD"], {
-          cwd,
-          allowFailure: true,
-        });
-        diffRange =
-          mbRes.ok && mbRes.stdout.trim() ? mbRes.stdout.trim() : compareBase;
+    const includeWorkingTreePromise = this.isWorkingTreeTarget(targetRef, cwd);
+    const diffRangePromise = includeWorkingTreePromise.then(async (includeWT) => {
+      if (!cwd || !includeWT) {
+        return `${compareBase}...${targetRef}`;
       }
-    }
+      const mbRes = await this.runGit(["merge-base", compareBase, "HEAD"], {
+        cwd,
+        allowFailure: true,
+      });
+      return mbRes.ok && mbRes.stdout.trim()
+        ? mbRes.stdout.trim()
+        : compareBase;
+    });
 
-    const statRes = await this.runGit(
-      ["diff", "--stat", diffRange],
-      { cwd, allowFailure: true },
-    );
-    const stat = (statRes.ok ? statRes.stdout : "").trim();
+    const [headShaRes, commitsAhead, committedFiles, dirtyFiles, diffRange] =
+      await Promise.all([
+        this.runGit(["rev-parse", targetRef], { cwd }),
+        this.getCommitCountAhead(compareBase, targetRef, cwd),
+        this.getCommittedChangedFiles(compareBase, targetRef, cwd),
+        includeWorkingTreePromise.then((includeWT) =>
+          cwd && includeWT ? this.getDirtyWorkingTreeFiles(cwd) : [],
+        ),
+        diffRangePromise,
+      ]);
 
-    const diffRes = await this.runGit(
-      ["diff", diffRange],
-      {
+    const [statRes, diffRes] = await Promise.all([
+      this.runGit(["diff", "--stat", diffRange], { cwd, allowFailure: true }),
+      this.runGit(["diff", diffRange], {
         cwd,
         allowFailure: true,
         maxBuffer: Math.max(maxDiffBytes * 2, DEFAULT_MAX_BUFFER),
-      },
-    );
+      }),
+    ]);
+
+    const headSha = headShaRes.stdout.trim();
+    const changedFiles = [...new Set([...committedFiles, ...dirtyFiles])].sort();
+    const stat = (statRes.ok ? statRes.stdout : "").trim();
     const rawDiff = diffRes.ok ? diffRes.stdout : "";
     const diff = truncateUtf8Bytes(rawDiff, maxDiffBytes);
 
@@ -1270,7 +1325,7 @@ export class WorktreeManager implements IWorktreeManager {
         }
 
         // Deregister worktree BEFORE any branch operations.
-        await this.removeWorktree(resolvedPath, { force: true });
+        await this.removeWorktree(resolvedPath, { force });
 
         if (deleteBranches && target.branch) {
           const delRes = await this.runGit(
@@ -1299,6 +1354,21 @@ export class WorktreeManager implements IWorktreeManager {
           ...(dirty && force ? { reason: "Force-removed dirty worktree" } : {}),
         });
       } catch (err) {
+        if (
+          err instanceof SwarmProtocolError &&
+          err.code === "DIRTY_WORKTREE" &&
+          !force
+        ) {
+          skipped.push({
+            memberName: target.memberName,
+            worktreePath: resolvedPath,
+            branch: target.branch,
+            action: "skipped_dirty",
+            reason:
+              "Worktree has uncommitted changes; preserved to avoid data loss.",
+          });
+          continue;
+        }
         errors.push({
           memberName: target.memberName,
           worktreePath: resolvedPath,

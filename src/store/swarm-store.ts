@@ -590,7 +590,7 @@ interface RunStateCacheEntry {
   size: number;
   mtimeMs: number;
   state: SwarmRunState;
-  lastRosterBody?: string;
+  lastCanonicalRosterBody?: string;
 }
 
 export interface SwarmStoreOptions {
@@ -825,7 +825,11 @@ export class SwarmStore implements ISwarmStore {
       try {
         const reapStat = await lstat(reapPath);
         if (reapStat.isSymbolicLink()) {
-          return false;
+          throw new SwarmProtocolError(
+            "PERMISSION_DENIED",
+            `Refusing to use symlinked reap lock file: ${reapPath}`,
+            { lockPath: reapPath },
+          );
         }
         let reapInfo: Partial<LockFilePayload> = {};
         let reapParsed = false;
@@ -848,8 +852,14 @@ export class SwarmStore implements ISwarmStore {
 
         if (isReapStale) {
           const confirmStat = await lstat(reapPath);
+          if (confirmStat.isSymbolicLink()) {
+            throw new SwarmProtocolError(
+              "PERMISSION_DENIED",
+              `Refusing to use symlinked reap lock file: ${reapPath}`,
+              { lockPath: reapPath },
+            );
+          }
           if (
-            !confirmStat.isSymbolicLink() &&
             confirmStat.ino === reapStat.ino &&
             confirmStat.dev === reapStat.dev
           ) {
@@ -877,7 +887,10 @@ export class SwarmStore implements ISwarmStore {
             }
           }
         }
-      } catch {
+      } catch (innerErr) {
+        if (innerErr instanceof SwarmProtocolError) {
+          throw innerErr;
+        }
         // Another recoverer just finished and removed the reap lock.
       }
       return false;
@@ -927,8 +940,25 @@ export class SwarmStore implements ISwarmStore {
         return false;
       }
 
+      // Confirm we still hold the .reap lock right before final lockPath verification and unlink.
+      try {
+        const reapCheck = await lstat(reapPath);
+        if (reapCheck.ino !== reapIno || reapCheck.dev !== reapDev) {
+          return false;
+        }
+      } catch {
+        return false;
+      }
+
       // Re-verify inode/dev and token (or size/mtime for 0-byte/unparsed locks) right before unlink so a concurrent release+reacquire is never deleted.
       const currentStat = await lstat(lockPath);
+      if (currentStat.isSymbolicLink()) {
+        throw new SwarmProtocolError(
+          "PERMISSION_DENIED",
+          `Refusing to use symlinked lock file: ${lockPath}`,
+          { lockPath },
+        );
+      }
       if (currentStat.ino !== st.ino || currentStat.dev !== st.dev) {
         return false;
       }
@@ -949,16 +979,6 @@ export class SwarmStore implements ISwarmStore {
         currentStat.size !== st.size ||
         currentStat.mtimeMs !== st.mtimeMs
       ) {
-        return false;
-      }
-
-      // Confirm we still hold the .reap lock right before unlinking lockPath.
-      try {
-        const reapCheck = await lstat(reapPath);
-        if (reapCheck.ino !== reapIno || reapCheck.dev !== reapDev) {
-          return false;
-        }
-      } catch {
         return false;
       }
 
@@ -1019,10 +1039,28 @@ export class SwarmStore implements ISwarmStore {
     }
   }
 
-  private async readStateUnlocked(runId: string): Promise<SwarmRunState> {
+  private setStateCacheEntry(runId: string, entry: RunStateCacheEntry): void {
+    if (this.stateCache.has(runId)) {
+      this.stateCache.delete(runId);
+    } else if (this.stateCache.size >= 32) {
+      const oldest = this.stateCache.keys().next().value;
+      if (oldest !== undefined) {
+        this.stateCache.delete(oldest);
+      }
+    }
+    this.stateCache.set(runId, entry);
+  }
+
+  private async readStateUnlocked(
+    runId: string,
+    options?: { runsRootVerified?: boolean },
+  ): Promise<SwarmRunState> {
     const safeRunId = validateSafeIdentifier(runId, "runId");
     const statePath = this.getStatePath(safeRunId);
-    await assertNoSymlinksWithin(this.projectRoot, statePath);
+    await assertNoSymlinksWithin(
+      options?.runsRootVerified ? this.runsRoot : this.projectRoot,
+      statePath,
+    );
     try {
       const st = await lstat(statePath);
       const cached = this.stateCache.get(safeRunId);
@@ -1032,10 +1070,19 @@ export class SwarmStore implements ISwarmStore {
         cached.size === st.size &&
         cached.mtimeMs === st.mtimeMs
       ) {
+        this.setStateCacheEntry(safeRunId, cached);
         return structuredClone(cached.state);
       }
 
-      const raw = await readFile(statePath, "utf8");
+      const handle = await open(statePath, "r");
+      let raw: string;
+      let actualStat: Awaited<ReturnType<typeof handle.stat>>;
+      try {
+        actualStat = await handle.stat();
+        raw = await handle.readFile("utf8");
+      } finally {
+        await handle.close().catch(() => {});
+      }
       const parsed = JSON.parse(raw) as SwarmRunState;
       if (
         !parsed ||
@@ -1049,16 +1096,12 @@ export class SwarmStore implements ISwarmStore {
           { runId: safeRunId },
         );
       }
-      const existingCached = this.stateCache.get(safeRunId);
       const backfilled = backfillRunState(parsed);
-      this.stateCache.set(safeRunId, {
-        ino: st.ino,
-        size: st.size,
-        mtimeMs: st.mtimeMs,
+      this.setStateCacheEntry(safeRunId, {
+        ino: actualStat.ino,
+        size: actualStat.size,
+        mtimeMs: actualStat.mtimeMs,
         state: structuredClone(backfilled),
-        ...(existingCached?.lastRosterBody !== undefined
-          ? { lastRosterBody: existingCached.lastRosterBody }
-          : {}),
       });
       return backfilled;
     } catch (err) {
@@ -1100,11 +1143,11 @@ export class SwarmStore implements ISwarmStore {
     );
     const json = `${JSON.stringify(state, null, 2)}\n`;
     const rosterBody = this.renderRosterMarkdown(state);
+    const canonicalRosterBody = canonicalizeRosterForDiff(rosterBody);
     const cached = this.stateCache.get(state.id);
     const shouldWriteRoster =
-      !cached?.lastRosterBody ||
-      canonicalizeRosterForDiff(rosterBody) !==
-        canonicalizeRosterForDiff(cached.lastRosterBody);
+      !cached?.lastCanonicalRosterBody ||
+      canonicalRosterBody !== cached.lastCanonicalRosterBody;
 
     await assertLeafNotSymlink(statePath);
     if (shouldWriteRoster) {
@@ -1119,12 +1162,14 @@ export class SwarmStore implements ISwarmStore {
     ]);
 
     const cachedState = structuredClone(state);
-    this.stateCache.set(state.id, {
+    this.setStateCacheEntry(state.id, {
       ino: stateStat.ino,
       size: stateStat.size,
       mtimeMs: stateStat.mtimeMs,
       state: cachedState,
-      lastRosterBody: shouldWriteRoster ? rosterBody : cached.lastRosterBody,
+      lastCanonicalRosterBody: shouldWriteRoster
+        ? canonicalRosterBody
+        : cached.lastCanonicalRosterBody,
     });
     return structuredClone(cachedState);
   }
@@ -1302,7 +1347,9 @@ export class SwarmStore implements ISwarmStore {
       while (cursor < validEntries.length) {
         const entry = validEntries[cursor++];
         try {
-          const state = await this.readStateUnlocked(entry);
+          const state = await this.readStateUnlocked(entry, {
+            runsRootVerified: true,
+          });
           const allMembers = Object.values(state.members);
           const workingCount = allMembers.filter(
             (m) => m.state === "working",

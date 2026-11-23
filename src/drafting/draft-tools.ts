@@ -1289,6 +1289,8 @@ export function createProposeSwarmPlanTool(
       );
       const refinedPlan: ProposedSwarmPlan = {
         ...proposedPlan,
+        roleModels:
+          outcome.roleModels ?? buildRoleModelsFromSettings(deps.getSettings()),
         validatorEnabled: refinedValidatorEnabled,
         maxConcurrency: refinedMaxConcurrency,
       };

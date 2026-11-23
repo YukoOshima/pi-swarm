@@ -9,7 +9,7 @@ import {
   matchesKey,
   type TUI,
 } from "@earendil-works/pi-tui";
-import { parseModelSpec } from "../store/settings.js";
+import { isProcessAlive, parseModelSpec } from "../store/index.js";
 import type {
   AvailableModelInfo,
   RoleModelOrigin,
@@ -117,6 +117,8 @@ export interface SwarmHubViewOptions {
   runs: readonly RunSummary[];
   availableModels: readonly AvailableModelInfo[];
   initialScope?: ModelSaveScope;
+  currentSessionId?: string;
+  activatedRun?: boolean;
   onApplyRole?: SwarmModelPickerViewOptions["onApplyRole"];
   onApplyFallbacks?: SwarmModelPickerViewOptions["onApplyFallbacks"];
   onComplete: (action: SwarmHubAction) => void;
@@ -1061,8 +1063,11 @@ export class SwarmModelPickerView implements Component, Focusable {
     const safeWidth = Math.max(1, Math.floor(width));
     const innerWidth = computeBoxInnerWidth(safeWidth);
     const maxRows = computeTerminalRows(this.tui);
-    const maxBoxLines = Math.max(10, Math.min(30, Math.floor(maxRows * 0.85)));
-    const maxInnerLines = Math.max(8, maxBoxLines - 2);
+    const maxBoxLines =
+      maxRows >= 10
+        ? Math.min(maxRows - 1, Math.max(9, Math.min(30, Math.floor(maxRows * 0.85))))
+        : Math.max(4, maxRows);
+    const maxInnerLines = Math.max(4, maxBoxLines - 2);
     const compact = innerWidth < 68;
     const ultraCompact = innerWidth < 46;
 
@@ -1167,7 +1172,7 @@ export class SwarmModelPickerView implements Component, Focusable {
         ),
       );
 
-      const effortViewport = Math.max(2, maxInnerLines - body.length - 2);
+      const effortViewport = Math.max(1, maxInnerLines - body.length - 2);
       let effStart = Math.max(
         0,
         this.effortIndex - Math.floor(effortViewport / 2),
@@ -1219,8 +1224,8 @@ export class SwarmModelPickerView implements Component, Focusable {
     body.push(renderedFilter);
     body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
 
-    const footerLinesCount = 2; // rule + key hint
-    const listViewport = Math.max(3, maxInnerLines - body.length - footerLinesCount);
+    const footerLinesCount = maxInnerLines - body.length >= 4 ? 2 : 1; // omit redundant rule on ultra-tight viewports
+    const listViewport = Math.max(1, maxInnerLines - body.length - footerLinesCount);
 
     if (this.rows.length === 0) {
       body.push(
@@ -1332,7 +1337,9 @@ export class SwarmModelPickerView implements Component, Focusable {
       }
     }
 
-    body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
+    if (footerLinesCount === 2) {
+      body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
+    }
     const hints =
       this.mode === "member"
         ? compact
@@ -1485,19 +1492,36 @@ export class SwarmHubView implements Component, Focusable {
   }
 
   private getResumableUnfinishedRun(): RunSummary | undefined {
-    if (this.snapshot.run) return undefined;
-    return this.runs.find((r) => r.status === "paused" || r.status === "active");
+    if (this.hasActiveOrPausedRun()) return undefined;
+    const sid = this.options.currentSessionId?.trim();
+    return this.runs.find((r) => {
+      if (r.status !== "paused" && r.status !== "active") return false;
+      if (
+        sid &&
+        r.ownerSessionId &&
+        r.ownerSessionId !== sid &&
+        r.ownerPid > 0 &&
+        isProcessAlive(r.ownerPid)
+      ) {
+        return false;
+      }
+      return true;
+    });
   }
 
   private rebuildMenu(): void {
     const run = this.snapshot.run;
     const items: HubMenuItem[] = [];
     if (run && this.hasActiveOrPausedRun()) {
+      const isCrashRecoveredUnstarted =
+        run.status === "active" &&
+        this.snapshot.workingMemberNames.length === 0 &&
+        this.options.activatedRun === false;
       items.push(
         { id: "ui", label: "🖥 Open Mission Control (4-Tab UI)" },
         { id: "models", label: "🎛 Configure Mission Models & Effort [Alt+M / ^M]" },
         { id: "tweak", label: "✏ Tweak Plan / Add Members" },
-        run.status === "paused"
+        run.status === "paused" || isCrashRecoveredUnstarted
           ? { id: "resume", label: "▶ Resume & Continue Mission", runId: run.id }
           : { id: "pause", label: "⏸ Pause Swarm" },
         { id: "done", label: "✓ Complete Swarm (/swarm done)" },
@@ -1792,11 +1816,12 @@ export class SwarmHubView implements Component, Focusable {
     const compact = innerWidth < 68;
     const body: string[] = [];
 
-    const maxBoxLines = Math.max(
-      10,
-      Math.min(30, Math.floor(computeTerminalRows(this.tui) * 0.85)),
-    );
-    const maxInner = Math.max(8, maxBoxLines - 2);
+    const termRows = computeTerminalRows(this.tui);
+    const maxBoxLines =
+      termRows >= 10
+        ? Math.min(termRows - 1, Math.max(9, Math.min(30, Math.floor(termRows * 0.85))))
+        : Math.max(4, termRows);
+    const maxInner = Math.max(4, maxBoxLines - 2);
     if (this.subView === "runs") {
       body.push(
         fitLine(
@@ -1807,7 +1832,7 @@ export class SwarmHubView implements Component, Focusable {
       body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
       const hasDetachRow = Boolean(this.snapshot.activeRunId);
       const totalRunRows = this.runs.length + (hasDetachRow ? 1 : 0);
-      const maxRows = Math.max(2, maxInner - body.length - 2);
+      const maxRows = Math.max(1, maxInner - body.length - 2);
       let runStart = Math.max(0, this.runSelectedIndex - Math.floor(maxRows / 2));
       if (runStart + maxRows > totalRunRows) {
         runStart = Math.max(0, totalRunRows - maxRows);
@@ -1951,7 +1976,8 @@ export class SwarmHubView implements Component, Focusable {
 
     body.push(renderHorizontalRule(innerWidth, "Actions", this.theme));
 
-    const menuViewport = Math.max(2, maxInner - body.length - 2);
+    const footerLines = maxInner - body.length >= 4 ? 2 : 1;
+    const menuViewport = Math.max(1, maxInner - body.length - footerLines);
     let menuStart = Math.max(0, this.selectedIndex - Math.floor(menuViewport / 2));
     if (menuStart + menuViewport > this.menuItems.length) {
       menuStart = Math.max(0, this.menuItems.length - menuViewport);
@@ -1969,7 +1995,9 @@ export class SwarmHubView implements Component, Focusable {
       body.push(fitLine(`${ptr}${num}${label}`, innerWidth));
     }
 
-    body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
+    if (footerLines === 2) {
+      body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
+    }
     const hint = this.hasActiveOrPausedRun()
       ? compact
         ? "↑↓/jk Select · Enter · Alt+M/^M Models · Esc"

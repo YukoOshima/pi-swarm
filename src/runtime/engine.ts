@@ -257,6 +257,21 @@ function mergeTokenBreakdown(
   };
 }
 
+function maxTokenBreakdown(
+  a: TokenUsage | undefined,
+  b: TokenUsage | undefined,
+): TokenUsage | undefined {
+  if (!a) return b ? { ...b } : undefined;
+  if (!b) return { ...a };
+  return {
+    input: Math.max(a.input, b.input),
+    output: Math.max(a.output, b.output),
+    cacheRead: Math.max(a.cacheRead, b.cacheRead),
+    cacheWrite: Math.max(a.cacheWrite, b.cacheWrite),
+    total: Math.max(a.total, b.total),
+  };
+}
+
 function sanitizeStallMentionsText(
   text: string,
   allowedMentions: readonly string[],
@@ -323,6 +338,8 @@ interface LiveMember {
     callerName: string;
     callerRole: CallerRole;
     autoResume?: boolean;
+    silentBoardNotice?: boolean;
+    fromRolePropagation?: boolean;
   };
   /** AbortController for cancelling in-flight concurrency/backoff waits on stop/kill/dispose. */
   launchAbort?: AbortController;
@@ -340,6 +357,14 @@ interface LiveMember {
   priorHandlesBreakdown?: TokenUsage;
   /** Cumulative cost persisted from previous handles before revival. */
   priorHandlesCost: number;
+  /** Monotonic live total tokens observed via telemetry/turn completion (survives cache refreshes). */
+  liveTokens?: number;
+  /** Monotonic live token breakdown observed via telemetry/turn completion. */
+  liveTokenBreakdown?: TokenUsage;
+  /** Monotonic live cost observed via telemetry/turn completion (survives cache refreshes). */
+  liveCost?: number;
+  /** Monotonic last read sequence observed via readBoard/turn completion (survives cache refreshes). */
+  lastReadSeq?: number;
 }
 
 interface BoardWaiter {
@@ -415,6 +440,8 @@ export class SwarmEngine implements ISwarmEngine {
   private boardHopCount = 0;
   private hopCapAlerted = false;
   private disposed = false;
+  private attachRunChain: Promise<void> = Promise.resolve();
+  private roleModelsChain: Promise<void> = Promise.resolve();
 
   constructor(deps: SwarmEngineDeps) {
     this.store = deps.store;
@@ -467,6 +494,23 @@ export class SwarmEngine implements ISwarmEngine {
     runId: string | null,
     hostContext?: ExtensionContext,
   ): Promise<SwarmSnapshot> {
+    const prev = this.attachRunChain;
+    let release!: () => void;
+    this.attachRunChain = new Promise<void>((r) => {
+      release = r;
+    });
+    await prev;
+    try {
+      return await this.attachRunInternal(runId, hostContext);
+    } finally {
+      release();
+    }
+  }
+
+  private async attachRunInternal(
+    runId: string | null,
+    hostContext?: ExtensionContext,
+  ): Promise<SwarmSnapshot> {
     if (hostContext) {
       this.hostContext = hostContext;
     }
@@ -476,9 +520,12 @@ export class SwarmEngine implements ISwarmEngine {
       await this.cancelActiveMonitor("Detached from Swarm run");
       this.clearOrchestratorWait("Detached from Swarm run.");
       this.resolveAllWaiters("run_ended", "Detached from Swarm run.");
-      await this.disposeLiveHandles("Detached from Swarm run");
+      const prevRunId = this.activeRunId;
+      const liveWorkingNames = this.collectLiveWorkingMemberNames();
       this.activeRunId = null;
       this.cachedRun = null;
+      await this.persistWorkingMembersStopped(prevRunId, liveWorkingNames, "stopped (detached)");
+      await this.disposeLiveHandles("Detached from Swarm run");
       this.cachedBoard = [];
       this.cachedEvents = [];
       this.runDonePosted = false;
@@ -501,16 +548,25 @@ export class SwarmEngine implements ISwarmEngine {
       this.resolveAllWaiters("run_ended", `Switched focus to run ${runId}.`);
       this.monitorTokens = 0;
       this.monitorCost = 0;
+      const prevRunId = this.activeRunId;
+      const liveWorkingNames = this.collectLiveWorkingMemberNames();
+      this.activeRunId = null;
+      this.cachedRun = null;
+      await this.persistWorkingMembersStopped(
+        prevRunId,
+        liveWorkingNames,
+        "stopped (switched run)",
+      );
       await this.disposeLiveHandles("Switched active run");
     }
 
     let run = await this.store.loadRun(runId);
 
     // Crash/restart recovery: when attaching a run after a fresh process start (no live handles in memory),
-    // normalize stale persisted `working` members to `stopped` so `@mention` revives them from disk `sessionFile`.
+    // normalize stale persisted `working` or orphan `waiting` members to `stopped` so `@mention` revives them from disk `sessionFile`.
     if (!isSameRun && (run.status === "active" || run.status === "paused")) {
       for (const m of Object.values(run.members)) {
-        if (m.state === "working" && !this.liveMembers.has(m.name)) {
+        if ((m.state === "working" || m.state === "waiting") && !this.liveMembers.has(m.name)) {
           run = await this.store.updateMember(run.id, m.name, {
             state: "stopped",
             currentActivity: null,
@@ -807,12 +863,12 @@ export class SwarmEngine implements ISwarmEngine {
     }
     const actor = options.actor ?? ORCHESTRATOR_NAME;
 
-    // Silence watchdog immediately and prevent any further wakes
+    // Silence watchdog immediately and prevent any further spawns, posts, or wakeups
     this.runDonePosted = true;
+    this.concurrencyGate.pause();
     this.cancelStallWatchdog();
     await this.cancelActiveMonitor("Run completed");
     this.clearOrchestratorWait("Run completed.");
-    this.cancelStallWatchdog();
 
     // Post `[done] <summary>` (NO @mentions!) on board directly so Stall Watchdog stays quiet
     const safeSummary = summary.replace(/@(?=#?[A-Za-z0-9])/g, "");
@@ -881,10 +937,10 @@ export class SwarmEngine implements ISwarmEngine {
       this.hostContext = input.hostContext;
     }
     const run = this.requireActiveRun();
-    if (run.status === "completed" || run.status === "abandoned") {
+    if (this.runDonePosted || run.status === "completed" || run.status === "abandoned") {
       throw new SwarmProtocolError(
         "INVALID_INPUT",
-        `Cannot add members to a ${run.status} Swarm run.`,
+        `Cannot add members to a ${this.runDonePosted ? "completing" : run.status} Swarm run.`,
       );
     }
 
@@ -1303,6 +1359,12 @@ export class SwarmEngine implements ISwarmEngine {
 
   async postMessage(input: PostBoardMessageInput): Promise<BoardMessage> {
     const run = this.requireActiveRun();
+    if (this.runDonePosted || run.status === "completed" || run.status === "abandoned") {
+      throw new SwarmProtocolError(
+        "INVALID_INPUT",
+        `Cannot post messages to a ${this.runDonePosted ? "completing" : run.status} Swarm run.`,
+      );
+    }
     const text = input.text?.trim() ?? "";
     if (!text) {
       throw new SwarmProtocolError("INVALID_INPUT", "Board message text must be non-empty.");
@@ -1808,19 +1870,23 @@ export class SwarmEngine implements ISwarmEngine {
           `Member "@${callerName}" cannot switch the orchestrator's model.`,
         );
       }
-      const previousModel = run.roleModels.orchestrator?.model;
-      const nextThinking =
-        requestedThinking ?? run.roleModels.orchestrator?.thinkingLevel;
-      const nextRoleModels: SwarmRoleModels = {
-        ...run.roleModels,
-        orchestrator: {
-          model: modelOverride,
-          thinkingLevel: nextThinking,
-        },
-      };
-      const updated = await this.store.updateRun(run.id, {
-        roleModels: nextRoleModels,
-        actor: callerName,
+      const { previousModel, nextThinking, updated } = await this.withRoleModelsLock(async () => {
+        const freshRun = await this.store.loadRun(run.id);
+        const prev = freshRun.roleModels.orchestrator?.model;
+        const thinking =
+          requestedThinking ?? freshRun.roleModels.orchestrator?.thinkingLevel;
+        const nextRoleModels: SwarmRoleModels = {
+          ...freshRun.roleModels,
+          orchestrator: {
+            model: modelOverride,
+            thinkingLevel: thinking,
+          },
+        };
+        const upd = await this.store.updateRun(run.id, {
+          roleModels: nextRoleModels,
+          actor: callerName,
+        });
+        return { previousModel: prev, nextThinking: thinking, updated: upd };
       });
 
       await this.store.appendEvent({
@@ -1945,6 +2011,8 @@ export class SwarmEngine implements ISwarmEngine {
           callerName,
           callerRole,
           autoResume: options.autoResume ?? true,
+          silentBoardNotice: options.silentBoardNotice,
+          fromRolePropagation: options.fromRolePropagation,
         };
         return {
           targetName: member.name,
@@ -2219,16 +2287,19 @@ export class SwarmEngine implements ISwarmEngine {
       };
     }
 
-    const nextRoleModels: SwarmRoleModels = {
-      ...run.roleModels,
-      [options.role]: {
-        ...(trimmedModel ? { model: trimmedModel } : {}),
-        ...(targetThinking !== undefined ? { thinkingLevel: targetThinking } : {}),
-      },
-    };
-    const updatedRun = await this.store.updateRun(run.id, {
-      roleModels: nextRoleModels,
-      actor: ORCHESTRATOR_NAME,
+    const updatedRun = await this.withRoleModelsLock(async () => {
+      const freshRun = await this.store.loadRun(run.id);
+      const nextRoleModels: SwarmRoleModels = {
+        ...freshRun.roleModels,
+        [options.role]: {
+          ...(trimmedModel ? { model: trimmedModel } : {}),
+          ...(targetThinking !== undefined ? { thinkingLevel: targetThinking } : {}),
+        },
+      };
+      return this.store.updateRun(run.id, {
+        roleModels: nextRoleModels,
+        actor: ORCHESTRATOR_NAME,
+      });
     });
     await this.refreshCache(updatedRun);
     this.emitEngineEvent(
@@ -3050,6 +3121,15 @@ export class SwarmEngine implements ISwarmEngine {
     await this.cancelActiveMonitor("Engine disposed");
     this.clearOrchestratorWait("Swarm engine disposed.");
     this.resolveAllWaiters("run_ended", "Swarm engine disposed.");
+    const prevRunId = this.activeRunId;
+    const liveWorkingNames = this.collectLiveWorkingMemberNames();
+    this.activeRunId = null;
+    this.cachedRun = null;
+    await this.persistWorkingMembersStopped(
+      prevRunId,
+      liveWorkingNames,
+      "stopped (engine disposed)",
+    );
     await this.disposeLiveHandles("Engine disposed");
     this.listeners.clear();
   }
@@ -3080,6 +3160,7 @@ export class SwarmEngine implements ISwarmEngine {
 
     const isCancelled = (): boolean =>
       this.disposed ||
+      this.runDonePosted ||
       this.activeRunId !== runId ||
       !isCurrentAttempt() ||
       launchAbort.signal.aborted;
@@ -3258,6 +3339,7 @@ export class SwarmEngine implements ISwarmEngine {
 
     const isCancelled = (): boolean =>
       this.disposed ||
+      this.runDonePosted ||
       this.activeRunId !== runId ||
       !isCurrentAttempt() ||
       launchAbort.signal.aborted;
@@ -3472,6 +3554,7 @@ export class SwarmEngine implements ISwarmEngine {
 
     const isCancelled = (): boolean =>
       this.disposed ||
+      this.runDonePosted ||
       this.activeRunId !== runId ||
       !isCurrentAttempt() ||
       launchAbort.signal.aborted;
@@ -3812,15 +3895,29 @@ export class SwarmEngine implements ISwarmEngine {
     const nextTurns = member.turns + 1;
     const nextTokens = Math.max(
       member.tokens,
+      live?.liveTokens ?? 0,
       (live?.priorHandlesTokens ?? 0) + result.tokens,
     );
-    const nextTokenBreakdown =
-      mergeTokenBreakdown(live?.priorHandlesBreakdown, result.tokenBreakdown) ??
-      member.tokenBreakdown;
+    const nextTokenBreakdown = maxTokenBreakdown(
+      live?.liveTokenBreakdown ?? member.tokenBreakdown,
+      mergeTokenBreakdown(live?.priorHandlesBreakdown, result.tokenBreakdown),
+    );
     const nextCost = Math.max(
       member.cost,
+      live?.liveCost ?? 0,
       (live?.priorHandlesCost ?? 0) + result.cost,
     );
+    const nextLastReadSeq = Math.max(
+      member.lastReadSeq,
+      live?.lastReadSeq ?? 0,
+      waitReq?.since ?? 0,
+      member.lastPostSeq ?? 0,
+    );
+    if (live) {
+      live.liveTokens = nextTokens;
+      live.liveTokenBreakdown = nextTokenBreakdown;
+      live.liveCost = nextCost;
+    }
     const effectiveModel = result.model ?? live?.handle?.getModel() ?? member.model;
     const effectiveThinking =
       result.thinkingLevel ?? live?.handle?.getThinkingLevel() ?? member.thinkingLevel;
@@ -3856,6 +3953,9 @@ export class SwarmEngine implements ISwarmEngine {
     }
 
     if (result.outcome === "stopped") {
+      if (result.stopReason !== "aborted") {
+        this.rateLimitBreaker.recordSuccess();
+      }
       const updated = await this.store.updateMember(runId, memberName, {
         state: "stopped",
         turns: nextTurns,
@@ -3865,13 +3965,7 @@ export class SwarmEngine implements ISwarmEngine {
         model: effectiveModel,
         thinkingLevel: effectiveThinking ?? null,
         ...(result.stopReason !== "aborted"
-          ? {
-              lastReadSeq: Math.max(
-                member.lastReadSeq,
-                waitReq?.since ?? 0,
-                member.lastPostSeq ?? 0,
-              ),
-            }
+          ? { lastReadSeq: nextLastReadSeq }
           : {}),
         currentActivity: null,
         parkedOn: result.summary?.slice(0, 120) || "stopped",
@@ -3880,6 +3974,10 @@ export class SwarmEngine implements ISwarmEngine {
       await this.refreshCache(updated);
       if (live) {
         live.parkedMentionsOnly = true;
+        if (result.stopReason !== "aborted") {
+          live.retryCount = 0;
+          live.lastReadSeq = nextLastReadSeq;
+        }
       }
 
       // Deferred Self Model Switch when keepWorkersWarm === false: execute model switch and revive onto new model.
@@ -3902,6 +4000,8 @@ export class SwarmEngine implements ISwarmEngine {
               callerName: pendingSwitch.callerName,
               callerRole: pendingSwitch.callerRole,
               autoResume: false,
+              silentBoardNotice: pendingSwitch.silentBoardNotice,
+              fromRolePropagation: pendingSwitch.fromRolePropagation,
             },
             { holdSwitchingLock: true },
           );
@@ -3985,7 +4085,7 @@ export class SwarmEngine implements ISwarmEngine {
         cost: nextCost,
         model: effectiveModel,
         thinkingLevel: effectiveThinking ?? null,
-        lastReadSeq: Math.max(member.lastReadSeq, waitReq?.since ?? 0, member.lastPostSeq ?? 0),
+        lastReadSeq: nextLastReadSeq,
         parkedOn,
         currentActivity: null,
         error: null,
@@ -3996,6 +4096,7 @@ export class SwarmEngine implements ISwarmEngine {
       // Remember whether this parked member asked for mentions_only=false so future non-mention posts wake it!
       if (live) {
         live.retryCount = 0;
+        live.lastReadSeq = nextLastReadSeq;
         live.parkedMentionsOnly = waitReq ? waitReq.mentionsOnly : true;
       }
 
@@ -4021,6 +4122,8 @@ export class SwarmEngine implements ISwarmEngine {
               callerName: pendingSwitch.callerName,
               callerRole: pendingSwitch.callerRole,
               autoResume: false,
+              silentBoardNotice: pendingSwitch.silentBoardNotice,
+              fromRolePropagation: pendingSwitch.fromRolePropagation,
             },
             { holdSwitchingLock: true },
           );
@@ -4082,7 +4185,7 @@ export class SwarmEngine implements ISwarmEngine {
       // Check for unread non-mention messages if the member explicitly called swarm_wait{mentions_only:false}
       if (live && waitReq && !waitReq.mentionsOnly && isStillValidTurn()) {
         const unread = await this.store.readBoard(runId, {
-          since: Math.max(waitReq.since, member.briefSeq ?? 0),
+          since: Math.max(waitReq.since, member.briefSeq ?? 0, member.lastReadSeq),
           memberChannels: member.channels,
           limit: 50,
         });
@@ -4444,6 +4547,9 @@ export class SwarmEngine implements ISwarmEngine {
     run: SwarmRunState,
     msg: BoardMessage,
   ): Promise<boolean> {
+    if (this.disposed || this.runDonePosted || run.status !== "active" || this.activeRunId !== run.id) {
+      return false;
+    }
     const senderLower = msg.from.toLowerCase();
     const mentionsLower = new Set(msg.mentions.map((m) => m.toLowerCase()));
     const chMentionsLower = new Set(msg.channelMentions.map((c) => c.toLowerCase()));
@@ -4603,6 +4709,9 @@ export class SwarmEngine implements ISwarmEngine {
     memberName: string,
     msg: BoardMessage,
   ): void {
+    if (this.disposed || this.runDonePosted || this.activeRunId !== runId) {
+      return;
+    }
     const run = this.cachedRun;
     const member = getOwnMember(run, memberName);
     if (!member || member.state === "killed") {
@@ -5320,11 +5429,11 @@ export class SwarmEngine implements ISwarmEngine {
     } finally {
       if (this.activeMonitorAbort === abort) {
         this.activeMonitorAbort = undefined;
+        this.monitorRunning = false;
       }
       if (this.activeMonitorHandle === handle) {
         this.activeMonitorHandle = undefined;
       }
-      this.monitorRunning = false;
       if (handle) {
         await handle.kill("Monitor check complete").catch(() => {});
       }
@@ -5397,8 +5506,31 @@ export class SwarmEngine implements ISwarmEngine {
       }
     }
 
-    // Fast in-memory cachedRun patch for crisp real-time UI rendering
     const existingMember = getOwnMember(this.cachedRun, evt.name);
+    if (live) {
+      if (evt.tokens !== undefined) {
+        live.liveTokens = Math.max(
+          live.liveTokens ?? 0,
+          existingMember?.tokens ?? 0,
+          live.priorHandlesTokens + evt.tokens,
+        );
+      }
+      if (evt.tokenBreakdown !== undefined) {
+        live.liveTokenBreakdown = maxTokenBreakdown(
+          live.liveTokenBreakdown ?? existingMember?.tokenBreakdown,
+          mergeTokenBreakdown(live.priorHandlesBreakdown, evt.tokenBreakdown),
+        );
+      }
+      if (evt.cost !== undefined) {
+        live.liveCost = Math.max(
+          live.liveCost ?? 0,
+          existingMember?.cost ?? 0,
+          live.priorHandlesCost + evt.cost,
+        );
+      }
+    }
+
+    // Fast in-memory cachedRun patch for crisp real-time UI rendering
     if (existingMember && this.cachedRun) {
       const member: SwarmMemberRecord = { ...existingMember };
       if (evt.activity !== undefined) {
@@ -5410,18 +5542,19 @@ export class SwarmEngine implements ISwarmEngine {
       if (evt.tokens !== undefined) {
         member.tokens = Math.max(
           member.tokens,
+          live?.liveTokens ?? 0,
           (live?.priorHandlesTokens ?? 0) + evt.tokens,
         );
       }
       if (evt.tokenBreakdown !== undefined) {
-        member.tokenBreakdown = mergeTokenBreakdown(
-          live?.priorHandlesBreakdown,
-          evt.tokenBreakdown,
-        );
+        member.tokenBreakdown =
+          live?.liveTokenBreakdown ??
+          mergeTokenBreakdown(live?.priorHandlesBreakdown, evt.tokenBreakdown);
       }
       if (evt.cost !== undefined) {
         member.cost = Math.max(
           member.cost,
+          live?.liveCost ?? 0,
           (live?.priorHandlesCost ?? 0) + evt.cost,
         );
       }
@@ -5502,6 +5635,12 @@ export class SwarmEngine implements ISwarmEngine {
             }
           } else if (options?.since !== undefined) {
             readUpToSeq = res.head;
+          }
+          if (readUpToSeq > 0) {
+            const live = this.liveMembers.get(latest.name);
+            if (live) {
+              live.lastReadSeq = Math.max(live.lastReadSeq ?? 0, readUpToSeq);
+            }
           }
           if (readUpToSeq > latest.lastReadSeq && this.cachedRun) {
             const cachedMember = getOwnMember(this.cachedRun, latest.name);
@@ -5731,16 +5870,32 @@ export class SwarmEngine implements ISwarmEngine {
         const isWorking = m.state === "working" || live.turnActive || live.spawning;
         const preserveActivity =
           isWorking && live.currentActivity ? live.currentActivity : m.currentActivity;
+        const preserveTokens = Math.max(m.tokens, live.liveTokens ?? 0);
+        const preserveCost = Math.max(m.cost, live.liveCost ?? 0);
+        const preserveLastReadSeq = Math.max(m.lastReadSeq, live.lastReadSeq ?? 0);
+        const preserveBreakdown = maxTokenBreakdown(m.tokenBreakdown, live.liveTokenBreakdown);
+        const breakdownAdvanced = Boolean(
+          live.liveTokenBreakdown &&
+            (!m.tokenBreakdown || preserveBreakdown!.total > m.tokenBreakdown.total),
+        );
         if (
           preserveLogTail !== m.logTail ||
           preserveLastTool !== m.lastTool ||
-          preserveActivity !== m.currentActivity
+          preserveActivity !== m.currentActivity ||
+          preserveTokens !== m.tokens ||
+          preserveCost !== m.cost ||
+          preserveLastReadSeq !== m.lastReadSeq ||
+          breakdownAdvanced
         ) {
           mergedMembers[name] = {
             ...m,
             logTail: preserveLogTail,
             lastTool: preserveLastTool,
             currentActivity: preserveActivity,
+            tokens: preserveTokens,
+            cost: preserveCost,
+            lastReadSeq: preserveLastReadSeq,
+            ...(breakdownAdvanced ? { tokenBreakdown: preserveBreakdown } : {}),
           };
         }
       }
@@ -5762,6 +5917,65 @@ export class SwarmEngine implements ISwarmEngine {
         .catch(() => this.cachedEvents);
     } catch {
       // retain prior cache on transient read failure
+    }
+  }
+
+  private async withRoleModelsLock<T>(fn: () => Promise<T>): Promise<T> {
+    const prev = this.roleModelsChain;
+    let release!: () => void;
+    this.roleModelsChain = new Promise<void>((r) => {
+      release = r;
+    });
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  private collectLiveWorkingMemberNames(): Set<string> {
+    const names = new Set<string>();
+    for (const [name, live] of this.liveMembers.entries()) {
+      if (
+        live.spawning ||
+        live.waking ||
+        live.turnActive ||
+        live.switchingModel ||
+        Boolean(live.retryTimer) ||
+        live.handle?.getState() === "working"
+      ) {
+        names.add(name);
+      }
+    }
+    return names;
+  }
+
+  private async persistWorkingMembersStopped(
+    runId: string | null,
+    liveWorkingNames: ReadonlySet<string>,
+    parkedOn: string,
+  ): Promise<void> {
+    if (!runId) {
+      return;
+    }
+    try {
+      const currentRun = await this.store.loadRun(runId);
+      if (currentRun.status !== "active" && currentRun.status !== "paused") {
+        return;
+      }
+      for (const m of Object.values(currentRun.members)) {
+        if (m.state === "killed") continue;
+        if (m.state === "working" || liveWorkingNames.has(m.name)) {
+          await this.store.updateMember(runId, m.name, {
+            state: "stopped",
+            currentActivity: null,
+            parkedOn,
+          });
+        }
+      }
+    } catch {
+      // Best-effort persistence during detach/switch/dispose
     }
   }
 

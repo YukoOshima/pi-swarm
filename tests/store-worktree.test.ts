@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import {
   access,
+  appendFile,
   lstat,
   mkdir,
   mkdtemp,
@@ -38,6 +39,7 @@ import {
   SwarmLedger,
   SwarmStore,
   WorktreeManager,
+  appendLedgerEvent,
   assertOwnerSession,
   deleteProjectSettingsKeys,
   deriveMemberBranch,
@@ -53,6 +55,8 @@ import {
   loadSwarmSettings,
   parseChannelMentions,
   parseMentions,
+  readAllLedgerEvents,
+  readRecentLedgerEvents,
   sanitizeSettingsPatch,
   sanitizeSwarmSettings,
   saveSwarmSettings,
@@ -2905,5 +2909,393 @@ describe("v0.3.7 store, board, ledger, settings & worktree regression fixes", ()
       false,
       "Branch clone must exclude .pi/swarm/ so runtime artifacts never mark it dirty",
     );
+  });
+
+  it("v0.5.1: board/ledger immutable delta cache, LRU refresh, non-finite limits, and monotonic ledger lastSeq", async () => {
+    const repoDir = await makeTempDir("pi-swarm-v051-board-ledger-");
+    const board = new SwarmBoard(repoDir);
+
+    // Non-finite limits fall back to defaults rather than returning unbounded or failing
+    for (let i = 1; i <= 25; i++) {
+      await board.post("run-lim", {
+        from: "orch",
+        fromRole: "orchestrator",
+        text: `msg-${i}`,
+      });
+    }
+    const nanRecent = await board.read("run-lim", { limit: Number.NaN });
+    assert.equal(nanRecent.messages.length, 20);
+    const infRecent = await board.read("run-lim", { limit: Number.POSITIVE_INFINITY });
+    assert.equal(infRecent.messages.length, 20);
+    const nanSince = await board.read("run-lim", { since: 0, limit: Number.NaN });
+    assert.equal(nanSince.messages.length, 25);
+
+    // Concurrent external delta append + read + post does not duplicate cached messages
+    const boardPath = board.getBoardPath("run-conc");
+    await board.post("run-conc", { from: "a", fromRole: "worker", text: "first" });
+    const extLine = `${JSON.stringify({
+      seq: 2,
+      runId: "run-conc",
+      channel: DEFAULT_CHANNEL,
+      from: "ext",
+      fromRole: "worker",
+      text: "external",
+      mentions: [],
+      channelMentions: [],
+      kind: "chat",
+      timestamp: new Date().toISOString(),
+    })}\n`;
+    await appendFile(boardPath, extLine, "utf8");
+    const [r1, r2] = await Promise.all([
+      board.read("run-conc"),
+      board.read("run-conc"),
+    ]);
+    assert.deepEqual(
+      r1.messages.map((m) => m.seq),
+      [1, 2],
+    );
+    assert.deepEqual(
+      r2.messages.map((m) => m.seq),
+      [1, 2],
+    );
+
+    // LRU refresh: reading run-hot keeps it ahead of 32 colder runs
+    await board.post("run-hot", { from: "a", fromRole: "worker", text: "hot" });
+    for (let i = 0; i < 31; i++) {
+      await board.post(`run-cold-${i}`, {
+        from: "a",
+        fromRole: "worker",
+        text: `cold-${i}`,
+      });
+    }
+    // Hit run-hot cache to refresh it to MRU, then add 2 more cold runs
+    assert.equal((await board.read("run-hot")).messages.length, 1);
+    await board.post("run-cold-31", { from: "a", fromRole: "worker", text: "c31" });
+    await board.post("run-cold-32", { from: "a", fromRole: "worker", text: "c32" });
+    const boardCache = (board as unknown as { boardCache: Map<string, unknown> })
+      .boardCache;
+    assert.equal(boardCache.size, 32);
+    assert.equal(boardCache.has(board.getBoardPath("run-hot")), true);
+
+    // Ledger: concurrent delta reads & monotonic lastSeq when external line lacks seq
+    const eventsPath = path.join(repoDir, SWARM_DIR, "events-v051.jsonl");
+    await appendLedgerEvent(eventsPath, {
+      runId: "run-l",
+      type: "run_created",
+      summary: "seq 1",
+    });
+    await appendLedgerEvent(eventsPath, {
+      runId: "run-l",
+      type: "member_added",
+      summary: "seq 2",
+    });
+    await appendLedgerEvent(eventsPath, {
+      runId: "run-l",
+      type: "board_posted",
+      summary: "seq 3",
+    });
+    // Externally append an event without `seq`
+    const noSeqEvent = `${JSON.stringify({
+      id: "evt_noseq",
+      runId: "run-l",
+      type: "board_posted",
+      timestamp: new Date().toISOString(),
+      summary: "external no seq",
+    })}\n`;
+    await appendFile(eventsPath, noSeqEvent, "utf8");
+    const [ev1, ev2] = await Promise.all([
+      readAllLedgerEvents(eventsPath),
+      readRecentLedgerEvents(eventsPath, Number.NaN),
+    ]);
+    assert.equal(ev1.length, 4);
+    assert.equal(ev2.length, 4);
+    const nextEvt = await appendLedgerEvent(eventsPath, {
+      runId: "run-l",
+      type: "run_completed",
+      summary: "seq >= 4",
+    });
+    assert.ok(
+      typeof nextEvt.seq === "number" && nextEvt.seq >= 4,
+      `Expected monotonic seq >= 4, got ${nextEvt.seq}`,
+    );
+  });
+
+  it("v0.5.1: settings clearing, undefined thinkingKey with :thinking, whitespace trim, colon-space parse, and projectPath save", async () => {
+    // parseModelSpec("provider/model: high") trims trailing ":"
+    assert.deepEqual(parseModelSpec("provider/model: high"), {
+      model: "provider/model",
+      thinkingLevel: "high",
+    });
+    assert.deepEqual(parseModelSpec("ollama/qwen3:32b high"), {
+      model: "ollama/qwen3:32b",
+      thinkingLevel: "high",
+    });
+
+    // Clearing project model to null/"" clears inherited global thinkingLevel unless explicitly provided
+    const baseGlobal = sanitizeSwarmSettings({
+      workerModel: "anthropic/claude-sonnet-4-5",
+      workerThinkingLevel: "high",
+      orchestratorModel: "anthropic/claude-opus-4-6",
+      orchestratorThinkingLevel: "xhigh",
+    });
+    const clearedModel = sanitizeSwarmSettings(
+      {
+        workerModel: null,
+        orchestratorModel: "   ",
+      },
+      baseGlobal,
+    );
+    assert.equal(clearedModel.workerModel, undefined);
+    assert.equal(clearedModel.workerThinkingLevel, undefined);
+    assert.equal(clearedModel.orchestratorModel, undefined);
+    assert.equal(clearedModel.orchestratorThinkingLevel, undefined);
+
+    const clearedWithExplicitThinking = sanitizeSwarmSettings(
+      {
+        workerModel: null,
+        workerThinkingLevel: "low",
+      },
+      baseGlobal,
+    );
+    assert.equal(clearedWithExplicitThinking.workerModel, undefined);
+    assert.equal(clearedWithExplicitThinking.workerThinkingLevel, "low");
+
+    // Explicit thinkingKey: undefined lets :thinking suffix extract cleanly
+    const withUndefinedThinking = sanitizeSwarmSettings({
+      workerModel: "anthropic/claude-sonnet-4-5:high",
+      workerThinkingLevel: undefined,
+    });
+    assert.equal(withUndefinedThinking.workerModel, "anthropic/claude-sonnet-4-5");
+    assert.equal(withUndefinedThinking.workerThinkingLevel, "high");
+
+    const patchUndefinedThinking = sanitizeSettingsPatch({
+      workerModel: "anthropic/claude-sonnet-4-5:medium",
+      workerThinkingLevel: undefined,
+    });
+    assert.equal(patchUndefinedThinking.workerModel, "anthropic/claude-sonnet-4-5");
+    assert.equal(patchUndefinedThinking.workerThinkingLevel, "medium");
+
+    // Whitespace thinking clears thinking level
+    const trimmedClear = sanitizeSwarmSettings(
+      { workerThinkingLevel: "   " } as unknown as Record<string, unknown>,
+      baseGlobal,
+    );
+    assert.equal(trimmedClear.workerThinkingLevel, undefined);
+
+    const trimmedPatch = sanitizeSettingsPatch({
+      workerThinkingLevel: "   ",
+    } as unknown as Record<string, unknown>);
+    assert.equal(Object.hasOwn(trimmedPatch, "workerThinkingLevel"), true);
+    assert.equal(trimmedPatch.workerThinkingLevel, undefined);
+
+    // saveSwarmSettings("project", patch, { projectPath, globalPath }) without projectRoot merges global
+    const tmpRoot = await makeTempDir("pi-swarm-v051-settings-");
+    const globalPath = path.join(tmpRoot, "global.json");
+    const projectPath = path.join(tmpRoot, "project.json");
+    await saveSwarmSettings(
+      "global",
+      {
+        orchestratorModel: "openai/gpt-5",
+        orchestratorThinkingLevel: "high",
+        workerModel: "anthropic/claude-sonnet-4-5",
+        workerThinkingLevel: "medium",
+      },
+      { globalPath },
+    );
+    const savedProject = await saveSwarmSettings(
+      "project",
+      {
+        workerModel: null,
+        validatorModel: "google/gemini-2.5-pro: low",
+      } as unknown as Record<string, unknown>,
+      { globalPath, projectPath },
+    );
+    assert.equal(savedProject.orchestratorModel, "openai/gpt-5");
+    assert.equal(savedProject.orchestratorThinkingLevel, "high");
+    assert.equal(savedProject.workerModel, undefined);
+    assert.equal(savedProject.workerThinkingLevel, undefined);
+    assert.equal(savedProject.validatorModel, "google/gemini-2.5-pro");
+    assert.equal(savedProject.validatorThinkingLevel, "low");
+  });
+
+  it("v0.5.1: swarm-store stateCache bounds, external write ROSTER sync, .reap symlink rejection, and listRuns symlink guard", async () => {
+    const repoDir = await makeTempDir("pi-swarm-v051-store-");
+    const store = new SwarmStore(repoDir, {
+      staleLockMs: 50,
+      lockTimeoutMs: 500,
+      lockRetryMs: 15,
+    });
+
+    // 1. External state.json + ROSTER.md edit does not leave ROSTER.md stale on next persist
+    await store.createRun({
+      id: "run-ext-roster",
+      title: "Ext Roster",
+      objective: "Sync ROSTER.md after external edit",
+      baseBranch: "main",
+      ownerSessionId: "sess-ext",
+    });
+    const runDir = store.getRunDir("run-ext-roster");
+    const statePath = path.join(runDir, SWARM_STATE_FILE);
+    const rosterPath = path.join(runDir, SWARM_ROSTER_FILE);
+
+    // Simulate external process pausing the run and updating ROSTER.md
+    const rawState = JSON.parse(await readFile(statePath, "utf8")) as Record<string, unknown>;
+    rawState.status = "paused";
+    rawState.revision = 99;
+    await writeFile(statePath, `${JSON.stringify(rawState, null, 2)}\n`, "utf8");
+    const extStat = await stat(statePath);
+    await utimes(statePath, new Date(extStat.atimeMs), new Date(extStat.mtimeMs + 1000));
+    await writeFile(rosterPath, "# Externally Edited Stale Roster\n", "utf8");
+
+    // Resume back to active: canonical roster matches initial active state, so it MUST NOT skip writing ROSTER.md!
+    await store.updateRun("run-ext-roster", { status: "active" });
+    const syncedRoster = await readFile(rosterPath, "utf8");
+    assert.match(syncedRoster, /Ext Roster/);
+    assert.doesNotMatch(syncedRoster, /Externally Edited Stale Roster/);
+
+    // 2. stateCache bounded to 32 entries across > 32 runs
+    for (let i = 0; i < 35; i++) {
+      await store.createRun({
+        id: `run-cap-${String(i).padStart(2, "0")}`,
+        title: `Run ${i}`,
+        objective: "Bound stateCache",
+        baseBranch: "main",
+        ownerSessionId: "sess-cap",
+      });
+    }
+    const runs = await store.listRuns();
+    assert.equal(runs.length, 36);
+    const stateCache = (store as unknown as { stateCache: Map<string, unknown> })
+      .stateCache;
+    assert.equal(stateCache.size, 32);
+
+    // 3. Symlinked .reap lockfile throws PERMISSION_DENIED immediately (not REVISION_CONFLICT timeout)
+    const locksDir = path.join(repoDir, SWARM_DIR, SWARM_LOCKS_DIR);
+    const lockPath = path.join(locksDir, "run-ext-roster.lock");
+    const reapPath = `${lockPath}.reap`;
+    await writeFile(
+      lockPath,
+      JSON.stringify({
+        pid: 999999,
+        token: "dead-holder",
+        hostname: os.hostname(),
+        createdAt: new Date(Date.now() - 60_000).toISOString(),
+      }),
+      "utf8",
+    );
+    await symlink(path.join(repoDir, "nonexistent-reap-target"), reapPath);
+    await assert.rejects(
+      () => store.updateRun("run-ext-roster", { title: "Should fail fast" }),
+      (err) => assertProtocolCode(err, "PERMISSION_DENIED"),
+    );
+    await rm(reapPath, { force: true });
+    await rm(lockPath, { force: true });
+
+    // 4. listRuns still rejects symlinked per-run directory
+    const evilRunLink = path.join(repoDir, SWARM_DIR, SWARM_RUNS_DIR, "run-symlink");
+    await symlink(runDir, evilRunLink);
+    const listAfterSymlink = await store.listRuns();
+    // listRuns swallows per-entry read errors cleanly, while loadRun throws PERMISSION_DENIED
+    assert.ok(!listAfterSymlink.some((r) => r.id === "run-symlink"));
+    await assert.rejects(
+      () => store.loadRun("run-symlink"),
+      (err) => assertProtocolCode(err, "PERMISSION_DENIED"),
+    );
+  });
+
+  it("v0.5.1: worktree branch-clone fetch errors, missing cwd validation, identity cache eviction, and safeTeardown force propagation", async () => {
+    const repoDir = await makeTempDir("pi-swarm-v051-wt-");
+    const wtMgr = new WorktreeManager(repoDir);
+    await wtMgr.ensureRepoReady("main");
+    await commitFile(repoDir, "base.txt", "base v1\n", "base v1");
+
+    const clonePath = path.join(repoDir, SWARM_DIR, "worktrees", "run-wt", "wt-clone");
+    await wtMgr.createWorktree({
+      branch: "swarm/run-wt/clone",
+      baseBranch: "main",
+      worktreePath: clonePath,
+      mode: "branch",
+    });
+    await commitFile(clonePath, "worker.txt", "worker change\n", "worker commit");
+
+    // Advance main in repoRoot while deleting `origin` remote inside clone to verify repoRoot fetch works!
+    await commitFile(repoDir, "base.txt", "base v2\n", "base v2");
+    await git(clonePath, ["remote", "remove", "origin"]);
+
+    const diffVsRepoMain = await wtMgr.getDiffSummary("main", "HEAD", { cwd: clonePath });
+    assert.equal(diffVsRepoMain.commitsAhead, 1);
+    assert.deepEqual(diffVsRepoMain.changedFiles, ["worker.txt"]);
+
+    const rebaseRes = await wtMgr.autoRebase(clonePath, "main");
+    assert.equal(rebaseRes.status, "rebased");
+    assert.equal(await readFile(path.join(clonePath, "base.txt"), "utf8"), "base v2\n");
+
+    // Missing baseBranch in both repoRoot & origin throws GIT_ERROR instead of silently falling back
+    await assert.rejects(
+      () => wtMgr.autoRebase(clonePath, "nonexistent-base"),
+      (err) => assertProtocolCode(err, "GIT_ERROR"),
+    );
+    await assert.rejects(
+      () => wtMgr.getDiffSummary("nonexistent-base", "HEAD", { cwd: clonePath }),
+      (err) => assertProtocolCode(err, "GIT_ERROR"),
+    );
+
+    // Missing options.cwd fails explicitly for HEAD, while falling back for named branch
+    const missingCwd = path.join(repoDir, SWARM_DIR, "worktrees", "run-wt", "wt-missing");
+    await assert.rejects(
+      () => wtMgr.getDiffSummary("main", "HEAD", { cwd: missingCwd }),
+      (err) => assertProtocolCode(err, "NOT_FOUND"),
+    );
+    await wtMgr.fetchBranchFromClone(clonePath, "swarm/run-wt/clone");
+    const namedFallback = await wtMgr.getDiffSummary("main", "swarm/run-wt/clone", {
+      cwd: missingCwd,
+    });
+    assert.equal(namedFallback.commitsAhead, 1);
+
+    // identityOverrideCache returns copies and evicts on removeWorktree
+    const cacheMap = (wtMgr as unknown as { identityOverrideCache: Map<string, string[]> })
+      .identityOverrideCache;
+    await wtMgr.autoRebase(clonePath, "main");
+    assert.equal(cacheMap.has(path.resolve(clonePath)), true);
+    const cachedRef = cacheMap.get(path.resolve(clonePath))!;
+    const returnedCopy = await (
+      wtMgr as unknown as { getIdentityOverrideArgs(cwd: string): Promise<string[]> }
+    ).getIdentityOverrideArgs(clonePath);
+    assert.notEqual(returnedCopy, cachedRef);
+
+    // safeTeardown passes force: false (not blindly force: true) when force is omitted
+    const sharePath = path.join(repoDir, SWARM_DIR, "worktrees", "run-wt", "wt-share");
+    await wtMgr.createWorktree({
+      branch: "swarm/run-wt/share",
+      baseBranch: "main",
+      worktreePath: sharePath,
+      mode: "share",
+    });
+    const origRemove = wtMgr.removeWorktree.bind(wtMgr);
+    const observedForceFlags: Array<boolean | undefined> = [];
+    wtMgr.removeWorktree = async (p, opts) => {
+      observedForceFlags.push(opts?.force);
+      return origRemove(p, opts);
+    };
+    const td = await wtMgr.safeTeardown(
+      [
+        {
+          memberName: "share",
+          worktreePath: sharePath,
+          branch: "swarm/run-wt/share",
+          hasActiveAgent: false,
+        },
+        {
+          memberName: "clone",
+          worktreePath: clonePath,
+          branch: "swarm/run-wt/clone",
+          hasActiveAgent: false,
+        },
+      ],
+      { deleteBranches: true },
+    );
+    assert.equal(td.removed.length, 2);
+    assert.deepEqual(observedForceFlags, [false, false]);
+    assert.equal(cacheMap.has(path.resolve(clonePath)), false);
   });
 });

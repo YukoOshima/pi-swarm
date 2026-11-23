@@ -544,16 +544,22 @@ export function createSwarmTools(deps: SwarmToolDeps): ToolDefinition[] {
               targetName.toLowerCase() === "coordinator";
             if (isOrchestratorTarget && deps.onOrchestratorModelSwitch) {
               const snapshot = deps.engine.getSnapshot();
+              const ctxModel = ctx?.model?.id
+                ? ctx.model.provider
+                  ? `${ctx.model.provider}/${ctx.model.id}`
+                  : ctx.model.id
+                : "";
               const effectiveOrchModel =
                 rawModel ||
                 snapshot.roleModels.orchestrator?.model?.trim() ||
-                "";
+                ctxModel;
               const res = await deps.onOrchestratorModelSwitch(
                 effectiveOrchModel,
                 params.thinking_level,
                 params.reason,
               );
-              const resolvedModel = res?.model ?? (effectiveOrchModel || "host-default");
+              const resolvedModel =
+                res?.model?.trim() || effectiveOrchModel || "host-default";
               const resolvedThinking = res?.thinkingLevel ?? params.thinking_level;
               return okResult(
                 `Switched orchestrator model -> ${resolvedModel}${resolvedThinking ? ` (${resolvedThinking})` : ""}.`,
@@ -767,15 +773,15 @@ export function createSwarmTools(deps: SwarmToolDeps): ToolDefinition[] {
     promptSnippet: "Read shared board messages (#seq/since/channel/search) or inspect roster (status:true).",
     parameters: Type.Object({
       since: Type.Optional(
-        Type.Number({ description: "Return oldest messages with seq > since." }),
+        Type.Integer({ minimum: 0, description: "Return oldest messages with seq > since." }),
       ),
       seqs: Type.Optional(
-        Type.Array(Type.Number(), {
+        Type.Array(Type.Integer({ minimum: 0 }), {
           description: "Fetch exact sequence numbers only (e.g. [4, 6]).",
         }),
       ),
       limit: Type.Optional(
-        Type.Number({ description: "Maximum number of messages to return (default 20)." }),
+        Type.Integer({ minimum: 0, description: "Maximum number of messages to return (default 20)." }),
       ),
       channel: Type.Optional(
         Type.String({ description: 'Filter by channel name, or "*" for all channels.' }),
@@ -840,7 +846,8 @@ export function createSwarmTools(deps: SwarmToolDeps): ToolDefinition[] {
     ],
     executionMode: "sequential",
     parameters: Type.Object({
-      since: Type.Number({
+      since: Type.Integer({
+        minimum: 0,
         description: "Highest sequence number you have already read (0 to wait from start).",
       }),
       mentions_only: Type.Optional(
@@ -995,13 +1002,13 @@ export function createMemberScopedTools(
     promptSnippet: "Read shared board messages (#seq/since/channel/search) or roster (status:true).",
     parameters: Type.Object({
       since: Type.Optional(
-        Type.Number({ description: "Return oldest messages with seq > since." }),
+        Type.Integer({ minimum: 0, description: "Return oldest messages with seq > since." }),
       ),
       seqs: Type.Optional(
-        Type.Array(Type.Number(), { description: "Fetch exact sequence numbers only." }),
+        Type.Array(Type.Integer({ minimum: 0 }), { description: "Fetch exact sequence numbers only." }),
       ),
       limit: Type.Optional(
-        Type.Number({ description: "Maximum number of messages to return (default 20)." }),
+        Type.Integer({ minimum: 0, description: "Maximum number of messages to return (default 20)." }),
       ),
       channel: Type.Optional(
         Type.String({ description: 'Optional channel filter, or "*" for all channels.' }),
@@ -1056,7 +1063,8 @@ export function createMemberScopedTools(
     ],
     executionMode: "sequential",
     parameters: Type.Object({
-      since: Type.Number({
+      since: Type.Integer({
+        minimum: 0,
         description: "Highest sequence number you have already read.",
       }),
       mentions_only: Type.Optional(
@@ -1123,12 +1131,15 @@ export function createMemberScopedTools(
         }),
       ),
       role: Type.Optional(
-        stringEnum(MEMBER_ROLES, {
-          description:
-            member.role === "validator"
-              ? 'Read-only "validator" only.'
-              : 'Helper role: "worker" (default) or read-only "validator".',
-        }),
+        stringEnum(
+          member.role === "validator" ? (["validator"] as const) : MEMBER_ROLES,
+          {
+            description:
+              member.role === "validator"
+                ? 'Read-only "validator" only.'
+                : 'Helper role: "worker" (default) or read-only "validator".',
+          },
+        ),
       ),
       brief: Type.Optional(
         Type.String({

@@ -47,6 +47,9 @@ export function parseModelSpec(raw: string): {
     const candidateTail = spaceMatch[2]!.trim().toLowerCase();
     if (VALID_THINKING_LEVELS.has(candidateTail as ThinkingLevel)) {
       modelCandidate = spaceMatch[1]!.trim();
+      if (modelCandidate.endsWith(":")) {
+        modelCandidate = modelCandidate.slice(0, -1).trim();
+      }
       thinkingLevel = candidateTail as ThinkingLevel;
     }
   }
@@ -223,9 +226,12 @@ function sanitizeOptionalThinking(
   modelKey: RoleModelKey,
   fallback: ThinkingLevel | undefined,
 ): ThinkingLevel | undefined {
-  if (key in raw) {
+  if (key in raw && raw[key] !== undefined) {
     const value = raw[key];
-    if (value === null || value === "") {
+    if (
+      value === null ||
+      (typeof value === "string" && value.trim() === "")
+    ) {
       return undefined;
     }
     if (
@@ -236,11 +242,22 @@ function sanitizeOptionalThinking(
     }
     return fallback;
   }
-  const rawModel = raw[modelKey];
-  if (typeof rawModel === "string" && rawModel.trim().length > 0) {
-    const parsed = parseModelSpec(rawModel);
-    if (parsed.thinkingLevel !== undefined) {
-      return parsed.thinkingLevel;
+  if (modelKey in raw) {
+    const rawModel = raw[modelKey];
+    if (
+      rawModel === null ||
+      (typeof rawModel === "string" && rawModel.trim() === "")
+    ) {
+      return undefined;
+    }
+    if (typeof rawModel === "string") {
+      const parsed = parseModelSpec(rawModel);
+      if (parsed.thinkingLevel !== undefined) {
+        return parsed.thinkingLevel;
+      }
+      if (parsed.model.length === 0) {
+        return undefined;
+      }
     }
   }
   return fallback;
@@ -527,24 +544,29 @@ export function sanitizeSettingsPatch(
       ) {
         patch[modelKey] = model;
       }
-      if (!(thinkingKey in input) && typeof rawVal === "string" && rawVal.trim()) {
+      if (
+        (!(thinkingKey in input) || input[thinkingKey] === undefined) &&
+        typeof rawVal === "string" &&
+        rawVal.trim()
+      ) {
         const parsed = parseModelSpec(rawVal);
         if (parsed.thinkingLevel !== undefined) {
           patch[thinkingKey] = parsed.thinkingLevel;
         }
       }
     }
-    if (thinkingKey in input) {
+    if (thinkingKey in input && input[thinkingKey] !== undefined) {
       const level = sanitizeOptionalThinking(input, thinkingKey, modelKey, undefined);
       const rawVal = input[thinkingKey];
       if (
         level !== undefined ||
         rawVal === null ||
-        rawVal === undefined ||
-        rawVal === ""
+        (typeof rawVal === "string" && rawVal.trim() === "")
       ) {
         patch[thinkingKey] = level;
       }
+    } else if (thinkingKey in input && !(thinkingKey in patch)) {
+      patch[thinkingKey] = undefined;
     }
   }
 
@@ -849,6 +871,22 @@ export async function saveSwarmSettings(
 
     if (options?.projectRoot) {
       return loadSwarmSettings(options.projectRoot, options);
+    }
+    if (scope === "project") {
+      const globalRaw = await readSettingsLayer(
+        getGlobalSettingsPath(options),
+        warnings,
+      );
+      const afterGlobal = sanitizeSwarmSettings(globalRaw, DEFAULT_SWARM_SETTINGS);
+      return sanitizeSwarmSettings(nextLayer, afterGlobal);
+    }
+    if (options?.projectPath) {
+      const afterGlobal = sanitizeSwarmSettings(nextLayer, DEFAULT_SWARM_SETTINGS);
+      const projectRaw = await readSettingsLayer(
+        getProjectSettingsPath(".", options),
+        warnings,
+      );
+      return sanitizeSwarmSettings(projectRaw, afterGlobal);
     }
     return sanitizeSwarmSettings(nextLayer, DEFAULT_SWARM_SETTINGS);
   });

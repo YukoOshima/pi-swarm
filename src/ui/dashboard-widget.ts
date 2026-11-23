@@ -515,10 +515,12 @@ class SwarmDashboardComponent implements Component {
     nowMs: number,
   ): string[] {
     const termRows = this.tui.terminal?.rows ?? 32;
-    const maxTotalLines = Math.max(16, Math.min(36, Math.floor(termRows * 0.82)));
+    const rawMaxTotal = Math.max(8, Math.min(36, Math.floor(termRows * 0.82)));
+    const maxTotalLines =
+      termRows >= 10 ? Math.min(termRows - 2, Math.max(10, rawMaxTotal)) : Math.max(4, termRows);
     const innerWidth =
       width < 12 ? Math.max(1, width) : Math.max(1, width - (width < 24 ? 2 : 4));
-    const maxInner = Math.max(12, maxTotalLines - 2);
+    const maxInner = Math.max(4, maxTotalLines - 2);
 
     const body: string[] = [];
 
@@ -672,7 +674,7 @@ class SwarmDashboardComponent implements Component {
 
       const recentBoardReserve = snapshot.recentBoard.length > 0 ? 7 : 0;
       const maxRosterRows = Math.max(
-        2,
+        1,
         Math.min(members.length, maxInner - body.length - recentBoardReserve - 2),
       );
       const tableLines = renderTable(members, columns, innerWidth, {

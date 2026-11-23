@@ -289,6 +289,7 @@ export class RateLimitBreaker {
   private consecutiveFailures = 0;
   private backoffUntil = 0;
   private lastReason?: string;
+  private readonly wakeListeners = new Set<() => void>();
 
   constructor(options: RateLimitBreakerOptions = {}) {
     this.baseBackoffMs = Math.max(10, options.baseBackoffMs ?? DEFAULT_SWARM_SETTINGS.rateLimitBaseBackoffMs);
@@ -340,12 +341,18 @@ export class RateLimitBreaker {
   }
 
   /**
-   * Records a successful provider completion, resetting consecutive failures and backoff window.
+   * Records a successful provider completion, resetting consecutive failures and backoff window,
+   * and promptly wakes any callers sleeping in `waitIfBackedOff`.
    */
   recordSuccess(): void {
     this.consecutiveFailures = 0;
     this.backoffUntil = 0;
     this.lastReason = undefined;
+    if (this.wakeListeners.size > 0) {
+      for (const wake of Array.from(this.wakeListeners)) {
+        wake();
+      }
+    }
   }
 
   /**
@@ -379,7 +386,7 @@ export class RateLimitBreaker {
   }
 
   /**
-   * Waits until the shared backoff window expires (re-checking if extended during sleep).
+   * Waits until the shared backoff window expires (re-checking if extended or cleared during sleep).
    */
   async waitIfBackedOff(signal?: AbortSignal): Promise<void> {
     while (true) {
@@ -390,8 +397,40 @@ export class RateLimitBreaker {
       if (remaining <= 0) {
         return;
       }
-      await sleepAbortable(remaining, signal);
+      await this.sleepWhileBackedOff(remaining, signal);
     }
+  }
+
+  private sleepWhileBackedOff(ms: number, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) {
+      return Promise.reject(createAbortError());
+    }
+    if (ms <= 0) {
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const cleanup = (): void => {
+        clearTimeout(timer);
+        this.wakeListeners.delete(onWake);
+        signal?.removeEventListener("abort", onAbort);
+      };
+      const onWake = (): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve();
+      };
+      const onAbort = (): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(createAbortError());
+      };
+      const timer = setTimeout(onWake, ms);
+      this.wakeListeners.add(onWake);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
   }
 }
 

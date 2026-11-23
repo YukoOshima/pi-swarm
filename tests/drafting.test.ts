@@ -55,6 +55,7 @@ import {
   SwarmProtocolError,
   type IQuestionnaireUI,
   type IWorktreeManager,
+  type ProposalDialogOutcome,
   type ProposedSwarmPlan,
   type QuestionSpec,
   type QuestionnaireResult,
@@ -2384,5 +2385,93 @@ describe("v0.3.7 drafting regression fixes", () => {
     assert.equal(qnDetails.answers.q_toString, "Own answer");
     assert.equal(controller.getDraft()?.questionnaireEcho?.q_constructor, "Answer 1");
     assert.equal(controller.getDraft()?.questionnaireEcho?.q_toString, "Own answer");
+  });
+
+  it("propose_swarm_plan continue branch preserves outcome.roleModels and falls back to updated settings", async () => {
+    const harness = new MockPiHarness();
+    let currentSettings: SwarmSettings = {
+      ...DEFAULT_SWARM_SETTINGS,
+      workerModel: "anthropic/claude-sonnet-4-5",
+      workerThinkingLevel: "medium",
+    };
+
+    const outcomes: ProposalDialogOutcome[] = [
+      {
+        action: "continue",
+        validatorEnabled: true,
+        maxConcurrency: 4,
+        feedback: "Keep refining with new picker models",
+        roleModels: {
+          orchestrator: { model: "openai/gpt-5", thinkingLevel: "high" },
+          worker: { model: "google/gemini-2.5-pro", thinkingLevel: "low" },
+        },
+      },
+      {
+        action: "continue",
+        validatorEnabled: false,
+        maxConcurrency: 2,
+        feedback: "Updated via settings directly",
+      },
+    ];
+
+    const controller = registerDraftingTools(harness.api, {
+      worktree: createMockWorktree(),
+      ui: {
+        askQuestion: async () => ({ cancelled: true, isCustom: false }),
+        askQuestionnaire: async () => ({
+          cancelled: true,
+          answers: {},
+          items: [],
+        }),
+        confirmProposal: async () => {
+          const next = outcomes.shift()!;
+          if (!next.roleModels) {
+            currentSettings = {
+              ...currentSettings,
+              validatorModel: "anthropic/claude-opus-4-6",
+              validatorThinkingLevel: "xhigh",
+            };
+          }
+          return next;
+        },
+      },
+      getSettings: () => currentSettings,
+      onPlanConfirmed: async (plan) => createMockRun(plan),
+    });
+
+    controller.start({ seed: "Continue roleModels test" });
+    const ctx = harness.createContext();
+    const proposeTool = harness.registeredTools.get(PROPOSE_SWARM_PLAN_TOOL);
+
+    // 1. Explicit outcome.roleModels preserved on "continue"
+    const res1 = await proposeTool.execute(
+      "tc-cont-rm-1",
+      makeSamplePlanParams(),
+      undefined,
+      undefined,
+      ctx,
+    );
+    const details1 = res1.details as ProposeSwarmPlanToolDetails;
+    assert.equal(details1.outcome, "continue");
+    assert.deepEqual(details1.plan?.roleModels, {
+      orchestrator: { model: "openai/gpt-5", thinkingLevel: "high" },
+      worker: { model: "google/gemini-2.5-pro", thinkingLevel: "low" },
+    });
+    assert.match(res1.content[0].text, /Orchestrator: openai\/gpt-5 \(high\)/);
+    assert.match(res1.content[0].text, /Worker: google\/gemini-2\.5-pro \(low\)/);
+
+    // 2. Omitted outcome.roleModels reads refreshed deps.getSettings()
+    const res2 = await proposeTool.execute(
+      "tc-cont-rm-2",
+      makeSamplePlanParams(),
+      undefined,
+      undefined,
+      ctx,
+    );
+    const details2 = res2.details as ProposeSwarmPlanToolDetails;
+    assert.equal(details2.outcome, "continue");
+    assert.equal(details2.plan?.roleModels?.validator?.model, "anthropic/claude-opus-4-6");
+    assert.equal(details2.plan?.roleModels?.validator?.thinkingLevel, "xhigh");
+    assert.match(res2.content[0].text, /Validator: anthropic\/claude-opus-4-6 \(xhigh\)/);
   });
 });

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
@@ -25,7 +25,9 @@ import {
 import {
   buildMemberInitialPrompt,
   buildMemberSystemPrompt,
+  buildOrchestratorLiveStateSection,
   buildOrchestratorPlaybookSection,
+  buildOrchestratorStaticSection,
   ConcurrencyGate,
   createMemberScopedTools,
   createSwarmTools,
@@ -40,6 +42,7 @@ import {
   parseRetryAfterMs,
   RateLimitBreaker,
   resolveRoleModel,
+  resolveWorktreeRelativePath,
   sanitizeForkSeedMessages,
   selectFallbackModel,
   SwarmEngine,
@@ -283,6 +286,7 @@ class MockSwarmStore implements ISwarmStore {
       channels,
       model: member.model,
       thinkingLevel: member.thinkingLevel,
+      ...(member.modelExplicit !== undefined ? { modelExplicit: member.modelExplicit } : {}),
       lastReadSeq: member.lastReadSeq ?? 0,
       turns: 0,
       tokens: 0,
@@ -4161,10 +4165,10 @@ describe("SwarmEngine & Runtime — v0.3.6 Fixes", () => {
       await waitUntil(() => engine.getSnapshot().run?.members["cold-waiter"]?.state === "waiting");
       const spawnsBeforeDetach = transport.spawns.length;
 
-      // Detach and reattach -> member is persisted as state="waiting" with NO live handle in memory
+      // Detach and reattach -> orphan 'waiting' member without a live handle is normalized to 'stopped' and auto-revives on switchModel
       await engine.attachRun(null);
       const snap = await engine.attachRun("run-dyn");
-      assert.equal(snap.run?.members["cold-waiter"]?.state, "waiting");
+      assert.equal(snap.run?.members["cold-waiter"]?.state, "stopped");
 
       const sw = await engine.switchModel({
         targetName: "cold-waiter",
@@ -5912,6 +5916,553 @@ describe("SwarmEngine & Runtime — v0.3.7 Fixes", () => {
         );
       } finally {
         await engine.dispose();
+      }
+    }
+  });
+
+  it("v0.5.1: fixes deferred role propagation flags, cold-worker breaker reset, telemetry/readSeq monotonic cache, attachRun normalization, completeRun/monitor races, guards, breaker wake, schemas & prompt cache", async () => {
+    // 1. Deferred propagateRoleModel preserves silentBoardNotice & fromRolePropagation (modelExplicit stays false, no [model] spam)
+    {
+      const { engine, store, transport } = await createTestHarness({
+        stallWatchdogEnabled: false,
+        workerModel: "openai/gpt-5",
+      });
+      let releaseTurn!: () => void;
+      const turnGate = new Promise<void>((r) => {
+        releaseTurn = r;
+      });
+      let enteredTurn!: () => void;
+      const enteredTurnP = new Promise<void>((r) => {
+        enteredTurn = r;
+      });
+      transport.onMember("def-role", async ({ turnIndex }) => {
+        if (turnIndex === 1) {
+          enteredTurn();
+          await turnGate;
+        }
+        return { outcome: "waiting", summary: "parked" };
+      });
+      try {
+        await engine.addMembers({ name: "def-role", brief: "Work while role model changes" });
+        await enteredTurnP;
+
+        const prop1 = await engine.propagateRoleModel({
+          role: "worker",
+          model: "anthropic/claude-sonnet-4-5",
+          thinkingLevel: "high",
+        });
+        assert.deepEqual(prop1.deferred, ["def-role"]);
+
+        releaseTurn();
+        await waitUntil(
+          () =>
+            engine.getSnapshot().run?.members["def-role"]?.state === "waiting" &&
+            engine.getSnapshot().run?.members["def-role"]?.model === "anthropic/claude-sonnet-4-5",
+        );
+
+        const after1 = engine.getSnapshot().run?.members["def-role"];
+        assert.equal(after1?.modelExplicit, false, "Deferred role propagation must keep modelExplicit=false");
+        const boardAfter1 = await store.readBoard("run-dyn", { limit: 20 });
+        assert.equal(
+          boardAfter1.messages.some((m) => m.kind === "model_switch"),
+          false,
+          "Deferred role propagation must preserve silentBoardNotice",
+        );
+
+        // Subsequent role propagation must STILL track and switch this member!
+        const prop2 = await engine.propagateRoleModel({
+          role: "worker",
+          model: "google/gemini-2.5-pro",
+          thinkingLevel: "medium",
+        });
+        assert.deepEqual(prop2.switched, ["def-role"]);
+      } finally {
+        releaseTurn?.();
+        await engine.dispose();
+      }
+    }
+
+    // 2. Cold worker (`keepWorkersWarm: false`) normal completions reset RateLimitBreaker and live.retryCount
+    {
+      const { engine, store, transport } = await createTestHarness({
+        stallWatchdogEnabled: false,
+        keepWorkersWarm: false,
+        maxRetries: 1,
+        rateLimitBaseBackoffMs: 25,
+        rateLimitMaxBackoffMs: 100,
+      });
+      await store.updateRun("run-dyn", { keepWorkersWarm: false });
+      try {
+        let count = 0;
+        transport.onMember("cold-rl", async () => {
+          count += 1;
+          // Attempt 1 (turn 1): 429; Attempt 2 (retry 1): ok; Attempt 3 (turn 2): 429; Attempt 4 (retry 1): ok
+          if (count === 1 || count === 3) {
+            return { outcome: "rate_limited", error: "429 transient", retryAfterMs: 10 };
+          }
+          return { outcome: "stopped", stopReason: "end_turn", summary: "ok" };
+        });
+
+        await engine.addMembers({ name: "cold-rl", brief: "Cold worker retry reset" });
+        await waitUntil(
+          () => count >= 2 && engine.getSnapshot().run?.members["cold-rl"]?.state === "stopped",
+          3000,
+        );
+        assert.equal(count, 2);
+
+        // Second turn hitting 429 would fail retry budget if retryCount wasn't reset by cold completion!
+        await engine.postMessage({
+          from: ORCHESTRATOR_NAME,
+          fromRole: "orchestrator",
+          text: "@cold-rl second turn",
+        });
+        await waitUntil(
+          () => count >= 4 && engine.getSnapshot().run?.members["cold-rl"]?.state === "stopped",
+          3000,
+        );
+        assert.equal(count, 4);
+      } finally {
+        await engine.dispose();
+      }
+    }
+
+    // 3. Monotonic live tokens/cost/lastReadSeq survive setCachedRun & floor waitForBoard(mentions_only:false)
+    {
+      const { engine, store, transport } = await createTestHarness({ stallWatchdogEnabled: false });
+      let releaseTurn!: () => void;
+      const gate = new Promise<void>((r) => {
+        releaseTurn = r;
+      });
+      let entered!: () => void;
+      const enteredP = new Promise<void>((r) => {
+        entered = r;
+      });
+      let capturedBridge: NonNullable<SpawnMemberRequest["engineApi"]> | undefined;
+      transport.onMember("mono-w", async ({ request, turnIndex }) => {
+        capturedBridge = request.engineApi;
+        if (turnIndex === 1) {
+          request.onTelemetry?.({
+            agentId: request.agentId,
+            name: request.name,
+            role: request.role,
+            runId: request.runId,
+            type: "turn_end",
+            timestamp: new Date().toISOString(),
+            tokens: 420,
+            tokenBreakdown: { input: 300, output: 120, cacheRead: 0, cacheWrite: 0, total: 420 },
+            cost: 0.042,
+          });
+          entered();
+          await gate;
+        }
+        return { outcome: "waiting", summary: "parked", tokens: 420, cost: 0.042 };
+      });
+      try {
+        await engine.addMembers({ name: "mono-w", brief: "Check monotonic live stats" });
+        await enteredP;
+
+        // Post an unrelated message and have mono-w read it via bridge
+        const p2 = await engine.postMessage({
+          from: ORCHESTRATOR_NAME,
+          fromRole: "orchestrator",
+          text: "FYI board post",
+        });
+        await capturedBridge!.readBoard({ since: 0 });
+
+        // Trigger concurrent setCachedRun via another postMessage
+        await engine.postMessage({
+          from: ORCHESTRATOR_NAME,
+          fromRole: "orchestrator",
+          text: "Second FYI post",
+        });
+
+        const mid = engine.getSnapshot().run?.members["mono-w"];
+        assert.ok((mid?.tokens ?? 0) >= 420, "live tokens must survive setCachedRun");
+        assert.ok((mid?.cost ?? 0) >= 0.042, "live cost must survive setCachedRun");
+        assert.ok((mid?.lastReadSeq ?? 0) >= p2.seq, "live lastReadSeq must survive setCachedRun");
+
+        releaseTurn();
+        await waitUntil(() => engine.getSnapshot().run?.members["mono-w"]?.state === "waiting");
+        assert.ok((engine.getSnapshot().run?.members["mono-w"]?.lastReadSeq ?? 0) >= p2.seq);
+
+        // Detach & reattach -> orphan waiting becomes stopped; revived member calling swarm_wait{since:0, mentions_only:false}
+        // must NOT re-receive messages <= member.lastReadSeq!
+        await engine.attachRun(null);
+        const reattached = await engine.attachRun("run-dyn");
+        assert.equal(reattached.run?.members["mono-w"]?.state, "stopped");
+        const savedReadSeq = reattached.run?.members["mono-w"]?.lastReadSeq ?? 0;
+        assert.ok(savedReadSeq >= p2.seq);
+
+        let secondReviveTurns = 0;
+        transport.onMember("mono-w", async ({ request }) => {
+          secondReviveTurns += 1;
+          request.onTelemetry?.({
+            agentId: request.agentId,
+            name: request.name,
+            role: request.role,
+            runId: request.runId,
+            type: "waiting",
+            timestamp: new Date().toISOString(),
+            logLine: "swarm_wait since=#0 mentions_only=false",
+          });
+          return { outcome: "waiting", summary: "parked after revive" };
+        });
+        await engine.postMessage({
+          from: ORCHESTRATOR_NAME,
+          fromRole: "orchestrator",
+          text: "@mono-w revive and wait with since=0",
+        });
+        await waitUntil(
+          () =>
+            secondReviveTurns === 1 &&
+            engine.getSnapshot().run?.members["mono-w"]?.state === "waiting",
+        );
+        // Wait briefly to confirm no spurious re-wakeup from old messages
+        await new Promise((r) => setTimeout(r, 40));
+        assert.equal(secondReviveTurns, 1, "Flooring waitForBoard with member.lastReadSeq prevents re-delivering old messages");
+      } finally {
+        releaseTurn?.();
+        await engine.dispose();
+      }
+    }
+
+    // 4. Working members persisted as stopped on detach/dispose; completeRun blocks postMessage/addMembers; concurrent propagateRoleModel serializes roleModels
+    {
+      const { engine, store, transport } = await createTestHarness({ stallWatchdogEnabled: false });
+      let releaseTurn!: () => void;
+      const gate = new Promise<void>((r) => {
+        releaseTurn = r;
+      });
+      let entered!: () => void;
+      const enteredP = new Promise<void>((r) => {
+        entered = r;
+      });
+      transport.onMember("busy-detach", async () => {
+        entered();
+        await gate;
+        return { outcome: "waiting", summary: "done" };
+      });
+      try {
+        await engine.addMembers({ name: "busy-detach", brief: "Stay working during detach" });
+        await enteredP;
+
+        await engine.attachRun(null);
+        const persisted = await store.loadRun("run-dyn");
+        assert.equal(
+          persisted.members["busy-detach"]?.state,
+          "stopped",
+          "attachRun(null) must persist live working members as stopped before disposing handles",
+        );
+
+        await engine.attachRun("run-dyn");
+        await Promise.all([
+          engine.propagateRoleModel({ role: "worker", model: "openai/gpt-5", thinkingLevel: "medium" }),
+          engine.propagateRoleModel({ role: "validator", model: "anthropic/claude-opus-4-6", thinkingLevel: "high" }),
+        ]);
+        const afterRoleRace = await store.loadRun("run-dyn");
+        assert.equal(afterRoleRace.roleModels.worker?.model, "openai/gpt-5");
+        assert.equal(afterRoleRace.roleModels.validator?.model, "anthropic/claude-opus-4-6");
+
+        // completeRun sets runDonePosted and blocks concurrent postMessage/addMembers
+        const origPost = store.postBoardMessage.bind(store);
+        let postEntered!: () => void;
+        let releasePost!: () => void;
+        const postEnteredP = new Promise<void>((r) => {
+          postEntered = r;
+        });
+        const releasePostP = new Promise<void>((r) => {
+          releasePost = r;
+        });
+        store.postBoardMessage = async (rId, msg) => {
+          if (msg.kind === "done") {
+            postEntered();
+            await releasePostP;
+          }
+          return origPost(rId, msg);
+        };
+        const doneP = engine.completeRun({ summary: "Closing run" });
+        await postEnteredP;
+        await assert.rejects(
+          () => engine.postMessage({ from: ORCHESTRATOR_NAME, fromRole: "orchestrator", text: "late" }),
+          (err) => err instanceof SwarmProtocolError && err.code === "INVALID_INPUT",
+        );
+        await assert.rejects(
+          () => engine.addMembers({ name: "late-worker", brief: "too late" }),
+          (err) => err instanceof SwarmProtocolError && err.code === "INVALID_INPUT",
+        );
+        releasePost();
+        await doneP;
+      } finally {
+        releaseTurn?.();
+        await engine.dispose();
+      }
+    }
+
+    // 5. Transport symlink containment, case-insensitive protected paths, shell mask & guard precision, thinking clamp
+    {
+      const tmpRoot = await mkdtemp(path.join(os.tmpdir(), "swarm-v051-guard-"));
+      try {
+        const outsideDir = path.join(tmpRoot, "outside");
+        const wtDir = path.join(tmpRoot, "wt");
+        await mkdir(outsideDir, { recursive: true });
+        await mkdir(path.join(wtDir, ".git"), { recursive: true });
+        await writeFile(path.join(outsideDir, "secret.txt"), "secret");
+        await symlink(outsideDir, path.join(wtDir, "escape-dir"));
+        await symlink(path.join(outsideDir, "missing.txt"), path.join(wtDir, "dangling-escape"));
+        await symlink(path.join(wtDir, ".git"), path.join(wtDir, "git-link"));
+
+        assert.equal(resolveWorktreeRelativePath(wtDir, "escape-dir/secret.txt"), null);
+        assert.equal(resolveWorktreeRelativePath(wtDir, "escape-dir/new-file.txt"), null);
+        assert.equal(resolveWorktreeRelativePath(wtDir, "dangling-escape"), null);
+        assert.equal(resolveWorktreeRelativePath(wtDir, "git-link/config"), ".git/config");
+        assert.equal(isProtectedSwarmPath(".git/config"), true);
+        if (process.platform === "darwin" || process.platform === "win32") {
+          assert.equal(isProtectedSwarmPath(".GIT/config"), true);
+          assert.equal(isProtectedSwarmPath(".Pi/Swarm/runs/1/state.json"), true);
+        }
+      } finally {
+        await rm(tmpRoot, { recursive: true, force: true });
+      }
+
+      // Nested quotes/escapes in $(...) and backticks + single-token quoted/escaped commands
+      assert.equal(isReadOnlyValidationCommand(`echo "$(echo ')'; rm -rf /)"`).allowed, false);
+      assert.equal(isForbiddenWorkerBashCommand(`echo "$(echo ')'; git push)"`, "main").allowed, false);
+      assert.equal(isReadOnlyValidationCommand('echo "`echo \'`\' ; rm -rf /`"').allowed, false);
+      assert.equal(isReadOnlyValidationCommand("'rm' -rf /tmp/x").allowed, false);
+      assert.equal(isReadOnlyValidationCommand("r\\m -rf /tmp/x").allowed, false);
+      assert.equal(isReadOnlyValidationCommand("$'rm' -rf /tmp/x").allowed, false);
+      assert.equal(isReadOnlyValidationCommand("'sh' -c \"rm -rf /tmp/x\"").allowed, false);
+      assert.equal(isForbiddenWorkerBashCommand('"git" push', "main").allowed, false);
+      assert.equal(isForbiddenWorkerBashCommand("git 'merge' feat", "main").allowed, false);
+
+      // Wrapper & flag expansions
+      assert.equal(isReadOnlyValidationCommand("timeout 5 rm -rf /tmp/x").allowed, false);
+      assert.equal(isReadOnlyValidationCommand("time rm -rf /tmp/x").allowed, false);
+      assert.equal(isReadOnlyValidationCommand("nice -n 10 rm -rf /tmp/x").allowed, false);
+      assert.equal(isReadOnlyValidationCommand("{ rm -rf /tmp/x; }").allowed, false);
+      assert.equal(isReadOnlyValidationCommand("env -i rm -rf /tmp/x").allowed, false);
+      assert.equal(isReadOnlyValidationCommand("cat files | xargs -0 rm").allowed, false);
+      assert.equal(isReadOnlyValidationCommand("git branch --delete feat").allowed, false);
+      assert.equal(isReadOnlyValidationCommand("npm --prefix . install").allowed, false);
+
+      // False-positive fixes: file paths containing eval/bash and git inspection flags
+      assert.equal(isReadOnlyValidationCommand('grep -n "rm -rf" src/eval.ts').allowed, true);
+      assert.equal(isReadOnlyValidationCommand("npx vitest run tests/bash/guard.test.ts").allowed, true);
+      assert.equal(isReadOnlyValidationCommand("git grep -n push").allowed, true);
+      assert.equal(isReadOnlyValidationCommand("git diff -U3 add").allowed, true);
+      assert.equal(isReadOnlyValidationCommand("git show --stat merge").allowed, true);
+      assert.equal(isReadOnlyValidationCommand("git diff feature-branch -M").allowed, true);
+
+      // Worker checkoutBaseRe flags
+      assert.equal(isForbiddenWorkerBashCommand("git checkout -b main", "main").allowed, false);
+      assert.equal(isForbiddenWorkerBashCommand("git checkout -B main", "main").allowed, false);
+      assert.equal(isForbiddenWorkerBashCommand("git switch -c main", "main").allowed, false);
+      assert.equal(isForbiddenWorkerBashCommand("git switch -C main", "main").allowed, false);
+      assert.equal(isForbiddenWorkerBashCommand("git checkout --force main", "main").allowed, false);
+
+      // RateLimitBreaker.recordSuccess wakes waitIfBackedOff sleepers promptly
+      const breaker = new RateLimitBreaker({ baseBackoffMs: 5000, maxBackoffMs: 5000 });
+      breaker.recordRateLimit(5000, "429");
+      const started = Date.now();
+      const waitP = breaker.waitIfBackedOff();
+      setTimeout(() => breaker.recordSuccess(), 15);
+      await waitP;
+      assert.ok(Date.now() - started < 500, "recordSuccess() must wake waitIfBackedOff promptly");
+
+      // swarm-tools: effort-only orchestrator fallback, validator role enum, integer schemas, zero Type.Union/anyOf/oneOf
+      const { engine } = await createTestHarness({ stallWatchdogEnabled: false });
+      try {
+        let capturedModelArg = "";
+        const orchTools = createSwarmTools({
+          engine,
+          onOrchestratorModelSwitch: async (model, thinkingLevel) => {
+            capturedModelArg = model;
+            return { targetName: ORCHESTRATOR_NAME, model: model || "", thinkingLevel };
+          },
+        });
+        const orchSwarm = orchTools.find((t) => t.name === SWARM_TOOL)!;
+        const switchRes = await orchSwarm.execute(
+          "tc-effort",
+          { action: "model", thinking_level: "high" },
+          undefined,
+          undefined,
+          { model: { provider: "openai", id: "gpt-5.4" } } as unknown as ExtensionToolContext,
+        );
+        assert.equal(capturedModelArg, "openai/gpt-5.4");
+        assert.ok((switchRes.content[0] as { text: string }).text.includes("openai/gpt-5.4 (high)"));
+
+        // Without ctx.model -> falls back to "host-default" in message
+        const fallbackRes = await orchSwarm.execute(
+          "tc-effort-2",
+          { action: "model", thinking_level: "medium" },
+          undefined,
+          undefined,
+          {} as ExtensionToolContext,
+        );
+        assert.ok((fallbackRes.content[0] as { text: string }).text.includes("host-default (medium)"));
+
+        const valTools = createMemberScopedTools(
+          {
+            postMessage: async () => {
+              throw new Error("unused");
+            },
+            readBoard: async () => ({ messages: [], head: 0 }),
+            getStatus: async () => ({
+              runId: "run-dyn",
+              title: "t",
+              status: "active",
+              baseBranch: "main",
+              boardHead: 0,
+              members: [],
+              channels: [],
+            }),
+            listModels: async () => [],
+            addHelper: async () => [],
+            killHelper: async () => {},
+            switchModel: async () => ({ targetName: "v1", model: "m" }),
+            manageChannel: async () => ({ action: "list", summary: "" }),
+          },
+          { name: "v1", role: "validator", runId: "run-dyn" },
+        );
+        const valSwarm = valTools.find((t) => t.name === SWARM_TOOL)!;
+        const roleSchema = (valSwarm.parameters as unknown as { properties: Record<string, { enum?: string[] }> }).properties.role;
+        assert.deepEqual(roleSchema?.enum, ["validator"]);
+        for (const tool of [...orchTools, ...valTools]) {
+          const schemaJson = JSON.stringify(tool.parameters);
+          assert.equal(schemaJson.includes('"anyOf"'), false);
+          assert.equal(schemaJson.includes('"oneOf"'), false);
+        }
+
+        // role-prompts: static section unchanged when roleModels change, live state includes 3-Role Models
+        const snap1 = engine.getSnapshot();
+        const static1 = buildOrchestratorStaticSection(snap1);
+        const live1 = buildOrchestratorLiveStateSection(snap1);
+        assert.equal(static1.includes("3-Role Models**: orchestrator="), false);
+        assert.equal(live1.includes("3-Role Models**: orchestrator="), true);
+        await engine.propagateRoleModel({ role: "worker", model: "google/gemini-2.5-pro" });
+        const static2 = buildOrchestratorStaticSection(engine.getSnapshot());
+        assert.equal(static2, static1, "Static section must stay cache-identical when roleModels update");
+      } finally {
+        await engine.dispose();
+      }
+    }
+
+    // 6. resolveModel clamps thinkingLevel when model.reasoning === false; attachRun serializes concurrent calls; monitorRunning is not clobbered by old monitor finally
+    {
+      const nonReasoningTransport = new InProcessPiTransport();
+      const nonReasoningCtx = {
+        modelRegistry: {
+          getAll: () => [
+            { id: "gpt-4o-mini", provider: "openai", name: "GPT-4o Mini", reasoning: false },
+            { id: "claude-sonnet-4-5", provider: "anthropic", name: "Sonnet", reasoning: true },
+          ],
+          getAvailable: () => [
+            { id: "gpt-4o-mini", provider: "openai", name: "GPT-4o Mini", reasoning: false },
+            { id: "claude-sonnet-4-5", provider: "anthropic", name: "Sonnet", reasoning: true },
+          ],
+          hasConfiguredAuth: () => true,
+        },
+      } as unknown as ExtensionContext;
+      const clamped = await nonReasoningTransport.resolveModel("openai/gpt-4o-mini", "high", nonReasoningCtx);
+      assert.equal(clamped.model, "openai/gpt-4o-mini");
+      assert.equal(clamped.thinkingLevel, "off");
+      const unclamped = await nonReasoningTransport.resolveModel("anthropic/claude-sonnet-4-5", "high", nonReasoningCtx);
+      assert.equal(unclamped.thinkingLevel, "high");
+
+      // Concurrent attachRun calls serialize without interleaving
+      const { engine, store } = await createTestHarness({ stallWatchdogEnabled: false });
+      try {
+        await store.createRun({
+          id: "run-second",
+          title: "Second",
+          objective: "Second run",
+          baseBranch: "main",
+          ownerSessionId: "sess-1",
+        });
+        const events: string[] = [];
+        const origLoad = store.loadRun.bind(store);
+        store.loadRun = async (id) => {
+          events.push(`load-start:${id}`);
+          await new Promise((r) => setTimeout(r, id === "run-dyn" ? 25 : 5));
+          events.push(`load-end:${id}`);
+          return origLoad(id);
+        };
+        await Promise.all([engine.attachRun("run-dyn"), engine.attachRun("run-second")]);
+        assert.ok(events.length >= 4 && events.length % 2 === 0);
+        for (let i = 0; i < events.length; i += 2) {
+          const startId = events[i]!.replace(/^load-start:/, "");
+          assert.equal(events[i], `load-start:${startId}`);
+          assert.equal(events[i + 1], `load-end:${startId}`, "Concurrent attachRun calls must never interleave");
+        }
+        assert.equal(events[0], "load-start:run-dyn");
+        assert.equal(events[events.length - 1], "load-end:run-second");
+        assert.equal(engine.getSnapshot().activeRunId, "run-second");
+      } finally {
+        await engine.dispose();
+      }
+
+      // Cancelled monitor's late finally does not clear monitorRunning for a newer active monitor
+      const { engine: monEngine, transport: monTransport } = await createTestHarness({
+        stallWatchdogEnabled: true,
+        stallMonitorMode: "llm",
+        stallTimeoutMs: 20,
+      });
+      let mon1Entered!: () => void;
+      let releaseMon1!: () => void;
+      const mon1EnteredP = new Promise<void>((r) => {
+        mon1Entered = r;
+      });
+      const releaseMon1P = new Promise<void>((r) => {
+        releaseMon1 = r;
+      });
+      let mon2Entered!: () => void;
+      let releaseMon2!: () => void;
+      const mon2EnteredP = new Promise<void>((r) => {
+        mon2Entered = r;
+      });
+      const releaseMon2P = new Promise<void>((r) => {
+        releaseMon2 = r;
+      });
+      let monSpawnCount = 0;
+      const origSpawn = monTransport.spawnMember.bind(monTransport);
+      monTransport.spawnMember = async (req) => {
+        if (req.isMonitor) {
+          monSpawnCount += 1;
+          if (monSpawnCount === 1) {
+            mon1Entered();
+            await releaseMon1P;
+          } else if (monSpawnCount === 2) {
+            mon2Entered();
+            await releaseMon2P;
+          }
+        }
+        return origSpawn(req);
+      };
+      try {
+        await monEngine.addMembers({ name: "mon-w", brief: "Park to trigger monitor" });
+        await waitUntil(() => monEngine.getSnapshot().run?.members["mon-w"]?.state === "waiting");
+        await mon1EnteredP;
+        // Activity cancels monitor #1 while its spawnMember is still awaiting releaseMon1P
+        await monEngine.postMessage({
+          from: ORCHESTRATOR_NAME,
+          fromRole: "orchestrator",
+          text: "Reset watchdog for monitor #2",
+        });
+        await mon2EnteredP;
+        // Now let monitor #1 finish unwinding while monitor #2 is active
+        releaseMon1();
+        await new Promise((r) => setTimeout(r, 20));
+        assert.equal(
+          (monEngine as unknown as { monitorRunning: boolean }).monitorRunning,
+          true,
+          "Old cancelled monitor's finally must not clear monitorRunning while a newer monitor is active",
+        );
+        releaseMon2();
+        await waitUntil(() => !(monEngine as unknown as { monitorRunning: boolean }).monitorRunning);
+      } finally {
+        releaseMon1?.();
+        releaseMon2?.();
+        await monEngine.dispose();
       }
     }
   });
