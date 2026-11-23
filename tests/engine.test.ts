@@ -150,6 +150,7 @@ class MockSwarmStore implements ISwarmStore {
   private readonly runs = new Map<string, SwarmRunState>();
   private readonly boards = new Map<string, BoardMessage[]>();
   readonly events: SwarmEvent[] = [];
+  readonly postedBoardInputs: PostBoardMessageInput[] = [];
   private seqCounter = 0;
   assertOwnerSession?: ISwarmStore["assertOwnerSession"];
 
@@ -250,6 +251,20 @@ class MockSwarmStore implements ISwarmStore {
     if (patch.validatorEnabled !== undefined) run.validatorEnabled = patch.validatorEnabled;
     if (patch.keepWorkersWarm !== undefined) run.keepWorkersWarm = patch.keepWorkersWarm;
     if (patch.roleModels !== undefined) run.roleModels = cloneState(patch.roleModels);
+    if (patch.phase !== undefined) {
+      if (patch.phase === null) {
+        delete run.phase;
+      } else {
+        run.phase = patch.phase;
+      }
+    }
+    if (patch.milestones !== undefined) {
+      if (patch.milestones === null) {
+        delete run.milestones;
+      } else {
+        run.milestones = cloneState(patch.milestones);
+      }
+    }
     if (patch.completionSummary !== undefined) run.completionSummary = patch.completionSummary;
     run.revision += 1;
     run.updatedAt = new Date().toISOString();
@@ -289,6 +304,8 @@ class MockSwarmStore implements ISwarmStore {
       ...(member.modelExplicit !== undefined ? { modelExplicit: member.modelExplicit } : {}),
       lastReadSeq: member.lastReadSeq ?? 0,
       turns: 0,
+      ...(member.llmTurns !== undefined ? { llmTurns: member.llmTurns } : {}),
+      ...(member.turnStartedAt !== undefined ? { turnStartedAt: member.turnStartedAt } : {}),
       tokens: 0,
       cost: 0,
       humanStopped: false,
@@ -347,6 +364,14 @@ class MockSwarmStore implements ISwarmStore {
       m.parkedOn = patch.parkedOn === null ? undefined : patch.parkedOn;
     }
     if (patch.turns !== undefined) m.turns = patch.turns;
+    if (patch.llmTurns !== undefined) m.llmTurns = patch.llmTurns;
+    if (patch.turnStartedAt !== undefined) {
+      if (patch.turnStartedAt === null) {
+        delete m.turnStartedAt;
+      } else {
+        m.turnStartedAt = patch.turnStartedAt;
+      }
+    }
     if (patch.tokens !== undefined) m.tokens = patch.tokens;
     if (patch.tokenBreakdown !== undefined) m.tokenBreakdown = patch.tokenBreakdown;
     if (patch.cost !== undefined) m.cost = patch.cost;
@@ -433,6 +458,7 @@ class MockSwarmStore implements ISwarmStore {
   }
 
   async postBoardMessage(runId: string, input: PostBoardMessageInput): Promise<BoardMessage> {
+    this.postedBoardInputs.push(input);
     const run = this.runs.get(runId)!;
     const list = this.boards.get(runId)!;
     const seq = run.boardHead + 1;
@@ -546,10 +572,20 @@ class MockSwarmStore implements ISwarmStore {
 
 class MockWorktreeManager implements IWorktreeManager {
   readonly repoRoot = "/repo";
-  readonly createdWorktrees: Array<{ branch: string; baseBranch: string; worktreePath: string }> = [];
+  readonly createdWorktrees: Array<{
+    branch: string;
+    baseBranch: string;
+    worktreePath: string;
+    reuseExistingBranch?: boolean;
+    mode?: "share" | "branch";
+  }> = [];
   readonly removedWorktrees: Array<{ worktreePath: string; force?: boolean }> = [];
   readonly deletedBranches: string[] = [];
-  readonly mergedBranches: Array<{ baseBranch: string; branch: string }> = [];
+  readonly mergedBranches: Array<{
+    baseBranch: string;
+    branch: string;
+    sourceWorktreePath?: string;
+  }> = [];
   readonly fetchedClones: Array<{ sourceWorktreePath: string; branch: string }> = [];
   readonly dirtyPaths = new Set<string>();
   failCreateWorktreeFor?: string;
@@ -579,6 +615,8 @@ class MockWorktreeManager implements IWorktreeManager {
     branch: string;
     baseBranch: string;
     worktreePath: string;
+    reuseExistingBranch?: boolean;
+    mode?: "share" | "branch";
   }): Promise<CreateWorktreeResult> {
     if (this.failCreateWorktreeFor && options.branch.includes(this.failCreateWorktreeFor)) {
       throw new SwarmProtocolError("GIT_ERROR", `Simulated worktree failure for ${options.branch}`);
@@ -636,8 +674,13 @@ class MockWorktreeManager implements IWorktreeManager {
   async mergeBranch(options: {
     baseBranch: string;
     branch: string;
+    sourceWorktreePath?: string;
   }): Promise<MergeBranchResult> {
-    this.mergedBranches.push({ baseBranch: options.baseBranch, branch: options.branch });
+    this.mergedBranches.push({
+      baseBranch: options.baseBranch,
+      branch: options.branch,
+      sourceWorktreePath: options.sourceWorktreePath,
+    });
     return {
       mergedCommitSha: this.nextMergeSha,
       strategy: "merge",
@@ -3514,6 +3557,7 @@ describe("SwarmEngine — v0.3.1 Hardening & Optimizations", () => {
         await waitUntil(() => engine.getSnapshot().run?.members.sharer?.state === "waiting");
         assert.equal(worktree.createdWorktrees.length, 1);
 
+        await engine.mergeMember("sharer");
         await engine.completeRun({ summary: "Shipped with autoTeardownOnComplete" });
         const tdEvent = store.events.find((e) => e.type === "teardown_completed");
         assert.ok(tdEvent, "completeRun must trigger teardown when autoTeardownOnComplete=true");
@@ -6841,6 +6885,716 @@ describe("SwarmEngine & Runtime — v0.6.0 Diagnostics & Self-Correcting Guards"
       assert.ok(!String(inheritBlockedBash?.reason).includes("should-not-appear"));
     } finally {
       await rm(repoDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ============================================================================
+// Suite 18: v0.7.0 Live Telemetry, Token Flush, Recovery & Safety Fixes
+// ============================================================================
+
+describe("SwarmEngine & Runtime — v0.7.0 Live Telemetry, Recovery & Safety Fixes", () => {
+  it("1. flushes live tokens, cost, tokenBreakdown, llmTurns & logTail when stopping working members on dispose/detach/stop", async () => {
+    const { engine, store, transport } = await createTestHarness({
+      stallWatchdogEnabled: false,
+    });
+    let releaseWorker!: () => void;
+    const workerGate = new Promise<void>((r) => {
+      releaseWorker = r;
+    });
+    let emitWorkerTelemetry!: (evt: {
+      type: "tool_start" | "turn_end";
+      toolName?: string;
+      activity?: string;
+      logLine?: string;
+      tokens?: number;
+      tokenBreakdown?: {
+        input: number;
+        output: number;
+        cacheRead: number;
+        cacheWrite: number;
+        total: number;
+      };
+      cost?: number;
+    }) => void;
+
+    transport.onMember("flusher", async ({ request }) => {
+      emitWorkerTelemetry = (partial) => {
+        request.onTelemetry?.({
+          agentId: request.agentId,
+          name: request.name,
+          role: request.role,
+          runId: request.runId,
+          timestamp: new Date().toISOString(),
+          ...partial,
+        });
+      };
+      await workerGate;
+    });
+
+    await engine.addMembers({ name: "flusher", brief: "Long running turn" });
+    await waitUntil(() => Boolean(emitWorkerTelemetry));
+
+    // Emit live telemetry while working (before turn finishes)
+    emitWorkerTelemetry({
+      type: "tool_start",
+      toolName: "bash",
+      activity: "bash: npm test",
+      logLine: "> bash: npm test",
+    });
+    emitWorkerTelemetry({
+      type: "turn_end",
+      tokens: 14500,
+      tokenBreakdown: {
+        input: 9000,
+        output: 3500,
+        cacheRead: 1500,
+        cacheWrite: 500,
+        total: 14500,
+      },
+      cost: 0.0875,
+    });
+
+    // Dispose engine mid-turn (simulates SIGTERM / process abort)
+    await engine.dispose();
+    releaseWorker();
+
+    const persisted = await store.loadRun("run-dyn");
+    const m = persisted.members.flusher!;
+    assert.equal(m.state, "stopped");
+    assert.equal(m.tokens, 14500, "dispose must flush live tokens into store");
+    assert.equal(m.cost, 0.0875, "dispose must flush live cost into store");
+    assert.deepEqual(m.tokenBreakdown, {
+      input: 9000,
+      output: 3500,
+      cacheRead: 1500,
+      cacheWrite: 500,
+      total: 14500,
+    });
+    assert.equal(m.llmTurns, 1, "dispose must flush accumulated llmTurns");
+    assert.ok(m.logTail.includes("> bash: npm test"), "dispose must flush live logTail");
+    assert.equal(m.currentActivity, undefined);
+    assert.equal(m.turnStartedAt, undefined, "turnStartedAt must be cleared on stop");
+  });
+
+  it("2. tracks turnStartedAt across working/waiting/wakeup/stopped and increments llmTurns on turn_end", async () => {
+    const { engine, store, transport } = await createTestHarness({
+      stallWatchdogEnabled: false,
+    });
+    let releaseTurn1!: () => void;
+    let releaseTurn2!: () => void;
+    const turn1Gate = new Promise<void>((r) => {
+      releaseTurn1 = r;
+    });
+    const turn2Gate = new Promise<void>((r) => {
+      releaseTurn2 = r;
+    });
+    let turnCount = 0;
+    let triggerTelemetry!: (type: "turn_end" | "text_delta", extra?: { activity?: string; tokens?: number; cost?: number }) => void;
+
+    transport.onMember("tracker", async ({ request }) => {
+      turnCount += 1;
+      triggerTelemetry = (type, extra) => {
+        request.onTelemetry?.({
+          agentId: request.agentId,
+          name: request.name,
+          role: request.role,
+          runId: request.runId,
+          timestamp: new Date().toISOString(),
+          type,
+          ...extra,
+        });
+      };
+      if (turnCount === 1) {
+        await turn1Gate;
+      } else {
+        await turn2Gate;
+      }
+      return { summary: `turn ${turnCount} done`, tokens: 500 * turnCount, cost: 0.01 * turnCount };
+    });
+
+    try {
+      await engine.addMembers({ name: "tracker", brief: "Track turns" });
+      await waitUntil(() => Boolean(triggerTelemetry));
+
+      const workingSnap = engine.getSnapshot().run!.members.tracker!;
+      assert.equal(workingSnap.state, "working");
+      assert.ok(typeof workingSnap.turnStartedAt === "string" && workingSnap.turnStartedAt.length > 0);
+
+      // Fire two LLM turn_end events within a single wakeup turn
+      triggerTelemetry("turn_end", { tokens: 200, cost: 0.004 });
+      triggerTelemetry("turn_end", { tokens: 400, cost: 0.008 });
+      assert.equal(engine.getSnapshot().run!.members.tracker!.llmTurns, 2);
+
+      // Also verify compaction clear (empty activity clears currentActivity)
+      triggerTelemetry("text_delta", { activity: "compacting context…" });
+      assert.equal(engine.getSnapshot().run!.members.tracker!.currentActivity, "compacting context…");
+      triggerTelemetry("text_delta", { activity: "" });
+      assert.equal(engine.getSnapshot().run!.members.tracker!.currentActivity, undefined);
+
+      // Finish turn 1 -> parks in waiting, clears turnStartedAt, persists llmTurns=2
+      releaseTurn1();
+      await waitUntil(() => engine.getSnapshot().run?.members.tracker?.state === "waiting");
+      const waitingPersisted = (await store.loadRun("run-dyn")).members.tracker!;
+      assert.equal(waitingPersisted.turnStartedAt, undefined);
+      assert.equal(waitingPersisted.llmTurns, 2);
+      assert.equal(waitingPersisted.turns, 1);
+
+      // Wake member -> sets fresh turnStartedAt and increments llmTurns further
+      await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        text: "@tracker please run second pass",
+      });
+      await waitUntil(() => turnCount === 2 && engine.getSnapshot().run?.members.tracker?.state === "working");
+      assert.ok(engine.getSnapshot().run!.members.tracker!.turnStartedAt);
+      triggerTelemetry("turn_end", { tokens: 900, cost: 0.02 });
+      assert.equal(engine.getSnapshot().run!.members.tracker!.llmTurns, 3);
+
+      releaseTurn2();
+      await waitUntil(() => engine.getSnapshot().run?.members.tracker?.state === "waiting");
+      const finalPersisted = (await store.loadRun("run-dyn")).members.tracker!;
+      assert.equal(finalPersisted.llmTurns, 3);
+      assert.equal(finalPersisted.turns, 2);
+      assert.equal(finalPersisted.turnStartedAt, undefined);
+    } finally {
+      releaseTurn1();
+      releaseTurn2();
+      await engine.dispose();
+    }
+  });
+
+  it("3. InProcessPiTransport streams thinking_delta, toolcall_start, tool_execution_update, compaction_start/end, and turn_end", async () => {
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), "pi-swarm-v070-stream-"));
+    try {
+      const listeners: Array<(event: any) => void> = [];
+      let totalTokens = 0;
+
+      const fakeSession = {
+        model: { provider: "anthropic", id: "claude-sonnet-4-5", reasoning: true },
+        thinkingLevel: "medium" as ThinkingLevel,
+        sessionManager: SessionManager.inMemory(tmpDir),
+        settingsManager: {},
+        async bindExtensions() {},
+        subscribe(fn: (ev: any) => void) {
+          listeners.push(fn);
+          return () => {
+            const idx = listeners.indexOf(fn);
+            if (idx >= 0) listeners.splice(idx, 1);
+          };
+        },
+        getSessionStats() {
+          return {
+            tokens: {
+              input: totalTokens,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              total: totalTokens,
+            },
+            cost: totalTokens * 0.00001,
+          };
+        },
+        async prompt() {
+          const emit = (ev: any) => {
+            for (const fn of [...listeners]) fn(ev);
+          };
+          // 1. thinking_delta (first emits immediately, rapid second is throttled)
+          emit({
+            type: "message_update",
+            assistantMessageEvent: { type: "thinking_start", contentIndex: 0, partial: { content: [] } },
+          });
+          emit({
+            type: "message_update",
+            assistantMessageEvent: {
+              type: "thinking_delta",
+              contentIndex: 0,
+              delta: "Checking worktree layout",
+              partial: { content: [] },
+            },
+          });
+          emit({
+            type: "message_update",
+            assistantMessageEvent: {
+              type: "thinking_delta",
+              contentIndex: 0,
+              delta: " should be throttled within 1.5s",
+              partial: { content: [] },
+            },
+          });
+
+          // 2. toolcall_start -> "preparing bash…"
+          emit({
+            type: "message_update",
+            assistantMessageEvent: {
+              type: "toolcall_start",
+              contentIndex: 1,
+              partial: {
+                content: [
+                  { type: "thinking", thinking: "Checking" },
+                  { type: "toolCall", id: "tc-1", name: "bash", arguments: {} },
+                ],
+              },
+            },
+          });
+
+          // 3. tool_execution_start + tool_execution_update -> "bash: <tail>"
+          emit({
+            type: "tool_execution_start",
+            toolCallId: "tc-1",
+            toolName: "bash",
+            args: { command: "npm test" },
+          });
+          emit({
+            type: "tool_execution_update",
+            toolCallId: "tc-1",
+            toolName: "bash",
+            args: { command: "npm test" },
+            partialResult: {
+              content: [{ type: "text", text: "line 1\n\x1b[32mPASS tests/engine.test.ts\x1b[0m\n   \n" }],
+            },
+          });
+          emit({
+            type: "tool_execution_end",
+            toolCallId: "tc-1",
+            toolName: "bash",
+            result: {},
+            isError: false,
+          });
+
+          // 4. compaction_start / compaction_end
+          emit({ type: "compaction_start", reason: "threshold" });
+          emit({
+            type: "compaction_end",
+            reason: "threshold",
+            result: undefined,
+            aborted: false,
+            willRetry: false,
+          });
+
+          // 5. turn_end -> reports tokens & triggers llmTurns increment
+          totalTokens = 1234;
+          emit({ type: "turn_end" });
+        },
+        async steer() {},
+        async followUp() {},
+        async abort() {},
+        dispose() {},
+      };
+
+      const transport = new InProcessPiTransport({
+        agentDir: tmpDir,
+        createSession: (async () => ({ session: fakeSession as unknown as AgentSession })) as any,
+      });
+
+      const telemetry: Array<{ type: string; activity?: string; toolName?: string; tokens?: number }> = [];
+      const handle = await transport.spawnMember({
+        agentId: "stream-1",
+        name: "streamer",
+        role: "worker",
+        runId: "run-stream",
+        cwd: tmpDir,
+        workspace: "inherit",
+        parentName: ORCHESTRATOR_NAME,
+        brief: "Stream telemetry",
+        systemPrompt: "sys",
+        initialPrompt: "go",
+        keepWarm: true,
+        onTelemetry: (evt) => {
+          telemetry.push({
+            type: evt.type,
+            activity: evt.activity,
+            toolName: evt.toolName,
+            tokens: evt.tokens,
+          });
+        },
+      });
+      await handle.currentTurn;
+      await handle.kill("done");
+
+      const thinkingEvents = telemetry.filter((e) => e.activity?.startsWith("thinking…"));
+      assert.equal(thinkingEvents.length, 1, "thinking_delta must emit once and throttle bursts within 1.5s");
+      assert.ok(thinkingEvents[0]!.activity!.includes("Checking worktree layout"));
+
+      assert.ok(
+        telemetry.some((e) => e.activity === "preparing bash…" && e.toolName === "bash"),
+        "toolcall_start must emit preparing <toolName>…",
+      );
+      assert.ok(
+        telemetry.some((e) => e.activity === "bash: PASS tests/engine.test.ts"),
+        "tool_execution_update must emit stripped last non-empty stdout line",
+      );
+      assert.ok(
+        telemetry.some((e) => e.activity === "compacting context…"),
+        "compaction_start must emit compacting context…",
+      );
+      assert.ok(
+        telemetry.some((e) => e.type === "usage_update" && e.activity === ""),
+        "compaction_end must clear compaction activity",
+      );
+      assert.ok(
+        telemetry.some((e) => e.type === "turn_end" && e.tokens === 1234),
+        "turn_end must emit telemetry with session tokens",
+      );
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("4. protects active/paused & unmerged worktrees on non-force teardown, auto-recovers missing worktrees on revive, and falls back cleanly on missing_worktree merge", async () => {
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), "pi-swarm-v070-wt-"));
+    try {
+      const { engine, store, worktree, transport } = await createTestHarness({
+        stallWatchdogEnabled: false,
+        autoRebase: true,
+      });
+
+      // Override getWorktreePath to use a real temp path we can delete to test existsSync recovery
+      const origGetWorktreePath = store.getWorktreePath.bind(store);
+      store.getWorktreePath = (runId, memberName) =>
+        path.join(tmpDir, `${runId}-${memberName}`);
+
+      const origCreate = worktree.createWorktree.bind(worktree);
+      worktree.createWorktree = async (opts) => {
+        await mkdir(opts.worktreePath, { recursive: true });
+        return origCreate(opts);
+      };
+
+      try {
+        await engine.addMembers({
+          name: "alpha",
+          workspace: "share",
+          brief: "Alpha slice",
+        });
+        await waitUntil(() => engine.getSnapshot().run?.members.alpha?.state === "waiting");
+
+        // A. Non-force teardown while run is active skips non-killed (waiting) member
+        const activeTd = await engine.teardown();
+        assert.equal(activeTd.removed.length, 0);
+        assert.equal(activeTd.skipped.length, 1);
+        assert.equal(activeTd.skipped[0]!.memberName, "alpha");
+        assert.equal(activeTd.skipped[0]!.action, "skipped_active");
+        assert.ok(activeTd.skipped[0]!.reason?.includes("active"));
+
+        // Non-force teardown while run is paused also skips non-killed (stopped) member
+        await engine.pause();
+        const pausedTd = await engine.teardown();
+        assert.equal(pausedTd.removed.length, 0);
+        assert.equal(pausedTd.skipped.length, 1);
+        assert.equal(pausedTd.skipped[0]!.memberName, "alpha");
+        assert.equal(pausedTd.skipped[0]!.action, "skipped_active");
+
+        // Force teardown DOES allow removing non-active (stopped) worktree
+        await engine.resume();
+        const alphaWtPath = engine.getSnapshot().run!.members.alpha!.cwd;
+        await rm(alphaWtPath, { recursive: true, force: true });
+
+        // Stop alpha so next mention triggers reviveMemberWithPendingWakes
+        await engine.stopMember("alpha", { humanStopped: false, reason: "simulate restart" });
+
+        // B. Revive when isolated worktree dir is missing -> auto-reprovisions with reuseExistingBranch: true
+        const createdBeforeRevive = worktree.createdWorktrees.length;
+        await engine.postMessage({
+          from: ORCHESTRATOR_NAME,
+          fromRole: "orchestrator",
+          text: "@alpha please continue after worktree recovery",
+        });
+        await waitUntil(() => engine.getSnapshot().run?.members.alpha?.state === "waiting");
+        assert.equal(worktree.createdWorktrees.length, createdBeforeRevive + 1);
+        const reprovision = worktree.createdWorktrees[worktree.createdWorktrees.length - 1]!;
+        assert.equal(reprovision.reuseExistingBranch, true);
+        assert.equal(reprovision.mode, "share");
+        assert.equal(reprovision.worktreePath, alphaWtPath);
+
+        // C. Merge fallback when autoRebase returns status="missing_worktree"
+        worktree.rebaseResult = {
+          status: "missing_worktree",
+          message: "Worktree does not exist; skipping auto-rebase.",
+        };
+        const mergeRes = await engine.mergeMember("alpha");
+        assert.ok(mergeRes, "mergeMember should succeed on missing_worktree fallback");
+        assert.equal(mergeRes.strategy, "merge");
+        const lastMergeCall = worktree.mergedBranches[worktree.mergedBranches.length - 1]!;
+        assert.equal(
+          lastMergeCall.sourceWorktreePath,
+          undefined,
+          "missing_worktree merge must omit sourceWorktreePath and merge branch ref directly",
+        );
+
+        // D. Non-force teardown on completed run skips unmerged member with commits ahead
+        await engine.addMembers({
+          name: "beta",
+          workspace: "share",
+          brief: "Unmerged slice",
+        });
+        await waitUntil(() => engine.getSnapshot().run?.members.beta?.state === "waiting");
+        await engine.completeRun({ summary: "Done with unmerged beta", teardown: false });
+
+        const completedTd = await engine.teardown({ runId: "run-dyn" });
+        assert.ok(
+          completedTd.removed.some((r) => r.memberName === "alpha"),
+          "merged alpha worktree should be removed after completion",
+        );
+        assert.ok(
+          completedTd.skipped.some(
+            (s) => s.memberName === "beta" && s.reason?.includes("unmerged commit"),
+          ),
+          "unmerged beta worktree with commits ahead must be skipped on non-force teardown",
+        );
+
+        // Force teardown removes unmerged beta too
+        const forcedTd = await engine.teardown({ runId: "run-dyn", force: true });
+        assert.ok(forcedTd.removed.some((r) => r.memberName === "beta"));
+      } finally {
+        store.getWorktreePath = origGetWorktreePath;
+        await engine.dispose();
+        void transport;
+      }
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("5. supports phase & milestones on swarm{action:'title'} with zero Type.Union/anyOf/oneOf in schema", async () => {
+    const { engine } = await createTestHarness({ stallWatchdogEnabled: false });
+    try {
+      const tools = createSwarmTools({ engine });
+      const swarmTool = tools.find((t) => t.name === SWARM_TOOL)!;
+
+      // Verify schema contains zero anyOf/oneOf
+      const schemaJson = JSON.stringify(swarmTool.parameters);
+      assert.ok(!schemaJson.includes('"anyOf"'), "SwarmToolParamsSchema must not contain anyOf");
+      assert.ok(!schemaJson.includes('"oneOf"'), "SwarmToolParamsSchema must not contain oneOf");
+
+      // Update phase & milestones WITHOUT passing title
+      const res1 = await swarmTool.execute(
+        "tc-title-1",
+        {
+          action: "title",
+          phase: "implementation",
+          milestones: [
+            { label: "Core runtime fixes", status: "in_progress", owner: "@runtime" },
+            { label: "Unit test verification", status: "pending" },
+          ],
+        } as any,
+        undefined,
+        undefined,
+        {} as unknown as ExtensionToolContext,
+      );
+      assert.ok(!res1.isError);
+      const run1 = engine.getSnapshot().run!;
+      assert.equal(run1.title, "Dynamic Swarm Test");
+      assert.equal(run1.phase, "implementation");
+      assert.deepEqual(run1.milestones, [
+        { label: "Core runtime fixes", status: "in_progress", owner: "runtime" },
+        { label: "Unit test verification", status: "pending" },
+      ]);
+
+      // Backward compatibility: passing only title preserves phase & milestones
+      const res2 = await swarmTool.execute(
+        "tc-title-2",
+        {
+          action: "title",
+          title: "v0.7.0 Release Swarm",
+        } as any,
+        undefined,
+        undefined,
+        {} as unknown as ExtensionToolContext,
+      );
+      assert.ok(!res2.isError);
+      const run2 = engine.getSnapshot().run!;
+      assert.equal(run2.title, "v0.7.0 Release Swarm");
+      assert.equal(run2.phase, "implementation");
+      assert.equal(run2.milestones?.length, 2);
+    } finally {
+      await engine.dispose();
+    }
+  });
+
+  it("6. sanitizes channel null/'null'/'undefined'/'' and filters @mentions against active roster via knownMembers", async () => {
+    const { engine, store, transport } = await createTestHarness({
+      stallWatchdogEnabled: false,
+    });
+    let workerBridge: SpawnMemberRequest["engineApi"] | undefined;
+    transport.onMember("alice", async ({ request }) => {
+      workerBridge = request.engineApi;
+    });
+
+    try {
+      await engine.addMembers({
+        name: "alice",
+        brief: "Fix @mention parsing and @param docs without waking @nonexistent",
+      });
+      await waitUntil(() => engine.getSnapshot().run?.members.alice?.state === "waiting");
+      assert.ok(workerBridge);
+
+      // Brief post passed knownMembers to store.postBoardMessage
+      const briefInput = store.postedBoardInputs.find((i) => i.kind === "brief")!;
+      assert.ok(briefInput.knownMembers, "brief post must pass knownMembers to store");
+      const briefKnown = new Set(Array.from(briefInput.knownMembers!).map((s) => s.toLowerCase()));
+      assert.ok(briefKnown.has("alice"));
+      assert.ok(!briefKnown.has("mention"));
+
+      const tools = createSwarmTools({ engine });
+      const postTool = tools.find((t) => t.name === POST_MESSAGE_TOOL)!;
+      const readTool = tools.find((t) => t.name === READ_BOARD_TOOL)!;
+      const memberTools = createMemberScopedTools(workerBridge, {
+        name: "alice",
+        role: "worker",
+        runId: "run-dyn",
+      });
+      const memberPostTool = memberTools.find((t) => t.name === POST_MESSAGE_TOOL)!;
+      const memberReadTool = memberTools.find((t) => t.name === READ_BOARD_TOOL)!;
+
+      // Test channel: null, "null", "undefined", "", and non-string across orchestrator & member tools
+      for (const badChannel of [null, "null", "NULL", "undefined", "", "#null", 42]) {
+        const pRes = await postTool.execute(
+          "tc-post",
+          { text: "Hello @alice and fake @mention / @param", channel: badChannel } as any,
+          undefined,
+          undefined,
+          {} as unknown as ExtensionToolContext,
+        );
+        assert.ok(!pRes.isError, `post_message must accept channel=${String(badChannel)}`);
+        const posted = pRes.details as BoardMessage;
+        assert.equal(posted.channel, DEFAULT_CHANNEL);
+        assert.deepEqual(posted.mentions, ["alice"], "prose tokens @mention/@param must be filtered out");
+
+        const rRes = await readTool.execute(
+          "tc-read",
+          { channel: badChannel } as any,
+          undefined,
+          undefined,
+          {} as unknown as ExtensionToolContext,
+        );
+        assert.ok(!rRes.isError, `read_board must accept channel=${String(badChannel)}`);
+
+        const mpRes = await memberPostTool.execute(
+          "tc-mpost",
+          { text: "Worker update citing @type only", channel: badChannel } as any,
+          undefined,
+          undefined,
+          {} as unknown as ExtensionToolContext,
+        );
+        assert.ok(!mpRes.isError, `member post_message must accept channel=${String(badChannel)}`);
+        assert.deepEqual((mpRes.details as BoardMessage).mentions, []);
+
+        const mrRes = await memberReadTool.execute(
+          "tc-mread",
+          { channel: badChannel } as any,
+          undefined,
+          undefined,
+          {} as unknown as ExtensionToolContext,
+        );
+        assert.ok(!mrRes.isError, `member read_board must accept channel=${String(badChannel)}`);
+      }
+
+      // Auto-routed [done] with fake prose @mention must still auto-prepend @orchestrator!
+      const doneRes = await workerBridge.postMessage({
+        text: "[done] Fixed @mention parsing bug cleanly",
+        channel: "null",
+      });
+      assert.equal(doneRes.channel, DEFAULT_CHANNEL);
+      assert.deepEqual(doneRes.mentions, [ORCHESTRATOR_NAME]);
+    } finally {
+      await engine.dispose();
+    }
+  });
+
+  it("7. prefers dynamic keyHint in tool renderers and includes batching & @validator prose guidance in role-prompts", async () => {
+    const { engine } = await createTestHarness({ stallWatchdogEnabled: false });
+    try {
+      const tools = createSwarmTools({ engine });
+      const swarmTool = tools.find((t) => t.name === SWARM_TOOL)!;
+      const postTool = tools.find((t) => t.name === POST_MESSAGE_TOOL)!;
+      const readTool = tools.find((t) => t.name === READ_BOARD_TOOL)!;
+
+      const stubTheme = {
+        fg: (_color: string, text: string) => text,
+        bold: (text: string) => text,
+      } as any;
+
+      // A. Prefer options.keyHint("app.tools.expand", "to expand")
+      const multiLineResult = {
+        content: [{ type: "text" as const, text: "Line 1 summary\nLine 2 detail" }],
+        details: {},
+      };
+      const renderedFromOptions = swarmTool.renderResult!(
+        multiLineResult,
+        {
+          expanded: false,
+          isPartial: false,
+          keyHint: (kb: string, desc: string) => `${kb}:${desc}`,
+        } as any,
+        stubTheme,
+        {} as any,
+      );
+      assert.ok(
+        renderedFromOptions.render(200).join("\n").includes("app.tools.expand:to expand"),
+        "renderSwarmResult must prefer options.keyHint when provided",
+      );
+
+      // B. Also supports Pi 1.6 context.keyHint("app.tools.expand", "to expand")
+      const warningResult = {
+        content: [{ type: "text" as const, text: "Completed\nLine 2\n⚠ Warning detail" }],
+        details: {},
+      };
+      const renderedFromContext = swarmTool.renderResult!(
+        warningResult,
+        { expanded: false, isPartial: false },
+        stubTheme,
+        { keyHint: (_kb: string, desc: string) => `alt+e ${desc}` } as any,
+      );
+      assert.ok(
+        renderedFromContext.render(200).join("\n").includes("alt+e to expand"),
+        "renderSwarmResult must use context.keyHint when provided",
+      );
+
+      // C. Fallback when keyHint is absent
+      const fallbackRendered = postTool.renderResult!(
+        {
+          content: [{ type: "text" as const, text: "Posted" }],
+          details: {
+            seq: 1,
+            channel: "main",
+            text: "Line 1\nLine 2",
+            mentions: [],
+            channelMentions: [],
+          },
+        },
+        { expanded: false, isPartial: false },
+        stubTheme,
+        {} as any,
+      );
+      assert.ok(fallbackRendered.render(200).join("\n").includes("(Ctrl+O to expand)"));
+
+      const readRendered = readTool.renderResult!(
+        {
+          content: [{ type: "text" as const, text: "Board" }],
+          details: { messages: [{ seq: 1 }], head: 1 },
+        },
+        { expanded: false, isPartial: false },
+        stubTheme,
+        { keyHint: () => "ctrl+e to expand" } as any,
+      );
+      assert.ok(readRendered.render(200).join("\n").includes("ctrl+e to expand"));
+
+      // D. Role prompts include batching guidance for workers and @validator prose discipline for orchestrator
+      await engine.addMembers({ name: "builder", brief: "Build feature" });
+      await waitUntil(() => engine.getSnapshot().run?.members.builder?.state === "waiting");
+      const snap = engine.getSnapshot();
+      const playbook = buildOrchestratorPlaybookSection(snap);
+      assert.ok(
+        playbook.includes("Avoid writing `@validator`") && playbook.includes("in prose"),
+        "orchestrator playbook must warn against mentioning @validator in prose",
+      );
+      const workerPrompt = buildMemberSystemPrompt(snap.run!, snap.run!.members.builder!);
+      assert.ok(
+        workerPrompt.includes("Batch independent read, inspection, or verification shell commands"),
+        "worker prompt must instruct batching independent shell commands",
+      );
+    } finally {
+      await engine.dispose();
     }
   });
 });

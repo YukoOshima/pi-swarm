@@ -1040,6 +1040,11 @@ function createFallbackBridge(request: SpawnMemberRequest): MemberEngineBridge {
 // Telemetry & Assistant Message Extraction Helpers
 // ============================================================================
 
+const ANSI_ESCAPE_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
+const TELEMETRY_CONTROL_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g;
+const THINKING_THROTTLE_MS = 1500;
+const TOOL_UPDATE_THROTTLE_MS = 1500;
+
 function formatToolActivity(toolName: string, args: unknown): string {
   if (!args || typeof args !== "object") {
     return toolName;
@@ -1053,6 +1058,96 @@ function formatToolActivity(toolName: string, args: unknown): string {
     (typeof record.name === "string" && record.name) ||
     "";
   return target ? `${toolName}: ${target}` : toolName;
+}
+
+function cleanTelemetryLine(raw: string): string {
+  return raw
+    .replace(ANSI_ESCAPE_RE, "")
+    .replace(TELEMETRY_CONTROL_RE, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractLastNonEmptyLine(raw: string, maxChars = 72): string {
+  const lines = raw.split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const cleaned = cleanTelemetryLine(lines[i] ?? "");
+    if (cleaned.length > 0) {
+      return cleaned.length > maxChars
+        ? `${cleaned.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`
+        : cleaned;
+    }
+  }
+  return "";
+}
+
+function extractToolUpdateTail(partialResult: unknown, maxChars = 72): string {
+  if (typeof partialResult === "string") {
+    return extractLastNonEmptyLine(partialResult, maxChars);
+  }
+  if (!partialResult || typeof partialResult !== "object") {
+    return "";
+  }
+  const rec = partialResult as Record<string, unknown>;
+  if (Array.isArray(rec.content)) {
+    for (let i = rec.content.length - 1; i >= 0; i--) {
+      const part = rec.content[i];
+      if (
+        part &&
+        typeof part === "object" &&
+        (part as { type?: unknown }).type === "text" &&
+        typeof (part as { text?: unknown }).text === "string"
+      ) {
+        const line = extractLastNonEmptyLine((part as { text: string }).text, maxChars);
+        if (line) {
+          return line;
+        }
+      }
+    }
+  }
+  for (const key of ["stdout", "output", "text"] as const) {
+    if (typeof rec[key] === "string") {
+      const line = extractLastNonEmptyLine(rec[key] as string, maxChars);
+      if (line) {
+        return line;
+      }
+    }
+  }
+  return "";
+}
+
+function formatThinkingActivity(thinkingTail: string): string {
+  const line = extractLastNonEmptyLine(thinkingTail, 56);
+  return line ? `thinking… ${line}` : "thinking…";
+}
+
+function extractToolCallStartName(
+  assistantMessageEvent: Extract<
+    Extract<AgentSessionEvent, { type: "message_update" }>["assistantMessageEvent"],
+    { type: "toolcall_start" }
+  >,
+): string {
+  const partialContent = assistantMessageEvent.partial?.content;
+  if (Array.isArray(partialContent)) {
+    const block = partialContent[assistantMessageEvent.contentIndex];
+    if (
+      block &&
+      typeof block === "object" &&
+      "name" in block &&
+      typeof block.name === "string" &&
+      block.name.trim().length > 0
+    ) {
+      return block.name.trim();
+    }
+  }
+  const raw = assistantMessageEvent as unknown as Record<string, unknown>;
+  if (typeof raw.toolName === "string" && raw.toolName.trim().length > 0) {
+    return raw.toolName.trim();
+  }
+  if (typeof raw.name === "string" && raw.name.trim().length > 0) {
+    return raw.name.trim();
+  }
+  return "";
 }
 
 function extractAssistantText(message: AssistantMessage | undefined): string {
@@ -1249,6 +1344,10 @@ export class InProcessPiTransport implements ISwarmTransport {
     const assistantRef: { current: AssistantMessage | undefined } = { current: undefined };
     const getLastAssistant = (): AssistantMessage | undefined => assistantRef.current;
     let lastTextEmitAt = 0;
+    let lastThinkingEmitAt = 0;
+    let thinkingTail = "";
+    let lastToolUpdateEmitAt = 0;
+    let lastToolUpdateActivity = "";
 
     const pendingSteers: Array<{ text: string; mode: "steer" | "followUp" }> = [];
 
@@ -1433,6 +1532,10 @@ export class InProcessPiTransport implements ISwarmTransport {
       let caughtError: unknown;
       assistantRef.current = undefined;
       endTurnRequested = false;
+      thinkingTail = "";
+      lastThinkingEmitAt = 0;
+      lastToolUpdateEmitAt = 0;
+      lastToolUpdateActivity = "";
 
       try {
         if (options.isInitialTurn) {
@@ -1574,6 +1677,8 @@ export class InProcessPiTransport implements ISwarmTransport {
           unsubscribe = session.subscribe((event: AgentSessionEvent) => {
             switch (event.type) {
               case "tool_execution_start": {
+                lastToolUpdateEmitAt = 0;
+                lastToolUpdateActivity = "";
                 const activity = formatToolActivity(event.toolName, event.args);
                 emitTelemetry({
                   type: "tool_start",
@@ -1583,7 +1688,28 @@ export class InProcessPiTransport implements ISwarmTransport {
                 });
                 break;
               }
+              case "tool_execution_update": {
+                const now = Date.now();
+                if (now - lastToolUpdateEmitAt >= TOOL_UPDATE_THROTTLE_MS) {
+                  const tail = extractToolUpdateTail(event.partialResult);
+                  if (tail) {
+                    const activity = `${event.toolName}: ${tail}`;
+                    if (activity !== lastToolUpdateActivity) {
+                      lastToolUpdateEmitAt = now;
+                      lastToolUpdateActivity = activity;
+                      emitTelemetry({
+                        type: "tool_start",
+                        toolName: event.toolName,
+                        activity,
+                      });
+                    }
+                  }
+                }
+                break;
+              }
               case "tool_execution_end": {
+                lastToolUpdateEmitAt = 0;
+                lastToolUpdateActivity = "";
                 emitTelemetry({
                   type: "tool_end",
                   toolName: event.toolName,
@@ -1595,11 +1721,12 @@ export class InProcessPiTransport implements ISwarmTransport {
                 break;
               }
               case "message_update": {
-                if (event.assistantMessageEvent.type === "text_delta") {
+                const msgEvt = event.assistantMessageEvent;
+                if (msgEvt.type === "text_delta") {
                   const now = Date.now();
                   if (now - lastTextEmitAt >= 250) {
                     lastTextEmitAt = now;
-                    const snippet = event.assistantMessageEvent.delta.replace(/\s+/g, " ").trim();
+                    const snippet = msgEvt.delta.replace(/\s+/g, " ").trim();
                     if (snippet) {
                       emitTelemetry({
                         type: "text_delta",
@@ -1608,7 +1735,47 @@ export class InProcessPiTransport implements ISwarmTransport {
                       });
                     }
                   }
+                } else if (msgEvt.type === "thinking_start") {
+                  thinkingTail = "";
+                  lastThinkingEmitAt = 0;
+                } else if (msgEvt.type === "thinking_delta") {
+                  thinkingTail = (thinkingTail + msgEvt.delta).slice(-240);
+                  const now = Date.now();
+                  if (now - lastThinkingEmitAt >= THINKING_THROTTLE_MS) {
+                    lastThinkingEmitAt = now;
+                    emitTelemetry({
+                      type: "text_delta",
+                      activity: formatThinkingActivity(thinkingTail),
+                    });
+                  }
+                } else if (msgEvt.type === "toolcall_start") {
+                  const toolName = extractToolCallStartName(msgEvt);
+                  emitTelemetry({
+                    type: "text_delta",
+                    ...(toolName ? { toolName } : {}),
+                    activity: toolName ? `preparing ${toolName}…` : "preparing tool call…",
+                  });
                 }
+                break;
+              }
+              case "compaction_start": {
+                emitTelemetry({
+                  type: "usage_update",
+                  activity: "compacting context…",
+                  logLine: `compacting context (${event.reason})`,
+                });
+                break;
+              }
+              case "compaction_end": {
+                emitTelemetry({
+                  type: "usage_update",
+                  activity: "",
+                  logLine: event.aborted
+                    ? "context compaction aborted"
+                    : event.errorMessage
+                      ? `context compaction error: ${event.errorMessage}`
+                      : "context compaction finished",
+                });
                 break;
               }
               case "message_end": {
@@ -1622,15 +1789,15 @@ export class InProcessPiTransport implements ISwarmTransport {
                 break;
               }
               case "turn_end": {
-                if (session) {
-                  const usage = readStats(session);
-                  emitTelemetry({
-                    type: "turn_end",
-                    tokens: usage.tokens,
-                    tokenBreakdown: usage.breakdown,
-                    cost: usage.cost,
-                  });
-                }
+                thinkingTail = "";
+                lastThinkingEmitAt = 0;
+                const usage = readStats(session);
+                emitTelemetry({
+                  type: "turn_end",
+                  tokens: usage.tokens,
+                  tokenBreakdown: usage.breakdown,
+                  cost: usage.cost,
+                });
                 break;
               }
               case "auto_retry_start": {
