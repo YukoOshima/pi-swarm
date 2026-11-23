@@ -11,11 +11,15 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
   ExtensionContext,
+  MessageRenderer,
   ModelRuntime,
+  Theme,
   ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import {
   ALL_SWARM_EXTENSION_TOOLS,
+  DEFAULT_CHANNEL,
   DEFAULT_SWARM_SETTINGS,
   DRAFTING_TOOLS,
   IDLE_SWARM_TOOLS,
@@ -459,6 +463,13 @@ interface MockHarness {
   terminalInputHandlers: Set<(data: string) => unknown>;
   setModelCalls: Array<{ provider: string; id: string }>;
   thinkingLevelCalls: ThinkingLevel[];
+  messageRenderers: Map<string, MessageRenderer<any>>;
+  shortcuts: Map<
+    string,
+    { description?: string; handler: (ctx: ExtensionContext) => Promise<void> | void }
+  >;
+  sessionNameCalls: string[];
+  getSessionName: () => string | undefined;
   setIdle: (idle: boolean) => void;
   setPendingMessages: (hasPending: boolean) => void;
   setSessionMessages: (messages: AgentMessage[]) => void;
@@ -482,6 +493,7 @@ function createMockPiHarness(
     initialHostModel?: Model<Api>;
     modelRuntime?: ModelRuntime;
     initialSessionMessages?: AgentMessage[];
+    initialSessionName?: string;
   },
 ): MockHarness {
   const sessionId = options?.sessionId ?? "sess-e2e-1";
@@ -506,6 +518,12 @@ function createMockPiHarness(
   const terminalInputHandlers = new Set<(data: string) => unknown>();
   const setModelCalls: Array<{ provider: string; id: string }> = [];
   const thinkingLevelCalls: ThinkingLevel[] = [];
+  const messageRenderers = new Map<string, MessageRenderer<any>>();
+  const shortcuts = new Map<
+    string,
+    { description?: string; handler: (ctx: ExtensionContext) => Promise<void> | void }
+  >();
+  const sessionNameCalls: string[] = [];
 
   let activeTools: string[] = ["read", "bash", "edit", "write", "grep", "find", "ls"];
   let idle = true;
@@ -514,6 +532,7 @@ function createMockPiHarness(
   let currentHostModel: Model<Api> | undefined =
     options?.initialHostModel ?? DEFAULT_TEST_MODELS[1];
   let currentThinkingLevel: ThinkingLevel = "medium";
+  let currentSessionName: string | undefined = options?.initialSessionName;
   let sessionMessages: AgentMessage[] = [...(options?.initialSessionMessages ?? [])];
 
   const modelRuntime = options?.modelRuntime ?? createMockModelRuntime();
@@ -548,6 +567,22 @@ function createMockPiHarness(
     },
     registerCommand(name: string, def: any) {
       commands.set(name, def);
+    },
+    registerShortcut(
+      shortcut: string,
+      def: { description?: string; handler: (ctx: ExtensionContext) => Promise<void> | void },
+    ) {
+      shortcuts.set(shortcut, def);
+    },
+    registerMessageRenderer(customType: string, renderer: MessageRenderer<any>) {
+      messageRenderers.set(customType, renderer);
+    },
+    setSessionName(name: string) {
+      currentSessionName = name;
+      sessionNameCalls.push(name);
+    },
+    getSessionName() {
+      return currentSessionName;
     },
     appendEntry(customType: string, data?: unknown) {
       const prev = branch[branch.length - 1];
@@ -687,6 +722,10 @@ function createMockPiHarness(
     terminalInputHandlers,
     setModelCalls,
     thinkingLevelCalls,
+    messageRenderers,
+    shortcuts,
+    sessionNameCalls,
+    getSessionName: () => currentSessionName,
     setIdle: (val) => {
       idle = val;
     },
@@ -3742,5 +3781,438 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     await owner.executeTool(SWARM_TOOL, { action: "done", summary: "Verified v0.5.1" });
     await observer.emit("session_shutdown", { reason: "quit" });
     await owner.emit("session_shutdown", { reason: "quit" });
+  });
+
+  it("15. v0.6.0: enforces Orchestrator write/edit/powershell delegation guard across draft/active/done/cancel, routes /swarm stop & intuitive aliases without drafting, auto-names unnamed sessions, registers SSH shortcuts, and renders sleek collapsible wakeup cards", async () => {
+    const repoDir = await createTempGitRepo("v060-host-ux");
+    tempDirs.push(repoDir);
+    const store = new SwarmStore(repoDir);
+
+    // 1. Exact 21 SWARM_SUBCOMMANDS in exact existing order + intuitive aliases in parseSwarmCommand
+    assert.deepEqual(
+      SWARM_SUBCOMMANDS.map((c) => c.name),
+      [
+        "direct",
+        "tweak",
+        "status",
+        "board",
+        "graph",
+        "tasks",
+        "ui",
+        "models",
+        "model",
+        "steer",
+        "merge",
+        "kill",
+        "done",
+        "pause",
+        "resume",
+        "cancel",
+        "teardown",
+        "runs",
+        "focus",
+        "settings",
+        "help",
+      ],
+    );
+    assert.deepEqual(parseSwarmCommand("stop worker-1 Too slow"), {
+      kind: "stop",
+      rest: "worker-1 Too slow",
+    });
+    assert.deepEqual(parseSwarmCommand("mc members"), { kind: "ui", rest: "members" });
+    assert.deepEqual(parseSwarmCommand("open board"), { kind: "ui", rest: "board" });
+    assert.deepEqual(parseSwarmCommand("panel"), { kind: "ui", rest: "" });
+    assert.deepEqual(parseSwarmCommand("ls"), { kind: "runs", rest: "" });
+    assert.deepEqual(parseSwarmCommand("list"), { kind: "runs", rest: "" });
+    assert.deepEqual(parseSwarmCommand("config"), { kind: "settings", rest: "" });
+    // Natural multi-word sentences still route to goal drafting
+    assert.deepEqual(parseSwarmCommand("list all slow endpoints and optimize"), {
+      kind: "goal",
+      rest: "list all slow endpoints and optimize",
+    });
+    assert.deepEqual(parseSwarmCommand("open a pull request review pipeline"), {
+      kind: "goal",
+      rest: "open a pull request review pipeline",
+    });
+
+    let releaseStopper!: () => void;
+    const stopperGate = new Promise<void>((resolve) => {
+      releaseStopper = resolve;
+    });
+    const trackers = new Map<string, MockMemberTracker>();
+
+    const makeTransport = (): ISwarmTransport => ({
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        const tracker = createMockPersistentMemberHandle({
+          request,
+          onAbort: () => {
+            if (request.name === "worker-stop") {
+              releaseStopper();
+            }
+          },
+          runInitialTurn: async ({ isAborted }) => {
+            if (request.name === "worker-stop") {
+              await stopperGate;
+              if (isAborted()) {
+                return {
+                  agentId: request.agentId,
+                  name: request.name,
+                  role: request.role,
+                  outcome: "stopped",
+                  stopReason: "aborted",
+                  summary: "Aborted cleanly",
+                  tokens: 10,
+                  cost: 0.0001,
+                };
+              }
+            }
+            return {
+              agentId: request.agentId,
+              name: request.name,
+              role: request.role,
+              outcome: "waiting",
+              summary: `${request.name} ready`,
+              tokens: 25,
+              cost: 0.0002,
+            };
+          },
+        });
+        trackers.set(request.name, tracker);
+        return tracker.handle;
+      },
+    });
+
+    const host = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-v060-host-1",
+    });
+    (host.ctx as { hasUI: boolean }).hasUI = false; // exercise headless paths for config/ls/mc cleanly without blocking modals
+    createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: false,
+      }),
+    })(host.pi);
+
+    await host.emit("session_start", { reason: "startup" });
+
+    // Verify SSH/tmux shortcuts (`alt+s`, `alt+m`, `alt+w`) & `/swarm help` documentation
+    assert.ok(host.shortcuts.has("alt+s"), "Expected alt+s shortcut registered");
+    assert.ok(host.shortcuts.has("alt+m"), "Expected alt+m shortcut registered");
+    assert.ok(host.shortcuts.has("alt+w"), "Expected alt+w shortcut registered");
+    await host.runCommand("swarm", "help");
+    const helpMsg = host.sentMessages[host.sentMessages.length - 1]!;
+    const helpText = String(helpMsg.message.content ?? "");
+    assert.match(helpText, /Alt\+S/);
+    assert.match(helpText, /Alt\+M/);
+    assert.match(helpText, /Alt\+W/);
+    assert.match(helpText, /Ctrl\+Shift\+S/);
+    assert.match(helpText, /\/swarm stop/);
+
+    // Helper to invoke `tool_call` hook
+    const checkToolCall = async (
+      h: MockHarness,
+      toolName: string,
+    ): Promise<{ block?: boolean; reason?: string } | undefined> => {
+      const results = await h.emit("tool_call", {
+        type: "tool_call",
+        toolCallId: `tc-${toolName}-${Date.now()}`,
+        toolName,
+        input: {},
+      });
+      return results.find((r) => r !== undefined);
+    };
+
+    // (a) Before drafting (idle): write, edit, powershell are all allowed
+    assert.equal(await checkToolCall(host, "write"), undefined);
+    assert.equal(await checkToolCall(host, "edit"), undefined);
+    assert.equal(await checkToolCall(host, "powershell"), undefined);
+
+    // Start drafting -> write, edit, powershell blocked with Drafting Mode reason; read/bash allowed
+    await host.runCommand("swarm", "Draft new feature architecture");
+    for (const blockedTool of ["write", "edit", "powershell"]) {
+      const res = await checkToolCall(host, blockedTool);
+      assert.equal(res?.block, true, `${blockedTool} must be blocked during drafting`);
+      assert.match(String(res?.reason), /Swarm Drafting Mode is read-only reconnaissance/);
+    }
+    assert.equal(await checkToolCall(host, "read"), undefined);
+    assert.equal(await checkToolCall(host, "bash"), undefined);
+
+    // `/swarm cancel` during draft restores write/edit/powershell to allowed
+    await host.runCommand("swarm", "cancel");
+    assert.equal(await checkToolCall(host, "write"), undefined);
+    assert.equal(await checkToolCall(host, "edit"), undefined);
+    assert.equal(await checkToolCall(host, "powershell"), undefined);
+
+    // Launch active run -> auto-sets Pi session name (`🐝 <title>`) & blocks Orchestrator write/edit/powershell
+    assert.equal(host.getSessionName(), undefined);
+    await host.runCommand("swarm-direct", "Ship v0.6.0 host improvements");
+    const planRes = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Host UX Polish",
+      objective: "Prevent direct edits and streamline commands",
+      strategy: "Delegate to share worker",
+      acceptance_criteria: "All integration tests pass",
+      base_branch: "main",
+      initial_members: [
+        {
+          name: "worker-stop",
+          role: "worker",
+          workspace: "inherit",
+          brief: "Long-running worker to test /swarm stop",
+        },
+      ],
+    });
+    const runId: string = planRes.details.runId;
+    assert.equal(host.getSessionName(), "🐝 Host UX Polish");
+    assert.deepEqual(host.sessionNameCalls, ["🐝 Host UX Polish"]);
+
+    for (const blockedTool of ["write", "edit", "powershell"]) {
+      const res = await checkToolCall(host, blockedTool);
+      assert.equal(res?.block, true, `${blockedTool} must be blocked while active run is owned`);
+      assert.match(
+        String(res?.reason),
+        /Orchestrator must not edit repository files directly/,
+      );
+    }
+    assert.equal(await checkToolCall(host, "read"), undefined);
+    assert.equal(await checkToolCall(host, "bash"), undefined);
+    assert.equal(await checkToolCall(host, SWARM_TOOL), undefined);
+
+    // Foreign observer session is NOT blocked from editing in its own session
+    const observer = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-v060-observer",
+    });
+    createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: false,
+      }),
+    })(observer.pi);
+    await observer.emit("session_start", { reason: "startup" });
+    await observer.runCommand("swarm", `focus ${runId}`);
+    assert.equal(
+      await checkToolCall(observer, "edit"),
+      undefined,
+      "Read-only observer session must not have its own edit tool blocked",
+    );
+
+    // (b) `/swarm stop @worker-stop` stops the member cleanly instead of starting a `/swarm <goal>` draft!
+    await waitFor(() => trackers.has("worker-stop"));
+    const stopCompletions = (await host.commands
+      .get("swarm")
+      ?.getArgumentCompletions?.("stop w")) as Array<{ value: string; label: string }> | null;
+    assert.ok(
+      (stopCompletions ?? []).some(
+        (c) => c.label === "worker-stop" && c.value === "stop worker-stop",
+      ),
+      "Expected `/swarm stop ` argument completions to suggest active member",
+    );
+
+    const userMsgsBeforeStop = host.sentUserMessages.length;
+    await host.runCommand("swarm", "stop @worker-stop Reassigning slice");
+    assert.equal(
+      host.sentUserMessages.length,
+      userMsgsBeforeStop,
+      "/swarm stop must never trigger a /swarm <goal> drafting prompt",
+    );
+    const runAfterStop = await store.loadRun(runId);
+    assert.equal(runAfterStop.members["worker-stop"]?.state, "stopped");
+    assert.equal(runAfterStop.members["worker-stop"]?.humanStopped, true);
+    assert.equal(runAfterStop.members["worker-stop"]?.parkedOn, "Reassigning slice");
+    assert.equal(trackers.get("worker-stop")?.aborted, true);
+
+    // Verify intuitive aliases (`ls`, `list`, `config`, `mc`, `open`, `panel`) execute zero-turn handlers, never drafting
+    const msgsBeforeAliases = host.sentMessages.length;
+    await host.runCommand("swarm", "ls");
+    await host.runCommand("swarm", "list");
+    await host.runCommand("swarm", "config");
+    await host.runCommand("swarm", "mc");
+    await host.runCommand("swarm", "open");
+    await host.runCommand("swarm", "panel");
+    assert.equal(
+      host.sentUserMessages.length,
+      userMsgsBeforeStop,
+      "Command aliases ls/list/config/mc/open/panel must never trigger drafting",
+    );
+    assert.equal(host.sentMessages.length - msgsBeforeAliases, 6);
+
+    // Complete run -> restores Orchestrator write/edit/powershell to allowed
+    await host.executeTool(SWARM_TOOL, {
+      action: "done",
+      summary: "Completed run 1",
+    });
+    assert.equal(await checkToolCall(host, "write"), undefined);
+    assert.equal(await checkToolCall(host, "edit"), undefined);
+    assert.equal(await checkToolCall(host, "powershell"), undefined);
+
+    // Launch run 2 and `/swarm cancel` -> also restores write/edit/powershell to allowed, and preserves existing session name!
+    await host.runCommand("swarm-direct", "Second mission to cancel");
+    await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Second Mission Title",
+      objective: "Verify cancel unblocks write/edit and keeps existing session name",
+      strategy: "No initial workers",
+      acceptance_criteria: "Cancelled cleanly",
+      base_branch: "main",
+    });
+    assert.equal(
+      host.getSessionName(),
+      "🐝 Host UX Polish",
+      "Existing non-empty session name must not be overwritten by subsequent runs",
+    );
+    assert.equal((await checkToolCall(host, "write"))?.block, true);
+    await host.runCommand("swarm", "cancel");
+    assert.equal(
+      await checkToolCall(host, "write"),
+      undefined,
+      "Orchestrator write must be restored after /swarm cancel abandons active run",
+    );
+    assert.equal(await checkToolCall(host, "edit"), undefined);
+
+    // (c) Cross-session `/swarm resume` sets `🐝 <runTitle>` on unnamed session, and preserves custom user session name!
+    const resumableRun = await store.createRun({
+      title: "Cross-Session Payments Mission",
+      objective: "Ship idempotent webhooks",
+      strategy: "Author + Validator",
+      acceptanceCriteria: "Tests green",
+      baseBranch: "main",
+      ownerSessionId: "dead-owner",
+      ownerPid: 999999,
+      maxConcurrency: 4,
+      validatorEnabled: true,
+      roleModels: {},
+    });
+    await store.updateRun(resumableRun.id, { status: "paused", actor: "human" });
+    await store.postBoardMessage(resumableRun.id, {
+      from: "orchestrator",
+      fromRole: "orchestrator",
+      channel: DEFAULT_CHANNEL,
+      kind: "update",
+      text: "Webhook signature verification landed on branch.",
+    });
+
+    const unnamedResumeHost = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-v060-resume-unnamed",
+    });
+    createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: false,
+      }),
+    })(unnamedResumeHost.pi);
+    await unnamedResumeHost.emit("session_start", { reason: "startup" });
+    await unnamedResumeHost.runCommand(
+      "swarm",
+      `resume ${resumableRun.id} "Audit webhook retries"`,
+    );
+    assert.equal(
+      unnamedResumeHost.getSessionName(),
+      "🐝 Cross-Session Payments Mission",
+    );
+    await waitFor(
+      () => unnamedResumeHost.sentMessages.some((m) => m.options?.triggerTurn === true),
+      2000,
+    );
+
+    // Pause and resume from a session that ALREADY has a user-chosen session name -> must NOT overwrite!
+    await unnamedResumeHost.runCommand("swarm", "pause");
+    const resumeWakeupMsg = unnamedResumeHost.sentMessages.find(
+      (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
+    )!;
+    await unnamedResumeHost.emit("session_shutdown", { reason: "quit" });
+
+    const namedResumeHost = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-v060-resume-named",
+      initialSessionName: "My Custom Session Title",
+    });
+    createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: false,
+      }),
+    })(namedResumeHost.pi);
+    await namedResumeHost.emit("session_start", { reason: "startup" });
+    await namedResumeHost.runCommand("swarm", `resume --quiet ${resumableRun.id}`);
+    assert.equal(namedResumeHost.getSessionName(), "My Custom Session Title");
+    assert.equal(namedResumeHost.sessionNameCalls.length, 0);
+
+    // Verify `registerMessageRenderer` for `SWARM_WAKEUP_CUSTOM_TYPE` & `SWARM_STATUS_CUSTOM_TYPE`
+    const wakeupRenderer = namedResumeHost.messageRenderers.get(SWARM_WAKEUP_CUSTOM_TYPE);
+    const statusRenderer = namedResumeHost.messageRenderers.get(SWARM_STATUS_CUSTOM_TYPE);
+    assert.equal(typeof wakeupRenderer, "function");
+    assert.equal(typeof statusRenderer, "function");
+
+    const mockTheme = {
+      fg: (_color: string, text: string) => text,
+      bg: (_color: string, text: string) => text,
+      bold: (text: string) => text,
+    } as unknown as Theme;
+
+    // Collapsed wakeup card: strips `<swarm_mission_resumed>`, renders 2-4 lines at 80/120 cols, shows `(Ctrl+O to expand full board wakeup)`
+    const collapsedComp = wakeupRenderer!(
+      resumeWakeupMsg.message as any,
+      { expanded: false, outputPad: 1, keyText: () => "ctrl+o", keyHint: () => "ctrl+o" },
+      mockTheme,
+    )!;
+    assert.ok(collapsedComp, "Wakeup renderer must return a Component");
+    for (const width of [40, 60, 80, 120]) {
+      const rendered = collapsedComp.render(width);
+      for (const line of rendered) {
+        assert.ok(
+          visibleWidth(line) <= width,
+          `Collapsed wakeup line exceeded width ${width}: ${visibleWidth(line)}`,
+        );
+      }
+      if (width >= 80) {
+        assert.ok(
+          rendered.length >= 2 && rendered.length <= 4,
+          `Expected 2-4 collapsed lines at width ${width}, got ${rendered.length}`,
+        );
+      }
+    }
+    const collapsedPlain = stripTerminalSequences(collapsedComp.render(100).join("\n"));
+    assert.ok(!collapsedPlain.includes("<swarm_mission_resumed"));
+    assert.ok(!collapsedPlain.includes("</swarm_mission_resumed>"));
+    assert.match(collapsedPlain, /MISSION RESUMED/);
+    assert.match(collapsedPlain, /\(Ctrl\+O to expand full board wakeup\)/);
+
+    // Expanded wakeup view: strips XML tags and shows full clean content without truncation notice
+    const expandedComp = wakeupRenderer!(
+      resumeWakeupMsg.message as any,
+      { expanded: true, outputPad: 1, keyText: () => "ctrl+o", keyHint: () => "ctrl+o" },
+      mockTheme,
+    )!;
+    const expandedPlain = stripTerminalSequences(expandedComp.render(100).join("\n"));
+    assert.ok(!expandedPlain.includes("<swarm_mission_resumed"));
+    assert.ok(!expandedPlain.includes("</swarm_mission_resumed>"));
+    assert.match(expandedPlain, /Audit webhook retries/);
+    assert.match(expandedPlain, /Webhook signature verification landed on branch/);
+    assert.ok(!expandedPlain.includes("(Ctrl+O to expand full board wakeup)"));
+
+    // Status message renderer width safety at 40/60/80/120 cols
+    const statusComp = statusRenderer!(
+      helpMsg.message as any,
+      { expanded: false, outputPad: 1, keyText: () => "", keyHint: () => "" },
+      mockTheme,
+    )!;
+    for (const width of [40, 60, 80, 120]) {
+      for (const line of statusComp.render(width)) {
+        assert.ok(visibleWidth(line) <= width);
+      }
+    }
+
+    await namedResumeHost.executeTool(SWARM_TOOL, {
+      action: "done",
+      summary: "Completed v0.6.0 verification",
+    });
+    await namedResumeHost.emit("session_shutdown", { reason: "quit" });
+    await observer.emit("session_shutdown", { reason: "quit" });
+    await host.emit("session_shutdown", { reason: "quit" });
   });
 });

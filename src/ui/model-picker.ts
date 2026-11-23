@@ -293,6 +293,89 @@ function matchModelId(a?: string, b?: string): boolean {
   return stripThinkingSuffix(a) === stripThinkingSuffix(b);
 }
 
+const GENERIC_MODEL_TIERS = new Set([
+  "pro",
+  "mini",
+  "nano",
+  "flash",
+  "lite",
+  "ultra",
+  "turbo",
+  "codex",
+  "max",
+  "chat",
+  "exp",
+  "preview",
+]);
+
+function stripProviderAndDateSuffix(model: string): string {
+  const clean = sanitizePlainText(model);
+  if (!clean) return "default";
+  const slash = clean.lastIndexOf("/");
+  const base = slash >= 0 && slash < clean.length - 1 ? clean.slice(slash + 1) : clean;
+  return base.replace(/-(?:20\d{6}|\d{8})$/, "");
+}
+
+function compactTabModelNickname(model: string): string {
+  const base = stripProviderAndDateSuffix(model);
+  if (base.startsWith("claude-") && base.length > 7) {
+    return base.slice(7);
+  }
+  const versionedVendor = /^(?:gemini|gpt)-\d+(?:\.\d+)?-([a-zA-Z][a-zA-Z0-9._-]*)$/.exec(base);
+  if (versionedVendor) {
+    const tail = versionedVendor[1]!;
+    const firstToken = tail.split("-")[0]!.toLowerCase();
+    if (!GENERIC_MODEL_TIERS.has(firstToken) && tail.length >= 3) {
+      return tail;
+    }
+  }
+  return base;
+}
+
+function budgetThreePills(
+  models: readonly [string, string, string],
+  availableCols: number,
+): [string, string, string] {
+  const safeTotal = Math.max(6, Math.floor(availableCols));
+  const desired = models.map((m) => visibleWidth(m));
+  if (desired[0]! + desired[1]! + desired[2]! <= safeTotal) {
+    return [models[0], models[1], models[2]];
+  }
+  const budgets = [0, 0, 0];
+  let remaining = safeTotal;
+  const open = new Set([0, 1, 2]);
+  while (open.size > 0 && remaining > 0) {
+    const share = Math.max(1, Math.floor(remaining / open.size));
+    let satisfiedAny = false;
+    for (const idx of [...open]) {
+      const need = (desired[idx] ?? 0) - (budgets[idx] ?? 0);
+      if (need <= share) {
+        budgets[idx] = (budgets[idx] ?? 0) + need;
+        remaining -= need;
+        open.delete(idx);
+        satisfiedAny = true;
+      }
+    }
+    if (!satisfiedAny) {
+      const list = [...open];
+      const baseShare = Math.floor(remaining / list.length);
+      let extra = remaining - baseShare * list.length;
+      for (const idx of list) {
+        const add = baseShare + (extra > 0 ? 1 : 0);
+        if (extra > 0) extra--;
+        budgets[idx] = (budgets[idx] ?? 0) + add;
+      }
+      remaining = 0;
+      open.clear();
+    }
+  }
+  return [
+    fitLine(models[0], Math.max(2, budgets[0]!)),
+    fitLine(models[1], Math.max(2, budgets[1]!)),
+    fitLine(models[2], Math.max(2, budgets[2]!)),
+  ];
+}
+
 function normalizeSearchToken(s: string): string {
   return s.toLowerCase().replace(/[._:/-]+/g, "");
 }
@@ -789,11 +872,19 @@ export class SwarmModelPickerView implements Component, Focusable {
     }
   }
 
-  private switchTab(delta: number): void {
+  private jumpToTab(targetIdx: number): void {
     if (this.mode !== "roles") return;
-    const idx = PICKER_TABS.indexOf(this.activeTab);
-    const nextIdx = (idx + delta + PICKER_TABS.length) % PICKER_TABS.length;
-    this.activeTab = PICKER_TABS[nextIdx]!;
+    const nextTab = PICKER_TABS[targetIdx];
+    if (!nextTab) return;
+    if (
+      nextTab === this.activeTab &&
+      this.step === "list" &&
+      this.searchQuery.length === 0
+    ) {
+      this.tui.requestRender();
+      return;
+    }
+    this.activeTab = nextTab;
     this.step = "list";
     this.pendingModel = null;
     this.setSearchQuery("");
@@ -801,6 +892,13 @@ export class SwarmModelPickerView implements Component, Focusable {
     this.hwCursor.sync(this.tui, this._focused);
     this.rebuildRows(true);
     this.tui.requestRender();
+  }
+
+  private switchTab(delta: number): void {
+    if (this.mode !== "roles") return;
+    const idx = PICKER_TABS.indexOf(this.activeTab);
+    const nextIdx = (idx + delta + PICKER_TABS.length) % PICKER_TABS.length;
+    this.jumpToTab(nextIdx);
   }
 
   handleInput(data: string): void {
@@ -887,6 +985,13 @@ export class SwarmModelPickerView implements Component, Focusable {
         return;
       }
       if (this.searchQuery.length === 0) {
+        const altTabKeys = ["1", "2", "3", "4"] as const;
+        for (let i = 0; i < altTabKeys.length; i++) {
+          if (matchesKey(data, Key.alt(altTabKeys[i]!))) {
+            this.jumpToTab(i);
+            return;
+          }
+        }
         if (matchesKey(data, Key.right)) {
           this.switchTab(1);
           return;
@@ -1059,6 +1164,221 @@ export class SwarmModelPickerView implements Component, Focusable {
     }
   }
 
+  private renderRoleTabBar(innerWidth: number): string {
+    const fbCount = this.state.settings.fallbackModels.length;
+
+    if (innerWidth >= 72) {
+      const roles: readonly SwarmModelRole[] = ["orchestrator", "worker", "validator"];
+      const nicks: [string, string, string] = ["default", "default", "default"];
+      const effs: [string, string, string] = ["", "", ""];
+      const explicits: [boolean, boolean, boolean] = [false, false, false];
+
+      for (let i = 0; i < 3; i++) {
+        const role = roles[i]!;
+        const cfg = this.getCurrentRoleConfig(role);
+        const explicit = sanitizePlainText(cfg.model ?? "");
+        const raw = explicit || sanitizePlainText(this.state.hostModel ?? "") || "default";
+        nicks[i] = compactTabModelNickname(raw);
+        effs[i] = cfg.thinkingLevel ? `(${cfg.thinkingLevel})` : "";
+        explicits[i] = Boolean(explicit);
+      }
+
+      const buildStyledTabs = (
+        prefixes: readonly [string, string, string],
+        models: readonly [string, string, string],
+        fbLabel: string,
+        sepPlain: string,
+      ): { plainWidth: number; styled: string } => {
+        const plainParts = [
+          `${prefixes[0]}${models[0]}${effs[0]}`,
+          `${prefixes[1]}${models[1]}${effs[1]}`,
+          `${prefixes[2]}${models[2]}${effs[2]}`,
+          fbLabel,
+        ];
+        const plainWidth =
+          plainParts.reduce((sum, p) => sum + visibleWidth(p), 0) +
+          visibleWidth(sepPlain) * 3;
+
+        const styledParts = PICKER_TABS.map((tab, idx) => {
+          const plain = plainParts[idx]!;
+          if (tab === this.activeTab) {
+            return this.theme.fg("accent", this.theme.bold(plain));
+          }
+          if (idx < 3) {
+            const pref = prefixes[idx as 0 | 1 | 2];
+            const val = `${models[idx as 0 | 1 | 2]}${effs[idx as 0 | 1 | 2]}`;
+            return (
+              this.theme.fg("muted", pref) +
+              this.theme.fg(explicits[idx as 0 | 1 | 2] ? "muted" : "dim", val)
+            );
+          }
+          return this.theme.fg("muted", plain);
+        });
+        const sepStyled =
+          sepPlain === " · " ? this.theme.fg("dim", " · ") : sepPlain;
+        return {
+          plainWidth,
+          styled: fitLine(styledParts.join(sepStyled), innerWidth),
+        };
+      };
+
+      const widePrefixes: readonly [string, string, string] = [
+        "[1] Orch: ",
+        "[2] Work: ",
+        "[3] Val: ",
+      ];
+      const cand1 = buildStyledTabs(
+        widePrefixes,
+        nicks,
+        `[4] Fallbacks(${fbCount})`,
+        " · ",
+      );
+      if (cand1.plainWidth <= innerWidth) {
+        return cand1.styled;
+      }
+
+      const cand2 = buildStyledTabs(
+        widePrefixes,
+        nicks,
+        `[4] FB(${fbCount})`,
+        " · ",
+      );
+      if (cand2.plainWidth <= innerWidth) {
+        return cand2.styled;
+      }
+
+      const tightPrefixes: readonly [string, string, string] =
+        innerWidth >= 84
+          ? widePrefixes
+          : ["[1]Orch:", "[2]Work:", "[3]Val:"];
+      const fbShort = innerWidth >= 84 ? `[4] FB(${fbCount})` : `[4]FB(${fbCount})`;
+      const baseFixed =
+        tightPrefixes.reduce((sum, p) => sum + visibleWidth(p), 0) +
+        effs.reduce((sum, e) => sum + visibleWidth(e), 0) +
+        visibleWidth(fbShort);
+      const sepPlain = innerWidth - (baseFixed + 9) >= 12 ? " · " : " ";
+      const availCols = Math.max(
+        6,
+        innerWidth - baseFixed - visibleWidth(sepPlain) * 3,
+      );
+      const budgeted = budgetThreePills(nicks, availCols);
+      return buildStyledTabs(tightPrefixes, budgeted, fbShort, sepPlain).styled;
+    }
+
+    if (innerWidth >= 46) {
+      const fullLabels = [
+        "[1] Orch",
+        "[2] Work",
+        "[3] Val",
+        `[4] Fallbacks(${fbCount})`,
+      ];
+      const shortLabels = [
+        "[1] Orch",
+        "[2] Work",
+        "[3] Val",
+        `[4] FB(${fbCount})`,
+      ];
+      const plainFull = fullLabels.join(" · ");
+      const chosen = visibleWidth(plainFull) <= innerWidth ? fullLabels : shortLabels;
+      const styled = PICKER_TABS.map((tab, idx) =>
+        tab === this.activeTab
+          ? this.theme.fg("accent", this.theme.bold(chosen[idx]!))
+          : this.theme.fg("muted", chosen[idx]!),
+      );
+      return fitLine(styled.join(this.theme.fg("dim", " · ")), innerWidth);
+    }
+
+    const withCount = ["[1]Orch", "[2]Work", "[3]Val", `[4]FB(${fbCount})`];
+    const bare = ["[1]Orch", "[2]Work", "[3]Val", "[4]FB"];
+    const chosen =
+      visibleWidth(withCount.join(" ")) <= innerWidth ? withCount : bare;
+    const styled = PICKER_TABS.map((tab, idx) =>
+      tab === this.activeTab
+        ? this.theme.fg("accent", this.theme.bold(chosen[idx]!))
+        : this.theme.fg("muted", chosen[idx]!),
+    );
+    return fitLine(styled.join(" "), innerWidth);
+  }
+
+  private renderPinnedCurrentBar(innerWidth: number): string {
+    if (this.activeTab === "fallbacks") {
+      const fbSummary =
+        this.state.settings.fallbackModels.length > 0
+          ? this.state.settings.fallbackModels
+              .map((m, i) => `#${i + 1} ${innerWidth < 72 ? shortenModelName(m) : m}`)
+              .join(" · ")
+          : "(none configured)";
+      const left = `${this.theme.fg("muted", "Pool: ")}${this.theme.fg("accent", fbSummary)}`;
+      const rightHint =
+        innerWidth >= 94
+          ? "Space toggle · [/] move · Ctrl+X clear · Ctrl+S scope"
+          : innerWidth >= 68
+            ? "Space · [/] · ^X clear · ^S scope"
+            : "";
+      return rightHint
+        ? joinColumns(left, this.theme.fg("dim", rightHint), innerWidth, 2)
+        : fitLine(left, innerWidth);
+    }
+
+    const cfg = this.getCurrentRoleConfig(this.activeTab);
+    const explicitModel = sanitizePlainText(cfg.model ?? "");
+    const hostModel = sanitizePlainText(this.state.hostModel ?? "");
+    const effectiveModel = explicitModel || hostModel || "session default";
+    const effortText = cfg.thinkingLevel ?? "default";
+    const origin: RoleModelOrigin =
+      this.state.origins?.[this.activeTab] ??
+      (explicitModel ? this.saveScope : "host");
+    const originPlain = `[${origin}]`;
+    const originStyled = formatOriginBadge(origin, this.theme);
+
+    const prefixPlain = innerWidth < 46 ? "Cur: " : "Current: ";
+    const suffixPlain = ` · ${effortText} ${originPlain}`;
+    const fixedLeftCols = visibleWidth(prefixPlain) + visibleWidth(suffixPlain);
+
+    const hintCandidates: ReadonlyArray<{ text: string; minModelCols: number }> = [
+      {
+        text: "Ctrl+E effort · Ctrl+X inherit host · Ctrl+S scope",
+        minModelCols: 14,
+      },
+      {
+        text: "^E effort · ^X inherit · ^S scope",
+        minModelCols: 12,
+      },
+      {
+        text: "^E · ^X · ^S",
+        minModelCols: 10,
+      },
+      { text: "", minModelCols: 0 },
+    ];
+
+    let rightHint = "";
+    for (const cand of hintCandidates) {
+      const rightReserve = cand.text ? visibleWidth(cand.text) + 2 : 0;
+      if (innerWidth - rightReserve - fixedLeftCols >= cand.minModelCols) {
+        rightHint = cand.text;
+        break;
+      }
+    }
+
+    const leftBudget = rightHint
+      ? Math.max(1, innerWidth - visibleWidth(rightHint) - 2)
+      : innerWidth;
+    const modelBudget = Math.max(4, leftBudget - fixedLeftCols);
+    const fittedModel = shortenModelName(effectiveModel, modelBudget) || "default";
+
+    const modelStyled = explicitModel
+      ? this.theme.fg("accent", this.theme.bold(fittedModel))
+      : this.theme.fg("dim", fittedModel);
+    const effortStyled = cfg.thinkingLevel
+      ? this.theme.fg("borderAccent", ` · ${effortText}`)
+      : this.theme.fg("dim", ` · ${effortText}`);
+    const leftStyled = `${this.theme.fg("muted", prefixPlain)}${modelStyled}${effortStyled} ${originStyled}`;
+
+    return rightHint
+      ? joinColumns(leftStyled, this.theme.fg("dim", rightHint), innerWidth, 2)
+      : fitLine(leftStyled, innerWidth);
+  }
+
   render(width: number): string[] {
     const safeWidth = Math.max(1, Math.floor(width));
     const innerWidth = computeBoxInnerWidth(safeWidth);
@@ -1068,68 +1388,20 @@ export class SwarmModelPickerView implements Component, Focusable {
         ? Math.min(maxRows - 1, Math.max(9, Math.min(30, Math.floor(maxRows * 0.85))))
         : Math.max(4, maxRows);
     const maxInnerLines = Math.max(4, maxBoxLines - 2);
-    const compact = innerWidth < 68;
+    const compact = innerWidth < 72;
     const ultraCompact = innerWidth < 46;
 
     const body: string[] = [];
 
     if (this.mode === "roles") {
-      // Tab strip + scope badge (responsively shortened so all tabs stay visible at 40/60/80 cols)
-      const shortTabLabels: Record<ModelPickerTab, string> = ultraCompact
-        ? { orchestrator: "Orch", worker: "Work", validator: "Val", fallbacks: "FB" }
-        : compact
-          ? { orchestrator: "Orch", worker: "Work", validator: "Val", fallbacks: "Fallbacks" }
-          : TAB_LABELS;
-      const tabParts = PICKER_TABS.map((t) => {
-        const lbl = shortTabLabels[t];
-        return t === this.activeTab
-          ? this.theme.fg("accent", this.theme.bold(`[${lbl}]`))
-          : this.theme.fg("muted", compact ? lbl : ` ${lbl} `);
-      });
-      const scopeLabel = compact
-        ? this.saveScope === "global"
-          ? "[Global ^S]"
-          : "[Proj ^S]"
-        : this.saveScope === "global"
-          ? "Scope: Global [Ctrl+S]"
-          : "Scope: Project [Ctrl+S]";
-      const scopeTag =
-        this.saveScope === "global"
-          ? this.theme.fg("accent", scopeLabel)
-          : this.theme.fg("warning", scopeLabel);
-      body.push(joinColumns(tabParts.join(" "), scopeTag, innerWidth));
+      // At-a-glance 3-role tab bar + pinned Current:/Pool: status bar
+      body.push(this.renderRoleTabBar(innerWidth));
+      body.push(this.renderPinnedCurrentBar(innerWidth));
 
-      // Role description & current summary
-      if (!ultraCompact) {
+      if (!ultraCompact && maxInnerLines >= 13) {
         body.push(
           fitLine(this.theme.fg("muted", TAB_DESCRIPTIONS[this.activeTab]), innerWidth),
         );
-      }
-
-      if (this.activeTab === "fallbacks") {
-        const fbSummary =
-          this.state.settings.fallbackModels.length > 0
-            ? this.state.settings.fallbackModels
-                .map((m, i) => `#${i + 1} ${compact ? shortenModelName(m) : m}`)
-                .join(" · ")
-            : "(none configured)";
-        body.push(
-          fitLine(
-            `${this.theme.fg("muted", "Pool: ")}${this.theme.fg("accent", fbSummary)}`,
-            innerWidth,
-          ),
-        );
-      } else {
-        const summary = formatRoleModelsLine(
-          buildRoleModelsFromPickerState(this.state),
-          this.state.hostModel ?? "default",
-          {
-            maxWidth: innerWidth,
-            theme: this.theme,
-            origins: compact ? undefined : this.state.origins,
-          },
-        );
-        body.push(summary);
       }
     } else if (this.member) {
       const curModel = sanitizePlainText(this.lastAppliedModel ?? this.member.model ?? "") || "default";
@@ -1349,21 +1621,40 @@ export class SwarmModelPickerView implements Component, Focusable {
           ? ultraCompact
             ? "Space Toggle · [/] · ^S Scope · Tab"
             : compact
-              ? "Space Toggle · [/] Move · ^S Scope · Tab · Esc"
-              : "↑/↓ Select · Space Toggle · [/] Move · ^S Scope · Tab Role · Esc Close"
+              ? "Space Toggle · [/] Move · ^S Scope · Tab/Alt+1-4 · Esc"
+              : innerWidth < 86
+                ? "↑/↓ Select · Space Toggle · [/] Move · ^S Scope · Tab/Alt+1-4 · Esc"
+                : "↑/↓ Select · Space Toggle · [/] Move · ^S Scope · Tab / Alt+1-4 Role · Esc Close"
           : ultraCompact
             ? "Enter Effort · ^E · ^S Scope · Tab"
             : compact
-              ? "Enter Effort · ^E Effort · ^X Inherit · ^S Scope · Tab"
-              : "↑/↓ Select · Enter Effort · ^E Effort · ^X Inherit · ^S Scope · Tab · Esc";
+              ? "Enter Effort · ^E · ^X Inherit · ^S Scope · Tab/Alt+1-4"
+              : innerWidth < 86
+                ? "↑/↓ Select · Enter Effort · ^E · ^X Inherit · ^S Scope · Tab/Alt+1-4 · Esc"
+                : "↑/↓ Select · Enter Effort · ^E Effort · ^X Inherit · ^S Scope · Tab / Alt+1-4 · Esc";
     body.push(fitLine(this.theme.fg("dim", hints), innerWidth));
 
-    const boxTitle =
-      this.mode === "member" && this.member
-        ? `🎛 Switch Model — @${this.member.name}`
-        : "🎛 Swarm Mission Models";
+    if (this.mode === "member" && this.member) {
+      const memberTitle = `🎛 Switch Model — @${this.member.name}`;
+      return renderBox(body.slice(0, maxInnerLines), safeWidth, {
+        title: this.theme.fg("accent", this.theme.bold(memberTitle)),
+        borderColor: (t) => this.theme.fg("borderAccent", t),
+      });
+    }
+
+    const baseTitle = this.theme.fg(
+      "accent",
+      this.theme.bold("🎛 Swarm Mission Models"),
+    );
+    const scopeTitle =
+      innerWidth >= 46
+        ? `${this.theme.fg("dim", " · ")}${this.theme.fg(
+            this.saveScope === "global" ? "accent" : "warning",
+            `Scope: ${this.saveScope === "global" ? "Global" : "Project"}`,
+          )}`
+        : "";
     return renderBox(body.slice(0, maxInnerLines), safeWidth, {
-      title: this.theme.fg("accent", this.theme.bold(boxTitle)),
+      title: `${baseTitle}${scopeTitle}`,
       borderColor: (t) => this.theme.fg("borderAccent", t),
     });
   }
@@ -1778,7 +2069,22 @@ export class SwarmHubView implements Component, Focusable {
       const normalized = isBackspaceKey(data) ? "\x7f" : normalizeEditorInput(data);
       if (normalized) {
         this.hubFeedback = null;
+        const prevValue = this.goalInput.getValue();
         this.goalInput.handleInput(normalized);
+        const nextValue = this.goalInput.getValue();
+        const typedPrintable =
+          !isBackspaceKey(data) &&
+          (Boolean(ch) || nextValue.length > prevValue.length);
+        if (
+          typedPrintable &&
+          nextValue.trim().length > 0 &&
+          this.menuItems[this.selectedIndex]?.id === "resume_unfinished"
+        ) {
+          const draftIdx = this.menuItems.findIndex((item) => item.id === "draft");
+          if (draftIdx >= 0) {
+            this.selectedIndex = draftIdx;
+          }
+        }
         this.tui.requestRender();
       }
       return;
@@ -1881,13 +2187,84 @@ export class SwarmHubView implements Component, Focusable {
     const unfinished = this.getResumableUnfinishedRun();
     if (run) {
       const title = sanitizePlainText(run.title || run.objective) || run.id;
-      const summary = `${run.id} · ${run.status} · working:${this.snapshot.workingMemberNames.length} waiting:${this.snapshot.waitingMemberNames.length} · board #${this.snapshot.boardHead}`;
-      body.push(
-        fitLine(
-          `${this.theme.fg("accent", this.theme.bold(title))}  ${this.theme.fg("dim", summary)}`,
-          innerWidth,
-        ),
-      );
+      if (this.hasActiveOrPausedRun()) {
+        const badge = formatRunStatusBadge(run.status, this.theme);
+        const leftHeader = `${this.theme.fg("accent", this.theme.bold(title))} [${badge}]`;
+        const rightHeader = this.theme.fg(
+          "dim",
+          compact
+            ? `#${this.snapshot.boardHead}`
+            : `${sanitizePlainText(run.id)} · board #${this.snapshot.boardHead}`,
+        );
+        body.push(joinColumns(leftHeader, rightHeader, innerWidth));
+
+        if (maxInner >= 9) {
+          const membersList = Object.values(run.members ?? {});
+          const workingCount =
+            membersList.length > 0
+              ? membersList.filter((m) => m.state === "working").length
+              : this.snapshot.workingMemberNames.length;
+          const waitingCount =
+            membersList.length > 0
+              ? membersList.filter((m) => m.state === "waiting").length
+              : this.snapshot.waitingMemberNames.length;
+          const mergedCount = membersList.filter((m) =>
+            Boolean(m.mergedCommitSha),
+          ).length;
+          const stoppedCount = membersList.filter(
+            (m) => m.state === "stopped",
+          ).length;
+          const sep = this.theme.fg("dim", " · ");
+          if (innerWidth < 46) {
+            const workShort =
+              workingCount > 0
+                ? this.theme.fg("accent", `${workingCount} working`)
+                : this.theme.fg("muted", "0 working");
+            const waitShort = this.theme.fg("muted", `${waitingCount} waiting`);
+            const mergeShort =
+              mergedCount > 0
+                ? this.theme.fg("success", `${mergedCount} merged`)
+                : this.theme.fg("dim", "0 merged");
+            body.push(
+              fitLine(
+                `${workShort}${sep}${waitShort}${sep}${mergeShort}`,
+                innerWidth,
+              ),
+            );
+          } else {
+            const workStyled =
+              workingCount > 0
+                ? this.theme.fg("accent", `● ${workingCount} working`)
+                : this.theme.fg("muted", "● 0 working");
+            const waitStyled = this.theme.fg(
+              "muted",
+              `◌ ${waitingCount} waiting`,
+            );
+            const mergeStyled =
+              mergedCount > 0
+                ? this.theme.fg("success", `✓ ${mergedCount} merged`)
+                : this.theme.fg("dim", "✓ 0 merged");
+            const stopStyled =
+              !compact && stoppedCount > 0
+                ? `${sep}${this.theme.fg("warning", `■ ${stoppedCount} stopped`)}`
+                : "";
+            body.push(
+              fitLine(
+                `${this.theme.fg("muted", "Pipeline: ")}${workStyled}${sep}${waitStyled}${sep}${mergeStyled}${stopStyled}`,
+                innerWidth,
+              ),
+            );
+          }
+        }
+      } else {
+        const summary = `${run.id} · ${run.status} · working:${this.snapshot.workingMemberNames.length} waiting:${this.snapshot.waitingMemberNames.length} · board #${this.snapshot.boardHead}`;
+        body.push(
+          fitLine(
+            `${this.theme.fg("accent", this.theme.bold(title))}  ${this.theme.fg("dim", summary)}`,
+            innerWidth,
+          ),
+        );
+      }
       body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
     } else if (unfinished) {
       const title = sanitizePlainText(unfinished.title || unfinished.objective || unfinished.id);
@@ -1964,10 +2341,20 @@ export class SwarmHubView implements Component, Focusable {
       body.push(fitLine(this.theme.fg("dim", policyLine), innerWidth));
     }
 
-    if (!this.hasActiveOrPausedRun()) {
+    const activeOrPaused = this.hasActiveOrPausedRun();
+    if (!activeOrPaused) {
       body.push(renderHorizontalRule(innerWidth, "Goal (optional)", this.theme));
       const renderedInput = this.goalInput.render(innerWidth)[0] ?? "Goal: ";
       body.push(renderedInput);
+      if (maxInner - body.length >= 5) {
+        const goalHint =
+          innerWidth >= 69
+            ? "  [Enter] Clarify & Plan · [Alt+Enter] Direct Launch · [Alt+M] Models"
+            : innerWidth >= 53
+              ? "[Enter] Clarify & Plan · [Alt+Enter] Direct · [Alt+M]"
+              : "[Enter] Plan · [Alt+Enter] Direct";
+        body.push(fitLine(this.theme.fg("dim", goalHint), innerWidth));
+      }
     }
 
     if (this.hubFeedback) {
@@ -1988,23 +2375,33 @@ export class SwarmHubView implements Component, Focusable {
       const item = this.menuItems[i]!;
       const isSel = i === this.selectedIndex;
       const ptr = isSel ? this.theme.fg("accent", "› ") : "  ";
-      const num = this.theme.fg("muted", `${i + 1}. `);
+      const badge = activeOrPaused
+        ? i < 9
+          ? `${this.theme.fg(isSel ? "accent" : "muted", `[${i + 1}]`)} `
+          : "    "
+        : "";
       const label = isSel
         ? this.theme.fg("accent", this.theme.bold(item.label))
         : item.label;
-      body.push(fitLine(`${ptr}${num}${label}`, innerWidth));
+      body.push(fitLine(`${ptr}${badge}${label}`, innerWidth));
     }
 
     if (footerLines === 2) {
       body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
     }
-    const hint = this.hasActiveOrPausedRun()
-      ? compact
-        ? "↑↓/jk Select · Enter · Alt+M/^M Models · Esc"
-        : "↑/↓/j/k Navigate · Enter Select · Alt+M / Ctrl+M Models · Esc Close"
-      : compact
-        ? "Goal · ↑↓ Action · Enter · Alt+Enter Direct · Alt+M/^M"
-        : "Type Goal · ↑/↓ Action · Enter Launch · Alt+Enter Direct · Alt+M / Ctrl+M Models · Esc";
+    const hint = activeOrPaused
+      ? innerWidth < 46
+        ? "1-9/↑↓ · Enter · m/Alt+M · Esc"
+        : compact
+          ? "1-9/↑↓ Select · Enter · m/Alt+M Models · Esc"
+          : "1-9 / ↑/↓/j/k Navigate · Enter Select · m / Alt+M / ^M Models · Esc Close"
+      : innerWidth < 46
+        ? "Goal · Enter · Alt+Enter Direct"
+        : compact
+          ? "Goal · ↑↓ Action · Enter · Alt+Enter Direct · Alt+M/^M"
+          : innerWidth < 86
+            ? "Type Goal · ↑/↓ Action · Enter · Alt+Enter Direct · Alt+M/^M Models · Esc"
+            : "Type Goal · ↑/↓ Action · Enter Launch · Alt+Enter Direct · Alt+M / Ctrl+M Models · Esc";
     body.push(fitLine(this.theme.fg("dim", hint), innerWidth));
 
     return renderBox(body.slice(0, maxInner), safeWidth, {

@@ -462,6 +462,22 @@ class SingleQuestionComponent implements Component, Focusable {
     this.input.invalidate();
   }
 
+  private selectOptionAt(idx: number): void {
+    const chosen = this.options[idx];
+    if (!chosen) return;
+    this.selectedIndex = idx;
+    if (chosen.isCustom) {
+      this.setCustomInputMode(true);
+      this.tui.requestRender();
+    } else {
+      this.finish({
+        cancelled: false,
+        answer: chosen.value,
+        isCustom: false,
+      });
+    }
+  }
+
   handleInput(data: string): void {
     if (this.settled || isKeyReleaseSafe(data)) return;
 
@@ -502,25 +518,13 @@ class SingleQuestionComponent implements Component, Focusable {
     if (ch && ch >= "1" && ch <= "9") {
       const idx = Number(ch) - 1;
       if (idx < this.options.length) {
-        this.selectedIndex = idx;
-        this.tui.requestRender();
+        this.selectOptionAt(idx);
       }
       return;
     }
 
     if (matchesKey(data, Key.enter) || matchesKey(data, Key.return)) {
-      const chosen = this.options[this.selectedIndex];
-      if (!chosen) return;
-      if (chosen.isCustom) {
-        this.setCustomInputMode(true);
-        this.tui.requestRender();
-      } else {
-        this.finish({
-          cancelled: false,
-          answer: chosen.value,
-          isCustom: false,
-        });
-      }
+      this.selectOptionAt(this.selectedIndex);
     }
   }
 
@@ -570,7 +574,7 @@ class SingleQuestionComponent implements Component, Focusable {
 
     const hint = this.inCustomInput
       ? "[Enter] submit · [Esc] back"
-      : "[↑↓] move · [1-9] jump · [Enter] select · [Esc] cancel";
+      : "[1-9] pick · [↑↓/Enter] select · [Esc] cancel";
     tailLines.push(fitLine(this.theme.fg("dim", hint), innerWidth));
 
     const optionRowBudget = Math.max(
@@ -950,18 +954,10 @@ class MultiQuestionComponent implements Component, Focusable {
       this.tui.requestRender();
       return;
     }
-    if (ch && ch >= "1" && ch <= "9") {
-      const idx = Number(ch) - 1;
-      if (idx < opts.length) {
-        this.cursors[this.activeTab] = idx;
-        this.tui.requestRender();
-      }
-      return;
-    }
-
-    if (matchesKey(data, Key.enter) || matchesKey(data, Key.return)) {
-      const chosen = opts[cur];
+    const selectOptionAt = (idx: number): void => {
+      const chosen = opts[idx];
       if (!chosen) return;
+      this.cursors[this.activeTab] = idx;
       if (chosen.isCustom) {
         const existing = this.answers.get(spec.id);
         this.setCustomInputMode(
@@ -974,6 +970,18 @@ class MultiQuestionComponent implements Component, Focusable {
         this.advanceAfterAnswer();
         this.tui.requestRender();
       }
+    };
+
+    if (ch && ch >= "1" && ch <= "9") {
+      const idx = Number(ch) - 1;
+      if (idx < opts.length) {
+        selectOptionAt(idx);
+      }
+      return;
+    }
+
+    if (matchesKey(data, Key.enter) || matchesKey(data, Key.return)) {
+      selectOptionAt(cur);
     }
   }
 
@@ -1175,7 +1183,7 @@ class MultiQuestionComponent implements Component, Focusable {
 
       const hint = this.inCustomInput
         ? "[Enter] save & next · [Esc] back"
-        : "[Tab/←→] tabs · [↑↓] move · [Enter] select · [Esc] cancel";
+        : "[1-9] pick · [Tab/←→] tabs · [↑↓/Enter] select · [Esc] cancel";
       tailLines.push(fitLine(this.theme.fg("dim", hint), innerWidth));
 
       const optionBudget = Math.max(
@@ -1376,7 +1384,7 @@ class ConfirmProposalComponent implements Component, Focusable {
         this.tui.requestRender();
         return;
       }
-      if (matchesKey(data, Key.enter)) {
+      if (matchesKey(data, Key.enter) || matchesKey(data, Key.return)) {
         this.commentText = this.commentInput.getValue().trim();
         this.setCommentEditMode(false);
         this.tui.requestRender();
@@ -1465,12 +1473,93 @@ class ConfirmProposalComponent implements Component, Focusable {
       return;
     }
 
-    if (matchesKey(data, Key.enter)) {
+    if (matchesKey(data, Key.enter) || matchesKey(data, Key.return)) {
       const choice = this.choices[this.selectedIndex];
       if (choice) {
         this.finish(choice.action);
       }
     }
+  }
+
+  private formatHintChip(
+    key: string,
+    label?: string,
+    primary = false,
+  ): string {
+    if (primary) {
+      return label
+        ? `${this.theme.fg("success", this.theme.bold(`[${key}]`))} ${this.theme.bold(label)}`
+        : this.theme.fg("success", this.theme.bold(`[${key}]`));
+    }
+    return label
+      ? `${this.theme.fg("accent", `[${key}]`)} ${this.theme.fg("muted", label)}`
+      : this.theme.fg("accent", `[${key}]`);
+  }
+
+  private renderControlsHint(innerWidth: number): string {
+    if (this.editingComment) {
+      const sep = this.theme.fg("dim", " · ");
+      const saveLine = `${this.formatHintChip("Enter", "Save Note", true)}${sep}${this.formatHintChip("Esc", "Cancel")}`;
+      return fitLine(saveLine, innerWidth);
+    }
+
+    const isConfirmSel = this.selectedIndex === 0;
+    const enterFull = isConfirmSel
+      ? "Confirm & Launch"
+      : this.selectedIndex === 1
+        ? "Continue Refining"
+        : "Cancel Draft";
+    const enterShort = isConfirmSel
+      ? "Launch"
+      : this.selectedIndex === 1
+        ? "Refine"
+        : "Cancel";
+
+    if (innerWidth >= 84) {
+      const sep = this.theme.fg("dim", " · ");
+      const parts = [
+        this.formatHintChip("Enter", enterFull, isConfirmSel),
+        this.formatHintChip("m", "Models"),
+        this.formatHintChip("v", "Validator"),
+        this.formatHintChip("+/-", "Concurrency"),
+        this.formatHintChip("c", "Note"),
+      ];
+      if (innerWidth >= 100) {
+        parts.push(this.formatHintChip("Esc", "Refine"));
+      }
+      return fitLine(parts.join(sep), innerWidth);
+    }
+
+    if (innerWidth >= 76) {
+      const parts = [
+        this.formatHintChip("Enter", enterFull, isConfirmSel),
+        this.formatHintChip("m", "Models"),
+        this.formatHintChip("v", "Validator"),
+        this.formatHintChip("+/-", "Concurrency"),
+        this.formatHintChip("c", "Note"),
+      ];
+      return fitLine(parts.join(" "), innerWidth);
+    }
+
+    if (innerWidth >= 52) {
+      const parts = [
+        this.formatHintChip("Enter", enterShort, isConfirmSel),
+        this.formatHintChip("m", "Models"),
+        this.formatHintChip("v", "Val"),
+        this.formatHintChip("+/-", "Max"),
+        this.formatHintChip("c", "Note"),
+      ];
+      return fitLine(parts.join(" "), innerWidth);
+    }
+
+    const compactParts = [
+      this.formatHintChip("Enter", enterShort, isConfirmSel),
+      this.formatHintChip("m"),
+      this.formatHintChip("v"),
+      this.formatHintChip("+/-"),
+      this.formatHintChip("c"),
+    ];
+    return fitLine(compactParts.join(" "), innerWidth);
   }
 
   private renderModelsLine(innerWidth: number): string {
@@ -1638,10 +1727,7 @@ class ConfirmProposalComponent implements Component, Focusable {
       body.push(fitLine(`${ptr}${num}${label}${badge}`, innerWidth));
     }
 
-    const hintsText = this.editingComment
-      ? "[Enter] save comment · [Esc] cancel comment"
-      : `${this.options?.onOpenModelPicker ? "[m] models · " : ""}[c] comment · [v] validator policy · [+/-] concurrency · [Esc] refine`;
-    body.push(fitLine(this.theme.fg("dim", hintsText), innerWidth));
+    body.push(this.renderControlsHint(innerWidth));
 
     const titleText =
       this.options?.mode === "tweak"

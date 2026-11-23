@@ -36,8 +36,12 @@ export function escapeXml(value: string): string {
     .replace(/'/g, "&apos;");
 }
 
+function collapseInlineWhitespace(value: string): string {
+  return value.replace(/\r?\n/g, " ").replace(/\s+/g, " ").trim();
+}
+
 function escapeTableCell(value: string): string {
-  return value.replace(/\r?\n/g, " ").replace(/\|/g, "\\|").trim();
+  return collapseInlineWhitespace(value).replace(/\|/g, "\\|");
 }
 
 function formatRoleModelSlot(config?: SwarmRoleModelConfig): string {
@@ -59,15 +63,18 @@ function formatRoleModelsLine(roleModels?: SwarmRoleModels): string {
   const orchestrator = formatRoleModelSlot(roleModels?.orchestrator);
   const worker = formatRoleModelSlot(roleModels?.worker);
   const validator = formatRoleModelSlot(roleModels?.validator);
+  const fallbackList = (roleModels?.fallbackModels ?? [])
+    .map((m) => m.trim())
+    .filter(Boolean);
   const fallbacks =
-    roleModels?.fallbackModels && roleModels.fallbackModels.length > 0
-      ? ` | **Fallbacks:** ${roleModels.fallbackModels.join(", ")}`
+    fallbackList.length > 0
+      ? ` | **Fallbacks:** ${fallbackList.join(", ")}`
       : "";
   return `**Models:** Orchestrator: ${orchestrator} | Worker: ${worker} | Validator: ${validator}${fallbacks}`;
 }
 
 function formatMemberBriefCell(member: InitialMemberProposal): string {
-  const brief = escapeTableCell(member.brief || "—");
+  const brief = escapeTableCell(member.brief || "") || "—";
   const channels = (member.channels ?? [])
     .map((c) => c.trim())
     .filter(Boolean);
@@ -78,6 +85,35 @@ function formatMemberBriefCell(member: InitialMemberProposal): string {
     .map((c) => `#${escapeTableCell(c.replace(/^#/, ""))}`)
     .join(", ");
   return `${brief} _(channels: ${channelTags})_`;
+}
+
+function formatInitialMembersBreakdown(
+  members: readonly InitialMemberProposal[],
+): string {
+  let workers = 0;
+  let validators = 0;
+  let isolated = 0;
+  for (const m of members) {
+    if (m.role === "validator") {
+      validators += 1;
+    } else {
+      workers += 1;
+    }
+    if (m.workspace === "share" || m.workspace === "branch") {
+      isolated += 1;
+    }
+  }
+  const parts: string[] = [];
+  if (workers > 0) {
+    parts.push(`${workers} ${workers === 1 ? "worker" : "workers"}`);
+  }
+  if (validators > 0) {
+    parts.push(`${validators} ${validators === 1 ? "validator" : "validators"}`);
+  }
+  if (isolated > 0) {
+    parts.push(`${isolated} isolated ${isolated === 1 ? "worktree" : "worktrees"}`);
+  }
+  return parts.length > 0 ? ` — ${parts.join(" · ")}` : "";
 }
 
 // ============================================================================
@@ -101,8 +137,8 @@ export interface DraftingKickoffOptions {
 
 /**
  * Builds the kickoff user message for interactive `pi-swarm` drafting (`/swarm [seed]`).
- * Guides the Orchestrator through `pi-goal-x`-style upfront clarification ("事前澄清")
- * and a Flexible Dynamic Swarm Plan tailored for the Dynamic Antigravity Swarm architecture.
+ * Guides the Orchestrator through fast targeted repo recon, lean high-leverage Q&A,
+ * right-sized slice decomposition, and a Flexible Dynamic Swarm Plan.
  */
 export function buildDraftingKickoffPrompt(
   seed: string,
@@ -157,7 +193,7 @@ export function buildDraftingKickoffPrompt(
   lines.push(
     mode === "tweak"
       ? "You are in `pi-swarm` Drafting Mode (`tweak`) as the **Orchestrator** to clarify and refine the active Dynamic Antigravity Swarm plan."
-      : "You are entering `pi-swarm` Planning / Drafting Mode as the **Orchestrator** to clarify requirements and propose a **Flexible Dynamic Swarm Plan** before launching the swarm.",
+      : "You are entering `pi-swarm` Planning / Drafting Mode as the **Orchestrator** to ground, clarify, and propose a **Flexible Dynamic Swarm Plan** before launching the swarm.",
   );
   lines.push("");
   lines.push("How the Dynamic Antigravity Swarm executes once approved:");
@@ -168,40 +204,52 @@ export function buildDraftingKickoffPrompt(
     "- **Workers:** Warm persistent sessions that collaborate on the shared `#seq` Message Board with `@mention` wakeups, optional context forking (`fork`), and flexible workspaces (`inherit` for read-only scouts/researchers, `share` or `branch` for isolated Git worktree edits). Workers can also spawn their own helpers when a slice splits naturally.",
   );
   lines.push(
-    "- **Validators:** Independent read-only verifiers (`validator` role) spawned on demand to audit diffs, run checks, and report issues directly via `@mention` on the board without mutating code.",
+    "- **Validators:** Independent read-only verifiers (`validator` role) spawned on demand to audit peer worktrees/diffs, run checks, and report issues directly via `@mention` on the board without mutating code.",
   );
   lines.push("");
   lines.push(
-    "1. DO NOT start editing, writing, or implementing code yet. Do not run mutating shell commands or create git branches/worktrees.",
+    "1. **No Mutations Yet:** DO NOT start editing, writing, or implementing code yet. Do not run mutating shell commands or create git branches/worktrees.",
   );
   lines.push(
-    "2. Read-only repository reconnaissance (`read`, `grep`, `find`, `ls`) IS strongly encouraged so your clarifying questions, strategy, and acceptance criteria are sharp and grounded in the actual codebase.",
+    "2. **Fast Targeted Reconnaissance FIRST:** Run fast read-only repository recon (`read`, `grep`, `find`, `ls` on `package.json`, key entrypoints, and target modules/tests) FIRST so every question, ownership slice, and verification command is grounded in real code.",
   );
   lines.push(
-    "3. Upfront Clarification (事前澄清 — `pi-goal-x` style): Identify genuine ambiguities around requirements, architecture choices, constraints, edge cases, and acceptance criteria.",
+    "3. **Lean Upfront Q&A (事前澄清 — `pi-goal-x` style):**",
   );
   lines.push(
-    `   - Prefer \`${SWARM_QUESTIONNAIRE_TOOL}\` to ask 2–4 related questions in a single tabbed prompt with clear options and recommended defaults, or \`${SWARM_QUESTION_TOOL}\` for one focused question.`,
+    "   - Ask **0 questions** when the goal, scope, and constraints are already clear from the seed + repo recon — proceed straight to proposing the plan!",
   );
   lines.push(
-    "   - Skip trivial or already-unambiguous questions; if the goal and constraints are already crystal clear, proceed straight to proposing the plan.",
+    `   - Otherwise ask **at most 1–3 high-leverage trade-off questions** via \`${SWARM_QUESTIONNAIRE_TOOL}\` (or \`${SWARM_QUESTION_TOOL}\` for a single focused question). Place the best option **first** and prefix its label with \`(Recommended)\`.`,
   );
   lines.push(
-    `4. Flexible Dynamic Swarm Plan: Once clear, call \`${PROPOSE_SWARM_PLAN_TOOL}\` with:`,
+    "   - **Never interrogate the user on obvious details** or facts you can inspect directly in the repository.",
+  );
+  lines.push(
+    "4. **Right-Size the Swarm:**",
+  );
+  lines.push(
+    "   - **1–2 workers** for small, localized, or single-module tasks (do not over-spawn).",
+  );
+  lines.push(
+    "   - **Disjoint parallel `share` authors + independent `validator`** for multi-module work (e.g. 1 read-only `validator` auditing peer branches/worktrees per 2–4 parallel authors).",
+  );
+  lines.push(
+    `5. **Flexible Dynamic Swarm Plan:** Once clear, call \`${PROPOSE_SWARM_PLAN_TOOL}\` with:`,
   );
   lines.push("   - `title`: short, clear human-readable title for this swarm.");
   lines.push("   - `objective`: crisp statement of what the swarm must accomplish.");
   lines.push(
-    "   - `strategy`: phased dynamic orchestration plan explaining how you will scout, partition work, iterate wave-by-wave, review with read-only validators, and adapt on the shared board as findings emerge. Do NOT invent a rigid pre-locked file-level DAG — keep the strategy flexible because you will dynamically spawn, steer, review, and adapt members live.",
+    "   - `strategy`: **wave-by-wave execution with disjoint file/directory ownership boundaries** (assign non-overlapping files/directories per parallel `share`/`branch` worker so zero two-worker collisions occur on the same file, plus `@mention` -> `validator` review and merge gates on the shared Message Board). Keep wave transitions adaptive on the live board — do NOT invent a rigid pre-locked file-level DAG.",
   );
   lines.push(
-    '   - `acceptance_criteria`: concrete, testable definition of "what done looks like" (commands, test suites, typechecks, and behavioral invariants).',
+    '   - `acceptance_criteria`: concrete, testable definition of "what done looks like" listing **exact runnable verification commands** (`typecheck`, targeted test commands, build checks) and behavioral invariants.',
   );
   lines.push(
-    `   - \`initial_members\` (optional): initial read-only researchers/scouts (\`workspace: "inherit"\`) or a first wave of workers (\`workspace: "share"\` / \`"branch"\`) and/or a validator. Each name must match \`${MEMBER_NAME_PATTERN.source}\`, be unique, and avoid reserved names (${RESERVED_MEMBER_NAMES.join(", ")}). Leave omitted/empty if you want to spawn the first wave dynamically after launch.`,
+    `   - \`initial_members\` (optional): right-sized initial wave — e.g. read-only scout (\`workspace: "inherit"\`) or disjoint parallel workers (\`workspace: "share"\` / \`"branch"\` with explicit file ownership & verification commands in each \`brief\`) plus an optional \`validator\`. Each name must match \`${MEMBER_NAME_PATTERN.source}\`, be unique, and avoid reserved names (${RESERVED_MEMBER_NAMES.join(", ")}). Leave omitted/empty to spawn wave 1 dynamically after launch.`,
   );
   lines.push(
-    `5. Do NOT dump the full plan in prose before calling \`${PROPOSE_SWARM_PLAN_TOOL}\` — its tool renderer already prints the full formatted proposal into scrollback before opening the confirmation modal.`,
+    `6. Do NOT dump the full plan in prose before calling \`${PROPOSE_SWARM_PLAN_TOOL}\` — its tool renderer already prints the full formatted proposal into scrollback before opening the confirmation modal.`,
   );
   lines.push("</instructions>");
   lines.push("</swarm_drafting_kickoff>");
@@ -217,7 +265,7 @@ export function buildDraftingSystemOverlay(draft: ActiveSwarmDraft): string {
   const autoConfirmAttr = draft.autoConfirm ? ' auto_confirm="true"' : "";
   const lines: string[] = [
     `<swarm_drafting_active mode="${escapeXml(draft.mode)}" base_branch="${escapeXml(draft.baseBranch ?? "auto")}" max_concurrency="${draft.maxConcurrency}" validator_enabled="${draft.validatorEnabled ? "true" : "false"}"${autoConfirmAttr}>`,
-    `Active \`pi-swarm\` draft for a **Dynamic Antigravity Swarm** (Orchestrator dynamically spawns/steers warm Workers & read-only Validators on the shared \`#seq\` Message Board with \`@mention\` wakeups). Rules: (1) Read-only reconnaissance (\`read\`, \`grep\`, \`find\`, \`ls\`) only — do NOT edit files or implement code yet; (2) Use \`${SWARM_QUESTIONNAIRE_TOOL}\` or \`${SWARM_QUESTION_TOOL}\` only for genuine ambiguities (with recommended defaults); (3) Finalize via \`${PROPOSE_SWARM_PLAN_TOOL}\` with \`title\`, \`objective\`, a flexible phased \`strategy\` (no rigid pre-locked file-level DAG), concrete \`acceptance_criteria\`, and optional valid \`initial_members\`; (4) Do not repeat the full plan in prose before calling \`${PROPOSE_SWARM_PLAN_TOOL}\`.`,
+    `Active \`pi-swarm\` draft for a **Dynamic Antigravity Swarm** (Orchestrator dynamically spawns/steers warm Workers & read-only Validators on the shared \`#seq\` Message Board with \`@mention\` wakeups). Rules: (1) Run fast targeted read-only recon (\`ls\`, \`find\`, \`grep\`, \`read\` key entrypoints/\`package.json\`) FIRST — do NOT edit files or implement code yet; (2) Ask **0 questions** when clear, or **at most 1–3 high-leverage trade-off questions** via \`${SWARM_QUESTIONNAIRE_TOOL}\` (or \`${SWARM_QUESTION_TOOL}\`) with the best option placed first and prefixed \`(Recommended)\` — never interrogate on obvious details; (3) Right-size the swarm (1–2 workers for small/single-module tasks; disjoint parallel \`share\` authors + independent \`validator\` for multi-module work); (4) Finalize via \`${PROPOSE_SWARM_PLAN_TOOL}\` with \`title\`, \`objective\`, \`strategy\` specifying **wave-by-wave execution with disjoint file/directory ownership boundaries** (zero same-file collisions; not a rigid pre-locked file-level DAG), \`acceptance_criteria\` listing **exact runnable verification commands** (\`typecheck\`, test commands, build checks), and optional valid \`initial_members\`; (5) Do not repeat the full plan in prose before calling \`${PROPOSE_SWARM_PLAN_TOOL}\`.`,
   ];
 
   if (draft.seed.trim()) {
@@ -259,11 +307,14 @@ export function buildDirectPlanPrompt(
     "<instructions>",
     "Fast-path `pi-swarm` launch (`/swarm direct`) as the **Orchestrator** (`autoConfirm: true`):",
     `1. Skip interactive Q&A — do NOT call \`${SWARM_QUESTION_TOOL}\` or \`${SWARM_QUESTIONNAIRE_TOOL}\`.`,
-    "2. Do NOT edit or implement code directly; perform a quick read-only inspection (`ls`, `find`, `grep`, `read`) if needed to ground your dynamic strategy and acceptance criteria in the real repository layout.",
-    `3. Immediately call \`${PROPOSE_SWARM_PLAN_TOOL}\` with a **Flexible Dynamic Swarm Plan** (not a rigid pre-locked file-level DAG):`,
+    "2. Run fast targeted read-only recon (`ls`, `find`, `grep`, `read` key entrypoints/`package.json`) FIRST so your slice boundaries and verification commands are grounded in real code — do NOT edit or implement code directly.",
+    "3. Right-size the swarm (1–2 workers for small/single-module tasks; disjoint parallel `share` authors + independent `validator` for multi-module work).",
+    `4. Immediately call \`${PROPOSE_SWARM_PLAN_TOOL}\` with a **Flexible Dynamic Swarm Plan** (not a rigid pre-locked file-level DAG):`,
     baseBranchRule,
-    `   - Provide \`title\`, \`objective\`, phased dynamic \`strategy\`, concrete testable \`acceptance_criteria\`, and optional \`initial_members\` (unique lowercase names matching \`${MEMBER_NAME_PATTERN.source}\`, avoiding ${RESERVED_MEMBER_NAMES.join(", ")}).`,
-    `4. Because this draft runs with \`autoConfirm: true\`, calling \`${PROPOSE_SWARM_PLAN_TOOL}\` validates and launches the Dynamic Swarm immediately without a confirmation modal. Do NOT dump the full plan in prose beforehand.`,
+    "   - `strategy`: **wave-by-wave execution with disjoint file/directory ownership boundaries** (zero two-worker collisions on the same file) plus board review/merge gates.",
+    "   - `acceptance_criteria`: **exact runnable verification commands** (`typecheck`, test commands, build checks) plus behavioral invariants.",
+    `   - Provide \`title\`, \`objective\`, and optional right-sized \`initial_members\` (unique lowercase names matching \`${MEMBER_NAME_PATTERN.source}\`, avoiding ${RESERVED_MEMBER_NAMES.join(", ")}, with explicit file ownership in each brief).`,
+    `5. Because this draft runs with \`autoConfirm: true\`, calling \`${PROPOSE_SWARM_PLAN_TOOL}\` validates and launches the Dynamic Swarm immediately without a confirmation modal. Do NOT dump the full plan in prose beforehand.`,
     "</instructions>",
     "</swarm_direct_plan>",
   ];
@@ -281,50 +332,61 @@ export function buildDirectPlanPrompt(
  * confirmation modal opens) AND persisted in the tool result for confirm/continue/cancel.
  */
 export function formatProposalTranscriptSummary(plan: ProposedSwarmPlan): string {
-  const titleText = plan.title?.trim() || "(pending)";
-  const objectiveText = plan.objective?.trim() || "(pending)";
+  const cleanTitle = collapseInlineWhitespace(plan.title ?? "");
+  const cleanObjective = collapseInlineWhitespace(plan.objective ?? "");
+  const cleanBaseBranch = collapseInlineWhitespace(plan.baseBranch ?? "") || "auto";
+  const titleText = cleanTitle || "(pending)";
+  const objectiveText = cleanObjective || "(pending)";
   const strategyText = plan.strategy?.trim() || "_(pending)_";
   const acceptanceText = plan.acceptanceCriteria?.trim() || "_(pending)_";
-  const baseBranchText = plan.baseBranch?.trim() || "auto";
+  const feedbackText = collapseInlineWhitespace(plan.feedback ?? "");
 
   const lines: string[] = [
-    `## Swarm Plan Proposal${plan.title?.trim() ? `: ${plan.title.trim()}` : ""}`,
+    `## Swarm Plan Proposal${cleanTitle ? `: ${cleanTitle}` : ""}`,
     "",
     `**Title:** ${titleText}`,
     `**Objective:** ${objectiveText}`,
-    `**Base Branch:** \`${baseBranchText}\` | **Max Concurrency:** ${plan.maxConcurrency} | **Validator Policy:** ${plan.validatorEnabled ? "ON" : "OFF"}`,
+    `**Base Branch:** \`${cleanBaseBranch}\` | **Max Concurrency:** ${plan.maxConcurrency} | **Validator Policy:** ${plan.validatorEnabled ? "ON" : "OFF"}`,
     formatRoleModelsLine(plan.roleModels),
+  ];
+
+  if (feedbackText) {
+    lines.push("", `> **Launch Note:** ${feedbackText}`);
+  }
+
+  lines.push(
     "",
-    "### Dynamic Strategy",
+    "### Dynamic Strategy (Waves & Disjoint Ownership)",
     "",
     strategyText,
     "",
-    "### Acceptance Criteria",
+    "### Acceptance Criteria & Verification",
     "",
     acceptanceText,
-  ];
+  );
 
   const initialMembers = plan.initialMembers ?? [];
   if (initialMembers.length > 0) {
+    const breakdown = formatInitialMembersBreakdown(initialMembers);
     lines.push(
       "",
-      `### Initial Members (${initialMembers.length})`,
+      `### Initial Members (${initialMembers.length})${breakdown}`,
       "",
       "| Name | Role | Workspace | Brief |",
       "| --- | --- | --- | --- |",
     );
 
     for (const member of initialMembers) {
-      const name = escapeTableCell(member.name || "(unnamed)");
-      const role = escapeTableCell(member.role || "worker");
-      const workspace = escapeTableCell(member.workspace ?? "inherit");
+      const name = escapeTableCell(member.name || "") || "(unnamed)";
+      const role = escapeTableCell(member.role || "") || "worker";
+      const workspace = escapeTableCell(member.workspace ?? "") || "inherit";
       const brief = formatMemberBriefCell(member);
       lines.push(`| **${name}** | \`${role}\` | \`${workspace}\` | ${brief} |`);
     }
   } else {
     lines.push(
       "",
-      "_Initial Members: none pre-specified — Orchestrator will dynamically spawn members wave-by-wave on the shared board._",
+      "_Initial Members: none pre-specified — Orchestrator will dynamically spawn right-sized waves on the shared board._",
     );
   }
 

@@ -102,33 +102,46 @@ export interface OrchestratorLiveStateOptions {
 }
 
 function buildOrchestratorPlaybookCore(validatorEnabled: boolean): string {
+  const nextPeerExample = validatorEnabled
+    ? `\`@validator [done] commit=<sha> workspace=<cwd> summary=...\` so author -> validator runs zero-hop without waking \`@${ORCHESTRATOR_NAME}\` in between, or \`@${ORCHESTRATOR_NAME} [done] ...\` when no downstream peer exists`
+    : `\`@<downstream-peer> [done] commit=<sha> workspace=<cwd> summary=...\` for zero-hop peer handoffs, or \`@${ORCHESTRATOR_NAME} [done] commit=<sha> workspace=<cwd> summary=...\` when no downstream peer exists`;
+
+  const rightSizingRule = validatorEnabled
+    ? "- **Right-Size the Swarm**: Spawn **1–2 workers** for localized/single-module changes (do not over-shard small edits); for multi-module work, fan out parallel `workspace:\"share\"` authors on strictly disjoint slices + **1 `role:\"validator\"` per 2–4 authors**."
+    : "- **Right-Size the Swarm**: Spawn **1–2 workers** for localized/single-module changes (do not over-shard small edits); for multi-module work, fan out parallel `workspace:\"share\"` authors on strictly disjoint file slices.";
+
   return [
     "# Pi Swarm Orchestrator Playbook (Antigravity Swarm)",
     "",
     "## 1. Do Not Do the Technical Work Yourself",
-    `- Delegate ALL technical work (codebase research, scaffolding, coding, integration, builds/tests, verification) to named swarm members via \`${SWARM_TOOL}{action:"add"}\`.`,
-    `- Your job is orchestration: read \`#seq\` board reports, judge quality and completeness, decide the next phase, merge isolated worktrees/clones (\`${SWARM_TOOL}{action:"merge"}\`), retire finished workers (\`${SWARM_TOOL}{action:"kill"}\`), and adapt seamlessly whenever the user redirects you.`,
+    `- Delegate ALL technical work (codebase research, scaffolding, coding, integration, builds/tests, verification) to named swarm members via \`${SWARM_TOOL}{action:"add"}\` — never edit repository files directly from Orchestrator (dirtying \`baseBranch\` breaks worktree merges).`,
+    `- Your job is orchestration: right-size the swarm, write high-signal briefs, read \`#seq\` board reports, judge quality and completeness, merge isolated worktrees/clones (\`${SWARM_TOOL}{action:"merge"}\`), verify post-merge integration on \`baseBranch\`, retire finished workers (\`${SWARM_TOOL}{action:"kill"}\`), and adapt seamlessly whenever the user redirects you.`,
     "",
-    "## 2. Dynamic Phased Collaboration & Mid-Flight User Redirection",
+    "## 2. Right-Sizing, Dynamic Phased Collaboration & Mid-Flight User Redirection",
+    rightSizingRule,
     "- Adapt wave-by-wave instead of locking into a rigid upfront DAG:",
     "  1. **Discovery**: Spawn read-only researchers/scouts first when unknowns exist → inspect their `#seq` reports.",
     "  2. **Contract / Scaffold**: Spawn a contract/scaffold worker when shared interfaces must settle before fan-out → inspect its `#seq`.",
     "  3. **Parallel Execution**: Spawn disjoint named authors in parallel (`workspace:\"share\"` for shared git worktrees when multiple authors edit/build simultaneously; `workspace:\"branch\"` for fully isolated git clones; `workspace:\"inherit\"` for read-only scouts; use `n` or `tasks[]` for sharded slices).",
     ...(validatorEnabled
       ? [
-          "  4. **Independent Read-Only Validation**: Spawn independent `role:\"validator\"` members (~1 validator per 2–4 authors) to audit code, diffs, tests, and runtime behavior. NEVER let authors self-certify!",
+          "  4. **Independent Read-Only Validation**: Spawn independent `role:\"validator\"` members (~1 validator per 2–4 authors) to audit code, diffs, tests, and runtime behavior inside each author's worktree `cwd`. NEVER let authors self-certify!",
           "  5. **Peer-to-Peer Bug Closure**: Let `@validator` and `@author` resolve defects directly on the board (`@author` <-> `@validator`) without waking `@orchestrator` on intermediate bounces.",
-          `  6. **Land & Complete**: Merge \`share\`/\`branch\` worktrees via \`${SWARM_TOOL}{action:"merge"}\`, kill finished members via \`${SWARM_TOOL}{action:"kill"}\`, and close the run cleanly via \`${SWARM_TOOL}{action:"done", summary}\`.`,
+          `  6. **Land & Complete**: Merge verified \`share\`/\`branch\` worktrees via \`${SWARM_TOOL}{action:"merge"}\`, run a **post-merge integration check on \`baseBranch\`** (wake \`@validator\` or an \`inherit\` verifier to run full \`typecheck\`/tests on merged \`baseBranch\`) BEFORE calling \`done\`, kill finished members via \`${SWARM_TOOL}{action:"kill"}\`, and close the run cleanly via \`${SWARM_TOOL}{action:"done", summary}\`.`,
         ]
       : [
-          `  4. **Land & Complete**: Merge \`share\`/\`branch\` worktrees via \`${SWARM_TOOL}{action:"merge"}\`, kill finished members via \`${SWARM_TOOL}{action:"kill"}\`, and close the run cleanly via \`${SWARM_TOOL}{action:"done", summary}\`.`,
+          `  4. **Land & Complete**: Merge \`share\`/\`branch\` worktrees via \`${SWARM_TOOL}{action:"merge"}\`, run a **post-merge integration check on \`baseBranch\`** (via an \`inherit\` check worker running full \`typecheck\`/tests on merged \`baseBranch\`) BEFORE calling \`done\`, kill finished members via \`${SWARM_TOOL}{action:"kill"}\`, and close the run cleanly via \`${SWARM_TOOL}{action:"done", summary}\`.`,
         ]),
     "- **Dynamic User Redirection**: Calling `swarm_wait` ends your turn cleanly so the user can message you at any time while workers run. When the user sends a new instruction or change of direction mid-flight:",
     `  - Use \`${SWARM_TOOL}{action:"steer", name, message, mode?}\` to redirect a working or parked member immediately (or \`post_message\` with \`@all\` / \`@name\` for parked members), \`${SWARM_TOOL}{action:"stop"/"kill"}\` to halt obsolete work, \`${SWARM_TOOL}{action:"title", objective, strategy, acceptance_criteria}\` to update the run goal/plan, and \`${SWARM_TOOL}{action:"add"}\` for new work, then call \`${SWARM_WAIT_TOOL}\` again.`,
     "",
-    "## 3. Zero-Copy `#seq` Referencing & `@mention` Discipline",
-    `- Point downstream workers to earlier reports by sequence number (e.g. "Read \`#4\` and \`#6\` via \`${READ_BOARD_TOOL}{seqs:[4,6]}\`") — NEVER copy-paste one worker's report into another worker's brief!`,
-    `- \`@name\` is a wakeup doorbell, never a CC. Use \`@<prefix>\` for sharded groups, \`@#<channel>\` for channel broadcasts (NEVER \`@#main\`), and \`@all\` only for genuine swarm-wide rules or plan changes.`,
+    "## 3. Mandatory 4-Part Brief Contract, Zero-Copy `#seq` & `@mention` Discipline",
+    `- **4-Part Brief Contract**: Every \`${SWARM_TOOL}{action:"add"}\` brief you write MUST explicitly state all four parts:`,
+    "  - **(a) Exclusive File/Directory Ownership & Off-Limits Files**: Exact files/directories this member owns and files it MUST NOT edit (prevents two-worker collisions and `REBASE_CONFLICT`).",
+    `  - **(b) Interface Contracts & \`#seq\` Board References**: Shared types/invariants plus prior \`#seq\` numbers to read via \`${READ_BOARD_TOOL}{seqs:[...]}\` — NEVER copy-paste one worker's report into another worker's brief!`,
+    "  - **(c) Concrete Verification Commands**: Exact runnable `typecheck`, test, and build commands the member must pass in its workspace before reporting `[done]`.",
+    `  - **(d) Direct Next-Peer \`@mention\` Doorbell**: Exact handle to wake on completion (e.g., ${nextPeerExample}).`,
+    `- **Zero-Copy \`#seq\` & \`@mention\` Discipline**: \`@name\` is a wakeup doorbell, never a CC. Use \`@<prefix>\` for sharded groups, \`@#<channel>\` for channel broadcasts (NEVER \`@#main\`), and \`@all\` only for genuine swarm-wide rules or plan changes.`,
     "",
     "## 4. Core Swarm Tools (4 Tools)",
     `- \`${SWARM_TOOL}\`: \`title\`, \`add\`, \`status\`, \`models\`, \`model\` (auto-resumes switched member), \`steer\`, \`stop\`, \`kill\`, \`merge\`, \`channel\`, \`done\`.`,
@@ -167,21 +180,106 @@ function formatChannelLine(ch: SwarmChannelRecord): string {
   return `- \`#${ch.name}\`${archived} subscribers=[${subs}]${topic}`;
 }
 
+function getOrderedMembers(run: SwarmRunState): SwarmMemberRecord[] {
+  const seen = new Set<string>();
+  const result: SwarmMemberRecord[] = [];
+  for (const name of run.memberOrder) {
+    const m = run.members[name];
+    if (m && !seen.has(m.name)) {
+      seen.add(m.name);
+      result.push(m);
+    }
+  }
+  for (const m of Object.values(run.members)) {
+    if (m && !seen.has(m.name)) {
+      seen.add(m.name);
+      result.push(m);
+    }
+  }
+  return result;
+}
+
 function formatMemberLine(
   m: SwarmMemberRecord,
   includeCurrentActivity: boolean,
 ): string {
   const ws = m.branch ? `${m.workspace}:${m.branch}` : m.workspace;
+  const isIsolated = m.workspace === "share" || m.workspace === "branch";
+  const cwdPart = isIsolated && m.state !== "killed" ? ` cwd=${m.cwd}` : "";
   const model = m.model ? ` model=${m.model}` : "";
   const post = m.lastPostSeq ? ` lastPost=#${m.lastPostSeq}` : "";
-  const merged = m.mergedCommitSha ? ` merged=${m.mergedCommitSha.slice(0, 7)}` : "";
+  const merged = m.mergedCommitSha
+    ? ` merged=${m.mergedCommitSha.slice(0, 7)}`
+    : isIsolated && m.state !== "killed"
+      ? " merged=UNMERGED"
+      : "";
   const stopped = m.humanStopped ? " [HUMAN-STOPPED]" : "";
   const err = m.error ? ` err="${m.error.slice(0, 80)}"` : "";
   const activityText = includeCurrentActivity
     ? (m.currentActivity ?? m.parkedOn)
     : m.parkedOn;
   const activity = activityText ? ` — ${activityText}` : "";
-  return `- \`@${m.name}\` (${m.role}) [${m.state}] ws=${ws} parent=@${m.parentName}${model} turns=${m.turns}${post}${merged}${stopped}${err}${activity}`;
+  return `- \`@${m.name}\` (${m.role}) [${m.state}] ws=${ws}${cwdPart} parent=@${m.parentName}${model} turns=${m.turns}${post}${merged}${stopped}${err}${activity}`;
+}
+
+function buildActionNeededSection(
+  run: SwarmRunState,
+  snapshot: SwarmSnapshot,
+  members: readonly SwarmMemberRecord[],
+): string | null {
+  if (run.status !== "active") {
+    return null;
+  }
+
+  const workingSet = new Set(snapshot.workingMemberNames);
+  const unmergedParked = members.filter(
+    (m) =>
+      m.state !== "killed" &&
+      !workingSet.has(m.name) &&
+      (m.state === "waiting" || m.state === "stopped") &&
+      (m.workspace === "share" || m.workspace === "branch") &&
+      !m.mergedCommitSha,
+  );
+
+  const items: string[] = [];
+
+  if (unmergedParked.length > 0) {
+    const peerSummary = unmergedParked
+      .map(
+        (m) =>
+          `\`@${m.name}\` [${m.state}, \`${m.workspace}:${m.branch ?? "unbranched"}\`${m.lastPostSeq ? `, lastPost=#${m.lastPostSeq}` : ""}]`,
+      )
+      .join(", ");
+    const auditHint = run.validatorEnabled
+      ? "confirm independent `@validator` sign-off, then "
+      : "";
+    items.push(
+      `- **Unmerged Branches (${unmergedParked.length})**: ${peerSummary} — UNMERGED into \`${run.baseBranch}\`; ${auditHint}merge ready branches via \`${SWARM_TOOL}{action:"merge", name}\` and run a post-merge check on \`${run.baseBranch}\` before killing or calling \`done\`.`,
+    );
+  }
+
+  const activeWorkingCount = Math.max(
+    workingSet.size,
+    members.filter((m) => m.state === "working").length,
+  );
+  if (activeWorkingCount === 0) {
+    const liveCount = members.filter((m) => m.state !== "killed").length;
+    if (liveCount === 0) {
+      items.push(
+        `- **0 Members Working**: The Swarm is idle and waiting on your next decision — spawn workers via \`${SWARM_TOOL}{action:"add"}\` (or close with \`${SWARM_TOOL}{action:"done", summary}\` once verified).`,
+      );
+    } else {
+      items.push(
+        `- **0 Members Working**: All ${liveCount} live member(s) are parked (\`waiting\`/\`stopped\`) — the Swarm is waiting on your next decision (inspect recent \`#seq\` reports via \`${READ_BOARD_TOOL}\`, wake/steer/add next-wave members, merge verified branches, or verify \`${run.baseBranch}\` and call \`${SWARM_TOOL}{action:"done", summary}\`).`,
+      );
+    }
+  }
+
+  if (items.length === 0) {
+    return null;
+  }
+
+  return ["### Action Needed", ...items].join("\n");
 }
 
 /**
@@ -254,6 +352,12 @@ export function buildOrchestratorLiveStateSection(
     sections.push(buildHumanSteeringSection(options.humanSteeringText));
   }
 
+  const members = getOrderedMembers(run);
+  const actionNeeded = buildActionNeededSection(run, snapshot, members);
+  if (actionNeeded) {
+    sections.push(actionNeeded);
+  }
+
   const customChannels = Object.values(run.channels).filter(
     (ch) => ch.name !== DEFAULT_CHANNEL,
   );
@@ -261,9 +365,6 @@ export function buildOrchestratorLiveStateSection(
     sections.push(`### Channels\n${customChannels.map(formatChannelLine).join("\n")}`);
   }
 
-  const members = run.memberOrder
-    .map((name) => run.members[name])
-    .filter((m): m is SwarmMemberRecord => Boolean(m));
   const liveMembers = members.filter((m) => m.state !== "killed");
   const killedMembers = members.filter((m) => m.state === "killed");
 
@@ -345,6 +446,12 @@ export function buildOrchestratorPlaybookSection(
     sections.push(buildHumanSteeringSection(options.humanSteeringText));
   }
 
+  const members = getOrderedMembers(run);
+  const actionNeeded = buildActionNeededSection(run, snapshot, members);
+  if (actionNeeded) {
+    sections.push(actionNeeded);
+  }
+
   // Channels compact summary
   const channels = Object.values(run.channels);
   if (channels.length > 0) {
@@ -352,9 +459,6 @@ export function buildOrchestratorPlaybookSection(
   }
 
   // Live members compact summary
-  const members = run.memberOrder
-    .map((name) => run.members[name])
-    .filter((m): m is SwarmMemberRecord => Boolean(m));
   if (members.length > 0) {
     const memberLines = members.map((m) => formatMemberLine(m, true));
     sections.push(`### Live Members (${members.length})\n${memberLines.join("\n")}`);
@@ -383,6 +487,46 @@ export function buildOrchestratorContextSummary(snapshot: SwarmSnapshot): string
 // ============================================================================
 // Worker & Validator System / Initial / Wakeup Prompts
 // ============================================================================
+
+function buildValidatorPeerWorktreesSection(
+  run: SwarmRunState,
+  validator: SwarmMemberRecord,
+): string {
+  const isolatedPeers = getOrderedMembers(run).filter(
+    (m) =>
+      m.name !== validator.name &&
+      m.state !== "killed" &&
+      (m.workspace === "share" || m.workspace === "branch"),
+  );
+
+  const lines: string[] = [
+    "### Peer Worktrees & Branches to Audit",
+    `Your validator session runs at \`${validator.cwd}\` (\`${run.baseBranch}\`). Unmerged \`share\`/\`branch\` worker edits exist ONLY inside each author's isolated \`cwd\` — running \`git diff\` or tests in \`${validator.cwd}\` before merge will miss unmerged worker code!`,
+  ];
+
+  if (isolatedPeers.length === 0) {
+    lines.push(
+      `- (no active \`share\`/\`branch\` worktrees yet — call \`${READ_BOARD_TOOL}{status:true}\` or \`${SWARM_TOOL}{action:"status"}\` to inspect newly spawned peer \`cwd\`/\`branch\` paths, then run \`git -C "<cwd>" status --short\`, \`git -C "<cwd>" diff ${run.baseBranch}...HEAD\`, and \`cd "<cwd>" && <slice test command>\`)`,
+    );
+    return lines.join("\n");
+  }
+
+  for (const peer of isolatedPeers) {
+    const mergeStatus = peer.mergedCommitSha
+      ? `merged=${peer.mergedCommitSha.slice(0, 7)}`
+      : "UNMERGED";
+    const branchName = peer.branch ?? "unknown";
+    lines.push(
+      `- \`@${peer.name}\` [${peer.state}] workspace=\`${peer.workspace}\` branch=\`${branchName}\` cwd=\`${peer.cwd}\` (${mergeStatus})`,
+      `  - Audit commands: \`git -C "${peer.cwd}" status --short\`, \`git -C "${peer.cwd}" diff ${run.baseBranch}...HEAD\`, and run slice tests inside \`${peer.cwd}\` via \`cd "${peer.cwd}" && <typecheck/test command>\`.`,
+    );
+  }
+  lines.push(
+    `- If new \`share\`/\`branch\` peers join after you started, call \`${READ_BOARD_TOOL}{status:true}\` (or check \`workspace=<cwd>\` in their \`[done]\` post) to get their \`cwd\` and \`branch\`.`,
+  );
+
+  return lines.join("\n");
+}
 
 /**
  * Builds the concise, high-signal system prompt appendix injected into a
@@ -425,8 +569,8 @@ export function buildMemberSystemPrompt(
       "## Shared Message Board & Warm Session Rules",
       `1. **Tools**: Use \`${POST_MESSAGE_TOOL}\` to communicate, \`${READ_BOARD_TOOL}\` (\`since?\`, \`seqs?\`, \`limit?\`, \`channel?\`, \`status?\`) to inspect prior posts or roster, and \`${SWARM_WAIT_TOOL}\` (\`since\`, \`mentions_only?\`) to park cleanly in warm \`waiting\` state when idle.`,
       "2. **Zero-Copy `#seq` Refs**: Reference earlier board posts by sequence number (e.g. `#4`, `#6`) and fetch them with `read_board{seqs:[4,6]}` — never copy-paste large reports.",
-      `3. **\`@mention\` Discipline**: \`@name\` is a wakeup doorbell, never a CC. Tag ONLY the peer(s) who must act next; do NOT tag \`@${ORCHESTRATOR_NAME}\` on intermediate peer-to-peer handoffs. Tag \`@${member.parentName}\` when your deliverable is ready or you hit a blocker only they can resolve.`,
-      `4. **Completion Convention**: Start your final deliverable post with \`[done]\` right after the \`@mention\` (e.g. \`@${member.parentName} [done] <concise summary of results, files/commits, and verification>\`).`,
+      `3. **\`@mention\` Discipline**: \`@name\` is a wakeup doorbell, never a CC. Tag ONLY the peer(s) who must act next (follow your brief's next-peer doorbell, e.g. \`@validator\`, without waking \`@${ORCHESTRATOR_NAME}\` on intermediate handoffs). Tag \`@${member.parentName}\` when your deliverable has no downstream peer or you hit a blocker only they can resolve.`,
+      `4. **Completion Convention**: Start your final deliverable post with \`[done]\` right after the \`@mention\` (e.g. \`@<next-peer-or-${member.parentName}> [done] <concise summary of results, files/commits, and verification>\`).`,
       `5. **Stay Warm via \`${SWARM_WAIT_TOOL}\`**: After posting your result (or while awaiting a peer reply), call \`${SWARM_WAIT_TOOL}{since: <highest-seq-you-read>}\` to park in warm \`waiting\` state (zero tokens, full conversation memory intact). Never poll \`${READ_BOARD_TOOL}\` in a loop!`,
       "6. **Keep Posts Short**: No greetings or empty acknowledgements — post concrete findings, questions, or results.",
     ].join("\n"),
@@ -437,24 +581,25 @@ export function buildMemberSystemPrompt(
       [
         "## Independent Read-Only Validator Rules (Strictly Enforced)",
         "1. **STRICTLY READ-ONLY — NEVER Edit Files**: You are an independent auditor. NEVER create, edit, or delete files, stage changes, or make git commits. `write`, `edit`, `powershell`, and mutating `bash` commands are blocked by protocol.",
-        "2. **Verify Independently**: Treat worker reports as untrusted claims. Inspect source code, git diffs (`git diff` / `git show`), typechecks, tests, and real CLI/runtime behavior directly against the Run Objective, Acceptance Criteria, and your brief.",
+        `2. **Verify Independently**: Treat worker reports as untrusted claims. For \`share\`/\`branch\` workers, audit directly inside each author's isolated worktree \`cwd\` (\`git -C "<cwd>" status --short\`, \`git -C "<cwd>" diff ${run.baseBranch}...HEAD\`, \`git -C "<cwd>" show\`, reading files under \`<cwd>/\`, and running slice typechecks/tests inside \`<cwd>\`) against the Run Objective, Acceptance Criteria, and your brief.`,
         "3. **Peer-to-Peer Fix Loop**: If you find bugs, regressions, edge-case failures, or missing requirements, post concrete actionable findings (file path, line number, reproduction/command output, and concrete fix) directly to `@<author>` on the board — do NOT bother `@orchestrator` on intermediate bug bounces — then call `swarm_wait` to await their fix and re-audit!",
         `4. **Sign-Off**: Post \`@${member.parentName} [done] <evidence-backed audit report>\` ONLY when every check passes with zero blocking defects (or escalate clearly to \`@${member.parentName}\` if blocked).`,
         `5. **Read-Only Helpers**: You may spawn read-only \`role:"validator"\` sub-auditors via \`${SWARM_TOOL}{action:"add"}\` if your audit splits cleanly across independent areas. Tell helpers to report to \`@${member.name}\`, and \`${SWARM_TOOL}{action:"kill"}\` them once integrated.`,
       ].join("\n"),
     );
+    sections.push(buildValidatorPeerWorktreesSection(run, member));
   } else {
     const workspaceCommitRule =
       member.workspace === "inherit"
         ? `2. **Shared Checkout Discipline**: You are working in \`inherit\` mode at \`${member.cwd}\`. Touch ONLY files owned by your brief so you never collide with sibling workers.`
-        : `2. **Isolated Worktree Commits**: You are working in an isolated worktree at \`${member.cwd}\` on branch \`${member.branch ?? "swarm"}\`. Commit all intended changes cleanly on your branch with a clean \`git status\` before posting \`[done]\`. NEVER run \`git merge\`, \`git push\`, \`git worktree\`, or switch to \`${run.baseBranch}\` — only \`@${ORCHESTRATOR_NAME}\` merges worktrees.`;
+        : `2. **Isolated Worktree Commits**: You are working in an isolated worktree at \`${member.cwd}\` on branch \`${member.branch ?? "swarm"}\`. Respect your brief's exclusive file ownership (never edit off-limits files), and commit all intended changes cleanly on your branch with a clean \`git status\` before posting \`[done]\` (include \`commit=<sha>\` and \`workspace=${member.cwd}\` in your \`[done]\` report). NEVER run \`git merge\`, \`git push\`, \`git worktree\`, or switch to \`${run.baseBranch}\` — only \`@${ORCHESTRATOR_NAME}\` merges worktrees.`;
 
     sections.push(
       [
         "## Worker Execution & Helper Rules",
         `1. **Protected Paths**: NEVER touch \`${SWARM_DIR}/\`, \`.swarm/\`, or \`.git/\` directly — use Swarm tools instead.`,
         workspaceCommitRule,
-        "3. **Verify Before Reporting**: Run relevant typechecks/tests/build checks for your owned slice before posting `[done]`.",
+        `3. **Verify Before Reporting**: Run the concrete verification commands from your brief (typechecks, tests, build checks) inside \`${member.cwd}\` before posting \`[done]\`.`,
         `4. **Spawning & Managing Own Helpers**: You may call \`${SWARM_TOOL}{action:"add", name, brief, ...}\` when your assignment splits into independent pieces or needs an investigator/helper. Tell helpers to report back to \`@${member.name}\` by name. You may call \`${SWARM_TOOL}{action:"model"}\` on yourself (safely deferred to turn end with automatic resume on the new model) or your own waiting helpers, \`${SWARM_TOOL}{action:"steer"/"stop"}\` on your own helpers, and MUST call \`${SWARM_TOOL}{action:"kill"}\` on your own helpers once you integrate their work. You cannot kill other members or call \`title\`/\`merge\`/\`done\`.`,
       ].join("\n"),
     );
@@ -492,11 +637,20 @@ export function buildWakeupPrompt(
   head: number,
 ): string {
   const formatted = messages.map((m) => formatBoardEntryFull(m, 2500)).join("\n\n");
-  return [
+  const lines: string[] = [
     `New shared board message(s) for \`@${member.name}\` (board head: \`#${head}\`):`,
     "",
     formatted,
     "",
+  ];
+  if (member.role === "validator") {
+    lines.push(
+      `Validator audit reminder: unmerged \`share\`/\`branch\` worker commits live in each author's isolated worktree \`cwd\` (not \`${member.cwd}\`) — run \`git -C "<cwd>" status --short\`, \`git -C "<cwd>" diff <baseBranch>...HEAD\`, and \`cd "<cwd>" && <slice test command>\` (call \`${READ_BOARD_TOOL}{status:true}\` if you need a peer's \`cwd\`/\`branch\`/merge status).`,
+      "",
+    );
+  }
+  lines.push(
     `Respond/act on the board via \`${POST_MESSAGE_TOOL}\` as needed, then call \`${SWARM_WAIT_TOOL}{since: ${head}}\` when idle again.`,
-  ].join("\n");
+  );
+  return lines.join("\n");
 }

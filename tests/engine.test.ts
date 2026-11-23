@@ -6467,3 +6467,380 @@ describe("SwarmEngine & Runtime — v0.3.7 Fixes", () => {
     }
   });
 });
+
+// ============================================================================
+// v0.6.0 Silent-Turn Digest, Merge Conflict/Noop Diagnostics & Worker Guards
+// ============================================================================
+
+describe("SwarmEngine & Runtime — v0.6.0 Diagnostics & Self-Correcting Guards", () => {
+  it("delivers silent-turn summaries once in all_idle wakeups (parked, immediate, multi-turn & stopped) without extra board posts and widens parkedOn to 240 chars", async () => {
+    const { engine, store, transport } = await createTestHarness({ stallWatchdogEnabled: false });
+    const wakeEvents: SwarmEngineEvent[] = [];
+    engine.subscribe((ev) => {
+      if (ev.type === "wakeup_needed") wakeEvents.push(ev);
+    });
+
+    try {
+      let releaseSilent!: () => void;
+      const silentGate = new Promise<void>((r) => {
+        releaseSilent = r;
+      });
+      const longSilentText =
+        `Implemented parser\n   and verified 14 edge cases — ` + "x".repeat(290) + " TAIL_CUTOFF";
+
+      transport.onMember("worker-a", async () => {
+        await silentGate;
+        return { outcome: "waiting", summary: longSilentText };
+      });
+
+      transport.onMember("worker-b", async ({ request, turnIndex }) => {
+        if (turnIndex === 1) {
+          await request.engineApi!.postMessage({
+            text: "Progress update on worker-b without mentioning orchestrator",
+          });
+          return { outcome: "waiting", summary: "Posted progress note" };
+        }
+        // Turn 2: forgets post_message even though lastPostSeq > 0 from Turn 1!
+        return { outcome: "waiting", summary: "Turn 2 silent fix completed" };
+      });
+
+      transport.onMember("waiter-c", async ({ request }) => {
+        request.onTelemetry?.({
+          agentId: request.agentId,
+          name: request.name,
+          role: request.role,
+          runId: request.runId,
+          type: "waiting",
+          activity: "waiting (since #3)",
+          logLine: "swarm_wait since=#3 mentions_only=true",
+          timestamp: new Date().toISOString(),
+        });
+        return { outcome: "waiting", summary: "Parked intentionally via swarm_wait" };
+      });
+
+      await engine.addMembers({ name: "worker-a", brief: "Implement parser" });
+      await engine.addMembers({ name: "worker-b", brief: "Implement formatter" });
+      await engine.addMembers({ name: "waiter-c", brief: "Stand by on swarm_wait" });
+
+      // Wait until worker-b and waiter-c park while worker-a is still working
+      await waitUntil(
+        () =>
+          engine.getSnapshot().run?.members["worker-b"]?.state === "waiting" &&
+          engine.getSnapshot().run?.members["waiter-c"]?.state === "waiting",
+      );
+      const headBeforeIdle = engine.getSnapshot().boardHead;
+
+      const parkRes = await engine.parkOrchestratorWait({ since: headBeforeIdle });
+      assert.equal(parkRes.parked, true);
+
+      // Finish worker-a silently -> triggers checkAllIdleAndNotifyWaiters wakeup_needed
+      releaseSilent();
+      await waitUntil(() => wakeEvents.length === 1);
+
+      // Exact #seq determinism: ZERO extra board.jsonl messages posted!
+      assert.equal(engine.getSnapshot().boardHead, headBeforeIdle);
+      assert.equal((await store.readBoard("run-dyn", { limit: 50 })).head, headBeforeIdle);
+
+      // parkedOn widened from 120 to 240 chars
+      const memberA = engine.getSnapshot().run!.members["worker-a"]!;
+      assert.equal(memberA.parkedOn!.length, 240);
+
+      // Wakeup summary includes normalized 300-char silent summary for worker-a, NOT worker-b or waiter-c
+      const wakeupSummary = wakeEvents[0]!.summary;
+      const expectedNormalized300 = longSilentText.replace(/\s+/g, " ").trim().slice(0, 300);
+      assert.ok(wakeupSummary.includes("Unposted turn summaries:"));
+      assert.ok(wakeupSummary.includes(`@worker-a: "${expectedNormalized300}"`));
+      assert.ok(!wakeupSummary.includes("TAIL_CUTOFF"));
+      assert.ok(!wakeupSummary.includes('@worker-b: "'));
+      assert.ok(!wakeupSummary.includes('@waiter-c: "'));
+
+      // Cleared once delivered: subsequent immediate parkOrchestratorWait does NOT repeat stale summary
+      const secondIdle = await engine.parkOrchestratorWait({ since: headBeforeIdle });
+      assert.equal(secondIdle.parked, false);
+      assert.equal(secondIdle.wokeBy, "all_idle");
+      assert.ok(!secondIdle.summary.includes("Unposted turn summaries:"));
+
+      // Multi-turn turnStartPostSeq + immediate parkOrchestratorWait/waitForBoard return:
+      // Wake worker-b (which had lastPostSeq > 0 from Turn 1); it finishes Turn 2 silently BEFORE orchestrator waits!
+      const wakeMsg = await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        text: "@worker-b run turn 2",
+      });
+      await waitUntil(
+        () =>
+          engine.getSnapshot().run?.members["worker-b"]?.turns === 2 &&
+          engine.getSnapshot().workingMemberNames.length === 0,
+      );
+
+      // Nobody was waiting when Turn 2 finished, so immediate parkOrchestratorWait delivers Turn 2 silent summary!
+      const immediateIdle = await engine.parkOrchestratorWait({ since: wakeMsg.seq });
+      assert.equal(immediateIdle.parked, false);
+      assert.equal(immediateIdle.wokeBy, "all_idle");
+      assert.ok(
+        immediateIdle.summary.includes('Unposted turn summaries: @worker-b: "Turn 2 silent fix completed"'),
+      );
+
+      // Consumed once -> subsequent waitForBoard does NOT repeat it
+      const postConsumeWait = await engine.waitForBoard({ since: wakeMsg.seq });
+      assert.equal(postConsumeWait.wokeBy, "all_idle");
+      assert.ok(!postConsumeWait.summary.includes("Unposted turn summaries:"));
+    } finally {
+      await engine.dispose();
+    }
+
+    // Also verify keepWorkersWarm: false ("stopped" normal non-aborted vs aborted branches)
+    const coldStore = new MockSwarmStore();
+    const coldWorktree = new MockWorktreeManager();
+    const coldTransport = new ScriptedTransport();
+    const coldEngine = new SwarmEngine({
+      store: coldStore,
+      worktree: coldWorktree,
+      transport: coldTransport,
+      settings: { stallWatchdogEnabled: false, keepWorkersWarm: false },
+    });
+    try {
+      const coldRun = await coldStore.createRun({
+        id: "run-cold-silent",
+        title: "Cold Silent Test",
+        objective: "Verify stopped outcome silent summary & 240-char parkedOn",
+        baseBranch: "main",
+        ownerSessionId: "sess-cold",
+        keepWorkersWarm: false,
+      });
+      await coldEngine.startRun(coldRun.id);
+
+      const coldLong = "Cold worker finished analysis — " + "y".repeat(230);
+      coldTransport.onMember("cold-ok", async () => ({
+        outcome: "stopped",
+        summary: coldLong,
+      }));
+      coldTransport.onMember("cold-aborted", async () => ({
+        outcome: "stopped",
+        stopReason: "aborted",
+        summary: "Aborted mid-flight",
+      }));
+
+      await coldEngine.addMembers({ name: "cold-ok", brief: "Analyze cold" });
+      await coldEngine.addMembers({ name: "cold-aborted", brief: "Abort cold" });
+      await waitUntil(() => coldEngine.getSnapshot().workingMemberNames.length === 0);
+
+      assert.equal(coldEngine.getSnapshot().run!.members["cold-ok"]!.parkedOn!.length, 240);
+      const coldWait = await coldEngine.waitForBoard({
+        since: coldEngine.getSnapshot().boardHead,
+      });
+      assert.equal(coldWait.wokeBy, "all_idle");
+      assert.ok(coldWait.summary.includes('@cold-ok: "Cold worker finished analysis'));
+      assert.ok(
+        !coldWait.summary.includes("@cold-aborted:"),
+        "Aborted stopped turns must not be reported as unposted turn summaries",
+      );
+    } finally {
+      await coldEngine.dispose();
+    }
+  });
+
+  it("includes conflictFiles and post_message recovery instructions on REBASE_CONFLICT and skips mergedCommitSha on noop merges", async () => {
+    const { engine, store, transport, worktree } = await createTestHarness({
+      stallWatchdogEnabled: false,
+    });
+    const engineEvents: SwarmEngineEvent[] = [];
+    engine.subscribe((ev) => engineEvents.push(ev));
+
+    try {
+      const [coder] = await engine.addMembers({
+        name: "coder",
+        role: "worker",
+        workspace: "share",
+        brief: "Implement isolated change",
+      });
+      await waitUntil(() => engine.getSnapshot().workingMemberNames.length === 0);
+
+      // 1. REBASE_CONFLICT lists exact conflictFiles + @member post_message + worktree cwd recovery instructions
+      worktree.rebaseResult = {
+        status: "conflict",
+        conflictFiles: ["src/runtime/engine.ts", "src/runtime/transport.ts"],
+      };
+      await assert.rejects(
+        () => engine.mergeMember("coder"),
+        (err: unknown) => {
+          assert.ok(err instanceof SwarmProtocolError);
+          assert.equal(err.code, "REBASE_CONFLICT");
+          assert.ok(err.message.includes("src/runtime/engine.ts, src/runtime/transport.ts"));
+          assert.ok(err.message.includes("@coder"));
+          assert.ok(err.message.includes("post_message"));
+          assert.ok(err.message.includes(coder!.cwd));
+          assert.match(err.message, /re-commit/i);
+          assert.deepEqual(err.details?.conflictFiles, [
+            "src/runtime/engine.ts",
+            "src/runtime/transport.ts",
+          ]);
+          assert.equal(err.details?.worktreePath, coder!.cwd);
+          return true;
+        },
+      );
+
+      // 2. noop merge (0 commits ahead) does NOT set mergedCommitSha and records 0 commits ahead in event summary
+      worktree.rebaseResult = { status: "up-to-date" };
+      const origMergeBranch = worktree.mergeBranch.bind(worktree);
+      worktree.mergeBranch = async () => ({
+        mergedCommitSha: "1111111111111111111111111111111111111111",
+        strategy: "noop",
+        changedFiles: [],
+      });
+
+      const noopRes = await engine.mergeMember("coder");
+      assert.ok(noopRes);
+      assert.equal(noopRes!.strategy, "noop");
+      assert.equal(
+        engine.getSnapshot().run?.members.coder?.mergedCommitSha,
+        undefined,
+        "noop merge must NOT set mergedCommitSha on member record",
+      );
+      assert.ok(
+        store.events.some(
+          (e) =>
+            e.type === "member_merged" &&
+            e.memberName === "coder" &&
+            e.summary.includes("@coder") &&
+            e.summary.includes("0 commits ahead of main"),
+        ),
+        "Ledger event summary must note @coder had 0 commits ahead of main",
+      );
+      assert.ok(
+        engineEvents.some(
+          (e) =>
+            e.memberName === "coder" &&
+            e.summary.includes("@coder") &&
+            e.summary.includes("0 commits ahead of main"),
+        ),
+        "Engine event summary must note @coder had 0 commits ahead of main",
+      );
+
+      // Verify member bridge.getStatus() exposes cwd and omits mergedCommitSha after noop merge
+      const coderBridge = transport.handles.get("coder")!.request.engineApi!;
+      const statusBeforeRealMerge = await coderBridge.getStatus();
+      const coderEntryBefore = statusBeforeRealMerge.members.find(
+        (m) => m.name === "coder",
+      ) as (typeof statusBeforeRealMerge.members)[number] & {
+        cwd?: string;
+        mergedCommitSha?: string;
+      };
+      assert.equal(coderEntryBefore?.cwd, coder!.cwd);
+      assert.equal(coderEntryBefore?.mergedCommitSha, undefined);
+
+      // Restore normal mergeBranch and verify real merge still sets mergedCommitSha
+      worktree.mergeBranch = origMergeBranch;
+      const realMerge = await engine.mergeMember("coder");
+      assert.equal(realMerge?.strategy, "merge");
+      assert.equal(
+        engine.getSnapshot().run?.members.coder?.mergedCommitSha,
+        worktree.nextMergeSha,
+      );
+
+      // Verify member bridge.getStatus() exposes both cwd and mergedCommitSha after real merge
+      const statusAfterRealMerge = await coderBridge.getStatus();
+      const coderEntryAfter = statusAfterRealMerge.members.find(
+        (m) => m.name === "coder",
+      ) as (typeof statusAfterRealMerge.members)[number] & {
+        cwd?: string;
+        mergedCommitSha?: string;
+      };
+      assert.equal(coderEntryAfter?.cwd, coder!.cwd);
+      assert.equal(coderEntryAfter?.mergedCommitSha, worktree.nextMergeSha);
+    } finally {
+      await engine.dispose();
+    }
+  });
+
+  it("includes worker exact cwd and isolated branch in blocked write, edit, and bash guard error reasons", async () => {
+    const repoDir = await mkdtemp(path.join(os.tmpdir(), "pi-swarm-v060-guard-"));
+    try {
+      const wtPath = path.join(repoDir, ".pi", "swarm", "worktrees", "run-v060", "wt-worker-1");
+      const branchName = "swarm/run-v060/worker-1";
+      const shareReq: SpawnMemberRequest = {
+        agentId: "worker-1-id",
+        name: "worker-1",
+        role: "worker",
+        runId: "run-v060",
+        cwd: wtPath,
+        branch: branchName,
+        baseBranch: "main",
+        workspace: "share",
+        isIsolatedWorktree: true,
+        parentName: ORCHESTRATOR_NAME,
+        brief: "Edit files inside isolated worktree",
+        systemPrompt: "sys",
+        initialPrompt: "go",
+        keepWarm: true,
+      };
+
+      let shareGuard!: (ev: any) => any;
+      createWorkerGuardExtensionFactory(shareReq, "main")({
+        on(ev: string, fn: (event: any) => any) {
+          if (ev === "tool_call") shareGuard = fn;
+        },
+      } as any);
+
+      // 1. Accidental repoRoot write -> blocked with exact wtPath + branchName
+      const blockedWrite = shareGuard({
+        toolName: "write",
+        input: { path: path.join(repoDir, "src", "engine.ts") },
+      });
+      assert.equal(blockedWrite?.block, true);
+      assert.ok(String(blockedWrite?.reason).includes(wtPath));
+      assert.ok(String(blockedWrite?.reason).includes(branchName));
+
+      // 2. Protected path edit inside worktree (.git/config) -> blocked with exact wtPath + branchName
+      const blockedEdit = shareGuard({
+        toolName: "edit",
+        input: { path: ".git/config" },
+      });
+      assert.equal(blockedEdit?.block, true);
+      assert.ok(String(blockedEdit?.reason).includes(wtPath));
+      assert.ok(String(blockedEdit?.reason).includes(branchName));
+
+      // 3. Forbidden bash command -> blocked with exact wtPath + branchName
+      const blockedBash = shareGuard({
+        toolName: "bash",
+        input: { command: "git checkout main" },
+      });
+      assert.equal(blockedBash?.block, true);
+      assert.ok(String(blockedBash?.reason).includes(wtPath));
+      assert.ok(String(blockedBash?.reason).includes(branchName));
+
+      // 4. inherit workspace includes exact cwd without branch label
+      const inheritReq: SpawnMemberRequest = {
+        ...shareReq,
+        cwd: repoDir,
+        branch: "should-not-appear",
+        workspace: "inherit",
+        isIsolatedWorktree: false,
+      };
+      let inheritGuard!: (ev: any) => any;
+      createWorkerGuardExtensionFactory(inheritReq, "main")({
+        on(ev: string, fn: (event: any) => any) {
+          if (ev === "tool_call") inheritGuard = fn;
+        },
+      } as any);
+
+      const inheritBlockedWrite = inheritGuard({
+        toolName: "write",
+        input: { path: path.join(path.dirname(repoDir), "outside.ts") },
+      });
+      assert.equal(inheritBlockedWrite?.block, true);
+      assert.ok(String(inheritBlockedWrite?.reason).includes(repoDir));
+      assert.ok(!String(inheritBlockedWrite?.reason).includes("should-not-appear"));
+
+      const inheritBlockedBash = inheritGuard({
+        toolName: "bash",
+        input: { command: "git push origin main" },
+      });
+      assert.equal(inheritBlockedBash?.block, true);
+      assert.ok(String(inheritBlockedBash?.reason).includes(repoDir));
+      assert.ok(!String(inheritBlockedBash?.reason).includes("should-not-appear"));
+    } finally {
+      await rm(repoDir, { recursive: true, force: true });
+    }
+  });
+});

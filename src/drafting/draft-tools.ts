@@ -103,11 +103,14 @@ export interface ProposeSwarmPlanToolDetails {
 }
 
 // ============================================================================
-// Parameter Schemas (Google-compatible — zero anyOf unions; StringEnum for enums)
+// Parameter Schemas (Google-compatible flat object schemas; StringEnum for enums)
 // ============================================================================
 
 const QuestionOptionSchema = Type.Object({
-  label: Type.String({ description: "Short choice label displayed to the user." }),
+  label: Type.String({
+    description:
+      "Short choice label displayed to the user (place the best option first and prefix with '(Recommended)').",
+  }),
   value: Type.Optional(
     Type.String({ description: "Optional canonical value returned when chosen." }),
   ),
@@ -120,13 +123,17 @@ export const SwarmQuestionParamsSchema = Type.Object({
   id: Type.Optional(
     Type.String({ description: "Optional short key for persisting this answer in draft state." }),
   ),
-  question: Type.String({ description: "Clear, concise clarifying question for the user." }),
+  question: Type.String({
+    description:
+      "Clear, concise high-leverage trade-off question grounded in repository recon.",
+  }),
   context: Type.Optional(
     Type.String({ description: "Optional brief repo-grounded context or tradeoff note." }),
   ),
   options: Type.Optional(
     Type.Array(QuestionOptionSchema, {
-      description: "Suggested answer choices for the user to select from.",
+      description:
+        "Suggested answer choices (put the best option first, prefixed with '(Recommended)').",
     }),
   ),
   recommended: Type.Optional(
@@ -139,13 +146,16 @@ export const SwarmQuestionParamsSchema = Type.Object({
 
 export const SwarmQuestionnaireItemSchema = Type.Object({
   id: Type.String({ description: "Short unique identifier for this question (e.g. 'auth_mode')." }),
-  question: Type.String({ description: "Clear, concise question text." }),
+  question: Type.String({
+    description: "Clear, concise high-leverage trade-off question text.",
+  }),
   context: Type.Optional(
     Type.String({ description: "Optional brief context or tradeoff grounded in the repo." }),
   ),
   options: Type.Array(QuestionOptionSchema, {
     minItems: 1,
-    description: "Suggested options for this question.",
+    description:
+      "Suggested options for this question (place the best option first and prefix with '(Recommended)').",
   }),
   recommended: Type.Optional(
     Type.String({ description: "Label or value of the recommended default option." }),
@@ -158,7 +168,8 @@ export const SwarmQuestionnaireItemSchema = Type.Object({
 export const SwarmQuestionnaireParamsSchema = Type.Object({
   questions: Type.Array(SwarmQuestionnaireItemSchema, {
     minItems: 1,
-    description: "Ordered list of 2–4 related clarifying questions shown in a tabbed modal.",
+    description:
+      "Ordered list of 1–3 high-leverage clarifying trade-off questions shown in a tabbed modal.",
   }),
 });
 
@@ -184,7 +195,7 @@ export const InitialMemberProposalSchema = Type.Object({
   role: InitialMemberRoleSchema,
   brief: Type.String({
     description:
-      "Public assignment posted on the shared Message Board: what this member owns, constraints, and what done looks like.",
+      "Public assignment posted on the shared Message Board: exclusive file/directory ownership, constraints, verification commands, and next-peer @mention.",
   }),
   workspace: Type.Optional(InitialMemberWorkspaceSchema),
   channels: Type.Optional(
@@ -204,11 +215,11 @@ export const ProposeSwarmPlanParamsSchema = Type.Object({
   }),
   strategy: Type.String({
     description:
-      "Phased dynamic orchestration plan — how the Orchestrator will scout, partition work, spawn/adapt members wave-by-wave, and verify results on the shared Message Board.",
+      "Wave-by-wave dynamic orchestration plan with disjoint file/directory ownership boundaries (zero two-worker collisions on the same file) and @mention -> validator review/merge gates on the shared Message Board.",
   }),
   acceptance_criteria: Type.String({
     description:
-      'Concrete, testable definition of "what done looks like" (commands, test suites, typechecks, and behavioral checks).',
+      'Concrete, testable definition of "what done looks like" listing exact runnable verification commands (typecheck, test commands, build checks) and behavioral checks.',
   }),
   base_branch: Type.Optional(
     Type.String({
@@ -232,7 +243,7 @@ export const ProposeSwarmPlanParamsSchema = Type.Object({
   initial_members: Type.Optional(
     Type.Array(InitialMemberProposalSchema, {
       description:
-        "Optional initial researchers/scouts or first wave of workers/validators to spawn at launch. Leave omitted/empty to spawn dynamically after launch.",
+        "Optional right-sized initial wave (1–2 workers for small/single-module tasks; disjoint parallel 'share' authors + independent 'validator' for multi-module work). Leave omitted/empty to spawn dynamically after launch.",
     }),
   ),
 });
@@ -643,14 +654,102 @@ function formatValidationErrors(issues: readonly DraftPlanValidationIssue[]): st
 }
 
 function extractFirstText(
-  content: readonly { type: string; text?: string }[],
+  content: readonly { type?: string; text?: string }[] | undefined | null,
 ): string {
+  if (!Array.isArray(content)) {
+    return "";
+  }
   for (const part of content) {
-    if (part.type === "text" && typeof part.text === "string") {
+    if (part && part.type === "text" && typeof part.text === "string") {
       return part.text;
     }
   }
   return "";
+}
+
+function formatInlineSnippet(value: unknown, maxChars = 88): string {
+  if (typeof value !== "string") {
+    return "";
+  }
+  const collapsed = value.replace(/\r?\n/g, " ").replace(/\s+/g, " ").trim();
+  if (!collapsed) {
+    return "";
+  }
+  return collapsed.length > maxChars
+    ? `${collapsed.slice(0, Math.max(1, maxChars - 1))}…`
+    : collapsed;
+}
+
+function shortenModelSlug(model: string | undefined): string {
+  const trimmed = typeof model === "string" ? model.trim() : "";
+  if (!trimmed) {
+    return "default";
+  }
+  const slashIdx = trimmed.lastIndexOf("/");
+  return slashIdx >= 0 && slashIdx < trimmed.length - 1
+    ? trimmed.slice(slashIdx + 1)
+    : trimmed;
+}
+
+function formatRoleModelPill(
+  roleTag: string,
+  config: SwarmRoleModelConfig | undefined,
+  theme: Theme,
+): string {
+  const hasModel = Boolean(config?.model?.trim());
+  const slug = shortenModelSlug(config?.model);
+  const effort = config?.thinkingLevel ? `(${config.thinkingLevel})` : "";
+  const modelStyled = hasModel
+    ? `${theme.fg("accent", slug)}${effort ? theme.fg("dim", effort) : ""}`
+    : `${theme.fg("dim", "default")}${effort ? theme.fg("dim", effort) : ""}`;
+  return `${theme.fg("muted", `${roleTag}:`)}${modelStyled}`;
+}
+
+function formatRoleModelsPillBar(
+  roleModels: SwarmRoleModels | undefined,
+  theme: Theme,
+): string {
+  const sep = theme.fg("dim", " · ");
+  const orch = formatRoleModelPill("Orch", roleModels?.orchestrator, theme);
+  const work = formatRoleModelPill("Work", roleModels?.worker, theme);
+  const val = formatRoleModelPill("Val", roleModels?.validator, theme);
+  const fbCount = Array.isArray(roleModels?.fallbackModels)
+    ? roleModels.fallbackModels.filter(
+        (m) => typeof m === "string" && m.trim().length > 0,
+      ).length
+    : 0;
+  const fbTag = fbCount > 0 ? `${sep}${theme.fg("dim", `+${fbCount} fb`)}` : "";
+  return `${theme.fg("dim", "[")}${orch}${sep}${work}${sep}${val}${fbTag}${theme.fg("dim", "]")}`;
+}
+
+function isRecommendedOption(
+  option: QuestionOption,
+  recommended?: string,
+): boolean {
+  const rec = typeof recommended === "string" ? recommended.trim().toLowerCase() : "";
+  const labelLower = option.label.trim().toLowerCase();
+  const valueLower = option.value?.trim().toLowerCase();
+  if (labelLower.startsWith("(recommended)")) {
+    return true;
+  }
+  if (!rec) {
+    return false;
+  }
+  return labelLower === rec || valueLower === rec;
+}
+
+function findRecommendedLabel(
+  options: readonly QuestionOption[],
+  recommended?: string,
+): string {
+  for (const opt of options) {
+    if (isRecommendedOption(opt, recommended)) {
+      return formatInlineSnippet(opt.label.replace(/^\(recommended\)\s*/i, ""), 28);
+    }
+  }
+  return typeof recommended === "string" && recommended.trim()
+    ? formatInlineSnippet(recommended.trim(), 28)
+    : "";
 }
 
 function ensureDraftSynced(
@@ -672,11 +771,11 @@ export function createSwarmQuestionTool(
     name: SWARM_QUESTION_TOOL,
     label: "Swarm Question",
     description:
-      "Ask the user a single focused clarifying question with optional choices and a recommended default during Swarm drafting.",
+      "Ask the user a single focused clarifying trade-off question with optional choices and a '(Recommended)' default during Swarm drafting.",
     promptSnippet:
-      "Ask the user one clarifying question with options and a recommended default during Swarm planning.",
+      "Ask the user one high-leverage clarifying question with '(Recommended)' first during Swarm planning.",
     promptGuidelines: [
-      `Use \`${SWARM_QUESTION_TOOL}\` only for a single genuine ambiguity during Swarm drafting; prefer \`${SWARM_QUESTIONNAIRE_TOOL}\` when you have 2–4 related questions.`,
+      `Run fast read-only repo recon FIRST; ask 0 questions when clear, or use \`${SWARM_QUESTION_TOOL}\` only for 1 high-leverage trade-off question (put the best option first, prefixed with '(Recommended)'). Prefer \`${SWARM_QUESTIONNAIRE_TOOL}\` when asking 2–3 related questions.`,
     ],
     exposure: "model-only",
     defaultActive: false,
@@ -778,31 +877,131 @@ export function createSwarmQuestionTool(
         } satisfies SwarmQuestionToolDetails,
       };
     },
-    renderCall(args: SwarmQuestionParams, theme: Theme) {
-      const question = args?.question ? args.question.trim() : "…";
-      return new Text(
-        `${theme.fg("toolTitle", theme.bold(SWARM_QUESTION_TOOL))} ${theme.fg("accent", question)}`,
-        0,
-        0,
-      );
+    renderCall(args: SwarmQuestionParams, theme: Theme, context) {
+      const isExpanded = Boolean(context?.expanded);
+      const rawId =
+        typeof args?.id === "string" ? formatInlineSnippet(args.id, 32) : "";
+      const question =
+        formatInlineSnippet(args?.question, isExpanded ? 400 : 140) || "…";
+      const optionsList = normalizeRawOptions(args?.options);
+      const allowCustom =
+        typeof args?.allow_custom === "boolean" ? args.allow_custom : true;
+      const recommended =
+        typeof args?.recommended === "string"
+          ? args.recommended.trim()
+          : undefined;
+      const optionBadge =
+        optionsList.length > 0
+          ? `${optionsList.length} ${optionsList.length === 1 ? "option" : "options"}${allowCustom ? " + custom" : ""}`
+          : allowCustom
+            ? "free-text"
+            : "prompt";
+      const idTag = rawId ? ` ${theme.fg("dim", `[${rawId}]`)}` : "";
+
+      const lines: string[] = [
+        `${theme.fg("accent", "❓")} ${theme.fg("toolTitle", theme.bold(SWARM_QUESTION_TOOL))}${idTag} ${theme.fg("muted", `(${optionBadge})`)}`,
+        `  ${theme.fg("accent", question)}`,
+      ];
+
+      if (typeof args?.context === "string" && args.context.trim()) {
+        lines.push(
+          isExpanded
+            ? `  ${theme.fg("muted", args.context.trim())}`
+            : `  ${theme.fg("dim", formatInlineSnippet(args.context, 100))}`,
+        );
+      }
+
+      if (optionsList.length > 0) {
+        if (isExpanded) {
+          for (let i = 0; i < optionsList.length; i++) {
+            const opt = optionsList[i]!;
+            const isRec = isRecommendedOption(opt, recommended);
+            const recStar = isRec ? ` ${theme.fg("warning", "★")}` : "";
+            const desc = opt.description
+              ? ` ${theme.fg("dim", `— ${formatInlineSnippet(opt.description, 100)}`)}`
+              : "";
+            lines.push(
+              `    ${theme.fg("muted", `${i + 1}.`)} ${theme.fg(isRec ? "accent" : "toolOutput", opt.label)}${recStar}${desc}`,
+            );
+          }
+        } else {
+          const previewChoices = optionsList
+            .slice(0, 4)
+            .map((opt) => {
+              const isRec = isRecommendedOption(opt, recommended);
+              const label = formatInlineSnippet(opt.label, 32);
+              return isRec
+                ? `${theme.fg("accent", label)}${theme.fg("warning", " ★")}`
+                : theme.fg("toolOutput", label);
+            })
+            .join(theme.fg("dim", " · "));
+          const moreTag =
+            optionsList.length > 4
+              ? theme.fg("dim", ` · +${optionsList.length - 4} more`)
+              : "";
+          lines.push(`  ${theme.fg("dim", "Choices:")} ${previewChoices}${moreTag}`);
+        }
+      }
+
+      return new Text(lines.join("\n"), 0, 0);
     },
-    renderResult(result, _options, theme: Theme) {
-      const details = result.details as SwarmQuestionToolDetails | undefined;
-      if (result.isError) {
-        return new Text(theme.fg("error", extractFirstText(result.content)), 0, 0);
-      }
-      if (details?.cancelled) {
-        return new Text(theme.fg("muted", "Question dismissed by user."), 0, 0);
-      }
-      if (details?.answer !== undefined) {
-        const suffix = details.isCustom ? theme.fg("dim", " (custom)") : "";
+    renderResult(result, options, theme: Theme, context) {
+      const details = result?.details as SwarmQuestionToolDetails | undefined;
+      const isExpanded = Boolean(options?.expanded);
+      if (result?.isError || context?.isError) {
+        const errText =
+          extractFirstText(result?.content) || "Question failed.";
         return new Text(
-          `${theme.fg("success", "✓")} ${theme.fg("toolOutput", details.answer)}${suffix}`,
+          `${theme.fg("error", "✗ [ERROR]")} ${theme.fg("error", errText)}`,
           0,
           0,
         );
       }
-      return new Text(theme.fg("toolOutput", extractFirstText(result.content)), 0, 0);
+      if (options?.isPartial) {
+        return new Text(
+          `${theme.fg("warning", "⏳ [AWAITING]")} ${theme.fg("muted", "Waiting for user answer…")}`,
+          0,
+          0,
+        );
+      }
+      if (details?.cancelled) {
+        return new Text(
+          theme.fg("muted", "○ [SKIPPED] Question dismissed by user."),
+          0,
+          0,
+        );
+      }
+      if (typeof details?.answer === "string") {
+        const idTag =
+          typeof details.id === "string" && details.id
+            ? ` ${theme.fg("dim", `[${details.id}]`)}`
+            : "";
+        const suffix = details.isCustom ? theme.fg("warning", " (custom)") : "";
+        if (isExpanded) {
+          const qLine =
+            typeof details.question === "string" && details.question
+              ? `\n  ${theme.fg("muted", "Question:")} ${theme.fg("toolOutput", details.question)}`
+              : "";
+          const aLine = `\n  ${theme.fg("muted", "Answer:")}   ${theme.fg("accent", details.answer)}${suffix}`;
+          return new Text(
+            `${theme.fg("success", "✓ [ANSWERED]")}${idTag}${qLine}${aLine}`,
+            0,
+            0,
+          );
+        }
+        const compactAns =
+          formatInlineSnippet(details.answer, 96) || details.answer;
+        return new Text(
+          `${theme.fg("success", "✓ [ANSWERED]")}${idTag} ${theme.fg("toolOutput", compactAns)}${suffix}`,
+          0,
+          0,
+        );
+      }
+      return new Text(
+        theme.fg("toolOutput", extractFirstText(result?.content)),
+        0,
+        0,
+      );
     },
   });
 }
@@ -819,11 +1018,11 @@ export function createSwarmQuestionnaireTool(
     name: SWARM_QUESTIONNAIRE_TOOL,
     label: "Swarm Questionnaire",
     description:
-      "Ask 2–4 related clarifying questions in a single tabbed questionnaire modal during Swarm drafting.",
+      "Ask 1–3 high-leverage clarifying trade-off questions in a single tabbed questionnaire modal (with '(Recommended)' placed first) during Swarm drafting.",
     promptSnippet:
-      "Present 2–4 related clarifying questions together in a tabbed modal with recommended defaults.",
+      "Present 1–3 high-leverage clarifying trade-off questions together in a tabbed modal with '(Recommended)' defaults.",
     promptGuidelines: [
-      `Prefer \`${SWARM_QUESTIONNAIRE_TOOL}\` over multiple sequential \`${SWARM_QUESTION_TOOL}\` calls whenever you have 2–4 related clarifying questions.`,
+      `Prefer \`${SWARM_QUESTIONNAIRE_TOOL}\` over multiple sequential \`${SWARM_QUESTION_TOOL}\` calls when asking 1–3 high-leverage trade-off questions; put the best choice first prefixed with '(Recommended)' and never interrogate on obvious details.`,
     ],
     exposure: "model-only",
     defaultActive: false,
@@ -997,35 +1196,166 @@ export function createSwarmQuestionnaireTool(
         } satisfies SwarmQuestionnaireToolDetails,
       };
     },
-    renderCall(args: SwarmQuestionnaireParams, theme: Theme) {
-      const count = Array.isArray(args?.questions) ? args.questions.length : 0;
-      const preview =
-        count > 0
-          ? args.questions.map((q) => q.id || "?").join(", ")
-          : "…";
-      return new Text(
-        `${theme.fg("toolTitle", theme.bold(SWARM_QUESTIONNAIRE_TOOL))} ${theme.fg("muted", `(${count} questions: ${preview})`)}`,
-        0,
-        0,
+    renderCall(args: SwarmQuestionnaireParams, theme: Theme, context) {
+      const isExpanded = Boolean(context?.expanded);
+      const rawQuestions = Array.isArray(args?.questions) ? args.questions : [];
+      const safeQuestions = rawQuestions.filter(
+        (q): q is SwarmQuestionnaireParams["questions"][number] =>
+          Boolean(q && typeof q === "object"),
       );
+      const count = rawQuestions.length;
+      let totalOptions = 0;
+      for (const q of safeQuestions) {
+        totalOptions += normalizeRawOptions(q.options).length;
+      }
+
+      const previewIds =
+        safeQuestions.length > 0
+          ? safeQuestions
+              .map((q, idx) =>
+                typeof q.id === "string" && q.id.trim()
+                  ? formatInlineSnippet(q.id, 24)
+                  : `q${idx + 1}`,
+              )
+              .join(", ")
+          : "…";
+      const countMeta = `${count} ${count === 1 ? "question" : "questions"}${totalOptions > 0 ? ` · ${totalOptions} ${totalOptions === 1 ? "option" : "options"}` : ""}: ${previewIds}`;
+
+      const lines: string[] = [
+        `${theme.fg("accent", "📋")} ${theme.fg("toolTitle", theme.bold(SWARM_QUESTIONNAIRE_TOOL))} ${theme.fg("muted", `(${countMeta})`)}`,
+      ];
+
+      const visibleQuestions = isExpanded
+        ? safeQuestions
+        : safeQuestions.slice(0, 4);
+      for (let idx = 0; idx < visibleQuestions.length; idx++) {
+        const q = visibleQuestions[idx]!;
+        const qId =
+          typeof q.id === "string" && q.id.trim()
+            ? formatInlineSnippet(q.id, 24)
+            : `q${idx + 1}`;
+        const qText =
+          formatInlineSnippet(q.question, isExpanded ? 300 : 88) || "…";
+        const opts = normalizeRawOptions(q.options);
+        const recRaw =
+          typeof q.recommended === "string" ? q.recommended.trim() : undefined;
+        const recLabel = findRecommendedLabel(opts, recRaw);
+        const optMeta = `${opts.length} ${opts.length === 1 ? "option" : "options"}${recLabel ? ` · ★ ${recLabel}` : ""}`;
+        lines.push(
+          `  ${theme.fg("muted", `${idx + 1}.`)} ${theme.fg("dim", `[${qId}]`)} ${theme.fg("accent", qText)} ${theme.fg("muted", `(${optMeta})`)}`,
+        );
+
+        if (isExpanded) {
+          if (typeof q.context === "string" && q.context.trim()) {
+            lines.push(`     ${theme.fg("dim", q.context.trim())}`);
+          }
+          for (const opt of opts) {
+            const isRec = isRecommendedOption(opt, recRaw);
+            const recStar = isRec ? ` ${theme.fg("warning", "★")}` : "";
+            const desc = opt.description
+              ? ` ${theme.fg("dim", `— ${formatInlineSnippet(opt.description, 88)}`)}`
+              : "";
+            lines.push(
+              `     ${theme.fg("muted", "•")} ${theme.fg(isRec ? "accent" : "toolOutput", opt.label)}${recStar}${desc}`,
+            );
+          }
+        }
+      }
+
+      if (!isExpanded && safeQuestions.length > 4) {
+        lines.push(
+          `  ${theme.fg("dim", `… +${safeQuestions.length - 4} more question(s) (Ctrl+O to expand)`)}`,
+        );
+      }
+
+      return new Text(lines.join("\n"), 0, 0);
     },
-    renderResult(result, options, theme: Theme) {
-      const details = result.details as SwarmQuestionnaireToolDetails | undefined;
-      if (result.isError) {
-        return new Text(theme.fg("error", extractFirstText(result.content)), 0, 0);
+    renderResult(result, options, theme: Theme, context) {
+      const details = result?.details as SwarmQuestionnaireToolDetails | undefined;
+      const isExpanded = Boolean(options?.expanded);
+      if (result?.isError || context?.isError || Boolean(details?.error)) {
+        const errText =
+          extractFirstText(result?.content) ||
+          (typeof details?.error === "string" && details.error
+            ? details.error
+            : "Questionnaire failed.");
+        return new Text(
+          `${theme.fg("error", "✗ [ERROR]")} ${theme.fg("error", errText)}`,
+          0,
+          0,
+        );
+      }
+      if (options?.isPartial) {
+        return new Text(
+          `${theme.fg("warning", "⏳ [AWAITING]")} ${theme.fg("muted", "Waiting for questionnaire submission…")}`,
+          0,
+          0,
+        );
       }
       if (details?.cancelled) {
-        return new Text(theme.fg("muted", "Questionnaire cancelled by user."), 0, 0);
+        return new Text(
+          theme.fg("muted", "○ [CANCELLED] Questionnaire cancelled by user."),
+          0,
+          0,
+        );
       }
-      if (options.expanded) {
-        return new Text(theme.fg("toolOutput", extractFirstText(result.content)), 0, 0);
-      }
-      const answeredCount = details ? Object.keys(details.answers).length : 0;
-      return new Text(
-        `${theme.fg("success", "✓")} ${theme.fg("toolOutput", `Recorded ${answeredCount} questionnaire answer(s).`)}`,
-        0,
-        0,
+
+      const rawAnswers =
+        details?.answers && typeof details.answers === "object"
+          ? details.answers
+          : {};
+      const answerEntries = Object.entries(rawAnswers).filter(
+        (entry): entry is [string, string] => typeof entry[1] === "string",
       );
+      const answeredCount = answerEntries.length;
+      const totalCount =
+        typeof details?.questionCount === "number" && details.questionCount > 0
+          ? details.questionCount
+          : answeredCount;
+
+      if (isExpanded) {
+        const body = extractFirstText(result?.content);
+        const header = `${theme.fg("success", "✓ [RECORDED]")} ${theme.fg("toolOutput", `Recorded ${answeredCount}/${totalCount} questionnaire answer(s)`)}`;
+        return new Text(
+          body ? `${header}\n${theme.fg("toolOutput", body)}` : header,
+          0,
+          0,
+        );
+      }
+
+      const items = Array.isArray(details?.items) ? details.items : [];
+      const customIds = new Set<string>();
+      for (const item of items) {
+        if (item && item.isCustom && typeof item.id === "string") {
+          customIds.add(sanitizeQuestionId(item.id));
+        }
+      }
+
+      const totalSuffix =
+        totalCount > answeredCount
+          ? theme.fg("muted", ` (of ${totalCount})`)
+          : "";
+      const expandHint =
+        answeredCount > 0 ? ` ${theme.fg("dim", "(Ctrl+O to expand)")}` : "";
+      const lines: string[] = [
+        `${theme.fg("success", "✓ [RECORDED]")} ${theme.fg("toolOutput", `Recorded ${answeredCount} questionnaire answer(s).`)}${totalSuffix}${expandHint}`,
+      ];
+
+      for (const [key, ans] of answerEntries.slice(0, 4)) {
+        const customSuffix = customIds.has(key)
+          ? theme.fg("warning", " (custom)")
+          : "";
+        lines.push(
+          `  ${theme.fg("muted", "•")} ${theme.fg("accent", key)}${theme.fg("dim", ":")} ${theme.fg("toolOutput", formatInlineSnippet(ans, 68) || ans)}${customSuffix}`,
+        );
+      }
+      if (answerEntries.length > 4) {
+        lines.push(
+          `  ${theme.fg("dim", `… +${answerEntries.length - 4} more answer(s)`)}`,
+        );
+      }
+
+      return new Text(lines.join("\n"), 0, 0);
     },
   });
 }
@@ -1046,7 +1376,7 @@ export function createProposeSwarmPlanTool(
     promptSnippet:
       "Validate and present a Flexible Dynamic Swarm Plan (title, objective, strategy, acceptance criteria, optional initial members) for user confirmation before launching.",
     promptGuidelines: [
-      `Call \`${PROPOSE_SWARM_PLAN_TOOL}\` once requirements are clear; do NOT duplicate the full plan in prose beforehand because \`${PROPOSE_SWARM_PLAN_TOOL}\` renders the full formatted proposal into scrollback automatically.`,
+      `Call \`${PROPOSE_SWARM_PLAN_TOOL}\` once requirements are clear with wave-by-wave disjoint file/directory ownership in \`strategy\` and exact runnable verification commands in \`acceptance_criteria\`; do NOT duplicate the full plan in prose beforehand because \`${PROPOSE_SWARM_PLAN_TOOL}\` renders the full formatted proposal into scrollback automatically.`,
     ],
     exposure: "model-only",
     defaultActive: false,
@@ -1360,6 +1690,10 @@ export function createProposeSwarmPlanTool(
             : {}),
         }));
 
+      const draftBranch =
+        draft?.baseBranch && draft.baseBranch !== "HEAD"
+          ? draft.baseBranch
+          : undefined;
       const previewPlan: ProposedSwarmPlan = {
         title: typeof args?.title === "string" ? args.title.trim() : "",
         objective: typeof args?.objective === "string" ? args.objective.trim() : "",
@@ -1370,7 +1704,7 @@ export function createProposeSwarmPlanTool(
             : "",
         baseBranch:
           (typeof args?.base_branch === "string" && args.base_branch.trim()) ||
-          draft?.baseBranch ||
+          draftBranch ||
           "auto",
         maxConcurrency: sanitizePositiveInt(
           typeof args?.max_concurrency === "number"
@@ -1386,40 +1720,142 @@ export function createProposeSwarmPlanTool(
         ...(previewMembers.length > 0 ? { initialMembers: previewMembers } : {}),
       };
 
+      const modeBadge = draft?.autoConfirm
+        ? theme.fg("accent", "[DIRECT]")
+        : draft?.mode === "tweak"
+          ? theme.fg("warning", "[TWEAK]")
+          : theme.fg("accent", "[PROPOSAL]");
+      const memberMeta =
+        previewMembers.length > 0
+          ? ` · ${previewMembers.length} ${previewMembers.length === 1 ? "member" : "members"}`
+          : " · dynamic waves";
+      const metaPill = theme.fg(
+        "dim",
+        `(${previewPlan.baseBranch} · max:${previewPlan.maxConcurrency} · validator:${previewPlan.validatorEnabled ? "ON" : "OFF"}${memberMeta})`,
+      );
+      const modelPills = formatRoleModelsPillBar(previewPlan.roleModels, theme);
       const summary = formatProposalTranscriptSummary(previewPlan);
-      const header = `${theme.fg("toolTitle", theme.bold("Swarm Plan"))} ${theme.fg("muted", `(${PROPOSE_SWARM_PLAN_TOOL})`)}`;
-      return new Text(`${header}\n${theme.fg("toolOutput", summary)}`, 0, 0);
+      const header = `${theme.fg("accent", "🗺")} ${theme.fg("toolTitle", theme.bold("Swarm Plan"))} ${theme.fg("muted", `(${PROPOSE_SWARM_PLAN_TOOL})`)} ${modeBadge} ${metaPill}\n  ${theme.fg("muted", "Role Models:")} ${modelPills}`;
+      return new Text(`${header}\n\n${theme.fg("toolOutput", summary)}`, 0, 0);
     },
-    renderResult(result, options, theme: Theme) {
-      const details = result.details as ProposeSwarmPlanToolDetails | undefined;
+    renderResult(result, options, theme: Theme, context) {
+      const details = result?.details as ProposeSwarmPlanToolDetails | undefined;
+      const isExpanded = Boolean(options?.expanded);
+
       if (
-        result.isError ||
+        result?.isError ||
+        context?.isError ||
         details?.outcome === "validation_error" ||
         details?.outcome === "error"
       ) {
-        return new Text(theme.fg("error", extractFirstText(result.content)), 0, 0);
+        const issueCount = Array.isArray(details?.errors)
+          ? details.errors.length
+          : 0;
+        const badge =
+          details?.outcome === "validation_error"
+            ? theme.fg(
+                "error",
+                `✗ [VALIDATION ERROR${issueCount > 0 ? ` · ${issueCount} ${issueCount === 1 ? "issue" : "issues"}` : ""}]`,
+              )
+            : theme.fg("error", "✗ [ERROR]");
+        const errBody =
+          extractFirstText(result?.content) ||
+          details?.errorMessage ||
+          "Swarm Plan failed.";
+        return new Text(`${badge} ${theme.fg("error", errBody)}`, 0, 0);
       }
-      if (options.expanded) {
-        return new Text(theme.fg("toolOutput", extractFirstText(result.content)), 0, 0);
+
+      if (options?.isPartial) {
+        return new Text(
+          `${theme.fg("warning", "⏳ [AWAITING]")} ${theme.fg("muted", "Awaiting Swarm Plan confirmation…")}`,
+          0,
+          0,
+        );
       }
+
+      if (isExpanded) {
+        const body = extractFirstText(result?.content);
+        let statusHeader = "";
+        if (details?.outcome === "confirmed") {
+          const badge = details.autoConfirmed
+            ? theme.fg("success", "✓ [CONFIRMED · DIRECT]")
+            : theme.fg("success", "✓ [CONFIRMED]");
+          const runTag = details.runId
+            ? ` ${theme.fg("accent", details.runId)}`
+            : "";
+          const pills = details.plan?.roleModels
+            ? ` ${formatRoleModelsPillBar(details.plan.roleModels, theme)}`
+            : "";
+          statusHeader = `${badge}${runTag}${pills}\n`;
+        } else if (details?.outcome === "continue") {
+          const pills = details.plan?.roleModels
+            ? ` ${formatRoleModelsPillBar(details.plan.roleModels, theme)}`
+            : "";
+          statusHeader = `${theme.fg("warning", "✎ [REFINING]")}${pills}\n`;
+        } else if (details?.outcome === "cancelled") {
+          statusHeader = `${theme.fg("muted", "✕ [CANCELLED]")}\n`;
+        }
+        return new Text(
+          `${statusHeader}${theme.fg("toolOutput", body)}`,
+          0,
+          0,
+        );
+      }
+
       if (details?.outcome === "confirmed") {
+        const statusBadge = details.autoConfirmed
+          ? theme.fg("success", "✓ [CONFIRMED · DIRECT]")
+          : theme.fg("success", "✓ [CONFIRMED]");
         const autoTag = details.autoConfirmed ? " (direct)" : "";
         const flagsSuffix = details.plan
           ? ` (Validator: ${details.plan.validatorEnabled ? "ON" : "OFF"}, concurrency: ${details.plan.maxConcurrency})`
           : "";
-        return new Text(
-          `${theme.fg("success", "✓")} ${theme.fg("toolOutput", `Swarm Plan confirmed${autoTag} — launched run ${details.runId ?? ""}${flagsSuffix}`)}`,
-          0,
-          0,
-        );
+        const expandHint = ` ${theme.fg("dim", "(Ctrl+O to expand)")}`;
+        const lines: string[] = [
+          `${statusBadge} ${theme.fg("toolOutput", `Swarm Plan confirmed${autoTag} — launched run ${details.runId ?? ""}${flagsSuffix}`)}${expandHint}`,
+        ];
+        if (details.plan) {
+          const metaParts: string[] = [];
+          if (details.plan.baseBranch) {
+            metaParts.push(
+              `${theme.fg("muted", "branch:")}${theme.fg("accent", details.plan.baseBranch)}`,
+            );
+          }
+          const memberCount = details.plan.initialMembers?.length ?? 0;
+          if (memberCount > 0) {
+            metaParts.push(
+              theme.fg(
+                "muted",
+                `${memberCount} initial ${memberCount === 1 ? "member" : "members"}`,
+              ),
+            );
+          }
+          if (details.plan.roleModels) {
+            metaParts.push(
+              formatRoleModelsPillBar(details.plan.roleModels, theme),
+            );
+          }
+          if (metaParts.length > 0) {
+            lines.push(`  ${metaParts.join(theme.fg("dim", " · "))}`);
+          }
+          const note = formatInlineSnippet(details.plan.feedback, 96);
+          if (note) {
+            lines.push(
+              `  ${theme.fg("muted", "Note:")} ${theme.fg("toolOutput", note)}`,
+            );
+          }
+        }
+        return new Text(lines.join("\n"), 0, 0);
       }
+
       if (details?.outcome === "cancelled") {
         return new Text(
-          `${theme.fg("muted", "✕ Swarm Plan cancelled — draft discarded.")}`,
+          `${theme.fg("muted", "✕ [CANCELLED] Swarm Plan cancelled — draft discarded.")}`,
           0,
           0,
         );
       }
+
       if (details?.outcome === "continue") {
         const validator = details.plan?.validatorEnabled ? "ON" : "OFF";
         const concurrency = details.plan?.maxConcurrency;
@@ -1427,13 +1863,29 @@ export function createProposeSwarmPlanTool(
           concurrency !== undefined
             ? `Validator: ${validator}, concurrency: ${concurrency}`
             : `Validator: ${validator}`;
-        return new Text(
-          `${theme.fg("warning", "✎")} ${theme.fg("toolOutput", `Continuing Swarm Plan refinement (${suffix}).`)}`,
-          0,
-          0,
-        );
+        const expandHint = ` ${theme.fg("dim", "(Ctrl+O to expand)")}`;
+        const lines: string[] = [
+          `${theme.fg("warning", "✎ [REFINING]")} ${theme.fg("toolOutput", `Continuing Swarm Plan refinement (${suffix}).`)}${expandHint}`,
+        ];
+        if (details.plan?.roleModels) {
+          lines.push(
+            `  ${theme.fg("muted", "Models:")} ${formatRoleModelsPillBar(details.plan.roleModels, theme)}`,
+          );
+        }
+        const feedback = formatInlineSnippet(details.feedback, 96);
+        if (feedback) {
+          lines.push(
+            `  ${theme.fg("muted", "Feedback:")} ${theme.fg("toolOutput", feedback)}`,
+          );
+        }
+        return new Text(lines.join("\n"), 0, 0);
       }
-      return new Text(theme.fg("toolOutput", extractFirstText(result.content)), 0, 0);
+
+      return new Text(
+        theme.fg("toolOutput", extractFirstText(result?.content)),
+        0,
+        0,
+      );
     },
   });
 }

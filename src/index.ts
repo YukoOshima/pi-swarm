@@ -1,17 +1,20 @@
 import path from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import {
+  type CustomMessageEntryDraft,
   type ExtensionAPI,
   type ExtensionCommandContext,
   type ExtensionContext,
   type ExtensionFactory,
+  type MessageRenderOptions,
   type SessionStartEvent,
   type Theme,
+  type ThemeColor,
   ModelRuntime,
   getAgentDir,
   resolveCliModel,
 } from "@earendil-works/pi-coding-agent";
-import type { AutocompleteItem, Component, TUI } from "@earendil-works/pi-tui";
+import { Text, type AutocompleteItem, type Component, type TUI } from "@earendil-works/pi-tui";
 import {
   DEFAULT_CHANNEL,
   DEFAULT_SWARM_SETTINGS,
@@ -197,6 +200,12 @@ const SINGLE_WORD_SUBCOMMANDS = new Set([
   "help",
 ]);
 
+const SINGLE_WORD_ALIASES = new Map<string, "runs" | "settings">([
+  ["ls", "runs"],
+  ["list", "runs"],
+  ["config", "settings"],
+]);
+
 const ARG_SUBCOMMANDS = new Set([
   "direct",
   "tweak",
@@ -206,6 +215,7 @@ const ARG_SUBCOMMANDS = new Set([
   "models",
   "model",
   "steer",
+  "stop",
   "merge",
   "kill",
   "done",
@@ -214,6 +224,18 @@ const ARG_SUBCOMMANDS = new Set([
   "teardown",
   "focus",
 ]);
+
+const ORCHESTRATOR_BLOCKED_EDIT_TOOLS = new Set([
+  "write",
+  "edit",
+  "powershell",
+]);
+
+const DRAFTING_WRITE_GUARD_REASON =
+  "Swarm Drafting Mode is read-only reconnaissance. Clarify via swarm_questionnaire or call propose_swarm_plan to launch the Swarm.";
+
+const ORCHESTRATOR_WRITE_GUARD_REASON =
+  'Orchestrator must not edit repository files directly (doing so dirties baseBranch and breaks worktree merges). Delegate edits to a worker via swarm{action:"add", workspace:"share"} or steer @member via post_message / swarm{action:"steer"}.';
 
 const MODEL_ROLES: ReadonlyArray<SwarmModelRole> = [
   "orchestrator",
@@ -244,6 +266,7 @@ export interface ParsedSwarmInvocation {
     | "models"
     | "model"
     | "steer"
+    | "stop"
     | "merge"
     | "kill"
     | "done"
@@ -279,14 +302,20 @@ export function parseSwarmCommand(rawArgs: string): ParsedSwarmInvocation {
         | "models"
         | "model"
         | "steer"
+        | "stop"
         | "merge"
         | "kill"
         | "done"
         | "pause"
+        | "resume"
         | "teardown"
         | "focus",
       rest,
     };
+  }
+
+  if (head === "mc" || ((head === "open" || head === "panel") && (!rest || !/\s/.test(rest)))) {
+    return { kind: "ui", rest };
   }
 
   if (SINGLE_WORD_SUBCOMMANDS.has(head) && !rest) {
@@ -294,13 +323,17 @@ export function parseSwarmCommand(rawArgs: string): ParsedSwarmInvocation {
       kind: head as
         | "status"
         | "graph"
-        | "resume"
         | "cancel"
         | "runs"
         | "settings"
         | "help",
       rest,
     };
+  }
+
+  const singleAlias = SINGLE_WORD_ALIASES.get(head);
+  if (singleAlias && !rest) {
+    return { kind: singleAlias, rest: "" };
   }
 
   return { kind: "goal", rest: trimmed };
@@ -814,7 +847,7 @@ function buildMissionResumePrompt(
 
 function buildHelpMarkdown(): string {
   return [
-    "### 🐝 Pi Swarm v0.5.1 (`/swarm`) — Dynamic Antigravity Swarm Commands",
+    "### 🐝 Pi Swarm v0.6.0 (`/swarm`) — Dynamic Antigravity Swarm Commands",
     "",
     "| Command | Description |",
     "| --- | --- |",
@@ -825,10 +858,11 @@ function buildHelpMarkdown(): string {
     "| `/swarm status` | Zero-LLM-turn dashboard: 3-role models, channels, member roster, recent board & events |",
     "| `/swarm board [limit] [--channel <ch>] [--search <q>]` | Zero-LLM-turn shared `#seq` Message Board feed (filterable by channel or substring) |",
     "| `/swarm graph` | Zero-LLM-turn ASCII/Unicode Spawn Tree & Peer `@mention` / `#channel` interaction graph |",
-    "| `/swarm tasks [tab\\|member\\|#ch]` · `/swarm ui` | Open interactive 4-tab Mission Control (`[M]` models, `[P]` pause/resume, `[?]` help) |",
+    "| `/swarm tasks [tab\\|member\\|#ch]` · `/swarm ui` · `/swarm mc` | Open interactive 4-tab Mission Control (`[M]` models, `[P]` pause/resume, `[?]` help; aliases: `mc`, `open`, `panel`) |",
     "| `/swarm models [role\\|--print]` | Open interactive Mission Model Picker (`Orchestrator` / `Worker` / `Validator` / `Fallbacks`), or `--print` overview |",
     "| `/swarm model <target> <model[:thinking]\\|default> [thinking] [--global]` | Set role default (propagates to live members) OR hot-switch a live member (`@name`) |",
     "| `/swarm steer <member> <message>` | Redirect a working member immediately or wake a parked member with new direction |",
+    "| `/swarm stop <member> [reason]` | Stop a working member cleanly without deleting its worktree or conversation history |",
     "| `/swarm merge <member>` | Merge a member's `share` worktree or `branch` clone onto `baseBranch` (`autoRebase` + `--no-ff`) |",
     "| `/swarm kill <member> [--force] [reason]` | Permanently kill a member and remove its clean worktree (`--force` overrides dirty worktree guard) |",
     "| `/swarm done [summary]` | Complete the active Swarm run, dispose warm handles, and restore `idle` tools |",
@@ -836,14 +870,237 @@ function buildHelpMarkdown(): string {
     "| `/swarm resume [run-id] [--continue\\|-c] [--quiet\\|-q] [guidance]` | Zero-turn unpause (focused same-session) OR Droid-style cross-session Mission resume |",
     "| `/swarm cancel` | Cancel active draft (restores tools) or abandon focused run (preserves worktrees & `.pi/swarm/runs/`) |",
     "| `/swarm teardown [--force] [--delete-branches]` | Safely remove clean idle worktrees while preserving `.pi/swarm/runs/` audit & board history |",
-    "| `/swarm runs` | List all runs stored in `.pi/swarm/runs/` |",
+    "| `/swarm runs` · `/swarm ls` · `/swarm list` | List all runs stored in `.pi/swarm/runs/` |",
     "| `/swarm focus [run-id\\|none]` | Switch or detach session-local run focus |",
-    "| `/swarm settings` | Configure Mission Models, warm pool, smart LLM monitor, concurrency & git settings |",
+    "| `/swarm settings` · `/swarm config` | Configure Mission Models, warm pool, smart LLM monitor, concurrency & git settings |",
     "| `/swarm help` | Print this command reference (zero LLM turn) |",
     "",
     "**Mid-Flight Redirection:** While workers run after Orchestrator calls `swarm_wait`, simply type any message directly to the Orchestrator to adjust direction, or run `/swarm steer <member> <msg>`.",
-    "**TUI Shortcuts:** `Ctrl+Shift+M` opens Mission Model Picker · `Ctrl+Shift+S` opens Mission Control / Hub · `Ctrl+Shift+T` toggles expanded above-editor dashboard · `Esc` collapses expanded dashboard.",
+    "**TUI Shortcuts:** `Alt+S` / `Ctrl+Shift+S` opens Mission Control / Hub · `Alt+M` / `Ctrl+Shift+M` opens Mission Model Picker · `Alt+W` / `Ctrl+Shift+T` toggles expanded above-editor dashboard · `Esc` collapses expanded dashboard.",
   ].join("\n");
+}
+
+function extractCustomMessageText(
+  content: CustomMessageEntryDraft["content"] | unknown,
+): string {
+  if (typeof content === "string") {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content
+      .filter(
+        (part): part is { type: "text"; text: string } =>
+          Boolean(
+            part &&
+              typeof part === "object" &&
+              (part as { type?: string }).type === "text" &&
+              typeof (part as { text?: unknown }).text === "string",
+          ),
+      )
+      .map((part) => part.text)
+      .join("\n");
+  }
+  return String(content ?? "");
+}
+
+function stripSwarmWakeupXml(raw: string): string {
+  return raw
+    .replace(/^\s*<swarm_mission_resumed\b[^>]*>\r?\n?/gim, "")
+    .replace(/\r?\n?\s*<\/swarm_mission_resumed>\s*$/gim, "")
+    .replace(/<\/?swarm_mission_resumed\b[^>]*>/gi, "")
+    .trim();
+}
+
+function stripInlineMarkdownSyntax(text: string): string {
+  return text
+    .replace(/\*\*([^*\n]+)\*\*/g, "$1")
+    .replace(/`([^`\n]+)`/g, "$1");
+}
+
+function styleInlineMarkdownLine(
+  text: string,
+  fg: (color: ThemeColor, value: string) => string,
+  bold: (value: string) => string,
+): string {
+  return text
+    .replace(/\*\*([^*\n]+)\*\*/g, (_m, inner: string) => bold(inner))
+    .replace(/`([^`\n]+)`/g, (_m, code: string) => fg("accent", code));
+}
+
+function clampPreviewText(
+  text: string,
+  maxChars: number,
+): { text: string; truncated: boolean } {
+  const normalized = sanitizePlainText(stripInlineMarkdownSyntax(text));
+  if (normalized.length <= maxChars) {
+    return { text: normalized, truncated: false };
+  }
+  return {
+    text: `${normalized.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`,
+    truncated: true,
+  };
+}
+
+function renderSwarmWakeupMessage(
+  message: { content: unknown; details?: unknown },
+  options: Partial<MessageRenderOptions> | undefined,
+  theme: Partial<Theme> | undefined,
+): Component {
+  const fg = (color: ThemeColor, value: string): string =>
+    typeof theme?.fg === "function" ? theme.fg(color, value) : value;
+  const bold = (value: string): string =>
+    typeof theme?.bold === "function" ? theme.bold(value) : value;
+  const bgFn =
+    typeof theme?.bg === "function"
+      ? (line: string) => theme.bg!("customMessageBg", line)
+      : undefined;
+  const padX = typeof options?.outputPad === "number" ? options.outputPad : 1;
+
+  const cleaned = stripSwarmWakeupXml(extractCustomMessageText(message.content));
+  const rawLines = cleaned.split(/\r?\n/);
+  const nonEmptyLines = rawLines.map((l) => l.trim()).filter((l) => l.length > 0);
+  const firstRaw = nonEmptyLines[0] ?? "Pi Swarm Mission Event";
+  const details = (message.details ?? {}) as {
+    kickoff?: boolean;
+    stallDetected?: boolean;
+  };
+
+  const isStall = Boolean(details.stallDetected) || /stall alert/i.test(firstRaw);
+  const isResumed = /mission resumed/i.test(firstRaw);
+  const isLiveKickoff = Boolean(details.kickoff) || /\bis live on\b/i.test(firstRaw);
+
+  const badgeLabel = isStall
+    ? "🐝 [SWARM STALL]"
+    : isResumed
+      ? "🐝 [MISSION RESUMED]"
+      : isLiveKickoff
+        ? "🐝 [MISSION LIVE]"
+        : "🐝 [MISSION EVENT]";
+  const badgeColor: ThemeColor = isStall
+    ? "warning"
+    : isLiveKickoff
+      ? "success"
+      : "accent";
+  const badge = fg(badgeColor, bold(badgeLabel));
+
+  const cleanTitleSource = firstRaw
+    .replace(/^🐝\s*/, "")
+    .replace(/^\*\*Swarm Mission Resumed:\*\*\s*/i, "")
+    .replace(/^Swarm Mission Resumed:\s*/i, "")
+    .trim();
+
+  if (options?.expanded) {
+    const expandedLines: string[] = [
+      `${badge} ${styleInlineMarkdownLine(cleanTitleSource, fg, bold)}`,
+    ];
+    const firstIdx = rawLines.findIndex((l) => l.trim().length > 0);
+    const bodyRawLines = firstIdx >= 0 ? rawLines.slice(firstIdx + 1) : [];
+    for (const line of bodyRawLines) {
+      if (!line.trim()) {
+        expandedLines.push("");
+        continue;
+      }
+      expandedLines.push(
+        fg("customMessageText", styleInlineMarkdownLine(line, fg, bold)),
+      );
+    }
+    return new Text(expandedLines.join("\n"), padX, 0, bgFn);
+  }
+
+  const titleClamped = clampPreviewText(cleanTitleSource, 50);
+  const tailLines = nonEmptyLines.slice(1);
+  const bulletCandidates = tailLines.filter((l) => /^[-*•]\s+/.test(l));
+  const statusLine = tailLines.find((l) => /^Run status:/i.test(l));
+  const rawHighlights: string[] = [];
+
+  for (const b of bulletCandidates) {
+    rawHighlights.push(b.replace(/^[-*•]\s+/, ""));
+  }
+  if (rawHighlights.length < 2 && statusLine) {
+    rawHighlights.push(statusLine);
+  }
+  if (rawHighlights.length === 0) {
+    for (const line of tailLines) {
+      if (/^(Board messages:|Resume Mission coordination|Initial members)/i.test(line)) {
+        continue;
+      }
+      rawHighlights.push(line);
+      if (rawHighlights.length >= 2) break;
+    }
+  }
+
+  const hasExtraContent =
+    titleClamped.truncated ||
+    tailLines.length > rawHighlights.length ||
+    rawHighlights.length > 3;
+
+  const maxHighlights = hasExtraContent ? 2 : 3;
+  const chosen = rawHighlights.slice(0, maxHighlights);
+  let anyHighlightClamped = false;
+  const formattedHighlights = chosen.map((item) => {
+    const clamped = clampPreviewText(item, 66);
+    if (clamped.truncated) {
+      anyHighlightClamped = true;
+    }
+    return `  ${fg(badgeColor, "•")} ${fg("customMessageText", clamped.text)}`;
+  });
+
+  const isTruncated =
+    hasExtraContent ||
+    anyHighlightClamped ||
+    rawHighlights.length > chosen.length;
+
+  const cardLines: string[] = [
+    `${badge} ${bold(fg("customMessageText", titleClamped.text))}`,
+  ];
+  if (formattedHighlights.length > 0) {
+    cardLines.push(...formattedHighlights);
+  } else if (!isTruncated) {
+    cardLines.push(`  ${fg("dim", "• Mission event synced")}`);
+  }
+  if (isTruncated) {
+    // Guarantee 2–4 total lines: 1 title + (1..2 highlights) + 1 expand hint <= 4 lines
+    while (cardLines.length > 3) {
+      cardLines.pop();
+    }
+    cardLines.push(`  ${fg("dim", "(Ctrl+O to expand full board wakeup)")}`);
+  }
+
+  return new Text(cardLines.join("\n"), padX, 0, bgFn);
+}
+
+function renderSwarmStatusMessage(
+  message: { content: unknown },
+  options: Partial<MessageRenderOptions> | undefined,
+  theme: Partial<Theme> | undefined,
+): Component {
+  const fg = (color: ThemeColor, value: string): string =>
+    typeof theme?.fg === "function" ? theme.fg(color, value) : value;
+  const bold = (value: string): string =>
+    typeof theme?.bold === "function" ? theme.bold(value) : value;
+  const bgFn =
+    typeof theme?.bg === "function"
+      ? (line: string) => theme.bg!("customMessageBg", line)
+      : undefined;
+  const padX = typeof options?.outputPad === "number" ? options.outputPad : 1;
+
+  const raw = stripSwarmWakeupXml(extractCustomMessageText(message.content));
+  const lines = raw.split(/\r?\n/);
+  if (lines.length <= 1) {
+    const single = lines[0]?.trim() ?? "";
+    const prefix = single.startsWith("🐝") ? "" : `${fg("accent", bold("🐝"))} `;
+    const styled = `${prefix}${fg("customMessageText", styleInlineMarkdownLine(single, fg, bold))}`;
+    return new Text(styled, padX, 0, bgFn);
+  }
+
+  const styledLines = lines.map((line) => {
+    if (/^#{1,4}\s+/.test(line)) {
+      const heading = line.replace(/^#{1,4}\s+/, "");
+      return fg("accent", bold(stripInlineMarkdownSyntax(heading)));
+    }
+    return fg("customMessageText", styleInlineMarkdownLine(line, fg, bold));
+  });
+  return new Text(styledLines.join("\n"), padX, 0, bgFn);
 }
 
 function formatTeardownReport(
@@ -1282,6 +1539,26 @@ export function createPiSwarmExtension(
       const runs = await store.listRuns();
       runsCache = { cwd, runs, fetchedAt: nowMs };
       return runs;
+    }
+
+    function syncSessionNameForRun(
+      run: Pick<SwarmRunState, "title" | "objective" | "id">,
+    ): void {
+      if (typeof pi.setSessionName !== "function") {
+        return;
+      }
+      if (pi.getSessionName?.()?.trim()) {
+        return;
+      }
+      const runTitle = sanitizePlainText(run.title || run.objective || run.id).trim();
+      if (!runTitle) {
+        return;
+      }
+      try {
+        pi.setSessionName(`🐝 ${runTitle}`);
+      } catch {
+        // ignore if host session does not support session naming in current mode
+      }
     }
 
     function refreshUI(
@@ -2547,6 +2824,7 @@ export function createPiSwarmExtension(
         const finalRun = engine.getSnapshot().run ?? revisedRun;
         activatedRunIds.add(finalRun.id);
         invalidateRunsCache();
+        syncSessionNameForRun(finalRun);
         applySwarmToolProfile(pi, "running");
         syncActiveRunSections({ ctx: toolCtx, ignoreDraft: true });
         refreshUI(toolCtx);
@@ -2640,6 +2918,7 @@ export function createPiSwarmExtension(
       const finalRun = engine.getSnapshot().run ?? createdRun;
       activatedRunIds.add(finalRun.id);
       invalidateRunsCache();
+      syncSessionNameForRun(finalRun);
 
       // 7. Swap tool profile to `"running"` (4 core tools) & refresh UI
       applySwarmToolProfile(pi, "running");
@@ -3553,6 +3832,86 @@ export function createPiSwarmExtension(
       }
     }
 
+    async function handleStopCommand(
+      rawArgs: string,
+      ctx: ExtensionCommandContext,
+    ): Promise<void> {
+      const { store, engine } = await ensureBound(ctx);
+      const snapshot = engine.getSnapshot();
+      if (!snapshot.run) {
+        const msg = "No focused Swarm run. Start one with `/swarm <goal>` first.";
+        if (ctx.hasUI) ctx.ui.notify(msg, "info");
+        else emitZeroTurnMessage(ctx, msg);
+        return;
+      }
+
+      try {
+        await assertFocusedRunOwner(store, snapshot.run.id, ctx);
+      } catch (err) {
+        const msg = `Failed to stop member: ${formatError(err)}`;
+        if (ctx.hasUI) ctx.ui.notify(msg, "error");
+        else emitZeroTurnMessage(ctx, msg);
+        return;
+      }
+
+      const tokens = tokenizeCommandArgs(rawArgs.trim());
+      let target = tokens[0]?.replace(/^@/, "").trim() ?? "";
+      const reason = tokens.slice(1).join(" ").trim() || undefined;
+
+      if (!target) {
+        const candidates = getOrderedMembers(snapshot.run).filter(
+          (entry) => entry.state !== "killed" && entry.state !== "stopped",
+        );
+        if (candidates.length > 0 && ctx.hasUI) {
+          const choiceMap = new Map<string, string>();
+          const choices: string[] = [];
+          for (const entry of candidates) {
+            const label = `@${entry.name} (${entry.role} · ${entry.state} · ${entry.workspace} · ${entry.model ?? "default"})`;
+            choiceMap.set(label, entry.name);
+            choices.push(label);
+          }
+          const picked = await withModalGuard(() =>
+            ctx.ui.select("Select member to stop:", choices),
+          );
+          if (!picked) {
+            return;
+          }
+          target = choiceMap.get(picked) ?? "";
+        } else {
+          const hint =
+            candidates.length > 0
+              ? `Usage: /swarm stop <member-name> [reason] (live: ${candidates.map((c) => c.name).join(", ")})`
+              : "Usage: /swarm stop <member-name> [reason] (no working or waiting members to stop).";
+          if (ctx.hasUI) ctx.ui.notify(hint, "info");
+          else emitZeroTurnMessage(ctx, hint);
+          return;
+        }
+      }
+
+      if (!target) return;
+
+      try {
+        await engine.stopMember(target, {
+          humanStopped: true,
+          callerRole: "human",
+          callerName: "human",
+          reason,
+        });
+        refreshUI(ctx);
+        const reasonPart = reason ? ` (${reason})` : "";
+        const msg = `Stopped member \`@${target}\`${reasonPart} — worktree & conversation history preserved.`;
+        if (ctx.hasUI) ctx.ui.notify(`Stopped @${target}.`, "info");
+        emitZeroTurnMessage(ctx, `⏹ ${msg}`, {
+          target,
+          reason: reason ?? "stopped by user",
+        });
+      } catch (err) {
+        const msg = `Failed to stop member "${target}": ${formatError(err)}`;
+        if (ctx.hasUI) ctx.ui.notify(msg, "error");
+        else emitZeroTurnMessage(ctx, msg);
+      }
+    }
+
     async function handleMergeCommand(
       rawArgs: string,
       ctx: ExtensionCommandContext,
@@ -3909,6 +4268,7 @@ export function createPiSwarmExtension(
           await assertFocusedRunOwner(store, snapshot.run.id, ctx);
           const updated = await engine.resume(snapshot.run.id, ctx);
           invalidateRunsCache();
+          syncSessionNameForRun(updated);
           if (draftController.isActive()) {
             draftController.clear("running");
             syncDraftWidgetState(null);
@@ -4042,6 +4402,7 @@ export function createPiSwarmExtension(
 
         const updated = await engine.resume(targetRun.id, ctx);
         invalidateRunsCache();
+        syncSessionNameForRun(updated);
         persistFocusEntry(pi, updated.id, currentSid, "resume_mission");
 
         if (draftController.isActive()) {
@@ -5035,6 +5396,9 @@ export function createPiSwarmExtension(
         case "steer":
           await handleSteerCommand(parsed.rest, ctx);
           return;
+        case "stop":
+          await handleStopCommand(parsed.rest, ctx);
+          return;
         case "merge":
           await handleMergeCommand(parsed.rest, ctx);
           return;
@@ -5130,7 +5494,7 @@ export function createPiSwarmExtension(
         return items.length > 0 ? items : null;
       }
 
-      if (sub === "tasks" || sub === "ui") {
+      if (sub === "tasks" || sub === "ui" || sub === "mc" || sub === "open" || sub === "panel") {
         const lowerActive = argPrefix.toLowerCase();
         const items: AutocompleteItem[] = [];
         for (const tab of ["board", "members", "graph", "search"] as const) {
@@ -5389,6 +5753,25 @@ export function createPiSwarmExtension(
         return items.length > 0 ? items : null;
       }
 
+      if (sub === "stop") {
+        const run = getSnapshotSafe().run;
+        if (!run) return null;
+        const lowerActive = argPrefix.toLowerCase();
+        const items = getOrderedMembers(run)
+          .filter(
+            (entry) =>
+              entry.state !== "killed" &&
+              entry.state !== "stopped" &&
+              entry.name.toLowerCase().startsWith(lowerActive),
+          )
+          .map((entry): AutocompleteItem => ({
+            value: `stop ${entry.name}`,
+            label: entry.name,
+            description: `${entry.role} [${entry.state}]`,
+          }));
+        return items.length > 0 ? items : null;
+      }
+
       if (sub === "merge") {
         const run = getSnapshotSafe().run;
         if (!run) return null;
@@ -5541,11 +5924,11 @@ export function createPiSwarmExtension(
     }
 
     // ------------------------------------------------------------------------
-    // Register Commands: ONLY `/swarm` and `/swarm-direct`
+    // Register Commands, Custom Message Renderers & SSH/Tmux Shortcuts
     // ------------------------------------------------------------------------
     pi.registerCommand("swarm", {
       description:
-        "Pi Swarm v0.5.1 — Dynamic Antigravity Swarm orchestrator (Droid Mission-style model/effort picker & cross-session resume, shared #seq board, non-blocking swarm_wait, warm disk sessions, fork & worktrees/clones)",
+        "Pi Swarm v0.6.0 — Dynamic Antigravity Swarm orchestrator (Droid Mission-style model/effort picker & cross-session resume, shared #seq board, non-blocking swarm_wait, warm disk sessions, fork & worktrees/clones)",
       getArgumentCompletions: getSwarmCompletions,
       handler: handleSwarmCommand,
     });
@@ -5558,11 +5941,95 @@ export function createPiSwarmExtension(
       },
     });
 
+    if (typeof pi.registerMessageRenderer === "function") {
+      pi.registerMessageRenderer(SWARM_WAKEUP_CUSTOM_TYPE, (message, options, theme) =>
+        renderSwarmWakeupMessage(message, options, theme),
+      );
+      pi.registerMessageRenderer(SWARM_STATUS_CUSTOM_TYPE, (message, options, theme) =>
+        renderSwarmStatusMessage(message, options, theme),
+      );
+    }
+
+    if (typeof pi.registerShortcut === "function") {
+      const registerSafeShortcut = (
+        shortcut: "alt+s" | "alt+m" | "alt+w",
+        description: string,
+        handler: (ctx: ExtensionContext) => Promise<void> | void,
+      ): void => {
+        try {
+          pi.registerShortcut(shortcut, { description, handler });
+        } catch {
+          // Ignore shortcut conflicts or unsupported host environments
+        }
+      };
+
+      registerSafeShortcut(
+        "alt+s",
+        "Open Swarm Mission Control (or Swarm Hub when idle)",
+        async (ctx) => {
+          if (isModalOpen(widgetState)) return;
+          lastCtx = ctx;
+          if (getSnapshotSafe().run) {
+            await handleOverlayCommand("", ctx);
+          } else {
+            await handleBareCommand(ctx);
+          }
+        },
+      );
+
+      registerSafeShortcut(
+        "alt+m",
+        "Open Swarm Mission Model Picker",
+        async (ctx) => {
+          if (isModalOpen(widgetState)) return;
+          lastCtx = ctx;
+          await handleModelsCommand("", ctx);
+        },
+      );
+
+      registerSafeShortcut(
+        "alt+w",
+        "Toggle expanded Swarm Dashboard above editor",
+        (ctx) => {
+          if (isModalOpen(widgetState)) return;
+          lastCtx = ctx;
+          widgetState.expanded = !widgetState.expanded;
+          refreshUI(ctx);
+        },
+      );
+    }
+
     // ------------------------------------------------------------------------
-    // Lifecycle Hooks (`session_start`, `session_tree`, `session_compact`,
-    // `session_compact_failed`, `turn_start`, `input`, `before_agent_start`,
-    // `agent_settled`, `session_shutdown`)
+    // Lifecycle Hooks (`tool_call`, `session_start`, `session_tree`,
+    // `session_compact`, `session_compact_failed`, `turn_start`, `input`,
+    // `before_agent_start`, `agent_settled`, `session_shutdown`)
     // ------------------------------------------------------------------------
+
+    pi.on("tool_call", (event, ctx) => {
+      if (ctx) {
+        lastCtx = ctx;
+      }
+      if (!ORCHESTRATOR_BLOCKED_EDIT_TOOLS.has(event.toolName.toLowerCase())) {
+        return undefined;
+      }
+      if (draftController.isActive()) {
+        return {
+          block: true,
+          reason: DRAFTING_WRITE_GUARD_REASON,
+        };
+      }
+      const snapshot = getSnapshotSafe();
+      if (
+        snapshot.run?.status === "active" &&
+        isCurrentSessionOwner(snapshot.run, ctx)
+      ) {
+        return {
+          block: true,
+          reason: ORCHESTRATOR_WRITE_GUARD_REASON,
+        };
+      }
+      return undefined;
+    });
 
     pi.on("session_start", async (event, ctx) => {
       if (

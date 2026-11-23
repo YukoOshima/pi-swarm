@@ -1,9 +1,19 @@
-# 🐝 pi-swarm (`v0.5.1`)
+# 🐝 pi-swarm (`v0.6.0`)
 
 **`pi-swarm`** is a **Dynamic Antigravity Swarm** multi-agent orchestration extension for [Pi](https://github.com/earendil-works/pi) (`v1.5.2+`).
 面向 [Pi](https://github.com/earendil-works/pi) (`v1.5.2+`) 的**动态蜂群（Dynamic Antigravity Swarm）多 Agent 协作与编排扩展**。
 
-Instead of locking work into a rigid upfront DAG, `pi-swarm` v0.5.1 pairs **`pi-goal-x`-style upfront clarification** and **Droid Mission-style Model & Effort Configuration + Cross-Session Mission Resume** (`/swarm resume`) with **Antigravity-Swarm-grade dynamic orchestration**: unified Mission Hub (`/swarm` with `🔄 Resume Mission`), searchable provider-grouped Model Picker (`/swarm models`, `Ctrl+Shift+M`, `Alt+M`), automatic live role propagation (`Running agents switch on their next turn; Inherit applies only to new agents`), non-blocking `swarm_wait`, disk-persisted member sessions (`SessionManager.create`/`open`), hot model switching, Smart LLM Monitor (`@monitor`), and true isolated `git clone` for `workspace:"branch"`.
+Instead of locking work into a rigid upfront DAG, `pi-swarm` v0.6.0 pairs **`pi-goal-x`-style upfront clarification** and **Droid Mission-style Model & Effort Configuration + Cross-Session Mission Resume** (`/swarm resume`) with **Antigravity-Swarm-grade dynamic orchestration**: unified Mission Hub (`/swarm` with `🔄 Resume Mission`), searchable provider-grouped Model Picker (`/swarm models`, `Ctrl+Shift+M`, `Alt+M`), automatic live role propagation (`Running agents switch on their next turn; Inherit applies only to new agents`), non-blocking `swarm_wait`, disk-persisted member sessions (`SessionManager.create`/`open`), hot model switching, Smart LLM Monitor (`@monitor`), and true isolated `git clone` for `workspace:"branch"`.
+
+### 🆕 v0.6.0 — Usability & Orchestration Quality / 易用性与编排质量
+
+- **SSH-friendly shortcuts / SSH 友好快捷键**: `Alt+S` (Mission Control overlay, or Swarm Hub when idle), `Alt+M` (Model Picker), `Alt+W` (toggle expanded dashboard) work over SSH/tmux where `Ctrl+Shift+*` chords are often swallowed.
+- **New subcommand & aliases / 新命令与别名**: `/swarm stop <member>` interrupts a single member's current turn; `mc` (→ `tasks`, Mission Control), `ls`/`list` (→ `runs`), and `config` (→ `settings`) aliases.
+- **Compact tool & wakeup cards / 紧凑工具卡片**: swarm tool calls and `swarm_wait` wakeups render as compact cards; press `Ctrl+O` to expand full details.
+- **Orchestrator write/edit guard / 编排者写入保护**: the Orchestrator's `write`/`edit` tools are blocked during drafting and while a run is active, so code changes go through workers.
+- **Validator worktree awareness / 验证者感知工作树**: validators now see peer worktree/clone paths so they review the actual branch under test.
+- **Done & merge gates / 完成与合并闸门**: `swarm{action:"done"}` refuses while members are still working (pass `force:true` to override) and warns about unmerged worker branches.
+- **Silent worker turns surfaced / 静默回合可见**: worker turns that end without posting are reported in `all_idle` wakeups instead of being lost.
 
 ---
 

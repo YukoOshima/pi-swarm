@@ -2745,8 +2745,9 @@ describe("v0.4.0 Droid Mission Model Picker, Hub & Overlay Upgrades", () => {
             const comp = factory(tui, theme, {}, resolve);
             const initialPlain = stripTerminalSequences(comp.render(100).join("\n"));
             assert.match(initialPlain, /claude-fable-5-2\(high\)/);
-            assert.match(initialPlain, /\[m\] models/);
-            assert.match(initialPlain, /\[c\] comment/);
+            assert.match(initialPlain, /\[Enter\] Confirm & Launch/);
+            assert.match(initialPlain, /\[m\] Models/);
+            assert.match(initialPlain, /\[c\] Note/);
 
             comp.handleInput?.("m");
             assert.match(stripTerminalSequences(comp.render(100).join("\n")), /Inline Picker Mock/);
@@ -3694,5 +3695,485 @@ describe("v0.5.1 UI protocol, cursor, responsive bounds & overlay hardening", ()
       fakeWorktree,
     );
     assert.equal(closed, true);
+  });
+});
+
+describe("v0.6.0 Mission Control Overlay, 1-Keystroke Q&A & Plan Confirmation UX", () => {
+  it("renders Mission Pipeline Strip (height >= 20), toggles member Brief & Logs on [Enter], and shows contextual member action bar within 40/60/80/120 & 16-row bounds", async () => {
+    const theme = createMockTheme();
+    const mockTui = createMockTUI(24, 90);
+    const snap = makeSampleSnapshot({
+      members: [
+        makeSampleMember({
+          name: "worker-live",
+          role: "worker",
+          state: "working",
+          workspace: "share",
+          branch: "swarm/dyn/worker-live",
+          brief: "Implement streaming lexer and verify edge cases",
+          logTail: ["Running lexer suite", "All 18 assertions green"],
+        }),
+        makeSampleMember({
+          name: "worker-unmerged",
+          role: "worker",
+          state: "waiting",
+          workspace: "share",
+          branch: "swarm/dyn/worker-unmerged",
+          parkedOn: "Ready for merge review",
+        }),
+        makeSampleMember({
+          name: "worker-stopped-branch",
+          role: "worker",
+          state: "stopped",
+          workspace: "branch",
+          branch: "swarm/dyn/worker-stopped-branch",
+        }),
+        makeSampleMember({
+          name: "worker-merged",
+          role: "worker",
+          state: "waiting",
+          workspace: "share",
+          branch: "swarm/dyn/worker-merged",
+          mergedCommitSha: "abcdef1234567890",
+        }),
+        makeSampleMember({
+          name: "validator",
+          role: "validator",
+          state: "waiting",
+          workspace: "inherit",
+          branch: undefined,
+        }),
+      ],
+    });
+
+    const steered: Array<{ name: string; message: string }> = [];
+    const fakeEngine: ISwarmEngine = {
+      startRun: async () => snap.run!,
+      attachRun: async () => snap,
+      setTitle: async () => snap.run!,
+      updateDirection: async () => snap.run!,
+      addMembers: async () => [],
+      postMessage: async () => snap.recentBoard[0]!,
+      readBoard: async () => ({ messages: snap.recentBoard, head: snap.boardHead }),
+      waitForBoard: async () => ({ wokeBy: "timeout", messages: [], head: 0, summary: "" }),
+      parkOrchestratorWait: async () => ({
+        parked: false,
+        messages: [],
+        head: 0,
+        activeMembers: [],
+        summary: "",
+      }),
+      clearOrchestratorWait: () => {},
+      steerMember: async (name, message) => {
+        steered.push({ name, message });
+        return { delivery: "steered" };
+      },
+      switchModel: async (o) => ({ targetName: o.targetName ?? "", model: o.model ?? "" }),
+      stopMember: async () => {},
+      killMember: async () => {},
+      mergeMember: async () => null,
+      manageChannel: async () => ({
+        action: "create",
+        name: "main",
+        topic: "",
+        createdBy: ORCHESTRATOR_NAME,
+        createdAt: "",
+        subscribers: [],
+        archived: false,
+        summary: "ok",
+      }),
+      completeRun: async () => snap.run!,
+      pause: async () => snap.run!,
+      resume: async () => snap.run!,
+      teardown: async () => ({ removed: [], skipped: [], errors: [] }),
+      listModels: async () => [],
+      getSnapshot: () => snap,
+      subscribe: () => () => {},
+      dispose: async () => {},
+    };
+
+    await openSwarmOverlay(
+      {
+        mode: "tui",
+        hasUI: true,
+        ui: {
+          theme,
+          notify() {},
+          async custom<T>(
+            factory: (
+              t: TUI,
+              th: Theme,
+              kb: unknown,
+              done: (r: T) => void,
+            ) => Component & { dispose?(): void },
+          ): Promise<T> {
+            return new Promise<T>((resolve) => {
+              const comp = factory(mockTui.tui, theme, {}, resolve);
+              if (isFocusable(comp)) comp.focused = true;
+              void (async () => {
+                await flushAsync();
+
+                // 1. Mission Pipeline Strip visible when rows >= 20 (1 working, 3 ready, 1 merged)
+                (mockTui.tui.terminal as unknown as { rows: number; columns: number }).rows = 20;
+                const at20Rows = stripTerminalSequences(comp.render(100).join("\n"));
+                assert.match(at20Rows, /Build and verify streaming parser pipeline/);
+                assert.match(at20Rows, /Working: 1 · Ready: 3 · Merged: 1/);
+
+                // 2. Switch to [2] Members tab -> selected worker-live (working)
+                comp.handleInput?.("2");
+                const workingView = stripTerminalSequences(comp.render(80).join("\n"));
+                assert.match(
+                  workingView,
+                  /\[Enter\] Logs  \[w\] Steer Live  \[d\] Diff  \[m\] Queue Model  \[x\] Stop  \[k\] Kill/,
+                );
+
+                // [Enter] toggles full Brief & Logs inspector on and off
+                comp.handleInput?.("\r");
+                const logsOpen = stripTerminalSequences(comp.render(90).join("\n"));
+                assert.match(logsOpen, /Brief & Logs/);
+                assert.match(logsOpen, /Log Tail \(2 line\(s\)\)/);
+                assert.match(logsOpen, /Implement streaming lexer and verify edge cases/);
+
+                comp.handleInput?.("\r");
+                const logsClosed = stripTerminalSequences(comp.render(90).join("\n"));
+                assert.match(logsClosed, /Details & Logs/);
+                assert.ok(!logsClosed.includes("Log Tail (2 line(s))"));
+
+                // When inline [w] prompt is active, [Enter] submits prompt rather than toggling logs
+                comp.handleInput?.("w");
+                for (const ch of "keep going") comp.handleInput?.(ch);
+                comp.handleInput?.("\r");
+                await flushAsync();
+                assert.deepEqual(steered, [{ name: "worker-live", message: "keep going" }]);
+                assert.match(
+                  stripTerminalSequences(comp.render(90).join("\n")),
+                  /Details & Logs/,
+                );
+
+                // 3. Down -> worker-unmerged (waiting + unmerged share): highlights [g] Merge Branch
+                comp.handleInput?.("\x1b[B");
+                const unmergedWaitingBar = stripTerminalSequences(comp.render(80).join("\n"));
+                assert.match(
+                  unmergedWaitingBar,
+                  /\[Enter\] Logs  \[g\] Merge Branch  \[d\] Diff  \[w\] Wake  \[m\] Model  \[k\] Kill/,
+                );
+
+                // 4. Down -> worker-stopped-branch (stopped + unmerged branch): highlights [g] Merge Branch
+                comp.handleInput?.("\x1b[B");
+                const unmergedStoppedBar = stripTerminalSequences(comp.render(80).join("\n"));
+                assert.match(
+                  unmergedStoppedBar,
+                  /\[Enter\] Logs  \[g\] Merge Branch  \[d\] Diff  \[w\] Wake  \[m\] Model  \[k\] Kill/,
+                );
+
+                // 5. Down -> worker-merged (already merged share): omits [g] Merge Branch
+                comp.handleInput?.("\x1b[B");
+                const mergedBar = stripTerminalSequences(comp.render(80).join("\n"));
+                assert.match(
+                  mergedBar,
+                  /\[Enter\] Logs  \[w\] Wake  \[m\] Model  \[k\] Kill/,
+                );
+                assert.ok(!mergedBar.includes("[g] Merge Branch"));
+
+                // 6. Down -> validator (inherit): omits [g] Merge Branch
+                comp.handleInput?.("\x1b[B");
+                const inheritBar = stripTerminalSequences(comp.render(80).join("\n"));
+                assert.match(
+                  inheritBar,
+                  /\[Enter\] Logs  \[w\] Wake  \[m\] Model  \[k\] Kill/,
+                );
+                assert.ok(!inheritBar.includes("[g] Merge Branch"));
+
+                // 7. Strict 40/60/80/120 width + 16-row bounds (strip omitted at 16 rows < 20)
+                (mockTui.tui.terminal as unknown as { rows: number; columns: number }).rows = 16;
+                for (const tabKey of ["1", "2", "3", "4"] as const) {
+                  comp.handleInput?.(tabKey);
+                  if (tabKey === "4") comp.handleInput?.("\x1b"); // exit search input focus so next tab digit switches tab
+                  for (const w of [40, 60, 80, 120] as const) {
+                    const lines = comp.render(w);
+                    assert.ok(
+                      lines.length <= 16,
+                      `Overlay tab ${tabKey} at 16x${w} exceeded 16 rows: ${lines.length}`,
+                    );
+                    assertAllLinesFit(lines, w, `v060-overlay-tab${tabKey}@16x${w}`);
+                  }
+                }
+                const at16Plain = stripTerminalSequences(comp.render(100).join("\n"));
+                assert.ok(
+                  !at16Plain.includes("Working: 1 · Ready: 3 · Merged: 1"),
+                  "Mission Pipeline Strip must be hidden when terminal height < 20",
+                );
+
+                comp.handleInput?.("q");
+              })();
+            });
+          },
+        },
+      } as unknown as ExtensionContext,
+      fakeEngine,
+      null,
+    );
+  });
+
+  it("supports 1-keystroke 1-9 selection (including Custom answer slot) in SingleQuestionComponent & MultiQuestionComponent within 40/60/80/120 & 16-row bounds", async () => {
+    const theme = createMockTheme();
+    const ui = createQuestionnaireUI();
+
+    const singleSpec: QuestionSpec = {
+      id: "strategy",
+      question: "How should we partition the refactor?",
+      context: "Choose the slice granularity",
+      options: [
+        { label: "(Recommended) By subsystem", value: "subsystem" },
+        { label: "Single worker", value: "single" },
+      ],
+      recommended: "subsystem",
+      allowCustom: true,
+    };
+
+    // 1. SingleQuestionComponent: pressing '2' submits option #2 immediately in 1 keystroke
+    {
+      const shortTui = createMockTUI(16, 80);
+      const res = await ui.askQuestion(
+        {
+          mode: "tui",
+          hasUI: true,
+          ui: {
+            theme,
+            notify() {},
+            async custom<T>(
+              factory: (
+                t: TUI,
+                th: Theme,
+                kb: unknown,
+                done: (r: T) => void,
+              ) => Component & { dispose?(): void },
+            ): Promise<T> {
+              return new Promise<T>((resolve) => {
+                const comp = factory(shortTui.tui, theme, {}, resolve);
+                if (isFocusable(comp)) comp.focused = true;
+                for (const w of [40, 60, 80, 120] as const) {
+                  const lines = comp.render(w);
+                  assert.ok(lines.length <= 16, `SingleQuestion 16x${w} got ${lines.length}`);
+                  assertAllLinesFit(lines, w, `v060-single@16x${w}`);
+                }
+                comp.handleInput?.("9"); // out-of-range digit ignored
+                comp.handleInput?.("2"); // 1-keystroke pick & submit
+              });
+            },
+          },
+        } as unknown as ExtensionContext,
+        singleSpec,
+      );
+      assert.deepEqual(res, { cancelled: false, answer: "single", isCustom: false });
+    }
+
+    // 2. SingleQuestionComponent: pressing '3' ("Custom answer…") enters custom input mode where digits type normally
+    {
+      const mockTui = createMockTUI(20, 80);
+      let sawCursorInCustom = false;
+      const res = await ui.askQuestion(
+        {
+          mode: "tui",
+          hasUI: true,
+          ui: {
+            theme,
+            notify() {},
+            async custom<T>(
+              factory: (
+                t: TUI,
+                th: Theme,
+                kb: unknown,
+                done: (r: T) => void,
+              ) => Component & { dispose?(): void },
+            ): Promise<T> {
+              return new Promise<T>((resolve) => {
+                const comp = factory(mockTui.tui, theme, {}, resolve);
+                if (isFocusable(comp)) comp.focused = true;
+                comp.handleInput?.("3"); // slot #3 = Custom answer…
+                sawCursorInCustom = mockTui.getHardwareCursor();
+                for (const ch of "3 parallel waves") {
+                  comp.handleInput?.(ch);
+                }
+                comp.handleInput?.("\r");
+              });
+            },
+          },
+        } as unknown as ExtensionContext,
+        singleSpec,
+      );
+      assert.equal(sawCursorInCustom, true);
+      assert.deepEqual(res, {
+        cancelled: false,
+        answer: "3 parallel waves",
+        isCustom: true,
+      });
+    }
+
+    // 3. MultiQuestionComponent: '2' records Q1 & advances to Q2; '3' on Q2 opens custom input; Submit tab ignores 1-9
+    {
+      const shortTui = createMockTUI(16, 80);
+      const questions: QuestionSpec[] = [
+        {
+          id: "mode",
+          question: "Workspace isolation?",
+          options: [
+            { label: "(Recommended) share", value: "share" },
+            { label: "branch", value: "branch" },
+          ],
+          allowCustom: true,
+        },
+        {
+          id: "checks",
+          question: "Verification command?",
+          options: [
+            { label: "npm test", value: "npm test" },
+            { label: "npm run typecheck", value: "npm run typecheck" },
+          ],
+          allowCustom: true,
+        },
+      ];
+
+      let sawQ2AfterDigit = false;
+      let sawReviewTabAfterCustom = false;
+      const multiRes = await ui.askQuestionnaire(
+        {
+          mode: "tui",
+          hasUI: true,
+          ui: {
+            theme,
+            notify() {},
+            async custom<T>(
+              factory: (
+                t: TUI,
+                th: Theme,
+                kb: unknown,
+                done: (r: T) => void,
+              ) => Component & { dispose?(): void },
+            ): Promise<T> {
+              return new Promise<T>((resolve) => {
+                const comp = factory(shortTui.tui, theme, {}, resolve);
+                if (isFocusable(comp)) comp.focused = true;
+                for (const w of [40, 60, 80, 120] as const) {
+                  const lines = comp.render(w);
+                  assert.ok(lines.length <= 16, `MultiQuestion 16x${w} got ${lines.length}`);
+                  assertAllLinesFit(lines, w, `v060-multi@16x${w}`);
+                }
+
+                // Press '2' on Q1 -> selects "branch" and advances immediately to Q2
+                comp.handleInput?.("2");
+                const q2Plain = stripTerminalSequences(comp.render(80).join("\n"));
+                sawQ2AfterDigit = q2Plain.includes("Verification command?");
+
+                // Press '3' on Q2 -> enters "Custom answer…" slot, digits '1'/'2' stay as text
+                comp.handleInput?.("3");
+                for (const ch of "vitest run 1 2") {
+                  comp.handleInput?.(ch);
+                }
+                comp.handleInput?.("\r"); // saves custom answer & advances to Submit review tab
+
+                const reviewPlain = stripTerminalSequences(comp.render(80).join("\n"));
+                sawReviewTabAfterCustom = reviewPlain.includes("Review Answers (2/2 answered)");
+
+                // Pressing '2' on Submit review tab must NOT submit or corrupt answers
+                comp.handleInput?.("2");
+                comp.handleInput?.("\r"); // confirm Submit all answers
+              });
+            },
+          },
+        } as unknown as ExtensionContext,
+        questions,
+      );
+
+      assert.equal(sawQ2AfterDigit, true);
+      assert.equal(sawReviewTabAfterCustom, true);
+      assert.equal(multiRes.cancelled, false);
+      assert.deepEqual(multiRes.answers, {
+        mode: "branch",
+        checks: "vitest run 1 2",
+      });
+    }
+  });
+
+  it("polishes ConfirmProposalComponent controls hint line and fits 40/60/80/120 cols and 16-row terminals", async () => {
+    const theme = createMockTheme();
+    const shortTui = createMockTUI(16, 80);
+    const ui = createQuestionnaireUI();
+    const plan: ProposedSwarmPlan = {
+      title: "v0.6.0 Polished Confirmation",
+      objective: "Launch cleanly with self-discoverable controls",
+      strategy: "Wave 1 parallel worktrees; Wave 2 independent verification",
+      acceptanceCriteria: "npm run typecheck && npm test",
+      baseBranch: "main",
+      maxConcurrency: 6,
+      validatorEnabled: true,
+      initialMembers: [
+        { name: "author-a", role: "worker", brief: "Slice A", workspace: "share" },
+        { name: "verifier", role: "validator", brief: "Audit A", workspace: "inherit" },
+      ],
+    };
+
+    const outcome = await ui.confirmProposal(
+      {
+        mode: "tui",
+        hasUI: true,
+        ui: {
+          theme,
+          notify() {},
+          async custom<T>(
+            factory: (
+              t: TUI,
+              th: Theme,
+              kb: unknown,
+              done: (r: T) => void,
+            ) => Component & { dispose?(): void },
+          ): Promise<T> {
+            return new Promise<T>((resolve) => {
+              const comp = factory(shortTui.tui, theme, {}, resolve);
+              if (isFocusable(comp)) comp.focused = true;
+
+              for (const w of [80, 120] as const) {
+                const plain = stripTerminalSequences(comp.render(w).join("\n"));
+                assert.match(plain, /\[Enter\] Confirm & Launch/);
+                assert.match(plain, /\[m\] Models/);
+                assert.match(plain, /\[v\] Validator/);
+                assert.match(plain, /\[(\+\/-)\] Concurrency/);
+                assert.match(plain, /\[c\] Note/);
+              }
+
+              for (const w of [40, 60, 80, 120] as const) {
+                const lines = comp.render(w);
+                assert.ok(
+                  lines.length <= 16,
+                  `ConfirmProposal at 16x${w} exceeded 16 rows: ${lines.length}`,
+                );
+                assertAllLinesFit(lines, w, `v060-confirm@16x${w}`);
+              }
+
+              // Open [c] Note at 16 rows -> verify still <= 16 rows across all widths
+              comp.handleInput?.("c");
+              for (const ch of "Ship cleanly") comp.handleInput?.(ch);
+              for (const w of [40, 60, 80, 120] as const) {
+                const linesEditing = comp.render(w);
+                assert.ok(linesEditing.length <= 16);
+                assertAllLinesFit(linesEditing, w, `v060-confirm-note@16x${w}`);
+              }
+              comp.handleInput?.("\r"); // save note
+              for (const w of [40, 60, 80, 120] as const) {
+                const linesSaved = comp.render(w);
+                assert.ok(linesSaved.length <= 16);
+                assertAllLinesFit(linesSaved, w, `v060-confirm-saved@16x${w}`);
+              }
+
+              comp.handleInput?.("\r"); // Confirm & Launch
+            });
+          },
+        },
+      } as unknown as ExtensionContext,
+      plan,
+    );
+
+    assert.equal(outcome.action, "confirm");
+    assert.equal(outcome.feedback, "Ship cleanly");
   });
 });

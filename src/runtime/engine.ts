@@ -330,6 +330,10 @@ interface LiveMember {
   currentActivity?: string;
   /** Latest swarm_wait request captured during current turn. */
   lastWaitRequest?: { since: number; mentionsOnly: boolean };
+  /** Member's lastPostSeq when its current/latest turn started (detects silent turns without post_message). */
+  turnStartPostSeq?: number;
+  /** Normalized summary from the most recent silent turn (cleared once delivered in an all_idle digest or on next turn). */
+  lastSilentSummary?: string;
   /** Pending deferred model switch scheduled while working (self-switch or human role propagation). */
   pendingSelfModelSwitch?: {
     model: string;
@@ -733,6 +737,7 @@ export class SwarmEngine implements ISwarmEngine {
       live.switchingModel = false;
       live.pendingSelfModelSwitch = undefined;
       live.lastWaitRequest = undefined;
+      live.lastSilentSummary = undefined;
       live.currentActivity = undefined;
       live.pendingWakes.length = 0;
       live.releaseSlot?.();
@@ -1252,6 +1257,8 @@ export class SwarmEngine implements ISwarmEngine {
           lastMessages: seedMessages ? sanitizeForkSeedMessages(seedMessages) : [],
           logTail: [],
           currentActivity: "queued to start",
+          turnStartPostSeq: 0,
+          lastSilentSummary: undefined,
           retryCount: 0,
           priorHandlesTokens: 0,
           priorHandlesBreakdown: undefined,
@@ -1456,6 +1463,12 @@ export class SwarmEngine implements ISwarmEngine {
     // Keep cached run synced with new boardHead / sender lastPostSeq
     const latestRun = await this.store.loadRun(run.id);
     this.setCachedRun(latestRun);
+    if (senderMember) {
+      const senderLive = this.liveMembers.get(senderMember.name);
+      if (senderLive) {
+        senderLive.lastSilentSummary = undefined;
+      }
+    }
 
     this.emitEngineEvent("board_posted", `Posted #${normalizedMsg.seq} from ${normalizedMsg.from}`, {
       memberName: senderMember?.name,
@@ -1561,14 +1574,16 @@ export class SwarmEngine implements ISwarmEngine {
 
     if (activeMembers.length === 0) {
       const digest = this.buildAllIdleDigest();
+      const silentDigest = this.consumeSilentTurnSummaries();
+      const fullDigest = [digest, silentDigest].filter(Boolean).join(" ");
       return {
         parked: false,
         wokeBy: "all_idle",
         messages: mergedUnread,
         head: latestHead,
         activeMembers: [],
-        summary: digest
-          ? `All swarm members are idle (0 working/pending); nothing left to wait for. ${digest}`
+        summary: fullDigest
+          ? `All swarm members are idle (0 working/pending); nothing left to wait for. ${fullDigest}`
           : "All swarm members are idle (0 working/pending); nothing left to wait for.",
       };
     }
@@ -1708,12 +1723,14 @@ export class SwarmEngine implements ISwarmEngine {
     const activeNames = this.getWorkingOrPendingMemberNames();
     if (activeNames.length === 0) {
       const digest = this.buildAllIdleDigest();
+      const silentDigest = this.consumeSilentTurnSummaries();
+      const fullDigest = [digest, silentDigest].filter(Boolean).join(" ");
       return {
         wokeBy: "all_idle",
         messages: mergedUnread,
         head: latestHead,
-        summary: digest
-          ? `All swarm members are idle (0 working/pending); nothing left to wait for. ${digest}`
+        summary: fullDigest
+          ? `All swarm members are idle (0 working/pending); nothing left to wait for. ${fullDigest}`
           : "All swarm members are idle (0 working/pending); nothing left to wait for.",
       };
     }
@@ -2057,6 +2074,8 @@ export class SwarmEngine implements ISwarmEngine {
         lastMessages: [],
         logTail: [...member.logTail],
         lastTool: member.lastTool,
+        turnStartPostSeq: member.lastPostSeq ?? 0,
+        lastSilentSummary: undefined,
         retryCount: 0,
         priorHandlesTokens: member.tokens,
         priorHandlesBreakdown: member.tokenBreakdown ? { ...member.tokenBreakdown } : undefined,
@@ -2493,6 +2512,7 @@ export class SwarmEngine implements ISwarmEngine {
       live.switchingModel = false;
       live.pendingSelfModelSwitch = undefined;
       live.lastWaitRequest = undefined;
+      live.lastSilentSummary = undefined;
       live.parkedMentionsOnly = true;
       live.currentActivity = undefined;
       live.pendingWakes.length = 0;
@@ -2589,6 +2609,7 @@ export class SwarmEngine implements ISwarmEngine {
       live.switchingModel = false;
       live.pendingSelfModelSwitch = undefined;
       live.lastWaitRequest = undefined;
+      live.lastSilentSummary = undefined;
       live.parkedMentionsOnly = true;
       live.currentActivity = undefined;
       live.pendingWakes.length = 0;
@@ -2732,14 +2753,23 @@ export class SwarmEngine implements ISwarmEngine {
     ) {
       const rebaseRes = await this.worktree.autoRebase(member.cwd, run.baseBranch);
       if (rebaseRes.status === "conflict") {
+        const conflictFiles = rebaseRes.conflictFiles ?? [];
+        const fileList = conflictFiles.length > 0 ? conflictFiles.join(", ") : "";
+        const baseMsg = rebaseRes.message
+          ? rebaseRes.message.replace(/\.?\s*$/, ".") +
+            (fileList && !conflictFiles.every((f) => rebaseRes.message!.includes(f))
+              ? ` Conflicting files: ${fileList}.`
+              : "")
+          : `Rebase conflict while rebasing "${member.branch}" onto "${run.baseBranch}".${fileList ? ` Conflicting files: ${fileList}.` : ""}`;
+        const recovery = ` Recovery: wake @${member.name} via post_message to rebase onto "${run.baseBranch}", resolve ${fileList || "the conflicts"} in "${member.cwd}", and re-commit cleanly before retrying merge.`;
         throw new SwarmProtocolError(
           "REBASE_CONFLICT",
-          rebaseRes.message ??
-            `Rebase conflict while rebasing "${member.branch}" onto "${run.baseBranch}".`,
+          `${baseMsg}${recovery}`,
           {
             memberName: member.name,
             branch: member.branch,
-            conflictFiles: rebaseRes.conflictFiles ?? [],
+            worktreePath: member.cwd,
+            conflictFiles,
           },
         );
       }
@@ -2763,6 +2793,29 @@ export class SwarmEngine implements ISwarmEngine {
     });
 
     const actor = options?.callerName ?? ORCHESTRATOR_NAME;
+    if (mergeRes.strategy === "noop") {
+      const noopSummary = `Merge noop for @${member.name} (${member.branch}): @${member.name} had 0 commits ahead of ${run.baseBranch}.`;
+      await this.store.appendEvent({
+        runId: run.id,
+        type: "member_merged",
+        actor,
+        memberName: member.name,
+        agentId: member.agentId,
+        summary: noopSummary,
+        data: {
+          strategy: "noop",
+          commitsAhead: 0,
+          baseBranch: run.baseBranch,
+          ...(member.branch ? { branch: member.branch } : {}),
+        },
+      });
+      await this.refreshCache();
+      this.emitEngineEvent("snapshot_changed", noopSummary, {
+        memberName: member.name,
+      });
+      return mergeRes;
+    }
+
     const updated = await this.store.updateMember(run.id, member.name, {
       mergedCommitSha: mergeRes.mergedCommitSha,
       actor,
@@ -3213,6 +3266,8 @@ export class SwarmEngine implements ISwarmEngine {
         member.workspace !== "inherit" ||
         path.resolve(member.cwd) !== path.resolve(this.store.projectRoot);
       live.lastWaitRequest = undefined;
+      live.turnStartPostSeq = member.lastPostSeq ?? 0;
+      live.lastSilentSummary = undefined;
 
       const handle = await this.transport.spawnMember({
         agentId: member.agentId,
@@ -3487,6 +3542,8 @@ export class SwarmEngine implements ISwarmEngine {
 
       live.turnActive = true;
       live.lastWaitRequest = undefined;
+      live.turnStartPostSeq = member.lastPostSeq ?? 0;
+      live.lastSilentSummary = undefined;
       let turnPromise: Promise<AgentTurnResult>;
       try {
         turnPromise = live.handle.wake(prompt);
@@ -3650,6 +3707,8 @@ export class SwarmEngine implements ISwarmEngine {
         member.workspace !== "inherit" ||
         path.resolve(member.cwd) !== path.resolve(this.store.projectRoot);
       live.lastWaitRequest = undefined;
+      live.turnStartPostSeq = member.lastPostSeq ?? 0;
+      live.lastSilentSummary = undefined;
 
       let handle: PersistentAgentHandle;
       try {
@@ -3953,8 +4012,22 @@ export class SwarmEngine implements ISwarmEngine {
     }
 
     if (result.outcome === "stopped") {
-      if (result.stopReason !== "aborted") {
+      const isNormalStop = result.stopReason !== "aborted";
+      if (isNormalStop) {
         this.rateLimitBreaker.recordSuccess();
+      }
+      const normalizedSummary = (result.summary ?? "").replace(/\s+/g, " ").trim();
+      const parkedOn = isNormalStop
+        ? normalizedSummary.slice(0, 240) || "stopped"
+        : result.summary?.slice(0, 120) || "stopped";
+      if (
+        isNormalStop &&
+        live &&
+        !waitReq &&
+        (member.lastPostSeq ?? 0) <= (live.turnStartPostSeq ?? 0) &&
+        normalizedSummary.length > 0
+      ) {
+        live.lastSilentSummary = normalizedSummary.slice(0, 300);
       }
       const updated = await this.store.updateMember(runId, memberName, {
         state: "stopped",
@@ -3964,11 +4037,11 @@ export class SwarmEngine implements ISwarmEngine {
         cost: nextCost,
         model: effectiveModel,
         thinkingLevel: effectiveThinking ?? null,
-        ...(result.stopReason !== "aborted"
+        ...(isNormalStop
           ? { lastReadSeq: nextLastReadSeq }
           : {}),
         currentActivity: null,
-        parkedOn: result.summary?.slice(0, 120) || "stopped",
+        parkedOn,
         ...persistedTelemetry,
       });
       await this.refreshCache(updated);
@@ -4073,9 +4146,19 @@ export class SwarmEngine implements ISwarmEngine {
 
     if (result.outcome === "waiting") {
       this.rateLimitBreaker.recordSuccess();
+      const normalizedSummary = (result.summary ?? "").replace(/\s+/g, " ").trim();
       const parkedOn = waitReq
         ? `waiting (since #${waitReq.since})`
-        : result.summary.replace(/\s+/g, " ").trim().slice(0, 120) || "waiting";
+        : normalizedSummary.slice(0, 240) || "waiting";
+      if (
+        result.stopReason !== "aborted" &&
+        live &&
+        !waitReq &&
+        (member.lastPostSeq ?? 0) <= (live.turnStartPostSeq ?? 0) &&
+        normalizedSummary.length > 0
+      ) {
+        live.lastSilentSummary = normalizedSummary.slice(0, 300);
+      }
 
       const updated = await this.store.updateMember(runId, memberName, {
         state: "waiting",
@@ -4735,6 +4818,8 @@ export class SwarmEngine implements ISwarmEngine {
         lastMessages: [],
         logTail: [...member.logTail],
         lastTool: member.lastTool,
+        turnStartPostSeq: member.lastPostSeq ?? 0,
+        lastSilentSummary: undefined,
         retryCount: 0,
         priorHandlesTokens: member.tokens,
         priorHandlesBreakdown: member.tokenBreakdown ? { ...member.tokenBreakdown } : undefined,
@@ -4862,20 +4947,51 @@ export class SwarmEngine implements ISwarmEngine {
     return `Roster: ${entries.join("; ")}.`;
   }
 
+  private consumeSilentTurnSummaries(): string {
+    const run = this.cachedRun;
+    if (!run) {
+      return "";
+    }
+    const entries: string[] = [];
+    for (const name of run.memberOrder) {
+      const m = getOwnMember(run, name);
+      if (!m || m.state === "killed" || m.state === "working") {
+        continue;
+      }
+      const live = this.liveMembers.get(m.name);
+      if (!live?.lastSilentSummary) {
+        continue;
+      }
+      if ((m.lastPostSeq ?? 0) <= (live.turnStartPostSeq ?? 0)) {
+        entries.push(`@${m.name}: "${live.lastSilentSummary}"`);
+      }
+      live.lastSilentSummary = undefined;
+    }
+    if (entries.length === 0) {
+      return "";
+    }
+    return `Unposted turn summaries: ${entries.join("; ")}`;
+  }
+
   private checkAllIdleAndNotifyWaiters(): void {
     const active = this.getWorkingOrPendingMemberNames();
     if (active.length > 0) {
       return;
     }
+    if (!this.orchestratorWait && this.boardWaiters.size === 0) {
+      return;
+    }
     const digest = this.buildAllIdleDigest();
+    const silentDigest = this.consumeSilentTurnSummaries();
+    const fullDigest = [digest, silentDigest].filter(Boolean).join(" ");
     if (this.orchestratorWait) {
       const since = this.orchestratorWait.since;
       this.clearOrchestratorWait();
       const unread = this.getCachedMessagesSince(since);
       this.emitEngineEvent(
         "wakeup_needed",
-        digest
-          ? `All active swarm members have finished and parked (all_idle). ${digest}`
+        fullDigest
+          ? `All active swarm members have finished and parked (all_idle). ${fullDigest}`
           : "All active swarm members have finished and parked (all_idle).",
         unread.length > 0 ? { messages: unread } : undefined,
       );
@@ -4884,8 +5000,8 @@ export class SwarmEngine implements ISwarmEngine {
       return;
     }
     const head = this.cachedRun?.boardHead ?? 0;
-    const waiterSummary = digest
-      ? `All active swarm members have finished and parked in waiting/stopped state. ${digest}`
+    const waiterSummary = fullDigest
+      ? `All active swarm members have finished and parked in waiting/stopped state. ${fullDigest}`
       : "All active swarm members have finished and parked in waiting/stopped state.";
     for (const waiter of Array.from(this.boardWaiters)) {
       waiter.resolve({
@@ -5773,28 +5889,31 @@ export class SwarmEngine implements ISwarmEngine {
   }
 
   private buildRosterStatus(run: SwarmRunState): SwarmRosterStatus {
-    const members: SwarmMemberStatusEntry[] = run.memberOrder
-      .map((n) => getOwnMember(run, n))
-      .filter((m): m is SwarmMemberRecord => Boolean(m))
-      .map((m) => ({
-        name: m.name,
-        role: m.role,
-        state: m.state,
-        parentName: m.parentName,
-        groupPrefix: m.groupPrefix,
-        workspace: m.workspace,
-        branch: m.branch,
-        model: m.model,
-        thinkingLevel: m.thinkingLevel,
-        channels: m.channels,
-        parkedOn: m.parkedOn,
-        currentActivity: m.currentActivity,
-        lastPostSeq: m.lastPostSeq,
-        lastPostTime: m.lastPostTime,
-        turns: m.turns,
-        tokens: m.tokens,
-        cost: m.cost,
-      }));
+    const members: Array<SwarmMemberStatusEntry & { cwd?: string; mergedCommitSha?: string }> =
+      run.memberOrder
+        .map((n) => getOwnMember(run, n))
+        .filter((m): m is SwarmMemberRecord => Boolean(m))
+        .map((m) => ({
+          name: m.name,
+          role: m.role,
+          state: m.state,
+          parentName: m.parentName,
+          groupPrefix: m.groupPrefix,
+          workspace: m.workspace,
+          cwd: m.cwd,
+          branch: m.branch,
+          ...(m.mergedCommitSha ? { mergedCommitSha: m.mergedCommitSha } : {}),
+          model: m.model,
+          thinkingLevel: m.thinkingLevel,
+          channels: m.channels,
+          parkedOn: m.parkedOn,
+          currentActivity: m.currentActivity,
+          lastPostSeq: m.lastPostSeq,
+          lastPostTime: m.lastPostTime,
+          turns: m.turns,
+          tokens: m.tokens,
+          cost: m.cost,
+        }));
     return {
       runId: run.id,
       title: run.title,
@@ -5992,6 +6111,7 @@ export class SwarmEngine implements ISwarmEngine {
         live.switchingModel = false;
         live.pendingSelfModelSwitch = undefined;
         live.lastWaitRequest = undefined;
+        live.lastSilentSummary = undefined;
         live.parkedMentionsOnly = true;
         live.currentActivity = undefined;
         live.pendingWakes.length = 0;

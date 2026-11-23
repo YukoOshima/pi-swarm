@@ -2475,3 +2475,556 @@ describe("v0.3.7 drafting regression fixes", () => {
     assert.match(res2.content[0].text, /Validator: anthropic\/claude-opus-4-6 \(xhigh\)/);
   });
 });
+
+// ============================================================================
+// 9. v0.6.0 Drafting Prompts & Polished TUI Tool Renderers Tests
+// ============================================================================
+
+describe("v0.6.0 drafting prompts & polished TUI renderers", () => {
+  it("enforces recon-first, 0-or-1-to-3 '(Recommended)' Q&A, right-sizing, disjoint file ownership waves, and runnable verification commands across prompts", () => {
+    const kickoff = buildDraftingKickoffPrompt("Refactor auth & session store", "swarm", {
+      baseBranch: "main",
+      maxConcurrency: 4,
+      validatorEnabled: true,
+    });
+    // Recon FIRST
+    assert.match(kickoff, /FIRST/);
+    assert.match(kickoff, /package\.json/);
+    // Lean Q&A: 0 questions when clear, at most 1–3 high-leverage trade-off questions, (Recommended) first
+    assert.match(kickoff, /0 questions/);
+    assert.match(kickoff, /1–3 high-leverage trade-off questions/);
+    assert.match(kickoff, /\(Recommended\)/);
+    assert.match(kickoff, /Never interrogate the user on obvious details/i);
+    // Right-sizing
+    assert.match(kickoff, /1–2 workers/);
+    assert.match(kickoff, /Disjoint parallel `share` authors \+ independent `validator`/);
+    // Wave-by-wave disjoint file/directory ownership & runnable verification commands
+    assert.match(
+      kickoff,
+      /wave-by-wave execution with disjoint file\/directory ownership boundaries/,
+    );
+    assert.match(kickoff, /exact runnable verification commands/);
+
+    const overlay = buildDraftingSystemOverlay({
+      version: 2,
+      mode: "swarm",
+      seed: "Refactor auth",
+      startedAt: new Date().toISOString(),
+      validatorEnabled: true,
+      maxConcurrency: 4,
+      baseBranch: "main",
+    });
+    assert.match(overlay, /FIRST/);
+    assert.match(overlay, /0 questions/);
+    assert.match(overlay, /1–3 high-leverage trade-off questions/);
+    assert.match(overlay, /\(Recommended\)/);
+    assert.match(overlay, /1–2 workers/);
+    assert.match(overlay, /disjoint file\/directory ownership boundaries/);
+    assert.match(overlay, /exact runnable verification commands/);
+
+    const direct = buildDirectPlanPrompt("Fix parser edge case", "main", {
+      maxConcurrency: 3,
+      validatorEnabled: true,
+    });
+    assert.match(direct, /Skip interactive Q&A/);
+    assert.match(direct, /FIRST/);
+    assert.match(direct, /1–2 workers/);
+    assert.match(direct, /wave-by-wave execution with disjoint file\/directory ownership boundaries/);
+    assert.match(direct, /exact runnable verification commands/);
+  });
+
+  it("polishes formatProposalTranscriptSummary with member breakdown, launch note, and clean fallback filtering", () => {
+    const summary = formatProposalTranscriptSummary({
+      title: "Multi-Slice Upgrade",
+      objective: "Upgrade drafting & TUI renderers cleanly.",
+      strategy: "Wave 1: disjoint `share` workers per module -> `@verifier` review.",
+      acceptanceCriteria: "`npm run typecheck && npm test` passes 100%.",
+      baseBranch: "main",
+      maxConcurrency: 4,
+      validatorEnabled: true,
+      feedback: "Prioritize narrow 40-col readability",
+      roleModels: {
+        orchestrator: { model: "anthropic/claude-opus-4-6", thinkingLevel: "high" },
+        worker: { model: "anthropic/claude-sonnet-4-5", thinkingLevel: "medium" },
+        validator: { model: "openai/gpt-5", thinkingLevel: "high" },
+        fallbackModels: ["  ", "google/gemini-2.5-pro", ""],
+      },
+      initialMembers: [
+        {
+          name: "draft-dev",
+          role: "worker",
+          workspace: "share",
+          brief: "Own src/drafting/*",
+        },
+        {
+          name: "ui-dev",
+          role: "worker",
+          workspace: "share",
+          brief: "Own src/ui/*",
+        },
+        {
+          name: "verifier",
+          role: "validator",
+          workspace: "inherit",
+          brief: "Audit both branches read-only",
+        },
+      ],
+    });
+
+    assert.match(summary, /> \*\*Launch Note:\*\* Prioritize narrow 40-col readability/);
+    assert.match(summary, /### Dynamic Strategy \(Waves & Disjoint Ownership\)/);
+    assert.match(summary, /### Acceptance Criteria & Verification/);
+    assert.match(
+      summary,
+      /### Initial Members \(3\) — 2 workers · 1 validator · 2 isolated worktrees/,
+    );
+    assert.match(summary, /\*\*Fallbacks:\*\* google\/gemini-2\.5-pro$/m);
+  });
+
+  it("renders sleek collapsed vs expanded views for swarm_question, swarm_questionnaire, and propose_swarm_plan", () => {
+    const harness = new MockPiHarness();
+    const controller = registerDraftingTools(harness.api, {
+      worktree: createMockWorktree(),
+      ui: {
+        askQuestion: async () => ({ cancelled: true, isCustom: false }),
+        askQuestionnaire: async () => ({ cancelled: true, answers: {}, items: [] }),
+        confirmProposal: async () => ({
+          action: "cancel",
+          validatorEnabled: true,
+          maxConcurrency: 3,
+        }),
+      },
+      getSettings: () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        orchestratorModel: "anthropic/claude-opus-4-6",
+        orchestratorThinkingLevel: "high",
+        workerModel: "anthropic/claude-sonnet-4-5",
+        workerThinkingLevel: "medium",
+        validatorModel: "openai/gpt-5",
+        validatorThinkingLevel: "low",
+        fallbackModels: ["google/gemini-2.5-pro"],
+      }),
+      onPlanConfirmed: async (plan) => createMockRun(plan),
+    });
+
+    const theme = createMockTheme();
+    const questionTool = harness.registeredTools.get(SWARM_QUESTION_TOOL);
+    const questionnaireTool = harness.registeredTools.get(SWARM_QUESTIONNAIRE_TOOL);
+    const proposeTool = harness.registeredTools.get(PROPOSE_SWARM_PLAN_TOOL);
+
+    // 1. swarm_question renderCall (collapsed vs expanded) & renderResult
+    const qArgs = {
+      id: "storage_engine",
+      question: "Which state store should we use?",
+      context: "Repo currently bundles better-sqlite3 in package.json.",
+      options: [
+        { label: "(Recommended) SQLite WAL", description: "Zero external services" },
+        { label: "PostgreSQL", description: "Shared cluster" },
+      ],
+      allow_custom: true,
+    };
+    const qCallCollapsed = questionTool
+      .renderCall(qArgs, theme, { expanded: false } as any)
+      .render(120)
+      .join("\n");
+    assert.match(qCallCollapsed, /❓.*swarm_question.*\[storage_engine\].*\(2 options \+ custom\)/);
+    assert.match(qCallCollapsed, /Choices:.*\(Recommended\) SQLite WAL ★ · PostgreSQL/);
+    assert.ok(!qCallCollapsed.includes("Zero external services"));
+
+    const qCallExpanded = questionTool
+      .renderCall(qArgs, theme, { expanded: true } as any)
+      .render(120)
+      .join("\n");
+    assert.match(qCallExpanded, /1\. \(Recommended\) SQLite WAL ★ — Zero external services/);
+    assert.match(qCallExpanded, /2\. PostgreSQL — Shared cluster/);
+
+    const qResCollapsed = questionTool
+      .renderResult(
+        {
+          content: [{ type: "text", text: "Answer: SQLite WAL" }],
+          details: {
+            cancelled: false,
+            id: "storage_engine",
+            question: "Which state store should we use?",
+            answer: "SQLite WAL",
+            isCustom: true,
+          },
+        },
+        { expanded: false, isPartial: false },
+        theme,
+        {} as any,
+      )
+      .render(120)
+      .join("\n");
+    assert.match(qResCollapsed, /✓ \[ANSWERED\] \[storage_engine\] SQLite WAL \(custom\)/);
+
+    const qResExpanded = questionTool
+      .renderResult(
+        {
+          content: [{ type: "text", text: "Answer: SQLite WAL" }],
+          details: {
+            cancelled: false,
+            id: "storage_engine",
+            question: "Which state store should we use?",
+            answer: "SQLite WAL",
+            isCustom: false,
+          },
+        },
+        { expanded: true, isPartial: false },
+        theme,
+        {} as any,
+      )
+      .render(120)
+      .join("\n");
+    assert.match(qResExpanded, /Question: Which state store should we use\?/);
+    assert.match(qResExpanded, /Answer:\s+SQLite WAL/);
+
+    const qResSkipped = questionTool
+      .renderResult(
+        {
+          content: [{ type: "text", text: "Dismissed" }],
+          details: { cancelled: true, id: "q1", question: "Skip?" },
+        },
+        { expanded: false, isPartial: false },
+        theme,
+        {} as any,
+      )
+      .render(120)
+      .join("\n");
+    assert.match(qResSkipped, /○ \[SKIPPED\] Question dismissed by user\./);
+
+    // 2. swarm_questionnaire renderCall & renderResult (collapsed summary vs expanded)
+    const qnArgs = {
+      questions: [
+        {
+          id: "scope",
+          question: "Which modules are in scope?",
+          options: [
+            { label: "(Recommended) Core + UI", description: "Full vertical slice" },
+            { label: "Core only", description: "Minimal backend patch" },
+          ],
+        },
+        {
+          id: "verify",
+          question: "Run integration suite?",
+          options: [{ label: "Yes" }, { label: "Unit only" }],
+          recommended: "Yes",
+        },
+      ],
+    };
+    const qnCallCollapsed = questionnaireTool
+      .renderCall(qnArgs, theme, { expanded: false } as any)
+      .render(120)
+      .join("\n");
+    assert.match(
+      qnCallCollapsed,
+      /📋.*swarm_questionnaire.*\(2 questions · 4 options: scope, verify\)/,
+    );
+    assert.match(qnCallCollapsed, /1\. \[scope\] Which modules are in scope\? \(2 options · ★ Core \+ UI\)/);
+    assert.match(qnCallCollapsed, /2\. \[verify\] Run integration suite\? \(2 options · ★ Yes\)/);
+    assert.ok(!qnCallCollapsed.includes("Full vertical slice"));
+
+    const qnCallExpanded = questionnaireTool
+      .renderCall(qnArgs, theme, { expanded: true } as any)
+      .render(120)
+      .join("\n");
+    assert.match(qnCallExpanded, /Full vertical slice/);
+
+    const qnResPayload = {
+      content: [
+        {
+          type: "text" as const,
+          text: "Questionnaire answers recorded:\n- [scope] Which modules?\n  Answer: Core + UI\n- [verify] Integration?\n  Answer: Custom gate (custom)",
+        },
+      ],
+      details: {
+        cancelled: false,
+        questionCount: 2,
+        answers: {
+          scope: "Core + UI",
+          verify: "Custom gate",
+        },
+        items: [
+          { id: "scope", question: "Which modules?", answer: "Core + UI", isCustom: false },
+          { id: "verify", question: "Integration?", answer: "Custom gate", isCustom: true },
+        ],
+      } satisfies SwarmQuestionnaireToolDetails,
+    };
+    const qnResCollapsed = questionnaireTool
+      .renderResult(qnResPayload, { expanded: false, isPartial: false }, theme, {} as any)
+      .render(120)
+      .join("\n");
+    assert.match(qnResCollapsed, /✓ \[RECORDED\] Recorded 2 questionnaire answer\(s\)\./);
+    assert.match(qnResCollapsed, /• scope: Core \+ UI/);
+    assert.match(qnResCollapsed, /• verify: Custom gate \(custom\)/);
+    assert.match(qnResCollapsed, /\(Ctrl\+O to expand\)/);
+
+    const qnResExpanded = questionnaireTool
+      .renderResult(qnResPayload, { expanded: true, isPartial: false }, theme, {} as any)
+      .render(120)
+      .join("\n");
+    assert.match(qnResExpanded, /✓ \[RECORDED\] Recorded 2\/2 questionnaire answer\(s\)/);
+    assert.match(qnResExpanded, /Questionnaire answers recorded:/);
+
+    // 3. propose_swarm_plan renderCall (mode badge + model pills) & renderResult badges
+    controller.start({
+      mode: "tweak",
+      seed: "Refine active swarm",
+      baseBranch: "main",
+      maxConcurrency: 4,
+      validatorEnabled: true,
+    });
+    const planCallText = proposeTool
+      .renderCall(makeSamplePlanParams(), theme, {} as any)
+      .render(160)
+      .join("\n");
+    assert.match(planCallText, /🗺 Swarm Plan \(propose_swarm_plan\) \[TWEAK\]/);
+    assert.match(
+      planCallText,
+      /Role Models: \[Orch:claude-opus-4-6\(high\) · Work:claude-sonnet-4-5\(medium\) · Val:gpt-5\(low\) · \+1 fb\]/,
+    );
+
+    const confirmedCollapsed = proposeTool
+      .renderResult(
+        {
+          content: [{ type: "text", text: "Full proposal markdown" }],
+          details: {
+            outcome: "confirmed",
+            runId: "run-v060",
+            autoConfirmed: false,
+            plan: {
+              title: "Ship v0.6.0",
+              objective: "Polish drafting",
+              strategy: "Wave 1",
+              acceptanceCriteria: "npm run typecheck",
+              baseBranch: "main",
+              maxConcurrency: 4,
+              validatorEnabled: true,
+              feedback: "Run full integration check before done",
+              initialMembers: [
+                { name: "author", role: "worker", workspace: "share", brief: "Edit slice" },
+              ],
+              roleModels: {
+                orchestrator: { model: "anthropic/claude-opus-4-6", thinkingLevel: "high" },
+                worker: { model: "anthropic/claude-sonnet-4-5", thinkingLevel: "medium" },
+                validator: { model: "openai/gpt-5", thinkingLevel: "low" },
+              },
+            },
+          } satisfies ProposeSwarmPlanToolDetails,
+        },
+        { expanded: false, isPartial: false },
+        theme,
+        {} as any,
+      )
+      .render(160)
+      .join("\n");
+    assert.match(confirmedCollapsed, /✓ \[CONFIRMED\] Swarm Plan confirmed — launched run run-v060/);
+    assert.match(confirmedCollapsed, /branch:main · 1 initial member · \[Orch:claude-opus-4-6\(high\)/);
+    assert.match(confirmedCollapsed, /Note: Run full integration check before done/);
+
+    const validationErrText = proposeTool
+      .renderResult(
+        {
+          isError: true,
+          content: [{ type: "text", text: "[SwarmProtocolError:INVALID_NAME] Bad name" }],
+          details: {
+            outcome: "validation_error",
+            errors: [{ code: "INVALID_NAME", message: "Bad name" }],
+          } satisfies ProposeSwarmPlanToolDetails,
+        },
+        { expanded: false, isPartial: false },
+        theme,
+        {} as any,
+      )
+      .render(120)
+      .join("\n");
+    assert.match(validationErrText, /✗ \[VALIDATION ERROR · 1 issue\]/);
+  });
+
+  it("handles null, undefined, partial, and malformed arguments/results in renderCall & renderResult without throwing", () => {
+    const harness = new MockPiHarness();
+    const { tools } = createDraftingTools(harness.api, {
+      worktree: createMockWorktree(),
+      ui: {
+        askQuestion: async () => ({ cancelled: true, isCustom: false }),
+        askQuestionnaire: async () => ({ cancelled: true, answers: {}, items: [] }),
+        confirmProposal: async () => ({
+          action: "cancel",
+          validatorEnabled: true,
+          maxConcurrency: 3,
+        }),
+      },
+      getSettings: () => ({ ...DEFAULT_SWARM_SETTINGS }),
+      onPlanConfirmed: async (plan) => createMockRun(plan),
+    });
+
+    const theme = createMockTheme();
+    for (const tool of tools) {
+      assert.ok(tool.renderCall, `${tool.name} must define renderCall`);
+      assert.ok(tool.renderResult, `${tool.name} must define renderResult`);
+
+      for (const weirdArgs of [
+        undefined,
+        null,
+        {},
+        { options: [null, 42, {}, "Valid"], questions: [null, "bad", { options: null }] },
+        { initial_members: [null, 123, { channels: [null, 99, "main"] }] },
+      ]) {
+        const comp = tool.renderCall!(weirdArgs as any, theme, undefined as any);
+        assert.ok(Array.isArray(comp.render(80)));
+      }
+
+      for (const weirdResult of [
+        undefined,
+        null,
+        {},
+        { isError: true, content: null, details: null },
+        { content: [{ type: "text", text: "Partial..." }], details: undefined },
+      ]) {
+        const compCollapsed = tool.renderResult!(
+          weirdResult as any,
+          undefined as any,
+          theme,
+          undefined as any,
+        );
+        assert.ok(Array.isArray(compCollapsed.render(80)));
+
+        const compPartial = tool.renderResult!(
+          weirdResult as any,
+          { expanded: false, isPartial: true },
+          theme,
+          undefined as any,
+        );
+        assert.ok(Array.isArray(compPartial.render(80)));
+
+        const compExpanded = tool.renderResult!(
+          weirdResult as any,
+          { expanded: true, isPartial: false },
+          theme,
+          undefined as any,
+        );
+        assert.ok(Array.isArray(compExpanded.render(80)));
+      }
+    }
+  });
+
+  it("renders ✗ [ERROR] when Pi ToolExecutionComponent strips result.isError and passes context.isError: true (or details.error)", () => {
+    const harness = new MockPiHarness();
+    registerDraftingTools(harness.api, {
+      worktree: createMockWorktree(),
+      ui: {
+        askQuestion: async () => ({ cancelled: true, isCustom: false }),
+        askQuestionnaire: async () => ({ cancelled: true, answers: {}, items: [] }),
+        confirmProposal: async () => ({
+          action: "cancel",
+          validatorEnabled: true,
+          maxConcurrency: 3,
+        }),
+      },
+      getSettings: () => ({ ...DEFAULT_SWARM_SETTINGS }),
+      onPlanConfirmed: async (plan) => createMockRun(plan),
+    });
+
+    const theme = createMockTheme();
+    const questionTool = harness.registeredTools.get(SWARM_QUESTION_TOOL);
+    const questionnaireTool = harness.registeredTools.get(SWARM_QUESTIONNAIRE_TOOL);
+    const proposeTool = harness.registeredTools.get(PROPOSE_SWARM_PLAN_TOOL);
+
+    // 1. swarm_question empty-question error (details.cancelled === true, result.isError stripped, context.isError: true)
+    const qEmptyErr = questionTool
+      .renderResult(
+        {
+          content: [{ type: "text", text: "Question text must not be empty." }],
+          details: { cancelled: true, id: "question", question: "" },
+        },
+        { expanded: false, isPartial: false },
+        theme,
+        { isError: true } as any,
+      )
+      .render(120)
+      .join("\n");
+    assert.match(qEmptyErr, /✗ \[ERROR\] Question text must not be empty\./);
+    assert.doesNotMatch(qEmptyErr, /\[SKIPPED\]/);
+
+    // Non-string details.answer falls back cleanly without throwing
+    const qMalformedAnswer = questionTool
+      .renderResult(
+        {
+          content: [{ type: "text", text: "Fallback text" }],
+          details: { cancelled: false, id: "q1", question: "Q?", answer: 12345 as any },
+        },
+        { expanded: false, isPartial: false },
+        theme,
+        { isError: false } as any,
+      )
+      .render(120)
+      .join("\n");
+    assert.match(qMalformedAnswer, /Fallback text/);
+
+    // 2. swarm_questionnaire empty-questions error via context.isError: true AND via details.error alone
+    const qnCtxErr = questionnaireTool
+      .renderResult(
+        {
+          content: [
+            { type: "text", text: "Questionnaire must include at least one question." },
+          ],
+          details: {
+            cancelled: true,
+            questionCount: 0,
+            answers: {},
+            error: "empty_questions",
+          },
+        },
+        { expanded: false, isPartial: false },
+        theme,
+        { isError: true } as any,
+      )
+      .render(120)
+      .join("\n");
+    assert.match(
+      qnCtxErr,
+      /✗ \[ERROR\] Questionnaire must include at least one question\./,
+    );
+    assert.doesNotMatch(qnCtxErr, /\[CANCELLED\]/);
+
+    const qnDetailsErr = questionnaireTool
+      .renderResult(
+        {
+          content: [{ type: "text", text: "Question #1 text must not be empty." }],
+          details: {
+            cancelled: true,
+            questionCount: 1,
+            answers: {},
+            error: "empty_question_text",
+          },
+        },
+        { expanded: false, isPartial: false },
+        theme,
+        {} as any,
+      )
+      .render(120)
+      .join("\n");
+    assert.match(qnDetailsErr, /✗ \[ERROR\] Question #1 text must not be empty\./);
+
+    // 3. Schema/runtime error with details: undefined and context.isError: true across all 3 tools
+    for (const tool of [questionTool, questionnaireTool, proposeTool]) {
+      const schemaErr = tool
+        .renderResult(
+          {
+            content: [{ type: "text", text: "Schema validation failed" }],
+            details: undefined,
+          },
+          { expanded: false, isPartial: false },
+          theme,
+          { isError: true } as any,
+        )
+        .render(120)
+        .join("\n");
+      assert.match(
+        schemaErr,
+        /✗ \[ERROR\] Schema validation failed/,
+        `${tool.name} must render ✗ [ERROR] when context.isError is true`,
+      );
+    }
+  });
+});

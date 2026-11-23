@@ -899,6 +899,13 @@ export function createWorkerGuardExtensionFactory(
   request: SpawnMemberRequest,
   baseBranch?: string,
 ): ExtensionFactory {
+  const isIsolated = request.workspace !== "inherit";
+  const branchLabel =
+    isIsolated && request.branch ? ` on branch "${request.branch}"` : "";
+  const allowedLocationHint = isIsolated
+    ? `Allowed worktree: "${request.cwd}"${branchLabel}. Use paths inside "${request.cwd}" (or relative paths).`
+    : `Allowed working directory: "${request.cwd}". Use paths inside "${request.cwd}" (or relative paths).`;
+
   return (pi) => {
     pi.on("tool_call", (event) => {
       if (isToolCallEventType("write", event) || isToolCallEventType("edit", event)) {
@@ -907,13 +914,13 @@ export function createWorkerGuardExtensionFactory(
         if (rel === null) {
           return {
             block: true,
-            reason: `Path "${rawPath}" escapes worktree root "${request.cwd}".`,
+            reason: `Path "${rawPath}" escapes worktree root "${request.cwd}"${branchLabel}. ${allowedLocationHint}`,
           };
         }
         if (isProtectedSwarmPath(rel)) {
           return {
             block: true,
-            reason: `Workers are forbidden from editing protected path "${rel}" (${SWARM_DIR}/, .swarm/, or .git/).`,
+            reason: `Workers are forbidden from editing protected path "${rel}" (${SWARM_DIR}/, .swarm/, or .git/). ${allowedLocationHint}`,
           };
         }
         return undefined;
@@ -930,7 +937,11 @@ export function createWorkerGuardExtensionFactory(
           request.cwd,
         );
         if (!check.allowed) {
-          return { block: true, reason: check.reason };
+          const baseReason = check.reason ?? "Command is forbidden in worker sessions.";
+          return {
+            block: true,
+            reason: `${baseReason} ${allowedLocationHint}`,
+          };
         }
       }
 

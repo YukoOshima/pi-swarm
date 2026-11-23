@@ -640,6 +640,52 @@ export function formatWorkspaceBadge(
   }
 }
 
+export function formatMergedBadge(
+  mergedCommitSha: string | undefined,
+  theme?: StyleTheme,
+): string {
+  const sha7 = mergedCommitSha
+    ? sanitizePlainText(mergedCommitSha).slice(0, 7)
+    : "";
+  if (!sha7) return "";
+  const raw = `✓ merged (${sha7})`;
+  return theme ? theme.fg("success", raw) : raw;
+}
+
+export function countMergedMembers(run: SwarmRunState): number {
+  let count = 0;
+  for (const member of getOrderedMembers(run)) {
+    if (member.mergedCommitSha && sanitizePlainText(member.mergedCommitSha).length > 0) {
+      count++;
+    }
+  }
+  return count;
+}
+
+export function formatHumanFleetSummary(
+  workingCount: number,
+  waitingCount: number,
+  mergedCount = 0,
+  theme?: StyleTheme,
+): string {
+  const sep = theme ? theme.fg("dim", " · ") : " · ";
+  const workPart = theme
+    ? theme.fg(workingCount > 0 ? "accent" : "muted", `${workingCount} working`)
+    : `${workingCount} working`;
+  const readyPart = theme
+    ? theme.fg("muted", `${waitingCount} ready`)
+    : `${waitingCount} ready`;
+  const parts = [workPart, readyPart];
+  if (mergedCount > 0) {
+    parts.push(
+      theme
+        ? theme.fg("success", `${mergedCount} merged`)
+        : `${mergedCount} merged`,
+    );
+  }
+  return parts.join(sep);
+}
+
 export function formatBoardKindBadge(
   kind: BoardMessageKind,
   theme?: StyleTheme,
@@ -1206,9 +1252,13 @@ export function buildSwarmGraphLines(
     const forkTag = forkTagRaw
       ? ` ${theme ? theme.fg("dim", forkTagRaw) : forkTagRaw}`
       : "";
+    const mergedSha7 = member.mergedCommitSha
+      ? sanitizePlainText(member.mergedCommitSha).slice(0, 7)
+      : "";
+    const mergedRaw = mergedSha7 ? `✓merged(${mergedSha7})` : "";
     const mergedTag =
-      targetWidth >= 64 && member.mergedCommitSha
-        ? ` ${theme ? theme.fg("dim", "✓merged") : "✓merged"}`
+      targetWidth >= 64 && mergedRaw
+        ? ` ${theme ? theme.fg("success", mergedRaw) : mergedRaw}`
         : "";
 
     const row = `${prefix}${connector}${icon} ${nameStr} (${roleStr})${stateTag}${modelPart} ${wsBadge}${forkTag}${mergedTag}`;
