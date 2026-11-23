@@ -483,25 +483,24 @@ export class SwarmBoard implements ISwarmBoard {
 
         if (bytesRead === delta) {
           const appended = parseBoardLines(tailText);
-          const mergedMessages =
-            appended.length > 0
-              ? [...existing.messages, ...appended]
-              : existing.messages;
+          if (appended.length > 0) {
+            existing.messages.push(...appended);
+          }
           const head = Math.max(existing.head, computeHead(appended));
           const endsWithNewline =
             tailText.length === 0
               ? existing.endsWithNewline
               : tailText.endsWith("\n");
-          this.boardCache.set(boardPath, {
+          this.setBoardCacheEntry(boardPath, {
             mtimeMs: st.mtimeMs,
             size: st.size,
             ino: st.ino,
             head,
             endsWithNewline,
-            messages: mergedMessages,
+            messages: existing.messages,
           });
           return {
-            messages: mergedMessages,
+            messages: existing.messages,
             head,
             endsWithNewline,
             size: st.size,
@@ -513,7 +512,7 @@ export class SwarmBoard implements ISwarmBoard {
       const endsWithNewline = raw.length === 0 || raw.endsWith("\n");
       const messages = parseBoardLines(raw);
       const head = computeHead(messages);
-      this.boardCache.set(boardPath, {
+      this.setBoardCacheEntry(boardPath, {
         mtimeMs: st.mtimeMs,
         size: st.size,
         ino: st.ino,
@@ -599,14 +598,14 @@ export class SwarmBoard implements ISwarmBoard {
         const stAfter = await lstat(boardPath);
         const expectedSize = prevSize + Buffer.byteLength(fullPayload, "utf8");
         if (stAfter.size === expectedSize) {
-          const updatedMessages = [...existingMessages, message];
-          this.boardCache.set(boardPath, {
+          existingMessages.push(message);
+          this.setBoardCacheEntry(boardPath, {
             mtimeMs: stAfter.mtimeMs,
             size: stAfter.size,
             ino: stAfter.ino,
             head: message.seq,
             endsWithNewline: true,
-            messages: updatedMessages,
+            messages: existingMessages,
           });
         } else {
           this.boardCache.delete(boardPath);
@@ -618,12 +617,28 @@ export class SwarmBoard implements ISwarmBoard {
     });
   }
 
+  private setBoardCacheEntry(
+    boardPath: string,
+    entry: BoardCacheEntry,
+  ): void {
+    if (this.boardCache.has(boardPath)) {
+      this.boardCache.delete(boardPath);
+    } else if (this.boardCache.size >= 32) {
+      const oldest = this.boardCache.keys().next().value;
+      if (oldest !== undefined) {
+        this.boardCache.delete(oldest);
+      }
+    }
+    this.boardCache.set(boardPath, entry);
+  }
+
   async read(
     runId: string,
     options?: ReadBoardOptions,
   ): Promise<ReadBoardResult> {
-    const all = await this.readAllMessages(runId);
-    const head = computeHead(all);
+    const boardPath = this.getBoardPath(runId);
+    const { messages: cachedMessages, head } = await this.loadCachedByPath(boardPath);
+    const all = [...cachedMessages];
 
     let scoped = all;
 

@@ -188,6 +188,12 @@ type RoleThinkingKey =
   | "workerThinkingLevel"
   | "validatorThinkingLevel";
 
+const ROLE_PAIR_KEYS: ReadonlyArray<readonly [RoleModelKey, RoleThinkingKey]> = [
+  ["orchestratorModel", "orchestratorThinkingLevel"],
+  ["workerModel", "workerThinkingLevel"],
+  ["validatorModel", "validatorThinkingLevel"],
+];
+
 function sanitizeOptionalModel(
   raw: Record<string, unknown>,
   key: RoleModelKey,
@@ -202,7 +208,11 @@ function sanitizeOptionalModel(
   }
   if (typeof value === "string") {
     const trimmed = value.trim();
-    return trimmed.length > 0 ? trimmed : undefined;
+    if (trimmed.length === 0) {
+      return undefined;
+    }
+    const parsed = parseModelSpec(trimmed);
+    return parsed.model.length > 0 ? parsed.model : undefined;
   }
   return fallback;
 }
@@ -210,20 +220,28 @@ function sanitizeOptionalModel(
 function sanitizeOptionalThinking(
   raw: Record<string, unknown>,
   key: RoleThinkingKey,
+  modelKey: RoleModelKey,
   fallback: ThinkingLevel | undefined,
 ): ThinkingLevel | undefined {
-  if (!(key in raw)) {
+  if (key in raw) {
+    const value = raw[key];
+    if (value === null || value === "") {
+      return undefined;
+    }
+    if (
+      typeof value === "string" &&
+      VALID_THINKING_LEVELS.has(value.trim().toLowerCase() as ThinkingLevel)
+    ) {
+      return value.trim().toLowerCase() as ThinkingLevel;
+    }
     return fallback;
   }
-  const value = raw[key];
-  if (value === null || value === "") {
-    return undefined;
-  }
-  if (
-    typeof value === "string" &&
-    VALID_THINKING_LEVELS.has(value as ThinkingLevel)
-  ) {
-    return value as ThinkingLevel;
+  const rawModel = raw[modelKey];
+  if (typeof rawModel === "string" && rawModel.trim().length > 0) {
+    const parsed = parseModelSpec(rawModel);
+    if (parsed.thinkingLevel !== undefined) {
+      return parsed.thinkingLevel;
+    }
   }
   return fallback;
 }
@@ -247,9 +265,16 @@ function sanitizeFallbackModels(
   for (const entry of value) {
     if (typeof entry !== "string") continue;
     const trimmed = entry.trim();
-    if (trimmed.length === 0 || seen.has(trimmed)) continue;
-    seen.add(trimmed);
-    cleaned.push(trimmed);
+    if (trimmed.length === 0) continue;
+    const parsed = parseModelSpec(trimmed);
+    if (!parsed.model) continue;
+    const canonical = parsed.thinkingLevel
+      ? `${parsed.model}:${parsed.thinkingLevel}`
+      : parsed.model;
+    const dedupKey = parsed.model.toLowerCase();
+    if (seen.has(dedupKey)) continue;
+    seen.add(dedupKey);
+    cleaned.push(canonical);
   }
   return cleaned;
 }
@@ -303,12 +328,14 @@ export function sanitizeSwarmSettings(
     orchestratorThinkingLevel: sanitizeOptionalThinking(
       input,
       "orchestratorThinkingLevel",
+      "orchestratorModel",
       base.orchestratorThinkingLevel,
     ),
     workerModel: sanitizeOptionalModel(input, "workerModel", base.workerModel),
     workerThinkingLevel: sanitizeOptionalThinking(
       input,
       "workerThinkingLevel",
+      "workerModel",
       base.workerThinkingLevel,
     ),
     validatorModel: sanitizeOptionalModel(
@@ -319,6 +346,7 @@ export function sanitizeSwarmSettings(
     validatorThinkingLevel: sanitizeOptionalThinking(
       input,
       "validatorThinkingLevel",
+      "validatorModel",
       base.validatorThinkingLevel,
     ),
     fallbackModels: sanitizeFallbackModels(input, base.fallbackModels),
@@ -487,40 +515,35 @@ export function sanitizeSettingsPatch(
     patch.autoTeardownOnComplete = input.autoTeardownOnComplete;
   }
 
-  for (const key of [
-    "orchestratorModel",
-    "workerModel",
-    "validatorModel",
-  ] as const) {
-    if (key in input) {
-      const model = sanitizeOptionalModel(input, key, undefined);
-      const rawVal = input[key];
+  for (const [modelKey, thinkingKey] of ROLE_PAIR_KEYS) {
+    if (modelKey in input) {
+      const model = sanitizeOptionalModel(input, modelKey, undefined);
+      const rawVal = input[modelKey];
       if (
         model !== undefined ||
         rawVal === null ||
         rawVal === undefined ||
         (typeof rawVal === "string" && rawVal.trim() === "")
       ) {
-        patch[key] = model;
+        patch[modelKey] = model;
+      }
+      if (!(thinkingKey in input) && typeof rawVal === "string" && rawVal.trim()) {
+        const parsed = parseModelSpec(rawVal);
+        if (parsed.thinkingLevel !== undefined) {
+          patch[thinkingKey] = parsed.thinkingLevel;
+        }
       }
     }
-  }
-
-  for (const key of [
-    "orchestratorThinkingLevel",
-    "workerThinkingLevel",
-    "validatorThinkingLevel",
-  ] as const) {
-    if (key in input) {
-      const level = sanitizeOptionalThinking(input, key, undefined);
-      const rawVal = input[key];
+    if (thinkingKey in input) {
+      const level = sanitizeOptionalThinking(input, thinkingKey, modelKey, undefined);
+      const rawVal = input[thinkingKey];
       if (
         level !== undefined ||
         rawVal === null ||
         rawVal === undefined ||
         rawVal === ""
       ) {
-        patch[key] = level;
+        patch[thinkingKey] = level;
       }
     }
   }

@@ -50,6 +50,19 @@ const THINKING_LEVEL_VALUES = [
 ] as const;
 
 const MEMBER_ROLES = ["worker", "validator"] as const;
+
+const MEMBER_SWARM_ACTIONS = [
+  "status",
+  "models",
+  "add",
+  "model",
+  "steer",
+  "stop",
+  "kill",
+  "channel",
+] as const;
+
+const MEMBER_CHANNEL_ACTIONS = ["list", "join", "leave"] as const;
 const WORKSPACE_MODES = ["inherit", "share", "branch"] as const;
 
 const BOARD_MESSAGE_KINDS = [
@@ -517,11 +530,11 @@ export function createSwarmTools(deps: SwarmToolDeps): ToolDefinition[] {
           }
 
           case "model": {
-            const model = params.model?.trim() ?? "";
-            if (!model) {
+            const rawModel = params.model?.trim() ?? "";
+            if (!rawModel && !params.thinking_level) {
               throw new SwarmProtocolError(
                 "INVALID_INPUT",
-                'model is required for swarm{action:"model"}.',
+                'Specify "model" and/or "thinking_level" for swarm{action:"model"}.',
               );
             }
             const targetName = params.name?.trim().replace(/^@/, "");
@@ -530,12 +543,17 @@ export function createSwarmTools(deps: SwarmToolDeps): ToolDefinition[] {
               targetName.toLowerCase() === ORCHESTRATOR_NAME ||
               targetName.toLowerCase() === "coordinator";
             if (isOrchestratorTarget && deps.onOrchestratorModelSwitch) {
+              const snapshot = deps.engine.getSnapshot();
+              const effectiveOrchModel =
+                rawModel ||
+                snapshot.roleModels.orchestrator?.model?.trim() ||
+                "";
               const res = await deps.onOrchestratorModelSwitch(
-                model,
+                effectiveOrchModel,
                 params.thinking_level,
                 params.reason,
               );
-              const resolvedModel = res?.model ?? model;
+              const resolvedModel = res?.model ?? (effectiveOrchModel || "host-default");
               const resolvedThinking = res?.thinkingLevel ?? params.thinking_level;
               return okResult(
                 `Switched orchestrator model -> ${resolvedModel}${resolvedThinking ? ` (${resolvedThinking})` : ""}.`,
@@ -544,7 +562,7 @@ export function createSwarmTools(deps: SwarmToolDeps): ToolDefinition[] {
             }
             const res = await deps.engine.switchModel({
               targetName,
-              model,
+              ...(rawModel ? { model: rawModel } : {}),
               thinkingLevel: params.thinking_level,
               reason: params.reason,
               callerName,
@@ -1084,9 +1102,9 @@ export function createMemberScopedTools(
     promptSnippet:
       "Inspect swarm status/models, manage your own helpers (add/model/steer/stop/kill), or join/leave channels.",
     parameters: Type.Object({
-      action: stringEnum(SWARM_ACTIONS, {
+      action: stringEnum(MEMBER_SWARM_ACTIONS, {
         description:
-          'Allowed member actions: "status" | "models" | "add" | "model" | "steer" | "stop" | "kill" | "channel". ("title", "merge", and "done" are orchestrator-only.)',
+          'Allowed member actions: "status" | "models" | "add" | "model" | "steer" | "stop" | "kill" | "channel".',
       }),
       name: Type.Optional(
         Type.String({
@@ -1148,7 +1166,7 @@ export function createMemberScopedTools(
         Type.Boolean({ description: 'For "models": list every available model.' }),
       ),
       op: Type.Optional(
-        stringEnum(SWARM_CHANNEL_ACTIONS, {
+        stringEnum(MEMBER_CHANNEL_ACTIONS, {
           description: 'Channel op ("list" | "join" | "leave").',
         }),
       ),
@@ -1166,7 +1184,7 @@ export function createMemberScopedTools(
     }),
     async execute(_toolCallId, params) {
       return runToolSafe(async () => {
-        switch (params.action) {
+        switch (params.action as string) {
           case "title":
           case "merge":
           case "done":
@@ -1216,16 +1234,16 @@ export function createMemberScopedTools(
           }
 
           case "model": {
-            const model = params.model?.trim() ?? "";
-            if (!model) {
+            const rawModel = params.model?.trim() ?? "";
+            if (!rawModel && !params.thinking_level) {
               throw new SwarmProtocolError(
                 "INVALID_INPUT",
-                'model is required for swarm{action:"model"}.',
+                'Specify "model" and/or "thinking_level" for swarm{action:"model"}.',
               );
             }
             const res = await bridge.switchModel(
               params.name?.trim().replace(/^@/, "") || member.name,
-              model,
+              rawModel,
               params.thinking_level,
               params.reason,
             );

@@ -144,6 +144,8 @@ export interface SwarmMemberRecord {
   channels: string[];
   model?: string;
   thinkingLevel?: ThinkingLevel;
+  /** True when explicitly pinned via per-member override or targeted switchModel; false/undefined tracks role default. */
+  modelExplicit?: boolean;
   lastReadSeq: number;
   lastPostSeq?: number;
   lastPostTime?: string;
@@ -327,6 +329,7 @@ export interface ProposedSwarmPlan {
   validatorEnabled: boolean;
   initialMembers?: InitialMemberProposal[];
   roleModels?: SwarmRoleModels;
+  feedback?: string;
 }
 
 export type SwarmDraftMode = "swarm" | "tweak";
@@ -536,6 +539,7 @@ export interface RegisterMemberInput {
   state?: SwarmMemberState;
   model?: string;
   thinkingLevel?: ThinkingLevel;
+  modelExplicit?: boolean;
   lastReadSeq?: number;
   createdAt?: string;
 }
@@ -549,6 +553,7 @@ export interface MemberUpdateInput {
   channels?: string[];
   model?: string;
   thinkingLevel?: ThinkingLevel | null;
+  modelExplicit?: boolean;
   lastReadSeq?: number;
   lastPostSeq?: number;
   lastPostTime?: string;
@@ -968,6 +973,7 @@ export interface SpawnMemberRequest {
   isIsolatedWorktree?: boolean;
   parentName: string;
   brief: string;
+  channels?: string[];
   systemPrompt: string;
   initialPrompt: string;
   keepWarm: boolean;
@@ -1050,6 +1056,10 @@ export interface SwitchModelOptions {
   autoResume?: boolean;
   /** When true for orchestrator/human callers, defer switching a working member until its current turn finishes. */
   deferIfWorking?: boolean;
+  /** Suppress individual `[model]` board.jsonl notices (used during role-wide propagation). */
+  silentBoardNotice?: boolean;
+  /** True when invoked from propagateRoleModel so members remain role-tracking (`modelExplicit: false`). */
+  fromRolePropagation?: boolean;
   callerName?: string;
   callerRole?: CallerRole;
   hostContext?: ExtensionContext;
@@ -1060,6 +1070,8 @@ export interface PropagateRoleModelOptions {
   model?: string;
   thinkingLevel?: ThinkingLevel;
   previousModel?: string;
+  /** True when clearing role back to full host Inherit (apply to future members only). */
+  clearToInherit?: boolean;
   hostContext?: ExtensionContext;
 }
 

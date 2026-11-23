@@ -43,6 +43,7 @@ import {
   type SwarmSettings,
   type TokenUsage,
 } from "../types.js";
+import { parseModelSpec } from "../store/settings.js";
 import { isRateLimitOrTransientError, parseRetryAfterMs } from "./rate-limit.js";
 import { createMemberScopedTools } from "./swarm-tools.js";
 
@@ -74,8 +75,15 @@ export function resolveRoleModel(
     defaultThinking = settings.validatorThinkingLevel;
   }
 
-  const effectiveModel = override?.trim() || defaultModel?.trim() || undefined;
-  const effectiveThinking = thinkingOverride ?? defaultThinking;
+  const parsedOverride = override?.trim() ? parseModelSpec(override.trim()) : undefined;
+  const parsedDefault = defaultModel?.trim() ? parseModelSpec(defaultModel.trim()) : undefined;
+
+  const effectiveModel = parsedOverride?.model || parsedDefault?.model || undefined;
+  const effectiveThinking =
+    thinkingOverride ??
+    parsedOverride?.thinkingLevel ??
+    defaultThinking ??
+    parsedDefault?.thinkingLevel;
   return {
     model: effectiveModel,
     thinkingLevel: effectiveThinking,
@@ -133,11 +141,6 @@ export function isProtectedSwarmPath(relPath: string): boolean {
     return false;
   }
   return PROTECTED_PREFIXES.some((prefix) => norm === prefix || norm.startsWith(`${prefix}/`));
-}
-
-function pathTargetsProtectedDir(rawPath: string): boolean {
-  const posix = rawPath.replace(/\\/g, "/").trim();
-  return /(?:^|\/)(?:\.pi\/swarm|\.swarm|\.git)(?:\/|$)/.test(posix);
 }
 
 function globToRegExp(pattern: string): RegExp {
@@ -232,13 +235,15 @@ export interface CommandGuardResult {
 
 const MUTATING_REDIRECTION_RE = /(?<![=\->&])(?:[0-9]?>{1,2}|&>|<>)\s*(?!\/dev\/null\b|&\d\b)\S/;
 
+const CMD_PREFIX_RE = /(?:^|(?:[;&|\r\n"']|`|\$\(|\b(?:xargs|env|command|sudo)\s+)\s*)(?:\(\s*)*/.source;
+
 const VALIDATOR_FORBIDDEN_PATTERNS: ReadonlyArray<{ pattern: RegExp; reason: string }> = [
   {
     pattern: MUTATING_REDIRECTION_RE,
     reason: "Output redirection to files is blocked in read-only validator sessions.",
   },
   {
-    pattern: /\btee\b/,
+    pattern: new RegExp(`${CMD_PREFIX_RE}tee\\b`),
     reason: "`tee` is blocked in read-only validator sessions.",
   },
   {
@@ -250,12 +255,18 @@ const VALIDATOR_FORBIDDEN_PATTERNS: ReadonlyArray<{ pattern: RegExp; reason: str
     reason: "In-place `perl -i` is blocked in read-only validator sessions.",
   },
   {
-    pattern: /(?:^|(?:[;&|\r\n]|`|\$\()\s*)(?:\(\s*)*(?:rm|rmdir|mv|cp|mkdir|touch|chmod|chown|ln|truncate|dd|install|patch)\b/,
+    pattern: /\bfind\b[^\n;|&]*\s-(?:delete|exec|execdir|ok|okdir|fprint|fprintf|fls)\b/,
+    reason: "Mutating `find` actions (`-delete`, `-exec`, `-fprint`) are blocked in read-only validator sessions.",
+  },
+  {
+    pattern: new RegExp(
+      `${CMD_PREFIX_RE}(?:rm|rmdir|mv|cp|mkdir|touch|chmod|chown|ln|truncate|dd|install|patch)\\b`,
+    ),
     reason: "Filesystem mutation commands are blocked in read-only validator sessions.",
   },
   {
     pattern:
-      /\bgit\b(?:\s+-[^\s]+(?:\s+[^\s]+)?)*\s+(?:add|commit|rm|mv|checkout|switch|reset|rebase|merge|cherry-pick|clean|stash|push|pull|fetch|tag|apply|am|restore|worktree)(?=\s|$|[;&|)\r\n`])/,
+      /\bgit\b(?:\s+-[^\s]+(?:\s+[^\s]+)?)*\s+(?:add|commit|rm|mv|checkout|switch|reset|rebase|merge|cherry-pick|clean|stash|push|pull|fetch|tag|apply|am|restore|worktree)(?=\s|$|[;&|)\r\n`"'])/,
     reason: "Mutating git subcommands are blocked in read-only validator sessions.",
   },
   {
@@ -269,10 +280,6 @@ const VALIDATOR_FORBIDDEN_PATTERNS: ReadonlyArray<{ pattern: RegExp; reason: str
 ];
 
 function maskQuotedShellLiterals(command: string): string {
-  // Preserve shell-eval invocations (`sh -c`, `bash -c`, `eval`, etc.) unmasked so nested mutations stay blocked.
-  if (/(?:^|[;&|\r\n(]\s*|\s)(?:sh|bash|zsh|dash|ksh|fish|eval)\b/.test(command)) {
-    return command;
-  }
   let out = "";
   let i = 0;
   while (i < command.length) {
@@ -340,6 +347,10 @@ function maskQuotedShellLiterals(command: string): string {
     out += ch;
     i += 1;
   }
+  // Preserve shell-eval invocations (`sh -c`, `/bin/bash -c`, `eval`) unmasked when invoked OUTSIDE quotes.
+  if (/(?:^|[;&|\r\n(]\s*|[\s\/])(?:sh|bash|zsh|dash|ksh|fish|eval)\b/.test(out)) {
+    return command;
+  }
   return out;
 }
 
@@ -367,15 +378,31 @@ export function isReadOnlyValidationCommand(command: string): CommandGuardResult
  * Blocks direct mutation of `.pi/swarm/` / `.swarm/` / `.git/` internals and manual
  * `git merge` / `git push` / `git worktree` (and switching to `baseBranch` when isolated).
  */
-export function isForbiddenWorkerBashCommand(command: string, baseBranch = ""): CommandGuardResult {
+export function isForbiddenWorkerBashCommand(
+  command: string,
+  baseBranch = "",
+  worktreePath = "",
+): CommandGuardResult {
   const trimmed = command.trim();
   if (!trimmed) {
     return { allowed: true };
   }
 
+  let pathChecked = trimmed;
+  if (worktreePath.trim()) {
+    const posixWt = path.resolve(worktreePath).replace(/\\/g, "/");
+    pathChecked = pathChecked.split(posixWt).join(".");
+    if (worktreePath !== posixWt) {
+      pathChecked = pathChecked.split(worktreePath).join(".");
+    }
+  }
+  const pathCheckedNoBenignRedir = pathChecked.replace(/(?:\d*>\s*\/dev\/null|\d*>&\d+)/g, "");
+
   if (
-    /(?:^|[\s"'`\/])(?:\.pi\/swarm|\.swarm|\.git)(?:\/|$|\s|["'`])/.test(trimmed) &&
-    /(?:>|>>|\b(?:rm|mv|cp|tee|touch|mkdir|chmod|truncate|sed\s+-i|perl\s+-i|cat\s+<<)\b)/.test(trimmed)
+    /(?:^|[\s"'`\/])(?:\.pi\/swarm|\.swarm|\.git)(?:\/|$|\s|["'`])/.test(pathChecked) &&
+    /(?:>|>>|\b(?:rm|mv|cp|tee|touch|mkdir|chmod|truncate|sed\s+-i|perl\s+-i|cat\s+<<)\b)/.test(
+      pathCheckedNoBenignRedir,
+    )
   ) {
     return {
       allowed: false,
@@ -383,7 +410,8 @@ export function isForbiddenWorkerBashCommand(command: string, baseBranch = ""): 
     };
   }
 
-  if (/\bgit\b(?:\s+-[^\s]+(?:\s+[^\s]+)?)*\s+(?:merge|push|worktree)(?=\s|$|[;&|)\r\n`])/.test(trimmed)) {
+  const masked = maskQuotedShellLiterals(trimmed);
+  if (/\bgit\b(?:\s+-[^\s]+(?:\s+[^\s]+)?)*\s+(?:merge|push|worktree)(?=\s|$|[;&|)\r\n`"'])/.test(masked)) {
     return {
       allowed: false,
       reason:
@@ -396,7 +424,7 @@ export function isForbiddenWorkerBashCommand(command: string, baseBranch = ""): 
     const checkoutBaseRe = new RegExp(
       `\\bgit\\b(?:\\s+-[^\\s]+(?:\\s+[^\\s]+)?)*\\s+(?:checkout|switch)\\s+(?:-f\\s+)?${escapedBase}(?:\\s|$|[;&|])`,
     );
-    if (checkoutBaseRe.test(trimmed)) {
+    if (checkoutBaseRe.test(masked)) {
       return {
         allowed: false,
         reason: `Workers must stay on their worktree branch and must not switch to base branch \`${baseBranch}\`.`,
@@ -692,10 +720,10 @@ export function createWorkerGuardExtensionFactory(
             reason: `Path "${rawPath}" escapes worktree root "${request.cwd}".`,
           };
         }
-        if (isProtectedSwarmPath(rel) || pathTargetsProtectedDir(rawPath)) {
+        if (isProtectedSwarmPath(rel)) {
           return {
             block: true,
-            reason: `Workers are forbidden from editing protected path "${rel ?? rawPath}" (${SWARM_DIR}/, .swarm/, or .git/).`,
+            reason: `Workers are forbidden from editing protected path "${rel}" (${SWARM_DIR}/, .swarm/, or .git/).`,
           };
         }
         return undefined;
@@ -709,6 +737,7 @@ export function createWorkerGuardExtensionFactory(
         const check = isForbiddenWorkerBashCommand(
           event.input.command,
           enforceBaseBranchGuard ? (baseBranch ?? "") : "",
+          request.cwd,
         );
         if (!check.allowed) {
           return { block: true, reason: check.reason };
@@ -894,11 +923,13 @@ export class InProcessPiTransport implements ISwarmTransport {
     if (!trimmed) {
       throw new SwarmProtocolError("MODEL_NOT_FOUND", "Model identifier must be non-empty.");
     }
+    const parsed = parseModelSpec(trimmed);
+    const cliThinking = thinkingLevel ?? parsed.thinkingLevel;
     const agentDir = this.agentDirOverride ?? getAgentDir();
     const runtime = await this.resolveModelRuntime(hostContext, agentDir);
     const cliRes = resolveCliModel({
-      cliModel: trimmed,
-      cliThinking: thinkingLevel,
+      cliModel: parsed.model || trimmed,
+      cliThinking,
       modelRuntime: runtime,
     });
     if (!cliRes.model) {
@@ -908,8 +939,8 @@ export class InProcessPiTransport implements ISwarmTransport {
         { modelOverride: trimmed },
       );
     }
-    const resolvedId = formatModelId(cliRes.model) ?? trimmed;
-    const effectiveThinking = thinkingLevel ?? cliRes.thinkingLevel;
+    const resolvedId = formatModelId(cliRes.model) ?? (parsed.model || trimmed);
+    const effectiveThinking = cliThinking ?? cliRes.thinkingLevel;
     return {
       model: resolvedId,
       ...(effectiveThinking ? { thinkingLevel: effectiveThinking } : {}),
@@ -1058,6 +1089,7 @@ export class InProcessPiTransport implements ISwarmTransport {
       name: request.name,
       role: request.role,
       runId: request.runId,
+      defaultChannel: request.channels?.[0],
       onWaitRecorded: ({ since, mentionsOnly }) => {
         endTurnRequested = true;
         emitTelemetry({
@@ -1209,16 +1241,18 @@ export class InProcessPiTransport implements ISwarmTransport {
           let resolvedThinking = request.thinkingLevel;
 
           if (request.modelOverride?.trim()) {
+            const parsedOverride = parseModelSpec(request.modelOverride.trim());
+            const cliThinking = request.thinkingLevel ?? parsedOverride.thinkingLevel;
             const cliRes = resolveCliModel({
-              cliModel: request.modelOverride.trim(),
-              cliThinking: request.thinkingLevel,
+              cliModel: parsedOverride.model || request.modelOverride.trim(),
+              cliThinking,
               modelRuntime,
             });
             if (cliRes.model) {
               resolvedModel = cliRes.model;
             }
-            if (cliRes.thinkingLevel && !resolvedThinking) {
-              resolvedThinking = cliRes.thinkingLevel;
+            if (!resolvedThinking && (cliThinking ?? cliRes.thinkingLevel)) {
+              resolvedThinking = cliThinking ?? cliRes.thinkingLevel;
             }
           }
 
@@ -1226,14 +1260,30 @@ export class InProcessPiTransport implements ISwarmTransport {
             return makeEarlyAbortResult();
           }
 
-          const resourceLoader = new DefaultResourceLoader({
-            cwd: request.cwd,
-            agentDir,
-            settingsManager,
-            noExtensions: true,
-            appendSystemPrompt: request.systemPrompt ? [request.systemPrompt] : [],
-            extensionFactories: [guardFactory],
-          });
+          const resourceLoader = request.isMonitor
+            ? new DefaultResourceLoader({
+                cwd: request.cwd,
+                agentDir,
+                settingsManager,
+                noExtensions: true,
+                noSkills: true,
+                noContextFiles: true,
+                noThemes: true,
+                noPromptTemplates: true,
+                ...(request.systemPrompt ? { systemPrompt: request.systemPrompt } : {}),
+                appendSystemPrompt: [],
+                extensionFactories: [],
+              })
+            : new DefaultResourceLoader({
+                cwd: request.cwd,
+                agentDir,
+                settingsManager,
+                noExtensions: true,
+                noThemes: true,
+                noPromptTemplates: true,
+                appendSystemPrompt: request.systemPrompt ? [request.systemPrompt] : [],
+                extensionFactories: [guardFactory],
+              });
           await resourceLoader.reload();
 
           if (killed || abortedByCaller) {
@@ -1311,7 +1361,10 @@ export class InProcessPiTransport implements ISwarmTransport {
           }
 
           currentModelId = formatModelId(session.model ?? resolvedModel) ?? currentModelId;
-          currentThinkingLevel = resolvedThinking ?? currentThinkingLevel;
+          currentThinkingLevel =
+            resolvedThinking !== undefined
+              ? (session.thinkingLevel ?? resolvedThinking)
+              : undefined;
 
           unsubscribe = session.subscribe((event: AgentSessionEvent) => {
             switch (event.type) {
@@ -1691,9 +1744,11 @@ export class InProcessPiTransport implements ISwarmTransport {
           throw new SwarmProtocolError("MODEL_NOT_FOUND", "Model identifier must be non-empty.");
         }
 
+        const parsed = parseModelSpec(trimmed);
+        const requestedThinking = thinkingLevel ?? parsed.thinkingLevel;
         const cliRes = resolveCliModel({
-          cliModel: trimmed,
-          cliThinking: thinkingLevel,
+          cliModel: parsed.model || trimmed,
+          cliThinking: requestedThinking,
           modelRuntime: activeRuntime,
         });
         if (!cliRes.model) {
@@ -1704,9 +1759,17 @@ export class InProcessPiTransport implements ISwarmTransport {
           );
         }
 
+        const sameModel = Boolean(
+          activeSession.model &&
+            activeSession.model.provider === cliRes.model.provider &&
+            activeSession.model.id === cliRes.model.id,
+        );
+
         switchingModel = true;
         try {
-          await activeSession.setModel(cliRes.model, { persist: false });
+          if (!sameModel) {
+            await activeSession.setModel(cliRes.model, { persist: false });
+          }
 
           const postSwitchState = getCurrentState();
           if (isKilled() || postSwitchState === "killed" || !session || session !== activeSession) {
@@ -1722,26 +1785,42 @@ export class InProcessPiTransport implements ISwarmTransport {
             );
           }
 
-          const effectiveThinking = thinkingLevel ?? cliRes.thinkingLevel;
-          if (effectiveThinking) {
+          const effectiveThinking = requestedThinking ?? cliRes.thinkingLevel;
+          let appliedThinking: ThinkingLevel | undefined;
+          if (effectiveThinking !== undefined) {
             activeSession.setThinkingLevel(effectiveThinking, { persist: false });
+            appliedThinking = activeSession.thinkingLevel ?? effectiveThinking;
+            currentThinkingLevel = appliedThinking;
+          } else {
+            const sm = activeSession.settingsManager as
+              | {
+                  getModelThinkingLevel?: (provider: string, id: string) => ThinkingLevel | undefined;
+                  getDefaultThinkingLevel?: () => ThinkingLevel | undefined;
+                }
+              | undefined;
+            const fallbackDefault =
+              sm?.getModelThinkingLevel?.(cliRes.model.provider, cliRes.model.id) ??
+              sm?.getDefaultThinkingLevel?.() ??
+              "medium";
+            activeSession.setThinkingLevel(fallbackDefault, { persist: false });
+            appliedThinking = undefined;
+            currentThinkingLevel = undefined;
           }
 
-          const resolvedId = formatModelId(cliRes.model) ?? trimmed;
+          const resolvedId = formatModelId(cliRes.model) ?? (parsed.model || trimmed);
           currentModelId = resolvedId;
-          currentThinkingLevel = effectiveThinking ?? currentThinkingLevel;
 
           emitTelemetry({
             type: "model_switched",
             model: resolvedId,
-            thinkingLevel: currentThinkingLevel,
+            thinkingLevel: appliedThinking,
             activity: `switched model -> ${resolvedId}`,
-            logLine: `model switched -> ${resolvedId}${effectiveThinking ? ` (${effectiveThinking})` : ""}`,
+            logLine: `model switched -> ${resolvedId}${appliedThinking ? ` (${appliedThinking})` : ""}`,
           });
 
           return {
             model: resolvedId,
-            thinkingLevel: effectiveThinking,
+            thinkingLevel: appliedThinking,
           };
         } finally {
           switchingModel = false;

@@ -23,6 +23,7 @@ import {
   buildSwarmGraphLines,
   fitLine,
   formatBoardKindBadge,
+  formatBoardTargets,
   formatCost,
   formatDuration,
   formatElapsedSince,
@@ -32,6 +33,9 @@ import {
   formatRunStatusBadge,
   formatTokens,
   formatWorkspaceBadge,
+  getOrderedMembers,
+  isEscapeKey,
+  isKeyReleaseSafe,
   joinColumns,
   memberStateIcon,
   renderBox,
@@ -71,6 +75,7 @@ export interface SwarmWidgetOptions {
 export interface SwarmShortcutCallbacks {
   isModalOpen: () => boolean;
   isExpanded: () => boolean;
+  isHostStreaming?: () => boolean;
   onToggleExpand: () => void;
   onCollapse: () => void;
   onOpenMissionControl?: () => void;
@@ -115,24 +120,6 @@ export function isModalOpen(state: Pick<SwarmWidgetState, "modalDepth">): boolea
 // ============================================================================
 // Internal Snapshot & Formatting Helpers
 // ============================================================================
-
-function getOrderedMembers(run: SwarmRunState): SwarmMemberRecord[] {
-  const seen = new Set<string>();
-  const out: SwarmMemberRecord[] = [];
-  for (const name of run.memberOrder) {
-    const member = run.members[name];
-    if (member) {
-      seen.add(name);
-      out.push(member);
-    }
-  }
-  for (const member of Object.values(run.members)) {
-    if (!seen.has(member.name)) {
-      out.push(member);
-    }
-  }
-  return out;
-}
 
 function memberStateRank(state: SwarmMemberState): number {
   switch (state) {
@@ -226,20 +213,6 @@ function formatEventClock(timestamp: string): string {
   return timestamp.slice(0, 8);
 }
 
-function formatBoardTargets(msg: Pick<BoardMessage, "mentions" | "channelMentions">): string {
-  const targets: string[] = [];
-  for (const m of msg.mentions) {
-    const clean = sanitizePlainText(m);
-    if (clean) targets.push(clean.startsWith("@") ? clean : `@${clean}`);
-  }
-  for (const ch of msg.channelMentions ?? []) {
-    const clean = sanitizePlainText(ch).replace(/^@#?/, "");
-    if (clean) targets.push(`@#${clean}`);
-  }
-  if (targets.length === 0) return "";
-  return ` -> ${targets.join(", ")}`;
-}
-
 function formatRoleShortBadge(role: SwarmMemberRole, theme?: Theme): string {
   const raw = role === "validator" ? "V" : "W";
   if (!theme) return `[${raw}]`;
@@ -323,7 +296,9 @@ class SwarmDashboardComponent implements Component {
           return;
         }
         this.spinnerFrame = (this.spinnerFrame + 1) % SPINNER_FRAMES.length;
-        this.tui.requestRender();
+        if (!isModalOpen(this.state)) {
+          this.tui.requestRender();
+        }
       }, this.spinnerIntervalMs);
       if (typeof this.spinnerTimer.unref === "function") {
         this.spinnerTimer.unref();
@@ -437,7 +412,6 @@ class SwarmDashboardComponent implements Component {
         {
           maxWidth: Math.max(1, width - 2),
           theme: this.theme,
-          includeThinking: false,
         },
       );
       lines.push(fitLine(`  ${modelsPill}`, width));
@@ -453,7 +427,6 @@ class SwarmDashboardComponent implements Component {
         {
           maxWidth: modelsBudget,
           theme: this.theme,
-          includeThinking: false,
         },
       );
       lines.push(fitLine(joinColumns(`  ${modelsPill}`, shortcutTag, width), width));
@@ -470,7 +443,6 @@ class SwarmDashboardComponent implements Component {
           {
             maxWidth: modelsBudget,
             theme: this.theme,
-            includeThinking: false,
           },
         );
         lines.push(
@@ -487,7 +459,6 @@ class SwarmDashboardComponent implements Component {
           {
             maxWidth: Math.max(1, width - 2),
             theme: this.theme,
-            includeThinking: false,
           },
         );
         lines.push(fitLine(`  ${modelsPill}`, width));
@@ -655,13 +626,14 @@ class SwarmDashboardComponent implements Component {
           key: "model",
           header: "Model",
           minWidth: 10,
-          maxWidth: 20,
+          maxWidth: 24,
           flex: 1,
           priority: 75,
-          render: (m) =>
-            m.model
-              ? this.theme.fg("muted", shortenModelName(m.model, 18))
-              : this.theme.fg("dim", "default"),
+          render: (m) => {
+            if (!m.model) return this.theme.fg("dim", "default");
+            const suffix = m.thinkingLevel ? `:${m.thinkingLevel}` : "";
+            return this.theme.fg("muted", `${shortenModelName(m.model, 16)}${suffix}`);
+          },
         },
         {
           key: "workspace",
@@ -734,7 +706,9 @@ class SwarmDashboardComponent implements Component {
     );
     const footer = this.theme.fg(
       "dim",
-      "Ctrl+Shift+T / Esc collapse · /swarm tasks · /swarm board · /swarm graph",
+      innerWidth >= 82
+        ? "Ctrl+Shift+T / Esc collapse · Ctrl+Shift+M Models · Ctrl+Shift+S UI · /swarm board · /swarm graph"
+        : "Ctrl+Shift+T / Esc collapse · ^M Models · ^S UI · /swarm tasks",
     );
 
     return renderBox(body.slice(0, maxInner), width, {
@@ -1207,6 +1181,10 @@ export function bindSwarmShortcuts(
   }
 
   return ctx.ui.onTerminalInput((data: string) => {
+    if (isKeyReleaseSafe(data)) {
+      return undefined;
+    }
+
     // Strictly never hijack input while any modal/dialog/overlay is open
     if (callbacks.isModalOpen()) {
       return undefined;
@@ -1227,7 +1205,7 @@ export function bindSwarmShortcuts(
       return { consume: true };
     }
 
-    if (matchesKey(data, Key.escape) && callbacks.isExpanded()) {
+    if (isEscapeKey(data) && callbacks.isExpanded() && !callbacks.isHostStreaming?.()) {
       callbacks.onCollapse();
       return { consume: true };
     }

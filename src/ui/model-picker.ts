@@ -2,13 +2,14 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import {
   type Component,
-  decodeKittyPrintable,
   type Focusable,
+  fuzzyMatch,
   Input,
   Key,
   matchesKey,
   type TUI,
 } from "@earendil-works/pi-tui";
+import { parseModelSpec } from "../store/settings.js";
 import type {
   AvailableModelInfo,
   RoleModelOrigin,
@@ -20,8 +21,20 @@ import type {
   SwarmSnapshot,
 } from "../types.js";
 import {
+  computeBoxInnerWidth,
+  decodePrintableInput,
   fitLine,
+  formatElapsedSince,
+  formatOriginBadge,
+  formatRoleModelsLine,
+  formatRunStatusBadge,
+  HardwareCursorController,
+  isBackspaceKey,
+  isEscapeKey,
+  isKeyReleaseSafe,
+  isTabKey,
   joinColumns,
+  normalizeEditorInput,
   renderBox,
   renderHorizontalRule,
   sanitizePlainText,
@@ -92,7 +105,7 @@ export type SwarmHubAction =
   | { kind: "ui" }
   | { kind: "tweak" }
   | { kind: "pause" }
-  | { kind: "resume" }
+  | { kind: "resume"; runId?: string; kickoff?: boolean }
   | { kind: "done" }
   | { kind: "focus"; runId: string }
   | { kind: "settings" }
@@ -196,22 +209,6 @@ const EFFORT_CYCLE: ReadonlyArray<ThinkingLevel | undefined> = [
   "minimal",
 ];
 
-function decodePrintableChar(data: string): string | undefined {
-  const kitty = decodeKittyPrintable(data);
-  if (kitty !== undefined) return kitty;
-  if (data.length === 1) {
-    const code = data.charCodeAt(0);
-    if (code >= 0x20 && code <= 0x7e) return data;
-  }
-  return undefined;
-}
-
-function computeBoxInnerWidth(totalWidth: number): number {
-  const safe = Math.max(20, Math.floor(totalWidth));
-  const padX = safe < 24 ? 0 : 1;
-  return Math.max(8, safe - 2 - padX * 2);
-}
-
 function computeTerminalRows(tui: TUI): number {
   const rows = Number((tui as unknown as { terminal?: { rows?: number } }).terminal?.rows);
   if (Number.isFinite(rows) && rows > 0) {
@@ -234,24 +231,21 @@ function formatContextWindow(tokens?: number): string {
   return String(tokens);
 }
 
-function formatOriginTag(origin?: RoleModelOrigin): string {
-  if (origin === "project") return "[project]";
-  if (origin === "global") return "[global]";
-  return "[session]";
-}
-
 function formatRoleSummaryCell(
   model: string | undefined,
   thinking: ThinkingLevel | undefined,
   hostModel: string | undefined,
   origin: RoleModelOrigin | undefined,
+  theme: Theme,
   compact = false,
 ): string {
   const raw = sanitizePlainText(model ?? "") || sanitizePlainText(hostModel ?? "") || "session default";
   const label = compact ? shortenModelName(raw) : raw;
-  const thinkPart = thinking ? ` · ${thinking}` : "";
-  const origPart = origin ? ` ${formatOriginTag(origin)}` : "";
-  return `${label}${thinkPart}${origPart}`;
+  const styledModel = model ? theme.fg("accent", label) : theme.fg("dim", label);
+  const thinkPart = thinking ? theme.fg("borderAccent", ` · ${thinking}`) : "";
+  const origStr = formatOriginBadge(origin, theme);
+  const origPart = origStr ? ` ${origStr}` : "";
+  return `${styledModel}${thinkPart}${origPart}`;
 }
 
 export function buildRoleModelsFromPickerState(
@@ -286,13 +280,24 @@ export function buildRoleModelsFromPickerState(
   };
 }
 
+function stripThinkingSuffix(raw?: string): string {
+  if (!raw) return "";
+  const parsed = parseModelSpec(raw.trim());
+  return (parsed.model || raw.trim()).toLowerCase();
+}
+
 function matchModelId(a?: string, b?: string): boolean {
   if (!a || !b) return false;
-  return a.trim().toLowerCase() === b.trim().toLowerCase();
+  return stripThinkingSuffix(a) === stripThinkingSuffix(b);
+}
+
+function normalizeSearchToken(s: string): string {
+  return s.toLowerCase().replace(/[._:/-]+/g, "");
 }
 
 type ModelListRow =
   | { kind: "header"; provider: string; selectable: false }
+  | { kind: "hint"; text: string; selectable: false }
   | { kind: "inherit"; label: string; selectable: true }
   | {
       kind: "model";
@@ -305,7 +310,9 @@ type ModelListRow =
 // SwarmModelPickerView (Droid missionModelPicker + Reasoning Effort Picker)
 // ============================================================================
 
-export class SwarmModelPickerView implements Component {
+export class SwarmModelPickerView implements Component, Focusable {
+  readonly capturesViewportInput = true;
+  private _focused = false;
   private readonly mode: "roles" | "member";
   private activeTab: ModelPickerTab;
   private saveScope: ModelSaveScope;
@@ -313,7 +320,8 @@ export class SwarmModelPickerView implements Component {
   private readonly availableModels: AvailableModelInfo[];
   private readonly member?: SwarmMemberRecord;
 
-  private searchQuery = "";
+  private readonly filterInput: Input;
+  private readonly hwCursor = new HardwareCursorController();
   private step: "list" | "effort" = "list";
   private selectedIndex = 0;
   private effortIndex = 5; // default to "high"
@@ -343,11 +351,40 @@ export class SwarmModelPickerView implements Component {
     };
     this.availableModels = [...options.availableModels];
     this.member = options.member;
+    this.filterInput = new Input({
+      prompt: "Filter: ",
+      placeholder: "Type or paste model / provider…",
+      placeholderStyle: (s) => this.theme.fg("dim", s),
+    });
+    this.filterInput.focused = true;
     this.rebuildRows(true);
   }
 
+  get focused(): boolean {
+    return this._focused;
+  }
+
+  set focused(value: boolean) {
+    this._focused = value;
+    this.filterInput.focused = value && this.step === "list";
+    this.hwCursor.sync(this.tui, value && this.step === "list");
+  }
+
+  private get searchQuery(): string {
+    return this.filterInput.getValue();
+  }
+
+  private setSearchQuery(next: string): void {
+    this.filterInput.setValue(next);
+  }
+
   invalidate(): void {
-    // Purely state-driven render
+    this.filterInput.invalidate();
+  }
+
+  dispose(): void {
+    this.filterInput.focused = false;
+    this.hwCursor.restore(this.tui);
   }
 
   getState(): ModelPickerSettingsState {
@@ -408,17 +445,18 @@ export class SwarmModelPickerView implements Component {
     const ensureConfigured = (rawId: string | undefined) => {
       const trimmed = rawId?.trim();
       if (!trimmed) return;
-      const lower = trimmed.toLowerCase();
+      const baseId = parseModelSpec(trimmed).model || trimmed;
+      const lower = baseId.toLowerCase();
       if (seen.has(lower) || seenShort.has(lower)) return;
-      const slash = trimmed.indexOf("/");
-      const provider = slash > 0 ? trimmed.slice(0, slash) : "configured";
-      const id = slash > 0 ? trimmed.slice(slash + 1) : trimmed;
+      const slash = baseId.indexOf("/");
+      const provider = slash > 0 ? baseId.slice(0, slash) : "configured";
+      const id = slash > 0 ? baseId.slice(slash + 1) : baseId;
       seen.add(lower);
       out.push({
         id,
         provider,
-        fullId: trimmed,
-        name: trimmed,
+        fullId: baseId,
+        name: baseId,
       });
     };
 
@@ -436,6 +474,7 @@ export class SwarmModelPickerView implements Component {
 
   private rebuildRows(resetCursor = false): void {
     const query = this.searchQuery.trim().toLowerCase();
+    const normQuery = normalizeSearchToken(query);
     const catalog = this.getMergedCatalog();
     const rows: ModelListRow[] = [];
 
@@ -449,12 +488,28 @@ export class SwarmModelPickerView implements Component {
           selectable: true,
         });
       }
+      if (this.availableModels.length === 0 && !query) {
+        rows.push({
+          kind: "hint",
+          text: "No catalog models discovered — type or paste any provider/model ID above.",
+          selectable: false,
+        });
+      }
     }
 
     const filtered = catalog.filter((m) => {
       if (!query) return true;
       const hay = `${m.fullId} ${m.id} ${m.provider} ${m.name ?? ""}`.toLowerCase();
-      return query.split(/\s+/).every((tok) => hay.includes(tok));
+      if (query.split(/\s+/).every((tok) => hay.includes(tok))) {
+        return true;
+      }
+      if (normQuery) {
+        const normHay = normalizeSearchToken(hay);
+        if (normHay.includes(normQuery)) {
+          return true;
+        }
+      }
+      return fuzzyMatch(query, m.fullId).matches || (m.name ? fuzzyMatch(query, m.name).matches : false);
     });
 
     const byProvider = new Map<string, AvailableModelInfo[]>();
@@ -552,19 +607,6 @@ export class SwarmModelPickerView implements Component {
     return idx >= 0 ? idx : 0;
   }
 
-  private clampSelectedIndex(): void {
-    if (this.rows.length === 0) {
-      this.selectedIndex = 0;
-      return;
-    }
-    const clamped = Math.max(0, Math.min(this.rows.length - 1, this.selectedIndex));
-    if (this.rows[clamped]?.selectable) {
-      this.selectedIndex = clamped;
-      return;
-    }
-    this.selectedIndex = this.findFirstSelectableIndex();
-  }
-
   private moveSelection(delta: number): void {
     if (this.rows.length === 0) return;
     const selectableIndices: number[] = [];
@@ -595,10 +637,13 @@ export class SwarmModelPickerView implements Component {
     const foundIdx = EFFORT_OPTIONS.findIndex((opt) => opt.level === preferredThinking);
     this.effortIndex = foundIdx >= 0 ? foundIdx : 5;
     this.step = "effort";
+    this.filterInput.focused = false;
+    this.hwCursor.sync(this.tui, false);
     this.tui.requestRender();
   }
 
   private closePicker(): void {
+    this.dispose();
     this.options.onClose?.({
       changed: this.changed,
       state: this.state,
@@ -651,6 +696,8 @@ export class SwarmModelPickerView implements Component {
       this.lastAppliedThinking = thinkingLevel;
       this.step = "list";
       this.pendingModel = null;
+      this.filterInput.focused = this._focused;
+      this.hwCursor.sync(this.tui, this._focused);
       this.rebuildRows(false);
     } catch (err) {
       this.feedback = {
@@ -747,13 +794,15 @@ export class SwarmModelPickerView implements Component {
     this.activeTab = PICKER_TABS[nextIdx]!;
     this.step = "list";
     this.pendingModel = null;
-    this.searchQuery = "";
+    this.setSearchQuery("");
+    this.filterInput.focused = this._focused;
+    this.hwCursor.sync(this.tui, this._focused);
     this.rebuildRows(true);
     this.tui.requestRender();
   }
 
   handleInput(data: string): void {
-    if (this.busy) {
+    if (this.busy || isKeyReleaseSafe(data)) {
       return;
     }
 
@@ -763,21 +812,28 @@ export class SwarmModelPickerView implements Component {
     }
 
     if (this.step === "effort") {
-      if (matchesKey(data, Key.escape)) {
+      if (isEscapeKey(data)) {
         this.step = "list";
         this.pendingModel = null;
+        this.filterInput.focused = this._focused;
+        this.hwCursor.sync(this.tui, this._focused);
         this.tui.requestRender();
         return;
       }
 
-      const ch = decodePrintableChar(data);
-      if (matchesKey(data, Key.up) || ch === "k") {
+      const ch = decodePrintableInput(data);
+      if (matchesKey(data, Key.up) || matchesKey(data, Key.shift("tab")) || ch === "k") {
         this.effortIndex =
           (this.effortIndex - 1 + EFFORT_OPTIONS.length) % EFFORT_OPTIONS.length;
         this.tui.requestRender();
         return;
       }
-      if (matchesKey(data, Key.down) || ch === "j") {
+      if (
+        matchesKey(data, Key.down) ||
+        isTabKey(data) ||
+        matchesKey(data, Key.ctrl("e")) ||
+        ch === "j"
+      ) {
         this.effortIndex = (this.effortIndex + 1) % EFFORT_OPTIONS.length;
         this.tui.requestRender();
         return;
@@ -787,7 +843,7 @@ export class SwarmModelPickerView implements Component {
         this.tui.requestRender();
         return;
       }
-      if (matchesKey(data, Key.enter) || matchesKey(data, Key.return)) {
+      if (matchesKey(data, Key.enter)) {
         const chosen = EFFORT_OPTIONS[this.effortIndex];
         const model = this.pendingModel;
         if (!chosen || !model) return;
@@ -802,13 +858,13 @@ export class SwarmModelPickerView implements Component {
     }
 
     // Step 1: Model / Fallback List
-    if (matchesKey(data, Key.escape)) {
+    if (isEscapeKey(data)) {
       this.closePicker();
       return;
     }
 
     if (this.mode === "roles") {
-      if (matchesKey(data, Key.tab)) {
+      if (isTabKey(data)) {
         this.switchTab(1);
         return;
       }
@@ -842,7 +898,7 @@ export class SwarmModelPickerView implements Component {
 
     if (matchesKey(data, Key.ctrl("u"))) {
       if (this.searchQuery.length > 0) {
-        this.searchQuery = "";
+        this.setSearchQuery("");
         this.rebuildRows(true);
         this.tui.requestRender();
       }
@@ -865,15 +921,27 @@ export class SwarmModelPickerView implements Component {
       const row = this.rows[this.selectedIndex];
       const activeModelId =
         targetModel ?? (row?.kind === "model" ? row.info.fullId : undefined);
+      if (this.mode === "member") {
+        const info =
+          row?.kind === "model" && !row.isCustomEntry
+            ? row.info
+            : activeModelId
+              ? this.getMergedCatalog().find((m) => matchModelId(m.fullId, activeModelId) || matchModelId(m.id, activeModelId)) ?? {
+                  id: activeModelId,
+                  provider: activeModelId.includes("/") ? activeModelId.split("/")[0]! : "custom",
+                  fullId: activeModelId,
+                }
+              : undefined;
+        if (info) {
+          this.openEffortStep(info);
+        }
+        return;
+      }
       if (activeModelId) {
         const curThinking = this.getTargetCurrentThinking();
         const curIdx = EFFORT_CYCLE.indexOf(curThinking);
         const nextThinking = EFFORT_CYCLE[(curIdx + 1) % EFFORT_CYCLE.length];
-        if (this.mode === "member") {
-          void this.commitMemberSelection(activeModelId, nextThinking);
-        } else {
-          void this.commitRoleSelection(this.activeTab, activeModelId, nextThinking);
-        }
+        void this.commitRoleSelection(this.activeTab, activeModelId, nextThinking);
       }
       return;
     }
@@ -899,20 +967,11 @@ export class SwarmModelPickerView implements Component {
       return;
     }
 
-    if (matchesKey(data, Key.backspace)) {
-      if (this.searchQuery.length > 0) {
-        this.searchQuery = this.searchQuery.slice(0, -1);
-        this.rebuildRows(false);
-        this.tui.requestRender();
-      }
-      return;
-    }
-
     const row = this.rows[this.selectedIndex];
+    const ch = decodePrintableInput(data);
 
     // Fallbacks reorder shortcuts: Alt+Up / Alt+Down, or `[` / `]` when filter is empty
     if (this.mode === "roles" && this.activeTab === "fallbacks" && row?.kind === "model") {
-      const ch = decodePrintableChar(data);
       const moveUp =
         matchesKey(data, Key.alt("up")) || (this.searchQuery.length === 0 && ch === "[");
       const moveDown =
@@ -938,7 +997,7 @@ export class SwarmModelPickerView implements Component {
       }
     }
 
-    if (matchesKey(data, Key.enter) || matchesKey(data, Key.return)) {
+    if (matchesKey(data, Key.enter)) {
       if (!row || !row.selectable) return;
       if (row.kind === "inherit" && this.mode === "roles" && this.activeTab !== "fallbacks") {
         void this.commitRoleSelection(this.activeTab, undefined, undefined);
@@ -954,19 +1013,28 @@ export class SwarmModelPickerView implements Component {
       }
     }
 
-    if (this.mode === "roles" && this.activeTab === "fallbacks" && data === " ") {
+    if (
+      this.mode === "roles" &&
+      this.activeTab === "fallbacks" &&
+      (matchesKey(data, Key.space) || ch === " ")
+    ) {
       if (row?.kind === "model") {
         this.toggleFallbackRow(row.info);
       }
       return;
     }
 
-    const ch = decodePrintableChar(data);
-    if (ch !== undefined) {
-      this.searchQuery += ch;
-      this.rebuildRows(false);
-      this.tui.requestRender();
+    // Forward typing, bracketed paste, cursor navigation, CJK/IME & Backspace cleanly to Input
+    const before = this.searchQuery;
+    const normalized = isBackspaceKey(data) ? "\x7f" : normalizeEditorInput(data);
+    if (!normalized) {
+      return;
     }
+    this.filterInput.handleInput(normalized);
+    if (this.searchQuery !== before) {
+      this.rebuildRows(false);
+    }
+    this.tui.requestRender();
   }
 
   private toggleFallbackRow(info: AvailableModelInfo): void {
@@ -990,32 +1058,48 @@ export class SwarmModelPickerView implements Component {
   }
 
   render(width: number): string[] {
-    const safeWidth = Math.max(20, Math.floor(width));
+    const safeWidth = Math.max(1, Math.floor(width));
     const innerWidth = computeBoxInnerWidth(safeWidth);
     const maxRows = computeTerminalRows(this.tui);
-    const maxInnerLines = Math.max(8, maxRows - 4);
+    const maxBoxLines = Math.max(10, Math.min(30, Math.floor(maxRows * 0.85)));
+    const maxInnerLines = Math.max(8, maxBoxLines - 2);
     const compact = innerWidth < 68;
+    const ultraCompact = innerWidth < 46;
 
     const body: string[] = [];
 
     if (this.mode === "roles") {
-      // Tab strip + scope badge
+      // Tab strip + scope badge (responsively shortened so all tabs stay visible at 40/60/80 cols)
+      const shortTabLabels: Record<ModelPickerTab, string> = ultraCompact
+        ? { orchestrator: "Orch", worker: "Work", validator: "Val", fallbacks: "FB" }
+        : compact
+          ? { orchestrator: "Orch", worker: "Work", validator: "Val", fallbacks: "Fallbacks" }
+          : TAB_LABELS;
       const tabParts = PICKER_TABS.map((t) => {
-        const lbl = TAB_LABELS[t];
+        const lbl = shortTabLabels[t];
         return t === this.activeTab
           ? this.theme.fg("accent", this.theme.bold(`[${lbl}]`))
-          : this.theme.fg("muted", ` ${lbl} `);
+          : this.theme.fg("muted", compact ? lbl : ` ${lbl} `);
       });
+      const scopeLabel = compact
+        ? this.saveScope === "global"
+          ? "[Global ^S]"
+          : "[Proj ^S]"
+        : this.saveScope === "global"
+          ? "Scope: Global [Ctrl+S]"
+          : "Scope: Project [Ctrl+S]";
       const scopeTag =
         this.saveScope === "global"
-          ? this.theme.fg("accent", "Scope: Global")
-          : this.theme.fg("warning", "Scope: Project");
+          ? this.theme.fg("accent", scopeLabel)
+          : this.theme.fg("warning", scopeLabel);
       body.push(joinColumns(tabParts.join(" "), scopeTag, innerWidth));
 
       // Role description & current summary
-      body.push(
-        fitLine(this.theme.fg("muted", TAB_DESCRIPTIONS[this.activeTab]), innerWidth),
-      );
+      if (!ultraCompact) {
+        body.push(
+          fitLine(this.theme.fg("muted", TAB_DESCRIPTIONS[this.activeTab]), innerWidth),
+        );
+      }
 
       if (this.activeTab === "fallbacks") {
         const fbSummary =
@@ -1031,33 +1115,16 @@ export class SwarmModelPickerView implements Component {
           ),
         );
       } else {
-        const oStr = formatRoleSummaryCell(
-          this.state.settings.orchestratorModel,
-          this.state.settings.orchestratorThinkingLevel,
-          this.state.hostModel,
-          this.state.origins?.orchestrator,
-          true,
+        const summary = formatRoleModelsLine(
+          buildRoleModelsFromPickerState(this.state),
+          this.state.hostModel ?? "default",
+          {
+            maxWidth: innerWidth,
+            theme: this.theme,
+            origins: compact ? undefined : this.state.origins,
+          },
         );
-        const wStr = formatRoleSummaryCell(
-          this.state.settings.workerModel,
-          this.state.settings.workerThinkingLevel,
-          this.state.hostModel,
-          this.state.origins?.worker,
-          true,
-        );
-        const vStr = formatRoleSummaryCell(
-          this.state.settings.validatorModel,
-          this.state.settings.validatorThinkingLevel,
-          this.state.hostModel,
-          this.state.origins?.validator,
-          true,
-        );
-        body.push(
-          fitLine(
-            `${this.theme.fg("muted", "O:")}${oStr} · ${this.theme.fg("muted", "W:")}${wStr} · ${this.theme.fg("muted", "V:")}${vStr}`,
-            innerWidth,
-          ),
-        );
+        body.push(summary);
       }
     } else if (this.member) {
       const curModel = sanitizePlainText(this.lastAppliedModel ?? this.member.model ?? "") || "default";
@@ -1068,15 +1135,17 @@ export class SwarmModelPickerView implements Component {
           innerWidth,
         ),
       );
-      body.push(
-        fitLine(
-          this.theme.fg(
-            "dim",
-            "Preserves 100% conversation history; running members switch at turn end.",
+      if (!ultraCompact) {
+        body.push(
+          fitLine(
+            this.theme.fg(
+              "dim",
+              "Preserves 100% conversation history; running members switch at turn end.",
+            ),
+            innerWidth,
           ),
-          innerWidth,
-        ),
-      );
+        );
+      }
     }
 
     if (this.feedback) {
@@ -1107,30 +1176,33 @@ export class SwarmModelPickerView implements Component {
         effStart = Math.max(0, EFFORT_OPTIONS.length - effortViewport);
       }
       const effEnd = Math.min(EFFORT_OPTIONS.length, effStart + effortViewport);
+      const savedThinking = this.getTargetCurrentThinking();
+      const savedModel = this.getTargetCurrentModel();
+      const editingSameModel =
+        Boolean(savedModel) &&
+        (matchModelId(savedModel, this.pendingModel.fullId) ||
+          matchModelId(savedModel, this.pendingModel.id));
 
       for (let i = effStart; i < effEnd; i++) {
         const opt = EFFORT_OPTIONS[i]!;
         const isSel = i === this.effortIndex;
+        const isCurrent = editingSameModel && opt.level === savedThinking;
         const ptr = isSel ? this.theme.fg("accent", "› ") : "  ";
+        const check = isCurrent ? this.theme.fg("success", "✓ ") : "  ";
         const num = this.theme.fg("muted", `${i + 1}. `);
         const label = isSel
           ? this.theme.fg("accent", this.theme.bold(opt.label))
           : opt.label;
         const badge = opt.recommended ? ` ${this.theme.fg("success", "★")}` : "";
         const desc = compact ? "" : ` — ${this.theme.fg("dim", opt.description)}`;
-        body.push(fitLine(`${ptr}${num}${label}${badge}${desc}`, innerWidth));
+        body.push(fitLine(`${ptr}${check}${num}${label}${badge}${desc}`, innerWidth));
       }
 
       body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
-      body.push(
-        fitLine(
-          this.theme.fg(
-            "dim",
-            "↑/↓ Navigate · 1-8 Jump · Enter Apply & Save · Esc Back to Models",
-          ),
-          innerWidth,
-        ),
-      );
+      const effHint = compact
+        ? "↑↓/1-8 Select · Enter Save · Esc Back"
+        : "↑/↓ Navigate · 1-8 Jump · Enter Apply & Save · Esc Back to Models";
+      body.push(fitLine(this.theme.fg("dim", effHint), innerWidth));
 
       const title =
         this.mode === "member" && this.member
@@ -1142,17 +1214,9 @@ export class SwarmModelPickerView implements Component {
       });
     }
 
-    // Step 1: Search bar + scrollable list
-    const filterDisplay =
-      this.searchQuery.length > 0
-        ? this.searchQuery
-        : this.theme.fg("dim", "Type to filter models…");
-    body.push(
-      fitLine(
-        `${this.theme.fg("muted", "Filter: ")}${filterDisplay}${this.theme.fg("accent", "▏")}`,
-        innerWidth,
-      ),
-    );
+    // Step 1: Search bar (real pi-tui Input with CURSOR_MARKER & bracketed paste) + scrollable list
+    const renderedFilter = this.filterInput.render(innerWidth)[0] ?? "Filter: ";
+    body.push(renderedFilter);
     body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
 
     const footerLinesCount = 2; // rule + key hint
@@ -1181,6 +1245,10 @@ export class SwarmModelPickerView implements Component {
               innerWidth,
             ),
           );
+          continue;
+        }
+        if (row.kind === "hint") {
+          body.push(fitLine(this.theme.fg("dim", `  ${row.text}`), innerWidth));
           continue;
         }
         const isSel = i === this.selectedIndex;
@@ -1267,10 +1335,20 @@ export class SwarmModelPickerView implements Component {
     body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
     const hints =
       this.mode === "member"
-        ? "↑/↓ Select · Enter Choose Effort · Ctrl+E Cycle Effort · Esc Back"
+        ? compact
+          ? "↑↓ Select · Enter Effort · ^E Effort · Esc"
+          : "↑/↓ Select · Enter Effort · Ctrl+E Effort · Esc Back"
         : this.activeTab === "fallbacks"
-          ? "↑/↓ Select · Space/Enter Toggle · [/] Reorder · Ctrl+S Scope · Tab Role · Esc Close"
-          : "↑/↓ Select · Enter Choose Effort · Ctrl+E Cycle · Ctrl+X Inherit · Ctrl+S Scope · Tab Role · Esc Close";
+          ? ultraCompact
+            ? "Space Toggle · [/] · ^S Scope · Tab"
+            : compact
+              ? "Space Toggle · [/] Move · ^S Scope · Tab · Esc"
+              : "↑/↓ Select · Space Toggle · [/] Move · ^S Scope · Tab Role · Esc Close"
+          : ultraCompact
+            ? "Enter Effort · ^E · ^S Scope · Tab"
+            : compact
+              ? "Enter Effort · ^E Effort · ^X Inherit · ^S Scope · Tab"
+              : "↑/↓ Select · Enter Effort · ^E Effort · ^X Inherit · ^S Scope · Tab · Esc";
     body.push(fitLine(this.theme.fg("dim", hints), innerWidth));
 
     const boxTitle =
@@ -1296,14 +1374,20 @@ export async function openSwarmModelPicker(
   if (!ctx.hasUI || ctx.mode !== "tui" || typeof ctx.ui.custom !== "function") {
     return { changed: false, state: options.state };
   }
-  return ctx.ui.custom((tui, theme, _kb, done) => {
-    return new SwarmModelPickerView(tui, theme, {
-      ...options,
-      onClose: (res) => {
-        done(res ?? { changed: false, state: options.state });
-      },
+  let component: SwarmModelPickerView | undefined;
+  try {
+    return await ctx.ui.custom((tui, theme, _kb, done) => {
+      component = new SwarmModelPickerView(tui, theme, {
+        ...options,
+        onClose: (res) => {
+          done(res ?? { changed: false, state: options.state });
+        },
+      });
+      return component;
     });
-  });
+  } finally {
+    component?.dispose();
+  }
 }
 
 // ============================================================================
@@ -1312,6 +1396,7 @@ export async function openSwarmModelPicker(
 
 interface HubMenuItem {
   id:
+    | "resume_unfinished"
     | "draft"
     | "direct"
     | "models"
@@ -1324,19 +1409,23 @@ interface HubMenuItem {
     | "done"
     | "teardown";
   label: string;
+  runId?: string;
 }
 
 export class SwarmHubView implements Component, Focusable {
-  focused = false;
+  readonly capturesViewportInput = true;
+  private _focused = false;
   private state: ModelPickerSettingsState;
   private readonly snapshot: SwarmSnapshot;
   private readonly runs: readonly RunSummary[];
   private readonly goalInput: Input;
+  private readonly hwCursor = new HardwareCursorController();
   private subView: "hub" | "models" | "runs" = "hub";
   private embeddedPicker: SwarmModelPickerView | null = null;
   private selectedIndex = 0;
   private runSelectedIndex = 0;
   private menuItems: HubMenuItem[] = [];
+  private hubFeedback: string | null = null;
 
   constructor(
     private readonly tui: TUI,
@@ -1353,12 +1442,40 @@ export class SwarmHubView implements Component, Focusable {
     };
     this.snapshot = options.snapshot;
     this.runs = options.runs;
-    this.goalInput = new Input();
-    this.goalInput.focused = true;
+    this.goalInput = new Input({
+      prompt: "Goal: ",
+      placeholder: "Type what you want to build…",
+      placeholderStyle: (s) => this.theme.fg("dim", s),
+    });
+    this.goalInput.focused = !this.hasActiveOrPausedRun();
     this.rebuildMenu();
   }
 
+  get focused(): boolean {
+    return this._focused;
+  }
+
+  set focused(value: boolean) {
+    this._focused = value;
+    if (this.embeddedPicker) {
+      this.embeddedPicker.focused = value;
+      this.goalInput.focused = false;
+      this.hwCursor.sync(this.tui, false);
+      return;
+    }
+    const showGoal = value && this.subView === "hub" && !this.hasActiveOrPausedRun();
+    this.goalInput.focused = showGoal;
+    this.hwCursor.sync(this.tui, showGoal);
+  }
+
+  dispose(): void {
+    this.embeddedPicker?.dispose();
+    this.goalInput.focused = false;
+    this.hwCursor.restore(this.tui);
+  }
+
   invalidate(): void {
+    this.goalInput.invalidate();
     this.embeddedPicker?.invalidate();
   }
 
@@ -1367,16 +1484,21 @@ export class SwarmHubView implements Component, Focusable {
     return status === "active" || status === "paused";
   }
 
+  private getResumableUnfinishedRun(): RunSummary | undefined {
+    if (this.snapshot.run) return undefined;
+    return this.runs.find((r) => r.status === "paused" || r.status === "active");
+  }
+
   private rebuildMenu(): void {
     const run = this.snapshot.run;
     const items: HubMenuItem[] = [];
     if (run && this.hasActiveOrPausedRun()) {
       items.push(
         { id: "ui", label: "🖥 Open Mission Control (4-Tab UI)" },
-        { id: "models", label: "🎛 Configure Mission Models & Effort [Ctrl+M]" },
+        { id: "models", label: "🎛 Configure Mission Models & Effort [Alt+M / ^M]" },
         { id: "tweak", label: "✏ Tweak Plan / Add Members" },
         run.status === "paused"
-          ? { id: "resume", label: "▶ Resume Swarm" }
+          ? { id: "resume", label: "▶ Resume & Continue Mission", runId: run.id }
           : { id: "pause", label: "⏸ Pause Swarm" },
         { id: "done", label: "✓ Complete Swarm (/swarm done)" },
         { id: "draft", label: "➕ Start New Swarm…" },
@@ -1392,11 +1514,24 @@ export class SwarmHubView implements Component, Focusable {
         { id: "teardown", label: "🧹 Teardown Clean Worktrees" },
       );
     } else {
+      const unfinished = this.getResumableUnfinishedRun();
+      if (unfinished) {
+        const title = sanitizePlainText(unfinished.title || unfinished.objective || unfinished.id);
+        items.push({
+          id: "resume_unfinished",
+          label: `🔄 Resume Mission: ${title.slice(0, 36)} (${unfinished.id})`,
+          runId: unfinished.id,
+        });
+      }
       items.push(
         { id: "draft", label: "▶ Start Interactive Swarm — clarify & plan" },
         { id: "direct", label: "⚡ Start Direct Swarm — fast-path, skip Q&A" },
-        { id: "models", label: "🎛 Configure Mission Models & Effort [Ctrl+M]" },
+        { id: "models", label: "🎛 Configure Mission Models & Effort [Alt+M / ^M]" },
       );
+      if (run) {
+        items.push({ id: "ui", label: "🖥 Inspect Run (4-Tab UI)" });
+        items.push({ id: "teardown", label: "🧹 Teardown Clean Worktrees" });
+      }
       if (this.runs.length > 0) {
         items.push({
           id: "runs",
@@ -1416,6 +1551,8 @@ export class SwarmHubView implements Component, Focusable {
 
   private openEmbeddedModels(): void {
     this.subView = "models";
+    this.goalInput.focused = false;
+    this.hwCursor.sync(this.tui, false);
     this.embeddedPicker = new SwarmModelPickerView(this.tui, this.theme, {
       mode: "roles",
       initialScope: this.options.initialScope ?? "global",
@@ -1429,19 +1566,38 @@ export class SwarmHubView implements Component, Focusable {
         }
         this.embeddedPicker = null;
         this.subView = "hub";
+        const showGoal = this._focused && !this.hasActiveOrPausedRun();
+        this.goalInput.focused = showGoal;
+        this.hwCursor.sync(this.tui, showGoal);
         this.tui.requestRender();
       },
     });
+    this.embeddedPicker.focused = this._focused;
     this.tui.requestRender();
   }
 
   private triggerMenuItem(item: HubMenuItem): void {
     const goal = this.goalInput.getValue().trim();
     switch (item.id) {
+      case "resume_unfinished":
+        this.dispose();
+        this.options.onComplete({
+          kind: "resume",
+          ...(item.runId ? { runId: item.runId } : {}),
+          kickoff: true,
+        });
+        return;
       case "draft":
+        this.dispose();
         this.options.onComplete({ kind: "draft", goal });
         return;
       case "direct":
+        if (!goal) {
+          this.hubFeedback = "Type a goal in Goal: above first (or choose Interactive Swarm).";
+          this.tui.requestRender();
+          return;
+        }
+        this.dispose();
         this.options.onComplete({ kind: "direct", goal });
         return;
       case "models":
@@ -1450,61 +1606,90 @@ export class SwarmHubView implements Component, Focusable {
       case "runs":
         if (this.runs.length > 0) {
           this.subView = "runs";
+          this.goalInput.focused = false;
+          this.hwCursor.sync(this.tui, false);
           this.runSelectedIndex = 0;
           this.tui.requestRender();
         }
         return;
       case "ui":
+        this.dispose();
         this.options.onComplete({ kind: "ui" });
         return;
       case "tweak":
+        this.dispose();
         this.options.onComplete({ kind: "tweak" });
         return;
       case "pause":
+        this.dispose();
         this.options.onComplete({ kind: "pause" });
         return;
       case "resume":
-        this.options.onComplete({ kind: "resume" });
+        this.dispose();
+        this.options.onComplete({
+          kind: "resume",
+          ...(item.runId ? { runId: item.runId } : {}),
+          kickoff: true,
+        });
         return;
       case "done":
+        this.dispose();
         this.options.onComplete({ kind: "done" });
         return;
       case "settings":
+        this.dispose();
         this.options.onComplete({ kind: "settings" });
         return;
       case "teardown":
+        this.dispose();
         this.options.onComplete({ kind: "teardown" });
         return;
     }
   }
 
   handleInput(data: string): void {
+    if (isKeyReleaseSafe(data)) {
+      return;
+    }
+
     if (this.subView === "models" && this.embeddedPicker) {
       this.embeddedPicker.handleInput(data);
       return;
     }
 
     if (this.subView === "runs") {
-      if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+      const hasDetachRow = Boolean(this.snapshot.activeRunId);
+      const totalRunRows = this.runs.length + (hasDetachRow ? 1 : 0);
+      const ch = decodePrintableInput(data);
+      if (isEscapeKey(data) || matchesKey(data, Key.ctrl("c"))) {
         this.subView = "hub";
+        const showGoal = this._focused && !this.hasActiveOrPausedRun();
+        this.goalInput.focused = showGoal;
+        this.hwCursor.sync(this.tui, showGoal);
         this.tui.requestRender();
         return;
       }
-      if (matchesKey(data, Key.up) || data === "k") {
+      if (matchesKey(data, Key.up) || ch === "k") {
         this.runSelectedIndex =
-          (this.runSelectedIndex - 1 + this.runs.length) % Math.max(1, this.runs.length);
+          (this.runSelectedIndex - 1 + totalRunRows) % Math.max(1, totalRunRows);
         this.tui.requestRender();
         return;
       }
-      if (matchesKey(data, Key.down) || data === "j") {
+      if (matchesKey(data, Key.down) || ch === "j") {
         this.runSelectedIndex =
-          (this.runSelectedIndex + 1) % Math.max(1, this.runs.length);
+          (this.runSelectedIndex + 1) % Math.max(1, totalRunRows);
         this.tui.requestRender();
         return;
       }
-      if (matchesKey(data, Key.enter) || matchesKey(data, Key.return)) {
+      if (matchesKey(data, Key.enter)) {
+        if (hasDetachRow && this.runSelectedIndex === this.runs.length) {
+          this.dispose();
+          this.options.onComplete({ kind: "focus", runId: "none" });
+          return;
+        }
         const chosen = this.runs[this.runSelectedIndex];
         if (chosen) {
+          this.dispose();
           this.options.onComplete({ kind: "focus", runId: chosen.id });
         }
         return;
@@ -1512,21 +1697,43 @@ export class SwarmHubView implements Component, Focusable {
       return;
     }
 
-    if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+    if (isEscapeKey(data) || matchesKey(data, Key.ctrl("c"))) {
+      this.dispose();
       this.options.onComplete({ kind: "cancel" });
       return;
     }
 
-    if (matchesKey(data, Key.enter) || matchesKey(data, Key.return)) {
+    const ch = decodePrintableInput(data);
+
+    // Avoid C0 Ctrl+M == '\r' collision on legacy ANSI terminals while supporting CSI-u Ctrl+M, Alt+M, and `m` when no goal input
+    const isUnambiguousCtrlM =
+      data !== "\r" && data !== "\n" && matchesKey(data, Key.ctrl("m"));
+    if (
+      isUnambiguousCtrlM ||
+      matchesKey(data, Key.alt("m")) ||
+      (this.hasActiveOrPausedRun() && (ch === "m" || ch === "M"))
+    ) {
+      this.openEmbeddedModels();
+      return;
+    }
+
+    if (matchesKey(data, Key.alt("enter")) && !this.hasActiveOrPausedRun()) {
+      const goal = this.goalInput.getValue().trim();
+      if (!goal) {
+        this.hubFeedback = "Type a goal in Goal: above first (or press Enter for Interactive Swarm).";
+        this.tui.requestRender();
+        return;
+      }
+      this.dispose();
+      this.options.onComplete({ kind: "direct", goal });
+      return;
+    }
+
+    if (matchesKey(data, Key.enter)) {
       const item = this.menuItems[this.selectedIndex];
       if (item) {
         this.triggerMenuItem(item);
       }
-      return;
-    }
-
-    if (matchesKey(data, Key.ctrl("m"))) {
-      this.openEmbeddedModels();
       return;
     }
 
@@ -1544,27 +1751,34 @@ export class SwarmHubView implements Component, Focusable {
     }
 
     if (!this.hasActiveOrPausedRun()) {
-      this.goalInput.handleInput(data);
-      this.tui.requestRender();
+      const normalized = isBackspaceKey(data) ? "\x7f" : normalizeEditorInput(data);
+      if (normalized) {
+        this.hubFeedback = null;
+        this.goalInput.handleInput(normalized);
+        this.tui.requestRender();
+      }
       return;
     }
 
     // Number / j / k shortcuts when no idle goal composer is active
-    if (data === "k") {
+    if (ch === "k") {
       this.selectedIndex =
         (this.selectedIndex - 1 + this.menuItems.length) % Math.max(1, this.menuItems.length);
       this.tui.requestRender();
       return;
     }
-    if (data === "j") {
+    if (ch === "j") {
       this.selectedIndex =
         (this.selectedIndex + 1) % Math.max(1, this.menuItems.length);
       this.tui.requestRender();
       return;
     }
-    if (data >= "1" && data <= String(this.menuItems.length)) {
-      this.selectedIndex = Number(data) - 1;
-      this.tui.requestRender();
+    if (ch && ch >= "1" && ch <= "9") {
+      const idx = Number(ch) - 1;
+      if (idx < this.menuItems.length) {
+        this.selectedIndex = idx;
+        this.tui.requestRender();
+      }
     }
   }
 
@@ -1573,12 +1787,16 @@ export class SwarmHubView implements Component, Focusable {
       return this.embeddedPicker.render(width);
     }
 
-    const safeWidth = Math.max(20, Math.floor(width));
+    const safeWidth = Math.max(1, Math.floor(width));
     const innerWidth = computeBoxInnerWidth(safeWidth);
     const compact = innerWidth < 68;
     const body: string[] = [];
 
-    const maxInner = Math.max(8, computeTerminalRows(this.tui) - 4);
+    const maxBoxLines = Math.max(
+      10,
+      Math.min(30, Math.floor(computeTerminalRows(this.tui) * 0.85)),
+    );
+    const maxInner = Math.max(8, maxBoxLines - 2);
     if (this.subView === "runs") {
       body.push(
         fitLine(
@@ -1587,21 +1805,34 @@ export class SwarmHubView implements Component, Focusable {
         ),
       );
       body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
+      const hasDetachRow = Boolean(this.snapshot.activeRunId);
+      const totalRunRows = this.runs.length + (hasDetachRow ? 1 : 0);
       const maxRows = Math.max(2, maxInner - body.length - 2);
       let runStart = Math.max(0, this.runSelectedIndex - Math.floor(maxRows / 2));
-      if (runStart + maxRows > this.runs.length) {
-        runStart = Math.max(0, this.runs.length - maxRows);
+      if (runStart + maxRows > totalRunRows) {
+        runStart = Math.max(0, totalRunRows - maxRows);
       }
-      const runEnd = Math.min(this.runs.length, runStart + maxRows);
+      const runEnd = Math.min(totalRunRows, runStart + maxRows);
       for (let i = runStart; i < runEnd; i++) {
-        const r = this.runs[i]!;
         const isSel = i === this.runSelectedIndex;
         const ptr = isSel ? this.theme.fg("accent", "› ") : "  ";
+        if (hasDetachRow && i === this.runs.length) {
+          const lbl = isSel
+            ? this.theme.fg("warning", this.theme.bold("Detach (unfocus current run)"))
+            : this.theme.fg("muted", "Detach (unfocus current run)");
+          body.push(fitLine(`${ptr}  ${lbl}`, innerWidth));
+          continue;
+        }
+        const r = this.runs[i]!;
         const isCurrent = this.snapshot.activeRunId === r.id;
         const tag = isCurrent ? this.theme.fg("success", "● ") : "  ";
+        const badge = formatRunStatusBadge(r.status, this.theme);
         const title = sanitizePlainText(r.title || r.objective);
-        const label = `${r.id} [${r.status}] ${title}`;
-        const right = `w:${r.workingCount} #${r.boardHead}`;
+        const age = formatElapsedSince(r.updatedAt);
+        const label = `${sanitizePlainText(r.id)} [${badge}] ${title}`;
+        const right = compact
+          ? `${r.workingCount}/${r.memberCount} #${r.boardHead}`
+          : `${r.memberCount}m (${r.workingCount}w) · #${r.boardHead} · ${age}`;
         const styledLeft = isSel
           ? this.theme.fg("accent", this.theme.bold(label))
           : label;
@@ -1620,8 +1851,9 @@ export class SwarmHubView implements Component, Focusable {
       });
     }
 
-    // Active run status card (if present)
+    // Active run status card (if present) or unfinished Mission notice
     const run = this.snapshot.run;
+    const unfinished = this.getResumableUnfinishedRun();
     if (run) {
       const title = sanitizePlainText(run.title || run.objective) || run.id;
       const summary = `${run.id} · ${run.status} · working:${this.snapshot.workingMemberNames.length} waiting:${this.snapshot.waitingMemberNames.length} · board #${this.snapshot.boardHead}`;
@@ -1632,73 +1864,89 @@ export class SwarmHubView implements Component, Focusable {
         ),
       );
       body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
-    }
-
-    // Mission Models Card
-    const oCell = formatRoleSummaryCell(
-      this.state.settings.orchestratorModel,
-      this.state.settings.orchestratorThinkingLevel,
-      this.state.hostModel,
-      this.state.origins?.orchestrator,
-      compact,
-    );
-    const wCell = formatRoleSummaryCell(
-      this.state.settings.workerModel,
-      this.state.settings.workerThinkingLevel,
-      this.state.hostModel,
-      this.state.origins?.worker,
-      compact,
-    );
-    const vCell = formatRoleSummaryCell(
-      this.state.settings.validatorModel,
-      this.state.settings.validatorThinkingLevel,
-      this.state.hostModel,
-      this.state.origins?.validator,
-      compact,
-    );
-
-    body.push(
-      fitLine(
-        `${this.theme.fg("muted", "Orchestrator  ")}${this.theme.fg("accent", oCell)}`,
-        innerWidth,
-      ),
-    );
-    body.push(
-      fitLine(
-        `${this.theme.fg("muted", "Worker        ")}${this.theme.fg("accent", wCell)}`,
-        innerWidth,
-      ),
-    );
-    body.push(
-      fitLine(
-        `${this.theme.fg("muted", "Validator     ")}${this.theme.fg("accent", vCell)}`,
-        innerWidth,
-      ),
-    );
-    if (this.state.settings.fallbackModels.length > 0) {
-      const fbText = this.state.settings.fallbackModels
-        .map((m) => (compact ? shortenModelName(m) : m))
-        .join(", ");
+    } else if (unfinished) {
+      const title = sanitizePlainText(unfinished.title || unfinished.objective || unfinished.id);
+      const badge = formatRunStatusBadge(unfinished.status, this.theme);
       body.push(
         fitLine(
-          `${this.theme.fg("muted", "Fallbacks     ")}${this.theme.fg("dim", fbText)}`,
+          `${this.theme.fg("warning", "Unfinished Mission:")} ${this.theme.bold(title)} [${badge}] ${this.theme.fg("dim", `(${unfinished.id} · #${unfinished.boardHead})`)}`,
           innerWidth,
         ),
       );
+      body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
     }
-    const policyLine = `Validator: ${this.state.settings.validatorEnabled ? "ON" : "OFF"} · Max Concurrency: ${this.state.settings.maxConcurrency}`;
-    body.push(fitLine(this.theme.fg("dim", policyLine), innerWidth));
+
+    // Mission Models Card (collapses cleanly on <= 14-row inner height terminals)
+    if (maxInner <= 14) {
+      body.push(
+        formatRoleModelsLine(
+          buildRoleModelsFromPickerState(this.state),
+          this.state.hostModel ?? "default",
+          {
+            maxWidth: innerWidth,
+            theme: this.theme,
+            origins: compact ? undefined : this.state.origins,
+          },
+        ),
+      );
+    } else {
+      const oCell = formatRoleSummaryCell(
+        this.state.settings.orchestratorModel,
+        this.state.settings.orchestratorThinkingLevel,
+        this.state.hostModel,
+        this.state.origins?.orchestrator,
+        this.theme,
+        compact,
+      );
+      const wCell = formatRoleSummaryCell(
+        this.state.settings.workerModel,
+        this.state.settings.workerThinkingLevel,
+        this.state.hostModel,
+        this.state.origins?.worker,
+        this.theme,
+        compact,
+      );
+      const vCell = formatRoleSummaryCell(
+        this.state.settings.validatorModel,
+        this.state.settings.validatorThinkingLevel,
+        this.state.hostModel,
+        this.state.origins?.validator,
+        this.theme,
+        compact,
+      );
+
+      body.push(
+        fitLine(`${this.theme.fg("muted", "Orchestrator  ")}${oCell}`, innerWidth),
+      );
+      body.push(
+        fitLine(`${this.theme.fg("muted", "Worker        ")}${wCell}`, innerWidth),
+      );
+      body.push(
+        fitLine(`${this.theme.fg("muted", "Validator     ")}${vCell}`, innerWidth),
+      );
+      if (this.state.settings.fallbackModels.length > 0) {
+        const fbText = this.state.settings.fallbackModels
+          .map((m) => (compact ? shortenModelName(m) : m))
+          .join(", ");
+        body.push(
+          fitLine(
+            `${this.theme.fg("muted", "Fallbacks     ")}${this.theme.fg("dim", fbText)}`,
+            innerWidth,
+          ),
+        );
+      }
+      const policyLine = `Validator: ${this.state.settings.validatorEnabled ? "ON" : "OFF"} · Max Concurrency: ${this.state.settings.maxConcurrency}`;
+      body.push(fitLine(this.theme.fg("dim", policyLine), innerWidth));
+    }
 
     if (!this.hasActiveOrPausedRun()) {
       body.push(renderHorizontalRule(innerWidth, "Goal (optional)", this.theme));
-      const inputBudget = Math.max(8, innerWidth - 6);
-      const renderedInput = this.goalInput.render(inputBudget)[0] ?? "";
-      body.push(
-        fitLine(
-          `${this.theme.fg("muted", "Goal: ")}${renderedInput || this.theme.fg("dim", "Type what you want to build…")}`,
-          innerWidth,
-        ),
-      );
+      const renderedInput = this.goalInput.render(innerWidth)[0] ?? "Goal: ";
+      body.push(renderedInput);
+    }
+
+    if (this.hubFeedback) {
+      body.push(fitLine(this.theme.fg("warning", this.hubFeedback), innerWidth));
     }
 
     body.push(renderHorizontalRule(innerWidth, "Actions", this.theme));
@@ -1723,8 +1971,12 @@ export class SwarmHubView implements Component, Focusable {
 
     body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
     const hint = this.hasActiveOrPausedRun()
-      ? "↑/↓/j/k Navigate · Enter Select · Ctrl+M Models · Esc Close"
-      : "Type Goal · ↑/↓ Choose Mode · Enter Launch · Ctrl+M Models · Esc Close";
+      ? compact
+        ? "↑↓/jk Select · Enter · Alt+M/^M Models · Esc"
+        : "↑/↓/j/k Navigate · Enter Select · Alt+M / Ctrl+M Models · Esc Close"
+      : compact
+        ? "Goal · ↑↓ Action · Enter · Alt+Enter Direct · Alt+M/^M"
+        : "Type Goal · ↑/↓ Action · Enter Launch · Alt+Enter Direct · Alt+M / Ctrl+M Models · Esc";
     body.push(fitLine(this.theme.fg("dim", hint), innerWidth));
 
     return renderBox(body.slice(0, maxInner), safeWidth, {
@@ -1741,10 +1993,16 @@ export async function openSwarmHub(
   if (!ctx.hasUI || ctx.mode !== "tui" || typeof ctx.ui.custom !== "function") {
     return { kind: "cancel" };
   }
-  return ctx.ui.custom<SwarmHubAction>((tui, theme, _kb, done) => {
-    return new SwarmHubView(tui, theme, {
-      ...options,
-      onComplete: (action) => done(action),
+  let component: SwarmHubView | undefined;
+  try {
+    return await ctx.ui.custom<SwarmHubAction>((tui, theme, _kb, done) => {
+      component = new SwarmHubView(tui, theme, {
+        ...options,
+        onComplete: (action) => done(action),
+      });
+      return component;
     });
-  });
+  } finally {
+    component?.dispose();
+  }
 }

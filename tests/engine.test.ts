@@ -5656,4 +5656,263 @@ describe("SwarmEngine & Runtime — v0.3.7 Fixes", () => {
       await engine.dispose();
     }
   });
+
+  it("v0.5.0: fixes worker guard absolute worktree paths & quotes, hardens validator bash checks, resets Zombie Effort, deduplicates :thinking 429 fallbacks on cold/warm members, and keeps host-inherited propagation silent", async () => {
+    // 1. Worker guard allows absolute paths inside .pi/swarm/worktrees/... while protecting runs/state.json & outside root
+    {
+      const repoDir = await mkdtemp(path.join(os.tmpdir(), "pi-swarm-v050-guard-"));
+      try {
+        const wtPath = path.join(repoDir, ".pi", "swarm", "worktrees", "run-1", "wt-author");
+        const req: SpawnMemberRequest = {
+          agentId: "author-1",
+          name: "author",
+          role: "worker",
+          runId: "run-1",
+          cwd: wtPath,
+          baseBranch: "main",
+          workspace: "share",
+          parentName: ORCHESTRATOR_NAME,
+          brief: "Implement src/app.ts inside share worktree",
+          systemPrompt: "worker",
+          initialPrompt: "go",
+          keepWarm: true,
+        };
+        let toolCallHandler: ((ev: any) => any) | undefined;
+        createWorkerGuardExtensionFactory(req, "main")({
+          on(ev: string, fn: (event: any) => any) {
+            if (ev === "tool_call") toolCallHandler = fn;
+          },
+        } as any);
+        assert.ok(toolCallHandler);
+
+        assert.equal(
+          toolCallHandler!({
+            toolName: "write",
+            input: { path: path.join(wtPath, "src", "app.ts") },
+          }),
+          undefined,
+          "Worker write inside own .pi/swarm/worktrees/<run>/wt-author must succeed",
+        );
+        assert.equal(
+          toolCallHandler!({
+            toolName: "edit",
+            input: { path: path.join(wtPath, "nested", "mod.ts") },
+          }),
+          undefined,
+          "Worker edit inside own worktree must succeed",
+        );
+        assert.equal(
+          toolCallHandler!({
+            toolName: "write",
+            input: { path: path.join(repoDir, ".pi", "swarm", "runs", "run-1", "state.json") },
+          })?.block,
+          true,
+        );
+        assert.equal(
+          toolCallHandler!({
+            toolName: "write",
+            input: { path: path.join(repoDir, "src", "app.ts") },
+          })?.block,
+          true,
+        );
+
+        // Quoted shell strings containing "git merge" and benign /dev/null redirects are allowed; actual git merge/checkout main are blocked
+        assert.equal(
+          isForbiddenWorkerBashCommand('git commit -m "avoid git merge regression" && npm test 2>/dev/null', "main").allowed,
+          true,
+        );
+        assert.equal(isForbiddenWorkerBashCommand("git merge main", "main").allowed, false);
+        assert.equal(isForbiddenWorkerBashCommand("git checkout main", "main").allowed, false);
+
+        // Validator guard blocks indirect destructors while allowing filenames like src/tee.test.ts
+        assert.equal(isReadOnlyValidationCommand('bash -c "rm -rf src"').allowed, false);
+        assert.equal(isReadOnlyValidationCommand("find . -delete").allowed, false);
+        assert.equal(isReadOnlyValidationCommand("xargs rm").allowed, false);
+        assert.equal(isReadOnlyValidationCommand("echo hi | tee out.txt").allowed, false);
+        assert.equal(isReadOnlyValidationCommand("npx vitest run src/tee.test.ts").allowed, true);
+        assert.equal(isReadOnlyValidationCommand("git diff --stat").allowed, true);
+      } finally {
+        await rm(repoDir, { recursive: true, force: true });
+      }
+    }
+
+    // 2. InProcessPiTransport switchModel resets Zombie Effort back to model/settings default when thinkingLevel is cleared
+    {
+      const tmpRoot = await mkdtemp(path.join(os.tmpdir(), "pi-swarm-v050-effort-"));
+      try {
+        const thinkingCalls: ThinkingLevel[] = [];
+        const modelA = {
+          id: "gpt-5",
+          provider: "openai",
+          name: "GPT-5",
+          reasoning: true,
+        } as unknown as import("@earendil-works/pi-ai").Model<import("@earendil-works/pi-ai").Api>;
+
+        const transport = new InProcessPiTransport({
+          agentDir: tmpRoot,
+          createSession: (async (opts?: { model?: unknown; sessionManager?: SessionManager }) => {
+            let currentThinking: ThinkingLevel =
+              (opts as { thinkingLevel?: ThinkingLevel } | undefined)?.thinkingLevel ??
+              "medium";
+            const fakeSession = {
+              model: opts?.model ?? modelA,
+              get thinkingLevel() {
+                return currentThinking;
+              },
+              settingsManager: {
+                getDefaultThinkingLevel: () => "medium" as ThinkingLevel,
+              },
+              sessionManager: opts?.sessionManager,
+              extensionRunner: { hasHandlers: () => false, emit: async () => {} },
+              bindExtensions: async () => {},
+              subscribe: () => () => {},
+              prompt: async () => {},
+              steer: async () => {},
+              followUp: async () => {},
+              setModel: async () => true,
+              setThinkingLevel: (lvl: ThinkingLevel) => {
+                currentThinking = lvl;
+                thinkingCalls.push(lvl);
+              },
+              abort: async () => {},
+              dispose: () => {},
+              getSessionStats: () => ({
+                tokens: { input: 5, output: 5, cacheRead: 0, cacheWrite: 0, total: 10 },
+                cost: 0.001,
+              }),
+            } as unknown as AgentSession;
+            return { session: fakeSession, extensionsResult: { extensions: [], errors: [], runtime: {} } };
+          }) as unknown as typeof import("@earendil-works/pi-coding-agent").createAgentSession,
+        });
+
+        const handle = await transport.spawnMember({
+          agentId: "eff-1",
+          name: "eff",
+          role: "worker",
+          runId: "run-eff",
+          cwd: tmpRoot,
+          workspace: "inherit",
+          parentName: ORCHESTRATOR_NAME,
+          brief: "Test effort reset",
+          systemPrompt: "sys",
+          initialPrompt: "go",
+          modelOverride: "openai/gpt-5",
+          thinkingLevel: "high",
+          keepWarm: true,
+          hostContext: {
+            modelRegistry: {
+              runtime: {
+                getModels: () => [modelA],
+                hasConfiguredAuth: () => true,
+              },
+            },
+          } as unknown as ExtensionContext,
+        });
+        await waitUntil(() => handle.getState() === "waiting");
+        assert.equal(handle.getThinkingLevel(), "high");
+
+        const switched = await handle.switchModel("openai/gpt-5", undefined);
+        assert.equal(switched.thinkingLevel, undefined);
+        assert.equal(handle.getThinkingLevel(), undefined);
+        assert.equal(thinkingCalls[thinkingCalls.length - 1], "medium");
+        await handle.kill("cleanup");
+      } finally {
+        await rm(tmpRoot, { recursive: true, force: true });
+      }
+    }
+
+    // 3. :thinking 429 fallback skips same failing base model & recovers cold `stopped` (`keepWorkersWarm: false`) member cleanly
+    {
+      const { engine, transport, store } = await createTestHarness({
+        stallWatchdogEnabled: false,
+        keepWorkersWarm: false,
+        workerModel: "openai/gpt-5",
+        fallbackModels: ["openai/gpt-5:low", "google/gemini-2.5-pro:high"],
+        maxRetries: 0,
+        rateLimitBaseBackoffMs: 10,
+        rateLimitMaxBackoffMs: 25,
+      });
+      await store.updateRun("run-dyn", { keepWorkersWarm: false });
+      try {
+        transport.onMember("cold429", async ({ model, thinkingLevel }) => {
+          if (model === "openai/gpt-5") {
+            return {
+              outcome: "rate_limited",
+              error: "HTTP 429 quota exceeded on gpt-5",
+              retryAfterMs: 10,
+            };
+          }
+          return {
+            outcome: "stopped",
+            summary: `Recovered cold turn on ${model}:${thinkingLevel}`,
+          };
+        });
+
+        await engine.addMembers({ name: "cold429", brief: "Survive 429 in cold mode" });
+        await waitUntil(
+          () => engine.getSnapshot().run?.members.cold429?.state === "stopped",
+          3000,
+        );
+
+        const member = engine.getSnapshot().run?.members.cold429;
+        assert.equal(member?.model, "google/gemini-2.5-pro");
+        assert.equal(member?.thinkingLevel, "high");
+        assert.ok(
+          !transport.spawns.some(
+            (s) => s.name === "cold429" && s.modelOverride === "openai/gpt-5" && s.thinkingLevel === "low",
+          ),
+          "429 fallback must skip same base model openai/gpt-5:low and move straight to google/gemini-2.5-pro:high",
+        );
+      } finally {
+        await engine.dispose();
+      }
+    }
+
+    // 4. propagateRoleModel updates members spawned with host-inherited default & stays silent on message board
+    {
+      const { engine, store, transport } = await createTestHarness({
+        stallWatchdogEnabled: false,
+        workerModel: undefined,
+      });
+      try {
+        transport.onMember("host-tracked", async () => ({
+          outcome: "waiting",
+          summary: "Parked cleanly",
+        }));
+        await engine.addMembers({
+          name: "host-tracked",
+          brief: "Spawned while workerModel was host-inherited",
+        });
+        await waitUntil(
+          () => engine.getSnapshot().run?.members["host-tracked"]?.state === "waiting",
+        );
+        assert.notEqual(engine.getSnapshot().run?.members["host-tracked"]?.modelExplicit, true);
+
+        const prop = await engine.propagateRoleModel({
+          role: "worker",
+          model: "anthropic/claude-sonnet-4-5",
+          thinkingLevel: "high",
+          previousModel: undefined,
+        });
+        assert.deepEqual(prop.switched, ["host-tracked"]);
+        assert.equal(
+          transport.handles.get("host-tracked")?.handle.getModel(),
+          "anthropic/claude-sonnet-4-5",
+        );
+        assert.equal(
+          transport.handles.get("host-tracked")?.handle.getThinkingLevel(),
+          "high",
+        );
+
+        const board = await store.readBoard("run-dyn", { limit: 20 });
+        assert.equal(
+          board.messages.some((m) => m.kind === "model_switch"),
+          false,
+          "propagateRoleModel must not spam [model] messages onto the shared board",
+        );
+      } finally {
+        await engine.dispose();
+      }
+    }
+  });
 });

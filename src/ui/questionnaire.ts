@@ -1,7 +1,6 @@
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import {
   type Component,
-  decodeKittyPrintable,
   type Focusable,
   Input,
   Key,
@@ -24,11 +23,18 @@ import type {
   SwarmRoleModels,
 } from "../types.js";
 import {
+  computeBoxInnerWidth,
+  decodePrintableInput,
   fitLine,
   formatMemberRoleBadge,
   formatRoleModelsLine,
   formatWorkspaceBadge,
+  HardwareCursorController,
+  isEscapeKey,
+  isKeyReleaseSafe,
+  isTabKey,
   joinColumns,
+  normalizeEditorInput,
   renderBox,
   renderHorizontalRule,
   sanitizePlainText,
@@ -52,16 +58,6 @@ interface NormalizedOption {
 const CUSTOM_OPTION_LABEL = "Custom answer…";
 const MIN_CONCURRENCY = 1;
 const MAX_CONCURRENCY = SWARM_SETTINGS_BOUNDS.maxConcurrency.max;
-
-function decodePrintableChar(data: string): string | undefined {
-  const kitty = decodeKittyPrintable(data);
-  if (kitty !== undefined) return kitty;
-  if (data.length === 1) {
-    const code = data.charCodeAt(0);
-    if (code >= 0x20 && code <= 0x7e) return data;
-  }
-  return undefined;
-}
 
 function normalizeQuestionOptions(spec: QuestionSpec): {
   options: NormalizedOption[];
@@ -110,11 +106,7 @@ function computeDialogMaxLines(tui: TUI): number {
   return Math.max(10, Math.min(28, rows - 4));
 }
 
-function computeInnerWidth(outerWidth: number): number {
-  if (outerWidth < 12) return Math.max(1, outerWidth);
-  const padX = outerWidth < 24 ? 0 : 1;
-  return Math.max(1, outerWidth - 2 - padX * 2);
-}
+const computeInnerWidth = computeBoxInnerWidth;
 
 function deriveTabLabel(spec: QuestionSpec, index: number): string {
   const idClean = sanitizePlainText(spec.id).replace(/[_-]+/g, " ");
@@ -362,6 +354,7 @@ async function confirmProposalBasic(
 // ============================================================================
 
 class SingleQuestionComponent implements Component, Focusable {
+  readonly capturesViewportInput = true;
   private _focused = false;
   private selectedIndex: number;
   private inCustomInput: boolean;
@@ -480,7 +473,7 @@ class SingleQuestionComponent implements Component, Focusable {
   }
 
   handleInput(data: string): void {
-    if (this.settled) return;
+    if (this.settled || isKeyReleaseSafe(data)) return;
 
     if (this.inCustomInput) {
       if (matchesKey(data, Key.ctrl("c"))) {
@@ -488,17 +481,20 @@ class SingleQuestionComponent implements Component, Focusable {
         return;
       }
       this.validationHint = undefined;
-      this.input.handleInput(data);
-      this.tui.requestRender();
+      const norm = normalizeEditorInput(data);
+      if (norm) {
+        this.input.handleInput(norm);
+        this.tui.requestRender();
+      }
       return;
     }
 
-    if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+    if (isEscapeKey(data) || matchesKey(data, Key.ctrl("c"))) {
       this.finish({ cancelled: true, isCustom: false });
       return;
     }
 
-    const ch = decodePrintableChar(data);
+    const ch = decodePrintableInput(data);
 
     if (matchesKey(data, Key.up) || ch === "k") {
       this.selectedIndex =
@@ -546,14 +542,15 @@ class SingleQuestionComponent implements Component, Focusable {
 
     const body: string[] = [];
 
+    const tightCustom = this.inCustomInput && maxInnerLines <= 12;
     const qWrapped = wrapLines(
       this.theme.bold(sanitizePlainText(this.spec.question)),
       innerWidth,
-      3,
+      tightCustom ? 1 : 3,
     );
     body.push(...qWrapped);
 
-    if (this.spec.context) {
+    if (this.spec.context && !tightCustom) {
       const ctxWrapped = wrapLines(
         this.theme.fg("muted", sanitizePlainText(this.spec.context)),
         innerWidth,
@@ -562,7 +559,9 @@ class SingleQuestionComponent implements Component, Focusable {
       body.push(...ctxWrapped);
     }
 
-    body.push("");
+    if (!tightCustom) {
+      body.push("");
+    }
 
     const tailLines: string[] = [];
     if (this.inCustomInput) {
@@ -585,11 +584,11 @@ class SingleQuestionComponent implements Component, Focusable {
     tailLines.push(fitLine(this.theme.fg("dim", hint), innerWidth));
 
     const optionRowBudget = Math.max(
-      1,
+      0,
       maxInnerLines - body.length - tailLines.length,
     );
 
-    if (this.hasPresetOptions) {
+    if (this.hasPresetOptions && !tightCustom && optionRowBudget > 0) {
       renderOptionListWindow(
         body,
         this.options,
@@ -696,6 +695,7 @@ function renderOptionListWindow(
 }
 
 class MultiQuestionComponent implements Component, Focusable {
+  readonly capturesViewportInput = true;
   private _focused = false;
   private activeTab = 0; // 0..questions.length-1 = questions, questions.length = Submit tab
   private readonly normalizedByTab: {
@@ -884,7 +884,7 @@ class MultiQuestionComponent implements Component, Focusable {
   }
 
   handleInput(data: string): void {
-    if (this.settled) return;
+    if (this.settled || isKeyReleaseSafe(data)) return;
 
     if (this.inCustomInput) {
       if (matchesKey(data, Key.ctrl("c"))) {
@@ -892,12 +892,15 @@ class MultiQuestionComponent implements Component, Focusable {
         return;
       }
       this.validationHint = undefined;
-      this.input.handleInput(data);
-      this.tui.requestRender();
+      const norm = normalizeEditorInput(data);
+      if (norm) {
+        this.input.handleInput(norm);
+        this.tui.requestRender();
+      }
       return;
     }
 
-    if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+    if (isEscapeKey(data) || matchesKey(data, Key.ctrl("c"))) {
       this.finish({ cancelled: true, answers: {}, items: [] });
       return;
     }
@@ -907,13 +910,13 @@ class MultiQuestionComponent implements Component, Focusable {
       this.tui.requestRender();
       return;
     }
-    if (matchesKey(data, Key.tab) || matchesKey(data, Key.right)) {
+    if (isTabKey(data) || matchesKey(data, Key.right)) {
       this.switchTab(1);
       this.tui.requestRender();
       return;
     }
 
-    const ch = decodePrintableChar(data);
+    const ch = decodePrintableInput(data);
 
     if (this.isOnSubmitTab) {
       const actions = this.getSubmitActions();
@@ -1136,14 +1139,15 @@ class MultiQuestionComponent implements Component, Focusable {
       const cur = this.cursors[this.activeTab] ?? 0;
       const saved = this.answers.get(spec.id);
 
+      const tightCustom = this.inCustomInput && maxInnerLines <= 12;
       const qWrapped = wrapLines(
         this.theme.bold(sanitizePlainText(spec.question)),
         innerWidth,
-        2,
+        tightCustom ? 1 : 2,
       );
       body.push(...qWrapped);
 
-      if (spec.context) {
+      if (spec.context && !tightCustom) {
         const ctxWrapped = wrapLines(
           this.theme.fg("muted", sanitizePlainText(spec.context)),
           innerWidth,
@@ -1152,7 +1156,7 @@ class MultiQuestionComponent implements Component, Focusable {
         body.push(...ctxWrapped);
       }
 
-      if (saved) {
+      if (saved && !tightCustom) {
         body.push(
           fitLine(
             this.theme.fg(
@@ -1164,7 +1168,9 @@ class MultiQuestionComponent implements Component, Focusable {
         );
       }
 
-      body.push("");
+      if (!tightCustom) {
+        body.push("");
+      }
 
       const tailLines: string[] = [];
       if (this.inCustomInput) {
@@ -1187,19 +1193,21 @@ class MultiQuestionComponent implements Component, Focusable {
       tailLines.push(fitLine(this.theme.fg("dim", hint), innerWidth));
 
       const optionBudget = Math.max(
-        1,
+        0,
         maxInnerLines - body.length - tailLines.length,
       );
 
-      renderOptionListWindow(
-        body,
-        tabMeta.options,
-        cur,
-        saved?.answer,
-        innerWidth,
-        optionBudget,
-        this.theme,
-      );
+      if (!tightCustom && optionBudget > 0) {
+        renderOptionListWindow(
+          body,
+          tabMeta.options,
+          cur,
+          saved?.answer,
+          innerWidth,
+          optionBudget,
+          this.theme,
+        );
+      }
 
       body.push(...tailLines);
     }
@@ -1218,7 +1226,8 @@ class MultiQuestionComponent implements Component, Focusable {
 }
 
 class ConfirmProposalComponent implements Component, Focusable {
-  focused = false;
+  readonly capturesViewportInput = true;
+  private _focused = false;
   private selectedIndex = 0;
   private validatorEnabled: boolean;
   private maxConcurrency: number;
@@ -1226,8 +1235,9 @@ class ConfirmProposalComponent implements Component, Focusable {
   private modelsChanged = false;
   private commentText = "";
   private editingComment = false;
-  private readonly commentInput = new Input();
-  private modelPickerComponent: Component | null = null;
+  private readonly commentInput: Input;
+  private readonly hwCursor = new HardwareCursorController();
+  private modelPickerComponent: (Component & Partial<Focusable> & { dispose?(): void }) | null = null;
   private settled = false;
   private readonly onAbort?: () => void;
 
@@ -1260,6 +1270,20 @@ class ConfirmProposalComponent implements Component, Focusable {
     private readonly options: ConfirmProposalOptions | undefined,
     private readonly done: (result: ProposalDialogOutcome) => void,
   ) {
+    this.commentInput = new Input({
+      prompt: "Comment: ",
+      placeholder: "Optional launch guidance or revision note…",
+      placeholderStyle: (t) => this.theme.fg("dim", t),
+    });
+    this.commentInput.onSubmit = (value) => {
+      this.commentText = value.trim();
+      this.setCommentEditMode(false);
+      this.tui.requestRender();
+    };
+    this.commentInput.onEscape = () => {
+      this.setCommentEditMode(false);
+      this.tui.requestRender();
+    };
     this.validatorEnabled = plan.validatorEnabled;
     this.maxConcurrency = Math.max(
       MIN_CONCURRENCY,
@@ -1294,6 +1318,31 @@ class ConfirmProposalComponent implements Component, Focusable {
     }
   }
 
+  get focused(): boolean {
+    return this._focused;
+  }
+
+  set focused(value: boolean) {
+    this._focused = value;
+    if (this.modelPickerComponent && "focused" in this.modelPickerComponent) {
+      this.modelPickerComponent.focused = value;
+      this.commentInput.focused = false;
+      this.hwCursor.sync(this.tui, false);
+      return;
+    }
+    this.commentInput.focused = value && this.editingComment;
+    this.hwCursor.sync(this.tui, value && this.editingComment);
+  }
+
+  private setCommentEditMode(active: boolean): void {
+    this.editingComment = active;
+    if (active) {
+      this.commentInput.setValue(this.commentText);
+    }
+    this.commentInput.focused = this._focused && active;
+    this.hwCursor.sync(this.tui, active);
+  }
+
   private finish(action: ProposalDialogAction): void {
     if (this.settled) return;
     this.settled = true;
@@ -1308,17 +1357,22 @@ class ConfirmProposalComponent implements Component, Focusable {
   }
 
   dispose(): void {
+    this.modelPickerComponent?.dispose?.();
+    this.modelPickerComponent = null;
+    this.commentInput.focused = false;
+    this.hwCursor.restore(this.tui);
     if (this.onAbort && this.options?.signal) {
       this.options.signal.removeEventListener("abort", this.onAbort);
     }
   }
 
   invalidate(): void {
+    this.commentInput.invalidate();
     this.modelPickerComponent?.invalidate();
   }
 
   handleInput(data: string): void {
-    if (this.settled) return;
+    if (this.settled || isKeyReleaseSafe(data)) return;
 
     if (this.modelPickerComponent) {
       this.modelPickerComponent.handleInput?.(data);
@@ -1326,31 +1380,37 @@ class ConfirmProposalComponent implements Component, Focusable {
     }
 
     if (this.editingComment) {
-      if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
-        this.editingComment = false;
-        this.commentInput.focused = false;
+      if (matchesKey(data, Key.ctrl("c"))) {
+        this.setCommentEditMode(false);
         this.tui.requestRender();
         return;
       }
-      if (matchesKey(data, Key.enter) || matchesKey(data, Key.return)) {
+      if (isEscapeKey(data)) {
+        this.setCommentEditMode(false);
+        this.tui.requestRender();
+        return;
+      }
+      if (matchesKey(data, Key.enter)) {
         this.commentText = this.commentInput.getValue().trim();
-        this.editingComment = false;
-        this.commentInput.focused = false;
+        this.setCommentEditMode(false);
         this.tui.requestRender();
         return;
       }
-      this.commentInput.handleInput(data);
-      this.tui.requestRender();
+      const norm = normalizeEditorInput(data);
+      if (norm) {
+        this.commentInput.handleInput(norm);
+        this.tui.requestRender();
+      }
       return;
     }
 
     // Esc always maps to "continue" so the user is never trapped
-    if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+    if (isEscapeKey(data) || matchesKey(data, Key.ctrl("c"))) {
       this.finish("continue");
       return;
     }
 
-    const ch = decodePrintableChar(data);
+    const ch = decodePrintableInput(data);
 
     if ((ch === "m" || ch === "M") && this.options?.onOpenModelPicker) {
       const comp = this.options.onOpenModelPicker(
@@ -1367,16 +1427,17 @@ class ConfirmProposalComponent implements Component, Focusable {
         },
       );
       if (comp && typeof (comp as Component).render === "function") {
-        this.modelPickerComponent = comp as Component;
+        this.modelPickerComponent = comp as Component & Partial<Focusable> & { dispose?(): void };
+        if ("focused" in this.modelPickerComponent) {
+          this.modelPickerComponent.focused = this._focused;
+        }
         this.tui.requestRender();
       }
       return;
     }
 
     if (ch === "c" || ch === "C") {
-      this.editingComment = true;
-      this.commentInput.setValue(this.commentText);
-      this.commentInput.focused = true;
+      this.setCommentEditMode(true);
       this.tui.requestRender();
       return;
     }
@@ -1418,7 +1479,7 @@ class ConfirmProposalComponent implements Component, Focusable {
       return;
     }
 
-    if (matchesKey(data, Key.enter) || matchesKey(data, Key.return)) {
+    if (matchesKey(data, Key.enter)) {
       const choice = this.choices[this.selectedIndex];
       if (choice) {
         this.finish(choice.action);
@@ -1428,36 +1489,15 @@ class ConfirmProposalComponent implements Component, Focusable {
 
   private renderModelsLine(innerWidth: number): string {
     const rm = this.roleModels;
-    const fmt = (cfg?: { model?: string; thinkingLevel?: string }) => {
-      const m = sanitizePlainText(cfg?.model ?? "") || "host default";
-      return cfg?.thinkingLevel ? `${m} · ${cfg.thinkingLevel}` : m;
-    };
-    const orch = fmt(rm?.orchestrator);
-    const work = fmt(rm?.worker);
-    const val = fmt(rm?.validator);
-
-    const styleVal = (raw: string, hasExplicit: boolean) =>
-      hasExplicit ? this.theme.fg("accent", raw) : this.theme.fg("dim", raw);
-
-    const verbose =
-      `${this.theme.fg("muted", "Models: ")}` +
-      `${this.theme.fg("muted", "O:")}${styleVal(orch, Boolean(rm?.orchestrator?.model))}` +
-      `${this.theme.fg("dim", " · ")}` +
-      `${this.theme.fg("muted", "W:")}${styleVal(work, Boolean(rm?.worker?.model))}` +
-      `${this.theme.fg("dim", " · ")}` +
-      `${this.theme.fg("muted", "V:")}${styleVal(val, Boolean(rm?.validator?.model))}`;
-
-    if (visibleWidth(verbose) <= innerWidth) {
-      return verbose;
-    }
-
     const prefix = this.theme.fg("muted", "Models: ");
     const budget = Math.max(1, innerWidth - visibleWidth("Models: "));
-    const compact = formatRoleModelsLine(rm, "host default", {
+    const origins = this.modelsChanged ? undefined : this.options?.roleModelOrigins;
+    const formatted = formatRoleModelsLine(rm, "host default", {
       maxWidth: budget,
       theme: this.theme,
+      origins,
     });
-    return fitLine(`${prefix}${compact}`, innerWidth);
+    return fitLine(`${prefix}${formatted}`, innerWidth);
   }
 
   render(width: number): string[] {
@@ -1480,7 +1520,7 @@ class ConfirmProposalComponent implements Component, Focusable {
         fitLine(this.theme.fg("accent", this.theme.bold(cleanTitle)), innerWidth),
       );
     }
-    if (cleanObjective && cleanObjective !== cleanTitle) {
+    if (cleanObjective && cleanObjective !== cleanTitle && maxInnerLines >= 11) {
       const objLines = wrapLines(
         this.theme.bold(cleanObjective),
         innerWidth,
@@ -1584,13 +1624,8 @@ class ConfirmProposalComponent implements Component, Focusable {
     body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
 
     if (this.editingComment) {
-      const inputRendered = this.commentInput.render(Math.max(10, innerWidth - 10))[0] ?? "";
-      body.push(
-        fitLine(
-          `${this.theme.fg("accent", "Comment: ")}${inputRendered}`,
-          innerWidth,
-        ),
-      );
+      const inputRendered = this.commentInput.render(innerWidth)[0] ?? "Comment: ";
+      body.push(inputRendered);
     } else if (this.commentText) {
       body.push(
         fitLine(

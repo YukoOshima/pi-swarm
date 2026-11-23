@@ -88,6 +88,18 @@ interface LedgerCacheEntry {
 
 const ledgerCache = new Map<string, LedgerCacheEntry>();
 
+function setLedgerCacheEntry(key: string, entry: LedgerCacheEntry): void {
+  if (ledgerCache.has(key)) {
+    ledgerCache.delete(key);
+  } else if (ledgerCache.size >= 32) {
+    const oldest = ledgerCache.keys().next().value;
+    if (oldest !== undefined) {
+      ledgerCache.delete(oldest);
+    }
+  }
+  ledgerCache.set(key, entry);
+}
+
 function computeLastSeq(events: readonly SwarmEvent[], priorCount = 0): number {
   if (events.length === 0) {
     return priorCount;
@@ -154,23 +166,24 @@ async function loadCachedLedger(eventsPath: string): Promise<{
 
       if (bytesRead === delta) {
         const appended = parseEventLines(tailText);
-        const events =
-          appended.length > 0 ? [...existing.events, ...appended] : existing.events;
+        if (appended.length > 0) {
+          existing.events.push(...appended);
+        }
         const lastSeq =
           appended.length > 0
-            ? computeLastSeq(appended, existing.events.length)
+            ? computeLastSeq(appended, existing.events.length - appended.length)
             : existing.lastSeq;
         const endsWithNewline =
           tailText.length === 0 ? existing.endsWithNewline : tailText.endsWith("\n");
-        ledgerCache.set(key, {
+        setLedgerCacheEntry(key, {
           ino: st.ino,
           size: st.size,
           mtimeMs: st.mtimeMs,
           lastSeq,
           endsWithNewline,
-          events,
+          events: existing.events,
         });
-        return { events, lastSeq, endsWithNewline, size: st.size };
+        return { events: existing.events, lastSeq, endsWithNewline, size: st.size };
       }
     }
 
@@ -178,7 +191,7 @@ async function loadCachedLedger(eventsPath: string): Promise<{
     const endsWithNewline = raw.length === 0 || raw.endsWith("\n");
     const events = parseEventLines(raw);
     const lastSeq = computeLastSeq(events);
-    ledgerCache.set(key, {
+    setLedgerCacheEntry(key, {
       ino: st.ino,
       size: st.size,
       mtimeMs: st.mtimeMs,
@@ -239,13 +252,14 @@ export async function appendLedgerEvent(
       const stAfter = await lstat(key);
       const expectedSize = prevSize + Buffer.byteLength(fullPayload, "utf8");
       if (stAfter.size === expectedSize) {
-        ledgerCache.set(key, {
+        existingEvents.push(event);
+        setLedgerCacheEntry(key, {
           ino: stAfter.ino,
           size: stAfter.size,
           mtimeMs: stAfter.mtimeMs,
           lastSeq: nextSeq,
           endsWithNewline: true,
-          events: [...existingEvents, event],
+          events: existingEvents,
         });
       } else {
         ledgerCache.delete(key);

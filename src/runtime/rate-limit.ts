@@ -1,4 +1,5 @@
 import { DEFAULT_SWARM_SETTINGS } from "../constants.js";
+import { parseModelSpec } from "../store/settings.js";
 
 // ============================================================================
 // Rate-Limit & Transient Provider Error Detection
@@ -186,7 +187,8 @@ function parseRetryAfterHeaderValue(raw: string, nowMs: number): number | undefi
 // ============================================================================
 
 function normalizeModelKey(model: string): string {
-  return model.trim().toLowerCase();
+  const parsed = parseModelSpec(model);
+  return (parsed.model || model).trim().toLowerCase();
 }
 
 /**

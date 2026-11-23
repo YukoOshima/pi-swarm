@@ -3304,4 +3304,163 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     await harness.executeTool(SWARM_TOOL, { action: "done", summary: "Done" });
     await harness.emit("session_shutdown", { reason: "quit" });
   });
+
+  it("12. v0.5.0: Cross-session Droid Mission Resume discovers unfinished runs, notifies on startup, restores orchestrator model, and honors --quiet vs guided wakeup", async () => {
+    const repoDir = await createTempGitRepo("v050-mission-resume");
+    tempDirs.push(repoDir);
+    const isolatedGlobalPath = path.join(repoDir, ".tmp-global-v050.json");
+    const isolatedProjectPath = path.join(repoDir, ".pi", SWARM_SETTINGS_FILE);
+
+    await mkdir(path.dirname(isolatedProjectPath), { recursive: true });
+    await writeFile(
+      isolatedGlobalPath,
+      JSON.stringify({
+        orchestratorModel: "anthropic/claude-opus-4-6",
+        orchestratorThinkingLevel: "high",
+        workerModel: "openai/gpt-5",
+        workerThinkingLevel: "medium",
+      }),
+      "utf8",
+    );
+
+    const spawnedByName = new Map<string, MockMemberTracker>();
+    const makeTransport = (): ISwarmTransport => ({
+      async listAvailableModels() {
+        return DEFAULT_TEST_MODELS.map((m) => ({
+          id: m.id,
+          provider: m.provider,
+          fullId: `${m.provider}/${m.id}`,
+          name: m.name,
+        }));
+      },
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        const tracker = createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async () => ({
+            agentId: request.agentId,
+            name: request.name,
+            role: request.role,
+            outcome: "waiting",
+            summary: `${request.name} initial work ready`,
+            tokens: 20,
+            cost: 0.0002,
+          }),
+        });
+        spawnedByName.set(request.name, tracker);
+        return tracker.handle;
+      },
+    });
+
+    // Session 1: launches Mission, spawns @worker-a, posts progress, pauses, and shuts down cleanly
+    const s1 = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-mission-1",
+    });
+    const ext1 = createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsPathOptions: {
+        globalPath: isolatedGlobalPath,
+        projectPath: isolatedProjectPath,
+      },
+    });
+    ext1(s1.pi);
+    await s1.emit("session_start", { reason: "startup" });
+    await s1.runCommand("swarm-direct", "Ship resumable mission");
+    await s1.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Resumable Auth Mission",
+      objective: "Implement auth and verify cleanly",
+      strategy: "Single worker followed by validation",
+      acceptance_criteria: "All tests pass",
+      base_branch: "main",
+      initial_members: [
+        {
+          name: "worker-a",
+          role: "worker",
+          workspace: "inherit",
+          brief: "Draft auth helpers",
+        },
+      ],
+    });
+    await waitFor(() => spawnedByName.get("worker-a")?.handle.getState() === "waiting");
+    await s1.executeTool(POST_MESSAGE_TOOL, {
+      text: "Checkpoint #1 posted before shutdown",
+      wake: false,
+    });
+    await s1.runCommand("swarm", "pause Stepping away");
+    await s1.emit("session_shutdown", { reason: "quit" });
+
+    // Session 2: fresh Pi session starting on a DIFFERENT host model (openai/gpt-5-mini)
+    const s2 = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-mission-2",
+      initialHostModel: DEFAULT_TEST_MODELS[2], // openai/gpt-5-mini
+    });
+    const ext2 = createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsPathOptions: {
+        globalPath: isolatedGlobalPath,
+        projectPath: isolatedProjectPath,
+      },
+    });
+    ext2(s2.pi);
+    await s2.emit("session_start", { reason: "startup" });
+
+    // Startup notifies non-intrusively about unfinished Mission while staying idle until resumed
+    assert.ok(
+      s2.notifications.some((n) => /Unfinished Swarm Mission/i.test(n.message)),
+      "Session 2 startup must notify about unfinished Swarm Mission",
+    );
+    assert.equal(s2.sentMessages.filter((m) => m.options?.triggerTurn === true).length, 0);
+    assert.ok(!s2.pi.getActiveTools().includes(POST_MESSAGE_TOOL));
+
+    // `/swarm resume --quiet` attaches, claims ownership, unpauses, restores Orchestrator model, and triggers ZERO turns
+    await s2.runCommand("swarm", "resume --quiet");
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.ok(
+      s2.setModelCalls.some((m) => `${m.provider}/${m.id}` === "anthropic/claude-opus-4-6"),
+      "Cross-session resume must restore saved orchestratorModel onto host session",
+    );
+    assert.ok(s2.thinkingLevelCalls.includes("high"));
+    for (const toolName of SWARM_CORE_TOOLS) {
+      assert.ok(s2.pi.getActiveTools().includes(toolName), `Expected ${toolName} active after resume`);
+    }
+    assert.equal(
+      s2.sentMessages.filter((m) => m.options?.triggerTurn === true).length,
+      0,
+      "/swarm resume --quiet must not fire an Orchestrator wakeup turn",
+    );
+    await s2.runCommand("swarm", "pause Pause again before Session 3");
+    await s2.emit("session_shutdown", { reason: "quit" });
+
+    // Session 3: fresh Pi session runs `/swarm resume "Verify worker-a output and complete"`
+    const s3 = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-mission-3",
+      initialHostModel: DEFAULT_TEST_MODELS[2],
+    });
+    const ext3 = createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsPathOptions: {
+        globalPath: isolatedGlobalPath,
+        projectPath: isolatedProjectPath,
+      },
+    });
+    ext3(s3.pi);
+    await s3.emit("session_start", { reason: "startup" });
+    await s3.runCommand("swarm", 'resume "Verify worker-a output and complete"');
+    await waitFor(
+      () => s3.sentMessages.some((m) => m.options?.triggerTurn === true),
+      2000,
+    );
+
+    const wakeupMsg = s3.sentMessages.find((m) => m.options?.triggerTurn === true)!;
+    const wakeupText = String(wakeupMsg.message.content ?? "");
+    assert.match(wakeupText, /<swarm_mission_resumed/);
+    assert.match(wakeupText, /Verify worker-a output and complete/);
+    assert.match(wakeupText, /Checkpoint #1 posted before shutdown/);
+
+    await s3.executeTool(SWARM_TOOL, { action: "done", summary: "Resumed and completed" });
+    await s3.emit("session_shutdown", { reason: "quit" });
+  });
 });

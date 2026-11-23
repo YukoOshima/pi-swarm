@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import path from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { assertOwnerSession, isPrototypeKey } from "../store/index.js";
+import { assertOwnerSession, isPrototypeKey, parseModelSpec } from "../store/index.js";
 import {
   ALL_MENTION_NAME,
   CHANNEL_NAME_PATTERN,
@@ -1221,6 +1221,7 @@ export class SwarmEngine implements ISwarmEngine {
             state: "working",
             model: effectiveModel,
             thinkingLevel: effectiveThinking,
+            modelExplicit: Boolean(input.model?.trim()),
             lastReadSeq: this.cachedRun?.boardHead ?? run.boardHead,
           },
           { actor: callerName },
@@ -1765,16 +1766,36 @@ export class SwarmEngine implements ISwarmEngine {
       this.hostContext = options.hostContext;
     }
     const run = this.requireActiveRun();
-    const modelOverride = options.model?.trim() ?? "";
-    if (!modelOverride) {
-      throw new SwarmProtocolError("INVALID_INPUT", "Model identifier must be non-empty.");
-    }
-
     const callerRole: CallerRole = options.callerRole ?? "orchestrator";
     const callerName =
       options.callerName?.trim() ||
       (callerRole === "human" ? "human" : ORCHESTRATOR_NAME);
     const targetRaw = options.targetName?.trim().replace(/^@/, "") || callerName;
+
+    const existingMemberForFallback =
+      targetRaw.toLowerCase() === ORCHESTRATOR_NAME ||
+      targetRaw.toLowerCase() === "coordinator"
+        ? undefined
+        : this.findMember(run, targetRaw);
+    const fallbackModelFromTarget =
+      targetRaw.toLowerCase() === ORCHESTRATOR_NAME ||
+      targetRaw.toLowerCase() === "coordinator"
+        ? run.roleModels.orchestrator?.model?.trim() ||
+          this.getEffectiveSettings().orchestratorModel?.trim() ||
+          (this.hostContext?.model?.id
+            ? this.hostContext.model.provider
+              ? `${this.hostContext.model.provider}/${this.hostContext.model.id}`
+              : this.hostContext.model.id
+            : "")
+        : existingMemberForFallback?.model?.trim() || "";
+
+    const rawModelInput = options.model?.trim() || (options.thinkingLevel ? fallbackModelFromTarget : "");
+    if (!rawModelInput) {
+      throw new SwarmProtocolError("INVALID_INPUT", "Model identifier must be non-empty.");
+    }
+    const parsedModelInput = parseModelSpec(rawModelInput);
+    const modelOverride = parsedModelInput.model || rawModelInput;
+    const requestedThinking = options.thinkingLevel ?? parsedModelInput.thinkingLevel;
 
     // Switching orchestrator role model
     if (
@@ -1789,7 +1810,7 @@ export class SwarmEngine implements ISwarmEngine {
       }
       const previousModel = run.roleModels.orchestrator?.model;
       const nextThinking =
-        options.thinkingLevel ?? run.roleModels.orchestrator?.thinkingLevel;
+        requestedThinking ?? run.roleModels.orchestrator?.thinkingLevel;
       const nextRoleModels: SwarmRoleModels = {
         ...run.roleModels,
         orchestrator: {
@@ -1816,20 +1837,22 @@ export class SwarmEngine implements ISwarmEngine {
         },
       });
 
-      const noticeMsg = await this.store.postBoardMessage(run.id, {
-        from: callerName,
-        fromRole: callerRole,
-        channel: DEFAULT_CHANNEL,
-        kind: "model_switch",
-        text: `[model] ${ORCHESTRATOR_NAME} switched to ${modelOverride}${nextThinking ? ` (${nextThinking})` : ""}${options.reason ? ` — ${options.reason}` : ""}`,
-        mentions: [],
-        channelMentions: [],
-      });
-      this.recordBoardMessageInCache(noticeMsg);
-      this.emitEngineEvent("board_posted", `Posted model switch #${noticeMsg.seq}`, {
-        memberName: ORCHESTRATOR_NAME,
-        seq: noticeMsg.seq,
-      });
+      if (!options.silentBoardNotice) {
+        const noticeMsg = await this.store.postBoardMessage(run.id, {
+          from: callerName,
+          fromRole: callerRole,
+          channel: DEFAULT_CHANNEL,
+          kind: "model_switch",
+          text: `[model] ${ORCHESTRATOR_NAME} switched to ${modelOverride}${nextThinking ? ` (${nextThinking})` : ""}${options.reason ? ` — ${options.reason}` : ""}`,
+          mentions: [],
+          channelMentions: [],
+        });
+        this.recordBoardMessageInCache(noticeMsg);
+        this.emitEngineEvent("board_posted", `Posted model switch #${noticeMsg.seq}`, {
+          memberName: ORCHESTRATOR_NAME,
+          seq: noticeMsg.seq,
+        });
+      }
 
       await this.refreshCache(updated);
       this.emitEngineEvent(
@@ -1843,7 +1866,7 @@ export class SwarmEngine implements ISwarmEngine {
       };
     }
 
-    const member = this.findMember(run, targetRaw);
+    const member = existingMemberForFallback ?? this.findMember(run, targetRaw);
     if (!member) {
       throw new SwarmProtocolError(
         "MEMBER_NOT_FOUND",
@@ -1897,30 +1920,39 @@ export class SwarmEngine implements ISwarmEngine {
     // validate the target model now and schedule the switch for turn end.
     if ((isWorkingSelfSwitch || isDeferredHumanSwitch) && live) {
       let validatedModel = modelOverride;
-      let validatedThinking = options.thinkingLevel;
+      let validatedThinking = requestedThinking;
       if (this.transport.resolveModel) {
         const resolved = await this.transport.resolveModel(
           modelOverride,
-          options.thinkingLevel,
+          requestedThinking,
           this.hostContext,
         );
         validatedModel = resolved.model;
-        validatedThinking = resolved.thinkingLevel ?? options.thinkingLevel;
+        validatedThinking = resolved.thinkingLevel;
       }
-      live.pendingSelfModelSwitch = {
-        model: validatedModel,
-        thinkingLevel: validatedThinking,
-        reason: options.reason,
-        callerName,
-        callerRole,
-        autoResume: options.autoResume ?? true,
-      };
-      return {
-        targetName: member.name,
-        model: validatedModel,
-        thinkingLevel: validatedThinking,
-        deferred: true,
-      };
+      const latestAfterResolve = getOwnMember(this.cachedRun, member.name);
+      const stillWorking =
+        live.turnActive ||
+        live.spawning ||
+        live.waking ||
+        live.handle?.getState() === "working" ||
+        latestAfterResolve?.state === "working";
+      if (stillWorking) {
+        live.pendingSelfModelSwitch = {
+          model: validatedModel,
+          thinkingLevel: validatedThinking,
+          reason: options.reason,
+          callerName,
+          callerRole,
+          autoResume: options.autoResume ?? true,
+        };
+        return {
+          targetName: member.name,
+          model: validatedModel,
+          thinkingLevel: validatedThinking,
+          deferred: true,
+        };
+      }
     }
 
     const isParkedState = member.state === "waiting" || member.state === "stopped";
@@ -1979,22 +2011,22 @@ export class SwarmEngine implements ISwarmEngine {
     let resumePromptText = "";
     try {
       let resolvedModel = modelOverride;
-      let resolvedThinking = options.thinkingLevel;
+      let resolvedThinking = requestedThinking;
 
       if (activeLive.handle && activeLive.handle.getState() === "waiting") {
-        const switched = await activeLive.handle.switchModel(modelOverride, options.thinkingLevel);
+        const switched = await activeLive.handle.switchModel(modelOverride, requestedThinking);
         resolvedModel = switched.model;
-        resolvedThinking = switched.thinkingLevel ?? options.thinkingLevel;
+        resolvedThinking = switched.thinkingLevel;
         activeLive.triedModels.add(resolvedModel);
       } else {
         if (this.transport.resolveModel) {
           const resolved = await this.transport.resolveModel(
             modelOverride,
-            options.thinkingLevel,
+            requestedThinking,
             this.hostContext,
           );
           resolvedModel = resolved.model;
-          resolvedThinking = resolved.thinkingLevel ?? options.thinkingLevel;
+          resolvedThinking = resolved.thinkingLevel;
         }
         activeLive.triedModels.add(resolvedModel);
       }
@@ -2002,6 +2034,7 @@ export class SwarmEngine implements ISwarmEngine {
       const updatedRun = await this.store.updateMember(run.id, member.name, {
         model: resolvedModel,
         thinkingLevel: resolvedThinking ?? null,
+        modelExplicit: options.fromRolePropagation ? false : true,
         error: null,
         actor: callerName,
       });
@@ -2021,21 +2054,23 @@ export class SwarmEngine implements ISwarmEngine {
         },
       });
 
-      // Post non-waking `[model]` notice on board (no `@` so it doesn't duplicate-wake)
-      const noticeMsg = await this.store.postBoardMessage(run.id, {
-        from: callerName,
-        fromRole: callerRole,
-        channel: member.channels[0] ?? DEFAULT_CHANNEL,
-        kind: "model_switch",
-        text: `[model] ${member.name} switched to ${resolvedModel}${resolvedThinking ? ` (${resolvedThinking})` : ""}${options.reason ? ` — ${options.reason}` : ""}`,
-        mentions: [],
-        channelMentions: [],
-      });
-      this.recordBoardMessageInCache(noticeMsg);
-      this.emitEngineEvent("board_posted", `Posted model switch #${noticeMsg.seq}`, {
-        memberName: member.name,
-        seq: noticeMsg.seq,
-      });
+      if (!options.silentBoardNotice) {
+        // Post non-waking `[model]` notice on board (no `@` so it doesn't duplicate-wake)
+        const noticeMsg = await this.store.postBoardMessage(run.id, {
+          from: callerName,
+          fromRole: callerRole,
+          channel: member.channels[0] ?? DEFAULT_CHANNEL,
+          kind: "model_switch",
+          text: `[model] ${member.name} switched to ${resolvedModel}${resolvedThinking ? ` (${resolvedThinking})` : ""}${options.reason ? ` — ${options.reason}` : ""}`,
+          mentions: [],
+          channelMentions: [],
+        });
+        this.recordBoardMessageInCache(noticeMsg);
+        this.emitEngineEvent("board_posted", `Posted model switch #${noticeMsg.seq}`, {
+          memberName: member.name,
+          seq: noticeMsg.seq,
+        });
+      }
 
       await this.refreshCache(updatedRun);
       this.emitEngineEvent(
@@ -2148,14 +2183,27 @@ export class SwarmEngine implements ISwarmEngine {
       this.hostContext = options.hostContext;
     }
     const run = this.cachedRun;
-    const trimmedModel = options.model?.trim() || undefined;
+    const rawTrimmed = options.model?.trim() || undefined;
+    const parsedOpt = rawTrimmed ? parseModelSpec(rawTrimmed) : undefined;
+    const trimmedModel = parsedOpt?.model || rawTrimmed;
+    const targetThinking = options.thinkingLevel ?? parsedOpt?.thinkingLevel;
+
     const prevModels = new Set<string>();
-    if (options.previousModel?.trim()) {
-      prevModels.add(options.previousModel.trim());
-    }
-    const runPrevModel = run?.roleModels?.[options.role]?.model?.trim();
-    if (runPrevModel) {
-      prevModels.add(runPrevModel);
+    const addPrev = (m: string | undefined): void => {
+      const clean = m?.trim();
+      if (!clean) return;
+      const base = parseModelSpec(clean).model || clean;
+      prevModels.add(base.toLowerCase());
+    };
+    addPrev(options.previousModel);
+    const runPrevModel = run?.roleModels?.[options.role]?.model;
+    addPrev(runPrevModel);
+    if (!runPrevModel && !options.previousModel) {
+      const hm = (options.hostContext ?? this.hostContext)?.model;
+      if (hm?.id) {
+        addPrev(hm.provider ? `${hm.provider}/${hm.id}` : hm.id);
+        addPrev(hm.id);
+      }
     }
 
     if (!run || this.activeRunId !== run.id) {
@@ -2163,7 +2211,7 @@ export class SwarmEngine implements ISwarmEngine {
         roleModels: {
           [options.role]: {
             ...(trimmedModel ? { model: trimmedModel } : {}),
-            ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
+            ...(targetThinking !== undefined ? { thinkingLevel: targetThinking } : {}),
           },
         },
         switched: [],
@@ -2175,7 +2223,7 @@ export class SwarmEngine implements ISwarmEngine {
       ...run.roleModels,
       [options.role]: {
         ...(trimmedModel ? { model: trimmedModel } : {}),
-        ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
+        ...(targetThinking !== undefined ? { thinkingLevel: targetThinking } : {}),
       },
     };
     const updatedRun = await this.store.updateRun(run.id, {
@@ -2191,7 +2239,10 @@ export class SwarmEngine implements ISwarmEngine {
     const switched: string[] = [];
     const deferred: string[] = [];
 
-    if (!trimmedModel || (updatedRun.status !== "active" && updatedRun.status !== "paused")) {
+    const isClearToInherit =
+      options.clearToInherit === true ||
+      (!trimmedModel && targetThinking === undefined);
+    if (isClearToInherit || (updatedRun.status !== "active" && updatedRun.status !== "paused")) {
       return {
         roleModels: updatedRun.roleModels,
         switched,
@@ -2199,32 +2250,50 @@ export class SwarmEngine implements ISwarmEngine {
       };
     }
 
+    const hostFallbackModel = (() => {
+      const hm = (options.hostContext ?? this.hostContext)?.model;
+      if (!hm?.id) return undefined;
+      return hm.provider ? `${hm.provider}/${hm.id}` : hm.id;
+    })();
+    const targetLower = trimmedModel?.toLowerCase();
+
     for (const member of Object.values(updatedRun.members)) {
       if (member.state === "killed" || member.role !== options.role) {
         continue;
       }
+      const memberModelLower = member.model?.trim().toLowerCase();
       const tracksDefault =
-        !member.model ||
-        prevModels.has(member.model) ||
-        member.model === trimmedModel;
+        member.modelExplicit === false
+          ? true
+          : member.modelExplicit === true
+            ? false
+            : !memberModelLower ||
+              prevModels.has(memberModelLower) ||
+              (targetLower !== undefined && memberModelLower === targetLower);
       if (!tracksDefault) {
         continue;
       }
+      const effectiveTargetModel = trimmedModel ?? member.model ?? hostFallbackModel;
+      if (!effectiveTargetModel) {
+        continue;
+      }
       if (
-        member.model === trimmedModel &&
-        member.thinkingLevel === options.thinkingLevel
+        member.model?.toLowerCase() === effectiveTargetModel.toLowerCase() &&
+        member.thinkingLevel === targetThinking
       ) {
         continue;
       }
       try {
         const res = await this.switchModel({
           targetName: member.name,
-          model: trimmedModel,
-          thinkingLevel: options.thinkingLevel,
+          model: effectiveTargetModel,
+          thinkingLevel: targetThinking,
           callerName: "human",
           callerRole: "human",
           autoResume: false,
           deferIfWorking: true,
+          silentBoardNotice: true,
+          fromRolePropagation: true,
           reason: `${options.role} role updated`,
           hostContext: options.hostContext,
         });
@@ -2830,7 +2899,7 @@ export class SwarmEngine implements ISwarmEngine {
         member.branch &&
         member.cwd !== this.worktree.repoRoot
       ) {
-        const live = this.liveMembers.get(member.name);
+        const live = targetRunId === this.activeRunId ? this.liveMembers.get(member.name) : undefined;
         const hasActiveAgent =
           member.state === "working" ||
           Boolean(live?.spawning) ||
@@ -3076,6 +3145,7 @@ export class SwarmEngine implements ISwarmEngine {
         isIsolatedWorktree,
         parentName: member.parentName,
         brief: member.brief,
+        channels: member.channels,
         systemPrompt,
         initialPrompt,
         keepWarm: run.keepWorkersWarm,
@@ -3140,9 +3210,10 @@ export class SwarmEngine implements ISwarmEngine {
       this.emitEngineEvent("snapshot_changed", `Started @${memberName}`, { memberName });
 
       const result = await handle.currentTurn;
+      const preRecordedDelayMs = this.recordRateLimitBeforeRelease(live, result);
       releaseCurrentSlot();
 
-      await this.handleTurnFinished(runId, memberName, result, attemptToken);
+      await this.handleTurnFinished(runId, memberName, result, attemptToken, preRecordedDelayMs);
     } catch (err) {
       if (isCurrentAttempt()) {
         live.spawning = false;
@@ -3304,6 +3375,26 @@ export class SwarmEngine implements ISwarmEngine {
           live.waking = false;
           live.turnActive = false;
         }
+        const canRequeue =
+          !this.disposed &&
+          this.activeRunId === runId &&
+          !getOwnMember(this.cachedRun, memberName)?.humanStopped &&
+          getOwnMember(this.cachedRun, memberName)?.state !== "killed";
+        if (batch.length > 0 && canRequeue) {
+          live.pendingWakes.unshift(...batch);
+        }
+        if (
+          !isCancelled() &&
+          canRequeue &&
+          this.cachedRun?.status === "active" &&
+          live.pendingWakes.length > 0 &&
+          (!live.handle || live.handle.getState() !== "waiting")
+        ) {
+          releaseCurrentSlot();
+          live.waking = true;
+          void this.reviveMemberWithPendingWakes(runId, memberName, directPrompt);
+          return;
+        }
         await this.ensureNotResurrectedAfterCancel(runId, memberName, attemptToken);
         this.checkAllIdleAndNotifyWaiters();
         this.maybeArmStallWatchdog();
@@ -3314,7 +3405,15 @@ export class SwarmEngine implements ISwarmEngine {
 
       live.turnActive = true;
       live.lastWaitRequest = undefined;
-      const turnPromise = live.handle.wake(prompt);
+      let turnPromise: Promise<AgentTurnResult>;
+      try {
+        turnPromise = live.handle.wake(prompt);
+      } catch (wakeErr) {
+        if (batch.length > 0) {
+          live.pendingWakes.unshift(...batch);
+        }
+        throw wakeErr;
+      }
       for (const m of batch) {
         live.deliveredSeqs.add(m.seq);
       }
@@ -3325,9 +3424,10 @@ export class SwarmEngine implements ISwarmEngine {
       }
 
       const result = await turnPromise;
+      const preRecordedDelayMs = this.recordRateLimitBeforeRelease(live, result);
       releaseCurrentSlot();
 
-      await this.handleTurnFinished(runId, memberName, result, attemptToken);
+      await this.handleTurnFinished(runId, memberName, result, attemptToken, preRecordedDelayMs);
     } catch (err) {
       if (isCurrentAttempt()) {
         live.waking = false;
@@ -3440,6 +3540,9 @@ export class SwarmEngine implements ISwarmEngine {
       if (isCancelled()) {
         if (isCurrentAttempt()) {
           live.waking = false;
+          if (batch.length > 0 && this.cachedRun?.status === "active") {
+            live.pendingWakes.unshift(...batch);
+          }
         }
         this.checkAllIdleAndNotifyWaiters();
         this.maybeArmStallWatchdog();
@@ -3465,30 +3568,39 @@ export class SwarmEngine implements ISwarmEngine {
         path.resolve(member.cwd) !== path.resolve(this.store.projectRoot);
       live.lastWaitRequest = undefined;
 
-      const handle = await this.transport.spawnMember({
-        agentId: member.agentId,
-        name: member.name,
-        role: member.role,
-        runId,
-        cwd: member.cwd,
-        branch: member.branch,
-        baseBranch: run.baseBranch,
-        workspace: member.workspace,
-        isIsolatedWorktree,
-        parentName: member.parentName,
-        brief: member.brief,
-        systemPrompt,
-        initialPrompt: prompt,
-        keepWarm: run.keepWorkersWarm,
-        modelOverride: member.model,
-        thinkingLevel: member.thinkingLevel,
-        seedMessages: live.lastMessages.length > 0 ? live.lastMessages : undefined,
-        sessionDir: this.store.getMemberSessionDir?.(runId),
-        sessionFile: member.sessionFile,
-        hostContext: this.hostContext,
-        onTelemetry: (evt) => this.handleTelemetry(runId, evt),
-        engineApi,
-      });
+      let handle: PersistentAgentHandle;
+      try {
+        handle = await this.transport.spawnMember({
+          agentId: member.agentId,
+          name: member.name,
+          role: member.role,
+          runId,
+          cwd: member.cwd,
+          branch: member.branch,
+          baseBranch: run.baseBranch,
+          workspace: member.workspace,
+          isIsolatedWorktree,
+          parentName: member.parentName,
+          brief: member.brief,
+          channels: member.channels,
+          systemPrompt,
+          initialPrompt: prompt,
+          keepWarm: run.keepWorkersWarm,
+          modelOverride: member.model,
+          thinkingLevel: member.thinkingLevel,
+          seedMessages: live.lastMessages.length > 0 ? live.lastMessages : undefined,
+          sessionDir: this.store.getMemberSessionDir?.(runId),
+          sessionFile: member.sessionFile,
+          hostContext: this.hostContext,
+          onTelemetry: (evt) => this.handleTelemetry(runId, evt),
+          engineApi,
+        });
+      } catch (spawnErr) {
+        if (batch.length > 0) {
+          live.pendingWakes.unshift(...batch);
+        }
+        throw spawnErr;
+      }
 
       // Critically check cancellation IMMEDIATELY after spawnMember so stopped/killed/paused/disposed runs never leak handles!
       if (isCancelled()) {
@@ -3560,9 +3672,10 @@ export class SwarmEngine implements ISwarmEngine {
       this.emitEngineEvent("snapshot_changed", `Revived @${memberName}`, { memberName });
 
       const result = await handle.currentTurn;
+      const preRecordedDelayMs = this.recordRateLimitBeforeRelease(live, result);
       releaseCurrentSlot();
 
-      await this.handleTurnFinished(runId, memberName, result, attemptToken);
+      await this.handleTurnFinished(runId, memberName, result, attemptToken, preRecordedDelayMs);
     } catch (err) {
       if (isCurrentAttempt()) {
         live.waking = false;
@@ -3614,11 +3727,35 @@ export class SwarmEngine implements ISwarmEngine {
     }
   }
 
+  private recordRateLimitBeforeRelease(
+    live: LiveMember | undefined,
+    result: AgentTurnResult,
+  ): number | undefined {
+    if (result.outcome !== "rate_limited") {
+      return undefined;
+    }
+    const settings = this.getEffectiveSettings();
+    const effectiveModel = result.model ?? live?.handle?.getModel();
+    const fallback = selectFallbackModel(
+      effectiveModel,
+      settings.fallbackModels,
+      live?.triedModels,
+    );
+    if (fallback) {
+      return undefined;
+    }
+    return this.rateLimitBreaker.recordRateLimit(
+      result.retryAfterMs,
+      result.error ?? "Provider rate limited (429)",
+    );
+  }
+
   private async handleTurnFinished(
     runId: string,
     memberName: string,
     result: AgentTurnResult,
     attemptToken?: symbol,
+    preRecordedDelayMs?: number,
   ): Promise<void> {
     const live = this.liveMembers.get(memberName);
     if (this.disposed || this.activeRunId !== runId) {
@@ -3778,14 +3915,18 @@ export class SwarmEngine implements ISwarmEngine {
             this.maybeArmStallWatchdog();
             return;
           }
-          live.waking = true;
           live.switchingModel = false;
-          this.cancelStallWatchdog();
-          void this.cancelActiveMonitor("Swarm activity resumed");
-          const reasonNote = pendingSwitch.reason ? ` (${pendingSwitch.reason})` : "";
-          const resumeMsg = `Self model switch to "${switched.model}"${switched.thinkingLevel ? ` (${switched.thinkingLevel})` : ""} completed${reasonNote} with conversation history preserved. Continue your work immediately.`;
-          void this.reviveMemberWithPendingWakes(runId, memberName, resumeMsg);
-          return;
+          if (pendingSwitch.autoResume !== false) {
+            live.waking = true;
+            this.cancelStallWatchdog();
+            void this.cancelActiveMonitor("Swarm activity resumed");
+            const reasonNote = pendingSwitch.reason ? ` (${pendingSwitch.reason})` : "";
+            const isSelfSwitch = pendingSwitch.callerName === memberName;
+            const resumeMsg = `${isSelfSwitch ? "Self model switch" : "Model switch"} to "${switched.model}"${switched.thinkingLevel ? ` (${switched.thinkingLevel})` : ""} completed${reasonNote} with conversation history preserved. Continue your work immediately.`;
+            void this.reviveMemberWithPendingWakes(runId, memberName, resumeMsg);
+            return;
+          }
+          // When autoResume is false (e.g. role-level propagation), fall through so member stays parked or drains wakes!
         } catch (err) {
           live.switchingModel = false;
           live.pendingWakes.length = 0;
@@ -4021,22 +4162,25 @@ export class SwarmEngine implements ISwarmEngine {
         settings.fallbackModels,
         live?.triedModels,
       );
-      if (
-        fallback &&
+      const canRecoverColdOrWarm =
         live &&
-        live.handle?.getState() === "waiting" &&
         isStillValidTurn() &&
-        !getOwnMember(this.cachedRun, memberName)?.humanStopped
-      ) {
-        live.triedModels.add(fallback);
+        !getOwnMember(this.cachedRun, memberName)?.humanStopped &&
+        (live.handle?.getState() === "waiting" ||
+          !live.handle ||
+          live.handle.getState() === "stopped");
+      if (fallback && canRecoverColdOrWarm) {
+        const parsedFallback = parseModelSpec(fallback);
+        live.triedModels.add(parsedFallback.model || fallback);
         // Atomic handoff: turnActive -> switchingModel (prevents concurrent @mention from racing wake!)
         live.switchingModel = true;
         live.turnActive = false;
         try {
-          await this.performSwitchModel(
+          const fbSwitched = await this.performSwitchModel(
             {
               targetName: memberName,
-              model: fallback,
+              model: parsedFallback.model || fallback,
+              thinkingLevel: parsedFallback.thinkingLevel,
               reason: `Auto-fallback after rate limit (${errorText})`,
               callerName: ORCHESTRATOR_NAME,
               callerRole: "orchestrator",
@@ -4059,11 +4203,12 @@ export class SwarmEngine implements ISwarmEngine {
           live.switchingModel = false;
           this.cancelStallWatchdog();
           void this.cancelActiveMonitor("Swarm activity resumed");
-          void this.drainMemberPendingWakes(
-            runId,
-            memberName,
-            `Model automatically hot-switched to "${fallback}" after provider rate limit (${errorText}). Continue your work with your preserved conversation history.`,
-          );
+          const fbPrompt = `Model automatically hot-switched to "${fbSwitched.model}"${fbSwitched.thinkingLevel ? ` (${fbSwitched.thinkingLevel})` : ""} after provider rate limit (${errorText}). Continue your work with your preserved conversation history.`;
+          if (live.handle?.getState() === "waiting") {
+            void this.drainMemberPendingWakes(runId, memberName, fbPrompt);
+          } else {
+            void this.reviveMemberWithPendingWakes(runId, memberName, fbPrompt);
+          }
           return;
         } catch {
           live.switchingModel = false;
@@ -4084,8 +4229,9 @@ export class SwarmEngine implements ISwarmEngine {
         return;
       }
 
-      // Engage shared fleet rate-limit breaker
-      const delayMs = this.rateLimitBreaker.recordRateLimit(result.retryAfterMs, errorText);
+      // Engage shared fleet rate-limit breaker (reusing delay if already recorded before slot release)
+      const delayMs =
+        preRecordedDelayMs ?? this.rateLimitBreaker.recordRateLimit(result.retryAfterMs, errorText);
       await this.store.appendEvent({
         runId,
         type: "rate_limit_backoff",
@@ -4102,10 +4248,12 @@ export class SwarmEngine implements ISwarmEngine {
         },
       });
 
-      // Automatic backoff retry when `settings.maxRetries` allows and warm handle is parked waiting
+      // Automatic backoff retry when `settings.maxRetries` allows and member can be woken/revived
       if (
         live &&
-        live.handle?.getState() === "waiting" &&
+        (live.handle?.getState() === "waiting" ||
+          !live.handle ||
+          live.handle.getState() === "stopped") &&
         isStillValidTurn() &&
         live.turnActive &&
         !getOwnMember(this.cachedRun, memberName)?.humanStopped &&
@@ -4128,7 +4276,7 @@ export class SwarmEngine implements ISwarmEngine {
           !isStillValidTurn() ||
           !live.turnActive ||
           getOwnMember(this.cachedRun, memberName)?.humanStopped ||
-          live.handle?.getState() !== "waiting"
+          (live.handle && live.handle.getState() !== "waiting" && live.handle.getState() !== "stopped")
         ) {
           live.turnActive = false;
           this.checkAllIdleAndNotifyWaiters();
@@ -4138,12 +4286,14 @@ export class SwarmEngine implements ISwarmEngine {
 
         live.retryTimer = setTimeout(() => {
           live.retryTimer = undefined;
+          const isWarmWaiting = live.handle?.getState() === "waiting";
+          const isColdRecoverable = !live.handle || live.handle.getState() === "stopped";
           if (
             this.disposed ||
             this.activeRunId !== runId ||
             this.cachedRun?.status !== "active" ||
             this.liveMembers.get(memberName) !== live ||
-            live.handle?.getState() !== "waiting" ||
+            (!isWarmWaiting && !isColdRecoverable) ||
             live.spawning ||
             live.waking ||
             live.turnActive ||
@@ -4157,7 +4307,11 @@ export class SwarmEngine implements ISwarmEngine {
           this.cancelStallWatchdog();
           void this.cancelActiveMonitor("Swarm activity resumed");
           const retryPrompt = `Rate-limit backoff elapsed (automatic retry ${attempt}/${maxRetries} after ${errorText}). Continue your work from where you left off.`;
-          void this.drainMemberPendingWakes(runId, memberName, retryPrompt);
+          if (isWarmWaiting) {
+            void this.drainMemberPendingWakes(runId, memberName, retryPrompt);
+          } else {
+            void this.reviveMemberWithPendingWakes(runId, memberName, retryPrompt);
+          }
         }, delayMs);
         live.retryTimer.unref?.();
         live.turnActive = false;
@@ -4240,12 +4394,14 @@ export class SwarmEngine implements ISwarmEngine {
       return;
     }
     if (live) {
-      live.pendingWakes.length = 0;
       live.pendingSelfModelSwitch = undefined;
     }
     try {
       const latestRun = await this.store.loadRun(runId);
       const current = getOwnMember(latestRun, memberName);
+      if (live && (!current || current.state === "killed" || current.humanStopped)) {
+        live.pendingWakes.length = 0;
+      }
       // Never resurrect killed or stopped members back to "waiting"!
       if (!current || current.state === "killed" || current.state === "stopped") {
         this.setCachedRun(latestRun);
@@ -5062,12 +5218,29 @@ export class SwarmEngine implements ISwarmEngine {
         },
       };
 
-      const monitorModel =
-        settings.validatorModel ??
-        settings.workerModel ??
-        settings.orchestratorModel;
-      const monitorThinking =
-        settings.validatorThinkingLevel ?? settings.workerThinkingLevel;
+      const rawMonitorConfig =
+        run.roleModels.validator?.model || settings.validatorModel
+          ? {
+              model: run.roleModels.validator?.model ?? settings.validatorModel,
+              thinkingLevel:
+                run.roleModels.validator?.thinkingLevel ?? settings.validatorThinkingLevel,
+            }
+          : run.roleModels.worker?.model || settings.workerModel
+            ? {
+                model: run.roleModels.worker?.model ?? settings.workerModel,
+                thinkingLevel:
+                  run.roleModels.worker?.thinkingLevel ?? settings.workerThinkingLevel,
+              }
+            : {
+                model: run.roleModels.orchestrator?.model ?? settings.orchestratorModel,
+                thinkingLevel:
+                  run.roleModels.orchestrator?.thinkingLevel ?? settings.orchestratorThinkingLevel,
+              };
+      const parsedMonitorSpec = rawMonitorConfig.model?.trim()
+        ? parseModelSpec(rawMonitorConfig.model.trim())
+        : undefined;
+      const monitorModel = parsedMonitorSpec?.model || rawMonitorConfig.model?.trim() || undefined;
+      const monitorThinking = rawMonitorConfig.thinkingLevel ?? parsedMonitorSpec?.thinkingLevel;
 
       handle = await this.transport.spawnMember({
         agentId: this.generateAgentIdFn(MONITOR_NAME),
@@ -5330,13 +5503,14 @@ export class SwarmEngine implements ISwarmEngine {
           } else if (options?.since !== undefined) {
             readUpToSeq = res.head;
           }
-          if (readUpToSeq > latest.lastReadSeq) {
-            void this.store
-              .updateMember(runId, latest.name, { lastReadSeq: readUpToSeq })
-              .then((u) => {
-                this.setCachedRun(u);
-              })
-              .catch(() => {});
+          if (readUpToSeq > latest.lastReadSeq && this.cachedRun) {
+            const cachedMember = getOwnMember(this.cachedRun, latest.name);
+            if (cachedMember && readUpToSeq > cachedMember.lastReadSeq) {
+              this.cachedRun.members[latest.name] = {
+                ...cachedMember,
+                lastReadSeq: readUpToSeq,
+              };
+            }
           }
         }
         return res;

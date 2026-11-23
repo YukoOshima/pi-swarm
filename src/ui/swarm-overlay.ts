@@ -2,14 +2,13 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import {
   type Component,
-  decodeKittyPrintable,
   type Focusable,
   Input,
   Key,
   matchesKey,
   type TUI,
 } from "@earendil-works/pi-tui";
-import { DEFAULT_CHANNEL, ORCHESTRATOR_NAME } from "../constants.js";
+import { DEFAULT_CHANNEL, DEFAULT_SWARM_SETTINGS, ORCHESTRATOR_NAME } from "../constants.js";
 import { parseModelSpec } from "../store/index.js";
 import type {
   AvailableModelInfo,
@@ -24,12 +23,17 @@ import type {
 import {
   SwarmModelPickerView,
   type ModelPickerSettingsState,
+  type ModelSaveScope,
   type SwarmModelPickerViewOptions,
 } from "./model-picker.js";
 import {
   buildSwarmGraphLines,
+  computeBoxInnerWidth,
+  decodePrintableInput,
   fitLine,
   formatBoardKindBadge,
+  formatBoardTargets,
+  formatClock,
   formatCost,
   formatMemberRoleBadge,
   formatMemberStateBadge,
@@ -37,8 +41,13 @@ import {
   formatRunStatusBadge,
   formatTokens,
   formatWorkspaceBadge,
+  getOrderedMembers,
+  isEscapeKey,
+  isKeyReleaseSafe,
+  isTabKey,
   joinColumns,
   memberStateIcon,
+  normalizeEditorInput,
   renderBox,
   renderHorizontalRule,
   sanitizeDiffLine,
@@ -63,6 +72,8 @@ export interface SwarmOverlayOptions {
   hostModel?: string;
   /** Available models catalog for interactive `[m]` / `[M]` Mission Model Picker. */
   availableModels?: readonly AvailableModelInfo[];
+  /** Preferred save scope for `[M]` Mission Models view. */
+  initialScope?: ModelSaveScope;
   /** Current 3-role settings & origin metadata getter for `[M]` Mission Models view. */
   getModelSettingsState?: () => ModelPickerSettingsState;
   /** Handler called when updating a role default from `[M]` Mission Models view. */
@@ -92,67 +103,12 @@ interface FeedbackMessage {
   text: string;
 }
 
-function decodePrintableChar(data: string): string | undefined {
-  const kitty = decodeKittyPrintable(data);
-  if (kitty !== undefined) return kitty;
-  if (data.length === 1) {
-    const code = data.charCodeAt(0);
-    if (code >= 0x20 && code <= 0x7e) return data;
-  }
-  return undefined;
-}
-
-function computeInnerWidth(outerWidth: number): number {
-  if (outerWidth < 12) return Math.max(1, outerWidth);
-  const padX = outerWidth < 24 ? 0 : 1;
-  return Math.max(1, outerWidth - 2 - padX * 2);
-}
-
-function formatClock(timestamp: string): string {
-  const tIndex = timestamp.indexOf("T");
-  if (tIndex >= 0 && timestamp.length >= tIndex + 9) {
-    return timestamp.slice(tIndex + 1, tIndex + 9);
-  }
-  return timestamp.slice(0, 8);
-}
+const formatInnerClock = formatClock;
+const formatTargetsSuffix = formatBoardTargets;
 
 function formatErrorMessage(err: unknown): string {
   if (err instanceof Error) return sanitizePlainText(err.message);
   return sanitizePlainText(String(err));
-}
-
-function formatTargetsSuffix(
-  msg: Pick<BoardMessage, "mentions" | "channelMentions">,
-): string {
-  const targets: string[] = [];
-  for (const m of msg.mentions) {
-    const clean = sanitizePlainText(m);
-    if (clean) targets.push(clean.startsWith("@") ? clean : `@${clean}`);
-  }
-  for (const ch of msg.channelMentions ?? []) {
-    const clean = sanitizePlainText(ch).replace(/^@#?/, "");
-    if (clean) targets.push(`@#${clean}`);
-  }
-  if (targets.length === 0) return "";
-  return ` -> ${targets.join(", ")}`;
-}
-
-function getOrderedMembers(run: SwarmRunState): SwarmMemberRecord[] {
-  const seen = new Set<string>();
-  const out: SwarmMemberRecord[] = [];
-  for (const name of run.memberOrder) {
-    const member = run.members[name];
-    if (member) {
-      seen.add(name);
-      out.push(member);
-    }
-  }
-  for (const member of Object.values(run.members)) {
-    if (!seen.has(member.name)) {
-      out.push(member);
-    }
-  }
-  return out;
 }
 
 function parseModelAndThinking(raw: string): {
@@ -233,12 +189,14 @@ class SwarmOverlayComponent implements Component, Focusable {
 
   private prevHardwareCursor: boolean | null = null;
   private feedback: FeedbackMessage | undefined;
-  private subComponent: Component | null = null;
+  private subComponent: (Component & Partial<Focusable> & { dispose?(): void }) | null = null;
   private showHelp = false;
   private unsubscribe: (() => void) | undefined;
   private closed = false;
   private currentRunId: string | null;
   private readonly hostModel?: string;
+  private boardRefreshInFlight = false;
+  private boardRefreshPending = false;
 
   constructor(
     private readonly tui: TUI,
@@ -291,7 +249,8 @@ class SwarmOverlayComponent implements Component, Focusable {
         prevFilteredLen === 0 || this.boardSelectedIndex >= prevFilteredLen - 1;
 
       const nextRunId = ev.snapshot.activeRunId ?? ev.snapshot.run?.id ?? null;
-      if (nextRunId !== this.currentRunId) {
+      const runSwitched = nextRunId !== this.currentRunId;
+      if (runSwitched) {
         this.currentRunId = nextRunId;
         this.boardMessages = [];
         this.diffState = null;
@@ -311,6 +270,12 @@ class SwarmOverlayComponent implements Component, Focusable {
         this.syncInputFocus();
       }
 
+      const prevMaxSeq =
+        this.boardMessages.length > 0
+          ? this.boardMessages[this.boardMessages.length - 1]!.seq
+          : 0;
+      const prevBoardLen = this.boardMessages.length;
+
       this.snapshot = ev.snapshot;
       this.mergeBoardMessages(ev.snapshot.recentBoard);
 
@@ -324,7 +289,15 @@ class SwarmOverlayComponent implements Component, Focusable {
         this.boardMessages.length > 0
           ? this.boardMessages[this.boardMessages.length - 1]!.seq
           : 0;
-      if (ev.type === "board_posted" || ev.snapshot.boardHead > maxLoadedSeq) {
+      const minRecentSeq =
+        ev.snapshot.recentBoard.length > 0
+          ? ev.snapshot.recentBoard[0]!.seq
+          : Infinity;
+      const hasSeqGap =
+        ev.snapshot.boardHead > maxLoadedSeq ||
+        (prevBoardLen === 0 && ev.snapshot.boardHead > ev.snapshot.recentBoard.length) ||
+        (prevMaxSeq > 0 && minRecentSeq > prevMaxSeq + 1);
+      if (runSwitched || hasSeqGap) {
         void this.refreshFullBoard();
       }
 
@@ -340,6 +313,9 @@ class SwarmOverlayComponent implements Component, Focusable {
 
   set focused(value: boolean) {
     this._focused = value;
+    if (this.subComponent && "focused" in this.subComponent) {
+      this.subComponent.focused = value;
+    }
     this.syncInputFocus();
   }
 
@@ -429,35 +405,56 @@ class SwarmOverlayComponent implements Component, Focusable {
     this.switchTab(TAB_ORDER[nextIdx]!);
   }
 
-  private mergeBoardMessages(incoming: readonly BoardMessage[]): void {
-    if (incoming.length === 0) return;
+  private mergeBoardMessages(incoming: readonly BoardMessage[]): boolean {
+    if (incoming.length === 0) return false;
     const bySeq = new Map<number, BoardMessage>();
     for (const msg of this.boardMessages) {
       bySeq.set(msg.seq, msg);
     }
+    let changed = false;
     for (const msg of incoming) {
+      const existing = bySeq.get(msg.seq);
+      if (!existing || existing.text !== msg.text || existing.kind !== msg.kind) {
+        changed = true;
+      }
       bySeq.set(msg.seq, msg);
     }
-    this.boardMessages = Array.from(bySeq.values()).sort((a, b) => a.seq - b.seq);
+    if (changed) {
+      this.boardMessages = Array.from(bySeq.values()).sort((a, b) => a.seq - b.seq);
+    }
+    return changed;
   }
 
   private async refreshFullBoard(): Promise<void> {
     const runId = this.snapshot.run?.id;
     if (this.closed || !runId) return;
+    if (this.boardRefreshInFlight) {
+      this.boardRefreshPending = true;
+      return;
+    }
+    this.boardRefreshInFlight = true;
     try {
       const res = await this.engine.readBoard({ channel: "*", limit: 500 });
       if (this.closed || this.snapshot.run?.id !== runId) return;
       const prevLen = this.getFilteredBoardMessages().length;
       const wasAtLatest = prevLen === 0 || this.boardSelectedIndex >= prevLen - 1;
-      this.mergeBoardMessages(res.messages);
-      const nextLen = this.getFilteredBoardMessages().length;
-      if (wasAtLatest && nextLen > 0) {
-        this.boardSelectedIndex = nextLen - 1;
+      const changed = this.mergeBoardMessages(res.messages);
+      if (changed) {
+        const nextLen = this.getFilteredBoardMessages().length;
+        if (wasAtLatest && nextLen > 0) {
+          this.boardSelectedIndex = nextLen - 1;
+        }
+        this.clampSelections();
+        this.tui.requestRender();
       }
-      this.clampSelections();
-      this.tui.requestRender();
     } catch {
       // Fall back silently to snapshot.recentBoard
+    } finally {
+      this.boardRefreshInFlight = false;
+      if (this.boardRefreshPending && !this.closed) {
+        this.boardRefreshPending = false;
+        void this.refreshFullBoard();
+      }
     }
   }
 
@@ -554,6 +551,8 @@ class SwarmOverlayComponent implements Component, Focusable {
 
   dispose(): void {
     this.closed = true;
+    this.subComponent?.dispose?.();
+    this.subComponent = null;
     this.inlineMode = undefined;
     this.searchFocused = false;
     this.pendingKillConfirm = undefined;
@@ -573,6 +572,7 @@ class SwarmOverlayComponent implements Component, Focusable {
   invalidate(): void {
     this.inlineInput.invalidate();
     this.searchInput.invalidate();
+    this.subComponent?.invalidate();
   }
 
   // ==========================================================================
@@ -698,37 +698,34 @@ class SwarmOverlayComponent implements Component, Focusable {
     }
   }
 
-  private openMissionModelsPicker(): void {
+  private buildModelPickerState(): ModelPickerSettingsState {
+    if (this.options?.getModelSettingsState) {
+      return this.options.getModelSettingsState();
+    }
     const run = this.snapshot.run;
-    const baseState: ModelPickerSettingsState = this.options?.getModelSettingsState
-      ? this.options.getModelSettingsState()
-      : {
-          settings: {
-            orchestratorModel: run?.roleModels?.orchestrator?.model,
-            orchestratorThinkingLevel: run?.roleModels?.orchestrator?.thinkingLevel,
-            workerModel: run?.roleModels?.worker?.model,
-            workerThinkingLevel: run?.roleModels?.worker?.thinkingLevel,
-            validatorModel: run?.roleModels?.validator?.model,
-            validatorThinkingLevel: run?.roleModels?.validator?.thinkingLevel,
-            fallbackModels: [...(run?.roleModels?.fallbackModels ?? [])],
-            maxConcurrency: run?.maxConcurrency ?? 6,
-            validatorEnabled: run?.validatorEnabled ?? true,
-            keepWorkersWarm: run?.keepWorkersWarm ?? true,
-            stallWatchdogEnabled: true,
-            stallMonitorMode: "llm",
-            stallTimeoutMs: 45_000,
-            maxRetries: 2,
-            rateLimitBaseBackoffMs: 5_000,
-            rateLimitMaxBackoffMs: 60_000,
-            gitTimeoutMs: 30_000,
-            autoRebase: true,
-            autoTeardownOnComplete: false,
-          },
-          hostModel: this.hostModel,
-        };
+    return {
+      settings: {
+        ...DEFAULT_SWARM_SETTINGS,
+        orchestratorModel: run?.roleModels?.orchestrator?.model,
+        orchestratorThinkingLevel: run?.roleModels?.orchestrator?.thinkingLevel,
+        workerModel: run?.roleModels?.worker?.model,
+        workerThinkingLevel: run?.roleModels?.worker?.thinkingLevel,
+        validatorModel: run?.roleModels?.validator?.model,
+        validatorThinkingLevel: run?.roleModels?.validator?.thinkingLevel,
+        fallbackModels: [...(run?.roleModels?.fallbackModels ?? [])],
+        maxConcurrency: run?.maxConcurrency ?? DEFAULT_SWARM_SETTINGS.maxConcurrency,
+        validatorEnabled: run?.validatorEnabled ?? DEFAULT_SWARM_SETTINGS.validatorEnabled,
+        keepWorkersWarm: run?.keepWorkersWarm ?? DEFAULT_SWARM_SETTINGS.keepWorkersWarm,
+      },
+      hostModel: this.hostModel,
+    };
+  }
 
-    this.subComponent = new SwarmModelPickerView(this.tui, this.theme, {
+  private openMissionModelsPicker(): void {
+    const baseState = this.buildModelPickerState();
+    const picker = new SwarmModelPickerView(this.tui, this.theme, {
       mode: "roles",
+      initialScope: this.options?.initialScope ?? "global",
       state: baseState,
       availableModels: this.options?.availableModels ?? [],
       onApplyRole: this.options?.onApplyRoleModel,
@@ -744,39 +741,14 @@ class SwarmOverlayComponent implements Component, Focusable {
         }
       },
     });
+    picker.focused = this._focused;
+    this.subComponent = picker;
     this.tui.requestRender();
   }
 
   private openMemberModelPicker(member: SwarmMemberRecord): void {
-    const run = this.snapshot.run;
-    const baseState: ModelPickerSettingsState = this.options?.getModelSettingsState
-      ? this.options.getModelSettingsState()
-      : {
-          settings: {
-            orchestratorModel: run?.roleModels?.orchestrator?.model,
-            orchestratorThinkingLevel: run?.roleModels?.orchestrator?.thinkingLevel,
-            workerModel: run?.roleModels?.worker?.model,
-            workerThinkingLevel: run?.roleModels?.worker?.thinkingLevel,
-            validatorModel: run?.roleModels?.validator?.model,
-            validatorThinkingLevel: run?.roleModels?.validator?.thinkingLevel,
-            fallbackModels: [...(run?.roleModels?.fallbackModels ?? [])],
-            maxConcurrency: run?.maxConcurrency ?? 6,
-            validatorEnabled: run?.validatorEnabled ?? true,
-            keepWorkersWarm: run?.keepWorkersWarm ?? true,
-            stallWatchdogEnabled: true,
-            stallMonitorMode: "llm",
-            stallTimeoutMs: 45_000,
-            maxRetries: 2,
-            rateLimitBaseBackoffMs: 5_000,
-            rateLimitMaxBackoffMs: 60_000,
-            gitTimeoutMs: 30_000,
-            autoRebase: true,
-            autoTeardownOnComplete: false,
-          },
-          hostModel: this.hostModel,
-        };
-
-    this.subComponent = new SwarmModelPickerView(this.tui, this.theme, {
+    const baseState = this.buildModelPickerState();
+    const picker = new SwarmModelPickerView(this.tui, this.theme, {
       mode: "member",
       member,
       state: baseState,
@@ -790,6 +762,7 @@ class SwarmOverlayComponent implements Component, Focusable {
           callerName: ORCHESTRATOR_NAME,
           callerRole: "human",
           deferIfWorking: true,
+          autoResume: false,
           hostContext: this.ctx,
         });
         if (!this.closed) {
@@ -808,6 +781,8 @@ class SwarmOverlayComponent implements Component, Focusable {
         }
       },
     });
+    picker.focused = this._focused;
+    this.subComponent = picker;
     this.tui.requestRender();
   }
 
@@ -824,6 +799,7 @@ class SwarmOverlayComponent implements Component, Focusable {
         reason: "Hot-switched by user via Swarm overlay",
         callerName: ORCHESTRATOR_NAME,
         callerRole: "human",
+        autoResume: false,
         hostContext: this.ctx,
       });
       if (this.closed) return;
@@ -997,7 +973,7 @@ class SwarmOverlayComponent implements Component, Focusable {
   // ==========================================================================
 
   handleInput(data: string): void {
-    if (this.closed) return;
+    if (this.closed || isKeyReleaseSafe(data)) return;
 
     if (this.subComponent) {
       this.subComponent.handleInput?.(data);
@@ -1010,8 +986,11 @@ class SwarmOverlayComponent implements Component, Focusable {
         this.close();
         return;
       }
-      this.inlineInput.handleInput(data);
-      this.tui.requestRender();
+      const norm = normalizeEditorInput(data);
+      if (norm) {
+        this.inlineInput.handleInput(norm);
+        this.tui.requestRender();
+      }
       return;
     }
 
@@ -1026,7 +1005,7 @@ class SwarmOverlayComponent implements Component, Focusable {
         this.tui.requestRender();
         return;
       }
-      if (matchesKey(data, Key.tab)) {
+      if (isTabKey(data)) {
         this.cycleTab(1);
         this.tui.requestRender();
         return;
@@ -1049,7 +1028,9 @@ class SwarmOverlayComponent implements Component, Focusable {
         }
         return;
       }
-      this.searchInput.handleInput(data);
+      const norm = normalizeEditorInput(data);
+      if (!norm) return;
+      this.searchInput.handleInput(norm);
       const nextQuery = this.searchInput.getValue();
       if (nextQuery !== this.searchQuery) {
         this.searchQuery = nextQuery;
@@ -1061,7 +1042,7 @@ class SwarmOverlayComponent implements Component, Focusable {
     }
 
     // 3. Global close & tab-switch shortcuts
-    const ch = decodePrintableChar(data);
+    const ch = decodePrintableInput(data);
 
     // 2.5. Inline [k] kill confirmation on Members tab
     if (this.pendingKillConfirm) {
@@ -1086,7 +1067,7 @@ class SwarmOverlayComponent implements Component, Focusable {
         this.tui.requestRender();
         return;
       }
-      if (ch === "n" || ch === "N" || matchesKey(data, Key.escape)) {
+      if (ch === "n" || ch === "N" || isEscapeKey(data)) {
         this.pendingKillConfirm = undefined;
         this.tui.requestRender();
         return;
@@ -1101,7 +1082,7 @@ class SwarmOverlayComponent implements Component, Focusable {
         this.close();
         return;
       }
-      if (matchesKey(data, Key.escape) || matchesKey(data, Key.enter)) {
+      if (isEscapeKey(data) || matchesKey(data, Key.enter)) {
         this.expandedPost = null;
         this.tui.requestRender();
         return;
@@ -1119,7 +1100,7 @@ class SwarmOverlayComponent implements Component, Focusable {
         this.tui.requestRender();
         return;
       }
-      if (matchesKey(data, Key.pageUp)) {
+      if (matchesKey(data, Key.pageUp) || ch === "b") {
         this.expandedPost.scrollOffset = Math.max(
           0,
           this.expandedPost.scrollOffset - 5,
@@ -1127,9 +1108,29 @@ class SwarmOverlayComponent implements Component, Focusable {
         this.tui.requestRender();
         return;
       }
-      if (matchesKey(data, Key.pageDown)) {
+      if (matchesKey(data, Key.pageDown) || ch === " ") {
         this.expandedPost.scrollOffset += 5;
         this.tui.requestRender();
+        return;
+      }
+      if (ch === "g" || matchesKey(data, Key.home)) {
+        this.expandedPost.scrollOffset = 0;
+        this.tui.requestRender();
+        return;
+      }
+      if (ch === "G" || matchesKey(data, Key.end)) {
+        this.expandedPost.scrollOffset += 1_000;
+        this.tui.requestRender();
+        return;
+      }
+      if (
+        ch === "1" || ch === "2" || ch === "3" || ch === "4" ||
+        isTabKey(data) || matchesKey(data, Key.shift("tab")) ||
+        ch === "?" || ch === "M" || ch === "P"
+      ) {
+        this.expandedPost = null;
+      } else {
+        // Never leak other keys (such as 'c' channel cycle or 'p' post) to list behind expandedPost
         return;
       }
     }
@@ -1140,7 +1141,7 @@ class SwarmOverlayComponent implements Component, Focusable {
         return;
       }
       if (
-        matchesKey(data, Key.escape) ||
+        isEscapeKey(data) ||
         matchesKey(data, Key.enter) ||
         ch === "?"
       ) {
@@ -1151,7 +1152,7 @@ class SwarmOverlayComponent implements Component, Focusable {
     }
 
     if (
-      matchesKey(data, Key.escape) ||
+      isEscapeKey(data) ||
       matchesKey(data, Key.ctrl("c")) ||
       ch === "q" ||
       ch === "Q"
@@ -1742,8 +1743,10 @@ class SwarmOverlayComponent implements Component, Focusable {
     }
 
     const modelShort = member.model
-      ? shortenModelName(member.model, 16)
-      : "default";
+      ? `${shortenModelName(member.model, 16)}${member.thinkingLevel ? `:${member.thinkingLevel}` : ""}`
+      : member.thinkingLevel
+        ? `default:${member.thinkingLevel}`
+        : "default";
     const modelStr = this.theme.fg("dim", `[${modelShort}]`);
     const wsStr = formatWorkspaceBadge(member.workspace, member.branch, this.theme);
     const parentStr =
@@ -2192,28 +2195,29 @@ class SwarmOverlayComponent implements Component, Focusable {
     }
 
     const targetWidth = Math.max(1, Math.floor(width));
-    const innerWidth = computeInnerWidth(targetWidth);
+    const innerWidth = computeBoxInnerWidth(targetWidth);
     const termRows = this.tui.terminal?.rows ?? 30;
-    const maxTotalLines = Math.max(14, Math.min(34, Math.floor(termRows * 0.85)));
+    const maxTotalLines = Math.max(12, Math.min(34, Math.floor(termRows * 0.85)));
     const maxInnerLines = Math.max(10, maxTotalLines - 2);
 
     if (this.showHelp) {
       const helpBody = [
-        fitLine(this.theme.fg("accent", this.theme.bold("Global Shortcuts")), innerWidth),
+        fitLine(this.theme.fg("accent", this.theme.bold("Global & Overlay Shortcuts")), innerWidth),
         fitLine("  1-4 / Tab / Shift+Tab   Switch Board, Members, Graph, Search tabs", innerWidth),
-        fitLine("  M (Shift+M)             Configure 3-Role Mission Models & Effort", innerWidth),
-        fitLine("  P (Shift+P)             Pause or Resume active Swarm run", innerWidth),
+        fitLine("  M (Shift+M) / ^Shift+M  Configure 3-Role Mission Models & Effort", innerWidth),
+        fitLine("  P (Shift+P) / ^Shift+S  Pause/Resume Swarm · Open Mission Control/Hub", innerWidth),
         fitLine("  ?                       Toggle this shortcuts help view", innerWidth),
         fitLine("  Esc / q                 Close Mission Control overlay", innerWidth),
         renderHorizontalRule(innerWidth, undefined, this.theme),
         fitLine(this.theme.fg("accent", this.theme.bold("Members Tab [2]")), innerWidth),
-        fitLine("  m                       Switch selected member model (keeps history)", innerWidth),
-        fitLine("  w / x / k / g           Steer / Stop / Kill / Merge worktree", innerWidth),
+        fitLine("  m / w / x / k / g       Switch model / Steer / Stop / Kill / Merge", innerWidth),
         fitLine("  l / d                   Toggle full Logs or Git Diff view", innerWidth),
-        renderHorizontalRule(innerWidth, undefined, this.theme),
-        fitLine(this.theme.fg("dim", "Press Esc, Enter or ? to return"), innerWidth),
       ];
-      return renderBox(helpBody.slice(0, maxInnerLines), targetWidth, {
+      const maxEntries = Math.max(2, maxInnerLines - 2);
+      const outHelp = helpBody.slice(0, maxEntries);
+      outHelp.push(renderHorizontalRule(innerWidth, undefined, this.theme));
+      outHelp.push(fitLine(this.theme.fg("dim", "Press Esc, Enter or ? to return"), innerWidth));
+      return renderBox(outHelp, targetWidth, {
         title: this.theme.fg("accent", this.theme.bold("🐝 Mission Control Shortcuts")),
         borderColor: (s) => this.theme.fg("borderAccent", s),
       });
@@ -2248,7 +2252,6 @@ class SwarmOverlayComponent implements Component, Focusable {
       {
         maxWidth: Math.max(12, Math.floor(innerWidth * 0.55)),
         theme: this.theme,
-        includeThinking: false,
       },
     );
     const runLeft = `[${statusBadge}] ${titleStr} · base:${sanitizePlainText(run.baseBranch)}`;

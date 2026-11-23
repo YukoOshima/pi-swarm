@@ -542,7 +542,10 @@ export function validateProposedSwarmPlan(
         const deduped: string[] = [];
         const seenChannels = new Set<string>();
         for (const ch of raw.channels) {
-          const trimmedCh = typeof ch === "string" ? ch.trim() : "";
+          const trimmedCh =
+            typeof ch === "string"
+              ? ch.trim().replace(/^[@#]+/, "").toLowerCase()
+              : "";
           if (!trimmedCh || !CHANNEL_NAME_PATTERN.test(trimmedCh) || isPrototypeKey(trimmedCh)) {
             issues.push({
               code: "INVALID_CHANNEL",
@@ -1175,6 +1178,7 @@ export function createProposeSwarmPlanTool(
             ? `${proposedPlan.strategy}\n\nUser launch guidance: ${launchComment}`
             : proposedPlan.strategy,
           ...(outcome.roleModels ? { roleModels: outcome.roleModels } : {}),
+          ...(launchComment ? { feedback: launchComment } : {}),
           validatorEnabled: outcome.validatorEnabled,
           maxConcurrency: sanitizePositiveInt(
             outcome.maxConcurrency,

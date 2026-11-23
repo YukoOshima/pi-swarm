@@ -144,6 +144,7 @@ function parsePorcelainUnmergedPaths(output: string): string[] {
 export class WorktreeManager implements IWorktreeManager {
   readonly repoRoot: string;
   private gitTimeoutMs: number;
+  private readonly identityOverrideCache = new Map<string, string[]>();
 
   constructor(repoRoot: string, options?: WorktreeManagerOptions) {
     this.repoRoot = path.resolve(repoRoot);
@@ -220,14 +221,21 @@ export class WorktreeManager implements IWorktreeManager {
   }
 
   private async getIdentityOverrideArgs(cwd: string): Promise<string[]> {
-    const nameRes = await this.runGit(["config", "--get", "user.name"], {
-      cwd,
-      allowFailure: true,
-    });
-    const emailRes = await this.runGit(["config", "--get", "user.email"], {
-      cwd,
-      allowFailure: true,
-    });
+    const cacheKey = path.resolve(cwd);
+    const cached = this.identityOverrideCache.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+    const [nameRes, emailRes] = await Promise.all([
+      this.runGit(["config", "--get", "user.name"], {
+        cwd,
+        allowFailure: true,
+      }),
+      this.runGit(["config", "--get", "user.email"], {
+        cwd,
+        allowFailure: true,
+      }),
+    ]);
     const extra: string[] = [];
     if (!nameRes.ok || !nameRes.stdout.trim()) {
       extra.push("-c", "user.name=pi-swarm");
@@ -235,6 +243,7 @@ export class WorktreeManager implements IWorktreeManager {
     if (!emailRes.ok || !emailRes.stdout.trim()) {
       extra.push("-c", "user.email=pi-swarm@local");
     }
+    this.identityOverrideCache.set(cacheKey, extra);
     return extra;
   }
 
@@ -560,6 +569,8 @@ export class WorktreeManager implements IWorktreeManager {
           });
         }
       }
+
+      await this.ensureSwarmExcluded(resolvedWorktree).catch(() => {});
 
       return {
         branch: options.branch,

@@ -34,6 +34,7 @@ import {
   buildDraftingKickoffPrompt,
   buildDraftingSystemOverlay,
   buildRoleModelsFromSettings,
+  escapeXml,
   isDraftActive,
   registerDraftingTools,
 } from "./drafting/index.js";
@@ -49,13 +50,13 @@ import {
 import {
   SWARM_SETTINGS_BOUNDS,
   SwarmStore,
+  VALID_THINKING_LEVELS,
   WorktreeManager,
   assertOwnerSession,
   deleteProjectSettingsKeys,
   getRoleModelOrigin,
   isProcessAlive,
   loadLayeredSwarmSettings,
-  loadSwarmSettings,
   parseModelSpec,
   saveSwarmSettings,
   type LayeredSettingsResult,
@@ -71,6 +72,7 @@ import {
   type IWorktreeManager,
   type ProposedSwarmPlan,
   type RoleModelOrigin,
+  type RunSummary,
   type SafeTeardownResult,
   type SwarmEngineEvent,
   type SwarmFocusEntry,
@@ -101,6 +103,7 @@ import {
   formatZeroTurnGraphView,
   formatZeroTurnModelsView,
   formatZeroTurnStatusDashboard,
+  getOrderedMembers,
   isModalOpen,
   openSwarmHub,
   openSwarmModelPicker,
@@ -169,7 +172,11 @@ export const SWARM_SUBCOMMANDS: ReadonlyArray<{
   { name: "kill", description: "Permanently kill a member (<member> [--force] [reason])" },
   { name: "done", description: "Complete the active Swarm run and restore idle tools [summary]" },
   { name: "pause", description: "Pause member launches & board wakeups [reason]" },
-  { name: "resume", description: "Resume a paused Swarm run" },
+  {
+    name: "resume",
+    description:
+      "Resume paused or cross-session Swarm Mission ([run-id] [--continue|-c] [--quiet|-q] [guidance])",
+  },
   { name: "cancel", description: "Cancel active draft or abandon focused run" },
   {
     name: "teardown",
@@ -184,7 +191,6 @@ export const SWARM_SUBCOMMANDS: ReadonlyArray<{
 const SINGLE_WORD_SUBCOMMANDS = new Set([
   "status",
   "graph",
-  "resume",
   "cancel",
   "runs",
   "settings",
@@ -204,18 +210,9 @@ const ARG_SUBCOMMANDS = new Set([
   "kill",
   "done",
   "pause",
+  "resume",
   "teardown",
   "focus",
-]);
-
-const VALID_THINKING_LEVELS: ReadonlySet<ThinkingLevel> = new Set<ThinkingLevel>([
-  "off",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
 ]);
 
 const MODEL_ROLES: ReadonlyArray<SwarmModelRole> = [
@@ -496,15 +493,26 @@ async function applyOrchestratorModel(
   ctx: ExtensionContext | undefined,
   settings: SwarmSettings,
   getFallbackRuntime: () => Promise<ModelRuntime>,
+  options: { clearThinking?: boolean } = {},
 ): Promise<ApplyOrchestratorModelResult> {
   const configuredModel = settings.orchestratorModel?.trim();
+  const resolveHostDefaultThinking = (): ThinkingLevel => {
+    const raw = (
+      ctx as
+        | { settingsManager?: { getDefaultThinkingLevel?: () => ThinkingLevel | undefined } }
+        | undefined
+    )?.settingsManager?.getDefaultThinkingLevel?.();
+    return raw && VALID_THINKING_LEVELS.has(raw) ? raw : "medium";
+  };
+
   if (!configuredModel) {
-    if (
-      settings.orchestratorThinkingLevel &&
-      typeof pi.setThinkingLevel === "function"
-    ) {
+    if (typeof pi.setThinkingLevel === "function") {
       try {
-        pi.setThinkingLevel(settings.orchestratorThinkingLevel);
+        if (settings.orchestratorThinkingLevel) {
+          pi.setThinkingLevel(settings.orchestratorThinkingLevel);
+        } else if (options.clearThinking) {
+          pi.setThinkingLevel(resolveHostDefaultThinking());
+        }
       } catch {
         // ignore thinking-level error when no model change requested
       }
@@ -556,8 +564,12 @@ async function applyOrchestratorModel(
 
     const effectiveThinking =
       settings.orchestratorThinkingLevel ?? resolved.thinkingLevel;
-    if (effectiveThinking && typeof pi.setThinkingLevel === "function") {
-      pi.setThinkingLevel(effectiveThinking);
+    if (typeof pi.setThinkingLevel === "function") {
+      if (effectiveThinking) {
+        pi.setThinkingLevel(effectiveThinking);
+      } else if (options.clearThinking) {
+        pi.setThinkingLevel(resolveHostDefaultThinking());
+      }
     }
 
     return {
@@ -689,28 +701,11 @@ function createDelegatingProxy<T extends object>(getTarget: () => T): T {
   });
 }
 
-function getOrderedMembers(run: SwarmRunState): SwarmMemberRecord[] {
-  const seen = new Set<string>();
-  const out: SwarmMemberRecord[] = [];
-  for (const name of run.memberOrder) {
-    const member = run.members[name];
-    if (member) {
-      seen.add(name);
-      out.push(member);
-    }
-  }
-  for (const member of Object.values(run.members)) {
-    if (!seen.has(member.name)) {
-      out.push(member);
-    }
-  }
-  return out;
-}
-
 function buildRunKickoffMessage(
   run: SwarmRunState,
   spawnedInitial: readonly SwarmMemberRecord[],
   failedInitial?: ReadonlyArray<{ name: string; error: string }>,
+  feedback?: string,
 ): string {
   const lines: string[] = [
     `🐝 Dynamic Swarm "${run.title}" (\`${run.id}\`) is live on \`${run.baseBranch}\` (max concurrency: ${run.maxConcurrency}, Validator policy: ${run.validatorEnabled ? "ON" : "OFF"}).`,
@@ -722,6 +717,9 @@ function buildRunKickoffMessage(
   }
   if (run.acceptanceCriteria.trim()) {
     lines.push(`- **Acceptance Criteria:** ${run.acceptanceCriteria.trim()}`);
+  }
+  if (feedback && feedback.trim()) {
+    lines.push(`- **User Confirmation Notes:** ${feedback.trim()}`);
   }
 
   lines.push("");
@@ -758,13 +756,69 @@ function buildRunKickoffMessage(
   return lines.join("\n");
 }
 
+function buildMissionResumePrompt(
+  run: SwarmRunState,
+  guidance?: string,
+  recentBoard?: readonly BoardMessage[],
+): string {
+  const members = getOrderedMembers(run).filter((m) => m.state !== "killed");
+  const lines: string[] = [
+    `<swarm_mission_resumed run_id="${escapeXml(run.id)}" status="${escapeXml(run.status)}" base_branch="${escapeXml(run.baseBranch)}" board_head="${run.boardHead}">`,
+    `🐝 **Swarm Mission Resumed:** "${run.title}" (\`${run.id}\`) on \`${run.baseBranch}\` (Validator policy: ${run.validatorEnabled ? "ON" : "OFF"}).`,
+    "",
+    `- **Objective:** ${run.objective}`,
+  ];
+  if (run.strategy.trim()) {
+    lines.push(`- **Strategy:** ${run.strategy.trim()}`);
+  }
+  if (run.acceptanceCriteria.trim()) {
+    lines.push(`- **Acceptance Criteria:** ${run.acceptanceCriteria.trim()}`);
+  }
+  if (guidance?.trim()) {
+    lines.push(`- **User Resume Guidance:** ${guidance.trim()}`);
+  }
+  if (members.length > 0) {
+    lines.push("", "**Active / Resumable Members:**");
+    for (const m of members.slice(0, 16)) {
+      const wsPart = m.branch ? `${m.workspace}:${m.branch}` : m.workspace;
+      const modelPart = m.model ? ` model=${m.model}${m.thinkingLevel ? `:${m.thinkingLevel}` : ""}` : "";
+      lines.push(`- \`@${m.name}\` (${m.role}, \`${wsPart}\`, state=${m.state}${modelPart})`);
+    }
+    if (members.length > 16) {
+      lines.push(`- … +${members.length - 16} more member(s)`);
+    }
+  } else {
+    lines.push("", "**Members:** none currently active (`0` non-killed members).");
+  }
+  if (recentBoard && recentBoard.length > 0) {
+    lines.push("", "**Recent Message Board Tail:**");
+    for (const msg of recentBoard.slice(-8)) {
+      const targets = [
+        ...msg.mentions.map((m) => `@${m}`),
+        ...msg.channelMentions.map((c) => `#${c}`),
+      ];
+      const targetStr = targets.length > 0 ? ` -> ${targets.join(", ")}` : "";
+      const preview = sanitizePlainText(msg.text).replace(/\s+/g, " ").trim().slice(0, 220);
+      lines.push(`- \`#${msg.seq}\` [${msg.channel}] \`@${msg.from}\`${targetStr}: ${preview}`);
+    }
+  }
+  lines.push(
+    "",
+    "Resume Mission coordination from the persisted board & git state:",
+    `1. Inspect recent board context via \`read_board{since: ${Math.max(0, run.boardHead - 20)}}\` (or inspect \`#tasks\` / \`git status\`) to see what is completed, parked, or unmerged.`,
+    '2. Wake parked/stopped members with `post_message` (`wake: true`), spawn any remaining work via `swarm{action:"add"}`, merge verified `share`/`branch` worktrees, and call `swarm{action:"done", summary}` once verified.',
+    "</swarm_mission_resumed>",
+  );
+  return lines.join("\n");
+}
+
 function buildHelpMarkdown(): string {
   return [
-    "### 🐝 Pi Swarm v0.4.0 (`/swarm`) — Dynamic Antigravity Swarm Commands",
+    "### 🐝 Pi Swarm v0.5.0 (`/swarm`) — Dynamic Antigravity Swarm Commands",
     "",
     "| Command | Description |",
     "| --- | --- |",
-    "| `/swarm` | Open Droid-style Mission Hub (TUI) or interactive drafting / status menu |",
+    "| `/swarm` | Open Droid-style Mission Hub (with `🔄 Resume Mission` when unfinished) or status menu |",
     "| `/swarm <goal>` | Interactive upfront Q&A → Flexible Dynamic Swarm Plan confirmation (`[m]` models, `[c]` comment) |",
     "| `/swarm direct <goal>` · `/swarm-direct <goal>` | Fast-path: skip Q&A, propose plan with auto-confirm, and launch Dynamic Swarm immediately |",
     "| `/swarm tweak [guidance]` | Revise the focused Swarm plan, strategy, or add members interactively |",
@@ -778,7 +832,8 @@ function buildHelpMarkdown(): string {
     "| `/swarm merge <member>` | Merge a member's `share` worktree or `branch` clone onto `baseBranch` (`autoRebase` + `--no-ff`) |",
     "| `/swarm kill <member> [--force] [reason]` | Permanently kill a member and remove its clean worktree (`--force` overrides dirty worktree guard) |",
     "| `/swarm done [summary]` | Complete the active Swarm run, dispose warm handles, and restore `idle` tools |",
-    "| `/swarm pause [reason]` / `/swarm resume` | Pause or resume member launches and board wakeups |",
+    "| `/swarm pause [reason]` | Pause member launches & board wakeups |",
+    "| `/swarm resume [run-id] [--continue\\|-c] [--quiet\\|-q] [guidance]` | Zero-turn unpause (focused same-session) OR Droid-style cross-session Mission resume |",
     "| `/swarm cancel` | Cancel active draft (restores tools) or abandon focused run (preserves worktrees & `.pi/swarm/runs/`) |",
     "| `/swarm teardown [--force] [--delete-branches]` | Safely remove clean idle worktrees while preserving `.pi/swarm/runs/` audit & board history |",
     "| `/swarm runs` | List all runs stored in `.pi/swarm/runs/` |",
@@ -895,6 +950,10 @@ export function createPiSwarmExtension(
     };
     let lastLayeredSettings: LayeredSettingsResult | undefined;
     let cachedAvailableModels: AvailableModelInfo[] = [];
+    let lastStatusText: string | undefined | null = null;
+    let runsCache:
+      | { cwd: string; runs: RunSummary[]; fetchedAt: number }
+      | undefined;
     let boundCwd: string | undefined;
     let lastCtx: ExtensionContext | undefined;
     let fallbackModelRuntimePromise: Promise<ModelRuntime> | undefined;
@@ -1160,6 +1219,29 @@ export function createPiSwarmExtension(
       widgetState.draftSeed = draft?.seed;
     }
 
+    function invalidateRunsCache(): void {
+      runsCache = undefined;
+    }
+
+    async function listRunsCached(
+      store: ISwarmStore,
+      forceRefresh = false,
+    ): Promise<RunSummary[]> {
+      const cwd = boundCwd ?? "";
+      const nowMs = (overrides.now ?? Date.now)();
+      if (
+        !forceRefresh &&
+        runsCache &&
+        runsCache.cwd === cwd &&
+        nowMs - runsCache.fetchedAt < 1500
+      ) {
+        return runsCache.runs;
+      }
+      const runs = await store.listRuns();
+      runsCache = { cwd, runs, fetchedAt: nowMs };
+      return runs;
+    }
+
     function refreshUI(
       ctxOverride?: ExtensionContext,
       snapshotOverride?: SwarmSnapshot,
@@ -1169,7 +1251,10 @@ export function createPiSwarmExtension(
       if (ctx?.hasUI) {
         const snapshot = snapshotOverride ?? getSnapshotSafe();
         const line = formatStatusLine(snapshot, draftController.isActive());
-        ctx.ui.setStatus(SWARM_STATUS_KEY, line);
+        if (line !== lastStatusText) {
+          lastStatusText = line;
+          ctx.ui.setStatus(SWARM_STATUS_KEY, line);
+        }
       }
     }
 
@@ -1316,7 +1401,11 @@ export function createPiSwarmExtension(
       modelValue: string | undefined,
       thinkingLevel: ThinkingLevel | undefined,
       ctx: ExtensionContext | undefined,
-      options: { scope?: "project" | "global"; updateRun?: boolean } = {},
+      options: {
+        scope?: "project" | "global";
+        updateRun?: boolean;
+        clearThinking?: boolean;
+      } = {},
     ): Promise<{
       settings: SwarmSettings;
       orchestratorApply?: ApplyOrchestratorModelResult;
@@ -1357,27 +1446,29 @@ export function createPiSwarmExtension(
         ? undefined
         : (null as unknown as ThinkingLevel);
       const nextModelPatchVal = isClearing ? clearModelVal : resolvedModelValue;
+      const shouldClearThinking =
+        resolvedThinking === undefined && (isClearing || Boolean(options.clearThinking));
 
       const patch: Partial<SwarmSettings> = {};
       if (role === "orchestrator") {
         patch.orchestratorModel = nextModelPatchVal;
         if (resolvedThinking !== undefined) {
           patch.orchestratorThinkingLevel = resolvedThinking;
-        } else if (isClearing) {
+        } else if (shouldClearThinking) {
           patch.orchestratorThinkingLevel = clearThinkingVal;
         }
       } else if (role === "worker") {
         patch.workerModel = nextModelPatchVal;
         if (resolvedThinking !== undefined) {
           patch.workerThinkingLevel = resolvedThinking;
-        } else if (isClearing) {
+        } else if (shouldClearThinking) {
           patch.workerThinkingLevel = clearThinkingVal;
         }
       } else {
         patch.validatorModel = nextModelPatchVal;
         if (resolvedThinking !== undefined) {
           patch.validatorThinkingLevel = resolvedThinking;
-        } else if (isClearing) {
+        } else if (shouldClearThinking) {
           patch.validatorThinkingLevel = clearThinkingVal;
         }
       }
@@ -1412,23 +1503,26 @@ export function createPiSwarmExtension(
             model: isClearing ? undefined : resolvedModelValue,
             thinkingLevel: resolvedThinking,
             previousModel,
+            clearToInherit: isClearing,
             hostContext: targetCtx,
           });
           propagated = {
             switched: propRes.switched,
             deferred: propRes.deferred,
           };
+        } else {
+          await syncActiveRunRoleModels(targetCtx);
         }
-        await syncActiveRunRoleModels(targetCtx);
       }
 
       let orchestratorApply: ApplyOrchestratorModelResult | undefined;
-      if (role === "orchestrator" && !isClearing) {
+      if (role === "orchestrator" && (!isClearing || shouldClearThinking)) {
         orchestratorApply = await applyOrchestratorModel(
           pi,
           targetCtx,
           currentSettings,
           getLazyFallbackModelRuntime,
+          { clearThinking: shouldClearThinking },
         );
       }
 
@@ -1478,7 +1572,11 @@ export function createPiSwarmExtension(
             sel.model ?? "default",
             sel.thinkingLevel,
             ctx ?? lastCtx,
-            { scope: sel.scope, updateRun: true },
+            {
+              scope: sel.scope,
+              updateRun: true,
+              clearThinking: sel.thinkingLevel === undefined,
+            },
           );
           const parts: string[] = [];
           if (!sel.model) {
@@ -1893,6 +1991,7 @@ export function createPiSwarmExtension(
       unbindShortcuts = bindSwarmShortcuts(ctx, {
         isModalOpen: () => isModalOpen(widgetState),
         isExpanded: () => widgetState.expanded,
+        isHostStreaming: () => Boolean(lastCtx && !lastCtx.isIdle()),
         onToggleExpand: () => {
           widgetState.expanded = !widgetState.expanded;
           refreshUI(ctx);
@@ -2000,6 +2099,9 @@ export function createPiSwarmExtension(
       }
 
       activeWidgetTui = undefined;
+      lastStatusText = null;
+      cachedAvailableModels = [];
+      runsCache = undefined;
       widgetState.expanded = false;
       widgetState.draftActive = false;
       widgetState.draftMode = undefined;
@@ -2231,7 +2333,7 @@ export function createPiSwarmExtension(
       const customChannels = new Set<string>();
       for (const memberSpec of candidates) {
         for (const rawCh of memberSpec.channels ?? []) {
-          const clean = rawCh.trim().replace(/^@#?/, "").toLowerCase();
+          const clean = rawCh.trim().replace(/^[@#]+/, "").toLowerCase();
           if (clean && clean !== DEFAULT_CHANNEL) {
             customChannels.add(clean);
           }
@@ -2372,6 +2474,7 @@ export function createPiSwarmExtension(
             finalRun,
             spawnedInitial,
             failedInitial,
+            plan.feedback,
           ),
         });
 
@@ -2409,7 +2512,7 @@ export function createPiSwarmExtension(
         maxConcurrency: plan.maxConcurrency,
         validatorEnabled: plan.validatorEnabled,
         keepWorkersWarm: currentSettings.keepWorkersWarm,
-        roleModels: buildRoleModelsFromSettings(currentSettings),
+        roleModels: plan.roleModels ?? buildRoleModelsFromSettings(currentSettings),
       });
 
       // 4. Attach & start the run in SwarmEngine (defer focus entry until initialMembers settle)
@@ -2461,7 +2564,12 @@ export function createPiSwarmExtension(
         type: "kickoff",
         runId: finalRun.id,
         summary: `Dynamic Swarm "${finalRun.title}" (${finalRun.id}) launched`,
-        kickoffBody: buildRunKickoffMessage(finalRun, spawnedInitial, failedInitial),
+        kickoffBody: buildRunKickoffMessage(
+          finalRun,
+          spawnedInitial,
+          failedInitial,
+          plan.feedback,
+        ),
       });
 
       return finalRun;
@@ -2948,6 +3056,7 @@ export function createPiSwarmExtension(
       await openSwarmOverlay(ctx, overlayEngine, worktree, {
         onModalEnter,
         onModalExit,
+        initialScope: getPreferredSaveScope(),
         ...(initialTab ? { initialTab } : {}),
         ...(initialMemberName ? { initialMemberName } : {}),
         ...(initialChannel ? { initialChannel } : {}),
@@ -3036,6 +3145,7 @@ export function createPiSwarmExtension(
                 thinkingLevel: sel.thinkingLevel,
                 callerName: "human",
                 callerRole: "human",
+                autoResume: false,
                 deferIfWorking: true,
                 hostContext: ctx,
               });
@@ -3244,6 +3354,7 @@ export function createPiSwarmExtension(
           thinkingLevel,
           callerName: "human",
           callerRole: "human",
+          autoResume: false,
           deferIfWorking: true,
           hostContext: ctx,
         });
@@ -3638,44 +3749,232 @@ export function createPiSwarmExtension(
       }
     }
 
-    async function handleResumeCommand(ctx: ExtensionContext): Promise<void> {
+    async function handleResumeCommand(
+      rawArg: string,
+      ctx: ExtensionContext,
+      options: { kickoff?: boolean } = {},
+    ): Promise<void> {
       const { store, engine } = await ensureBound(ctx);
+      await reloadSettings(ctx.cwd);
       const snapshot = engine.getSnapshot();
-      if (!snapshot.run) {
+
+      const tokens = tokenizeCommandArgs(rawArg.trim());
+      let continueFlag = false;
+      let quietFlag = false;
+      const positional: string[] = [];
+      for (const tok of tokens) {
+        const lower = tok.toLowerCase();
+        if (lower === "--continue" || lower === "-c") {
+          continueFlag = true;
+        } else if (lower === "--quiet" || lower === "-q") {
+          quietFlag = true;
+        } else {
+          positional.push(tok);
+        }
+      }
+
+      const plainFocusedResume =
+        positional.length === 0 &&
+        !continueFlag &&
+        !options.kickoff &&
+        snapshot.run !== null &&
+        isCurrentSessionOwner(snapshot.run, ctx);
+
+      if (plainFocusedResume && snapshot.run) {
+        if (isTerminalRunStatus(snapshot.run.status)) {
+          const msg = `Cannot resume Swarm run \`${snapshot.run.id}\` because it is already ${snapshot.run.status}.`;
+          if (ctx.hasUI) ctx.ui.notify(msg, "warning");
+          else emitZeroTurnMessage(ctx, msg);
+          return;
+        }
+        try {
+          await assertFocusedRunOwner(store, snapshot.run.id, ctx);
+          const updated = await engine.resume(snapshot.run.id, ctx);
+          invalidateRunsCache();
+          applySwarmToolProfile(pi, computeDesiredToolProfile(ctx));
+          syncActiveRunSections({ ctx });
+          refreshUI(ctx);
+          const members = getOrderedMembers(updated);
+          const workingCount = members.filter((m) => m.state === "working").length;
+          const parked = members.filter(
+            (m) => m.state === "waiting" || m.state === "stopped",
+          );
+          let parkedNote = "";
+          if (workingCount === 0 && parked.length > 0) {
+            const preview = parked
+              .slice(0, 8)
+              .map((m) => `\`@${m.name}\` (${m.state})`)
+              .join(", ");
+            const extra = parked.length > 8 ? `, … +${parked.length - 8} more` : "";
+            parkedNote = ` Parked (0 working): ${preview}${extra} — wake via \`post_message\` or \`/swarm steer\`.`;
+          }
+          const msg = `Resumed Swarm run \`${updated.id}\`.${parkedNote}`;
+          if (ctx.hasUI) ctx.ui.notify(`Resumed Swarm run ${updated.id}.`, "info");
+          emitZeroTurnMessage(ctx, `▶ ${msg}`, { runId: updated.id, status: updated.status });
+        } catch (err) {
+          const msg = `Resume failed: ${formatError(err)}`;
+          if (ctx.hasUI) ctx.ui.notify(msg, "error");
+          else emitZeroTurnMessage(ctx, msg);
+        }
+        return;
+      }
+
+      const allRuns = (await listRunsCached(store, true)).slice().sort((a, b) =>
+        b.updatedAt.localeCompare(a.updatedAt),
+      );
+
+      let requestedRunId: string | undefined;
+      let guidance = "";
+      if (positional.length > 0) {
+        const firstTok = positional[0]!;
+        const matched = allRuns.find(
+          (r) => r.id === firstTok || r.id.toLowerCase() === firstTok.toLowerCase(),
+        );
+        if (matched) {
+          requestedRunId = matched.id;
+          guidance = positional.slice(1).join(" ").trim();
+        } else if (/^run-/i.test(firstTok)) {
+          const msg = `Swarm run \`${firstTok}\` not found.`;
+          if (ctx.hasUI) ctx.ui.notify(msg, "error");
+          else emitZeroTurnMessage(ctx, msg);
+          return;
+        } else {
+          guidance = positional.join(" ").trim();
+        }
+      }
+
+      let chosenSummary: RunSummary | undefined;
+      if (requestedRunId) {
+        chosenSummary = allRuns.find((r) => r.id === requestedRunId);
+      } else if (snapshot.run && !isTerminalRunStatus(snapshot.run.status)) {
+        chosenSummary = undefined;
+      } else {
+        const resumable = allRuns.filter((r) => !isTerminalRunStatus(r.status));
+        if (resumable.length === 0) {
+          const msg =
+            allRuns.length > 0
+              ? "No unfinished Swarm Mission to resume. Use `/swarm runs` to inspect past runs or `/swarm <goal>` to start a new Mission."
+              : "No focused Swarm run to resume.";
+          if (ctx.hasUI) ctx.ui.notify(msg, "info");
+          else emitZeroTurnMessage(ctx, msg);
+          return;
+        }
+        if (resumable.length === 1 || !ctx.hasUI || typeof ctx.ui.select !== "function") {
+          chosenSummary = resumable[0]!;
+        } else {
+          const labels = resumable.map(
+            (r) =>
+              `${r.id} [${r.status}] — ${(r.title || r.objective).slice(0, 52)} (board #${r.boardHead})`,
+          );
+          const choice = await withModalGuard(() =>
+            ctx.ui.select("Select an unfinished Swarm Mission to resume", labels),
+          );
+          if (!choice) {
+            return;
+          }
+          const idx = labels.indexOf(choice);
+          chosenSummary = idx >= 0 ? resumable[idx] : undefined;
+          if (!chosenSummary) {
+            return;
+          }
+        }
+      }
+
+      const targetRun: SwarmRunState | undefined = chosenSummary
+        ? await store.loadRun(chosenSummary.id).catch(() => undefined)
+        : snapshot.run ?? undefined;
+
+      if (!targetRun) {
         const msg = "No focused Swarm run to resume.";
         if (ctx.hasUI) ctx.ui.notify(msg, "info");
         else emitZeroTurnMessage(ctx, msg);
         return;
       }
-      if (isTerminalRunStatus(snapshot.run.status)) {
-        const msg = `Cannot resume Swarm run \`${snapshot.run.id}\` because it is already ${snapshot.run.status}.`;
+
+      if (isTerminalRunStatus(targetRun.status)) {
+        const msg = `Cannot resume Swarm run \`${targetRun.id}\` because it is already ${targetRun.status}.`;
         if (ctx.hasUI) ctx.ui.notify(msg, "warning");
         else emitZeroTurnMessage(ctx, msg);
         return;
       }
+
       try {
-        await assertFocusedRunOwner(store, snapshot.run.id, ctx);
-        const updated = await engine.resume(snapshot.run.id, ctx);
+        const currentSid = getCurrentSessionId(ctx);
+        assertOwnerSession(targetRun, currentSid);
+        const wasAlreadyFocusedAndOwned =
+          snapshot.activeRunId === targetRun.id && isCurrentSessionOwner(targetRun, ctx);
+
+        if (!isCurrentSessionOwner(targetRun, ctx)) {
+          await store.updateRun(targetRun.id, {
+            ownerSessionId: currentSid,
+            ownerPid: process.pid,
+            actor: ORCHESTRATOR_NAME,
+          });
+        }
+
+        if (engine.getSnapshot().activeRunId !== targetRun.id || !wasAlreadyFocusedAndOwned) {
+          await engine.attachRun(targetRun.id, ctx);
+        }
+
+        const updated = await engine.resume(targetRun.id, ctx);
+        invalidateRunsCache();
+        persistFocusEntry(pi, updated.id, currentSid, "resume_mission");
+
+        const runOrch = updated.roleModels?.orchestrator;
+        const effectiveOrchModel =
+          runOrch?.model?.trim() || currentSettings.orchestratorModel;
+        const effectiveOrchThinking = runOrch?.model?.trim()
+          ? runOrch.thinkingLevel
+          : currentSettings.orchestratorThinkingLevel;
+        if (!wasAlreadyFocusedAndOwned && effectiveOrchModel) {
+          await applyOrchestratorModel(
+            pi,
+            ctx,
+            {
+              ...currentSettings,
+              orchestratorModel: effectiveOrchModel,
+              orchestratorThinkingLevel: effectiveOrchThinking,
+            },
+            getLazyFallbackModelRuntime,
+          );
+        }
+
         applySwarmToolProfile(pi, computeDesiredToolProfile(ctx));
         syncActiveRunSections({ ctx });
         refreshUI(ctx);
-        const members = getOrderedMembers(updated);
-        const workingCount = members.filter((m) => m.state === "working").length;
-        const parked = members.filter(
-          (m) => m.state === "waiting" || m.state === "stopped",
-        );
-        let parkedNote = "";
-        if (workingCount === 0 && parked.length > 0) {
-          const preview = parked
-            .slice(0, 8)
-            .map((m) => `\`@${m.name}\` (${m.state})`)
-            .join(", ");
-          const extra = parked.length > 8 ? `, … +${parked.length - 8} more` : "";
-          parkedNote = ` Parked (0 working): ${preview}${extra} — wake via \`post_message\` or \`/swarm steer\`.`;
+
+        const shouldWakeOrchestrator =
+          !quietFlag &&
+          (continueFlag ||
+            Boolean(guidance) ||
+            Boolean(options.kickoff) ||
+            !wasAlreadyFocusedAndOwned);
+
+        if (!shouldWakeOrchestrator) {
+          const msg = `Resumed Swarm run \`${updated.id}\`.`;
+          if (ctx.hasUI) ctx.ui.notify(`Resumed Swarm run ${updated.id}.`, "info");
+          emitZeroTurnMessage(ctx, `▶ ${msg}`, { runId: updated.id, status: updated.status });
+          return;
         }
-        const msg = `Resumed Swarm run \`${updated.id}\`.${parkedNote}`;
-        if (ctx.hasUI) ctx.ui.notify(`Resumed Swarm run ${updated.id}.`, "info");
-        emitZeroTurnMessage(ctx, `▶ ${msg}`, { runId: updated.id, status: updated.status });
+
+        const boardRes = await store
+          .readBoard(updated.id, { limit: 8 })
+          .catch(() => ({ messages: [] as BoardMessage[] }));
+        if (ctx.hasUI) {
+          ctx.ui.notify(`Resumed Swarm Mission ${updated.id} — waking Orchestrator…`, "info");
+        } else {
+          emitZeroTurnMessage(ctx, `▶ Resumed Swarm Mission \`${updated.id}\`.`, {
+            runId: updated.id,
+            status: updated.status,
+          });
+        }
+
+        enqueueWakeupItem({
+          type: "kickoff",
+          runId: updated.id,
+          summary: `Resumed Swarm Mission "${updated.title}" (${updated.id})`,
+          kickoffBody: buildMissionResumePrompt(updated, guidance, boardRes.messages),
+        });
       } catch (err) {
         const msg = `Resume failed: ${formatError(err)}`;
         if (ctx.hasUI) ctx.ui.notify(msg, "error");
@@ -4214,13 +4513,18 @@ export function createPiSwarmExtension(
                   : Array.from(
                       new Set(
                         trimmed
-                          .split(/[\s,]+/)
+                          .split(",")
                           .map((s) => s.trim())
                           .filter(
                             (s) =>
                               s.length > 0 &&
                               !CLEAR_MODEL_TOKENS.has(s.toLowerCase()),
-                          ),
+                          )
+                          .map((s) => {
+                            const p = parseModelSpec(s);
+                            return p.thinkingLevel ? `${p.model}:${p.thinkingLevel}` : p.model;
+                          })
+                          .filter(Boolean),
                       ),
                     );
               await persistPatch({ fallbackModels: nextFallbacks });
@@ -4393,7 +4697,7 @@ export function createPiSwarmExtension(
       if (canUseCustomTui(ctx)) {
         const [availableModels, runs] = await Promise.all([
           refreshAvailableModels(ctx, true),
-          store.listRuns().catch(() => []),
+          listRunsCached(store, true).catch(() => []),
         ]);
         const callbacks = makeModelPickerCallbacks(ctx);
         const action = await withModalGuard(() =>
@@ -4423,7 +4727,9 @@ export function createPiSwarmExtension(
             await handlePauseCommand("", ctx);
             return;
           case "resume":
-            await handleResumeCommand(ctx);
+            await handleResumeCommand(action.runId ?? "", ctx, {
+              kickoff: action.kickoff ?? true,
+            });
             return;
           case "done":
             await handleDoneCommand("", ctx);
@@ -4508,7 +4814,7 @@ export function createPiSwarmExtension(
         await handleTweakCommand("", ctx);
       } else if (choice === pauseOrResumeLabel) {
         if (run.status === "paused") {
-          await handleResumeCommand(ctx);
+          await handleResumeCommand("", ctx);
         } else {
           await handlePauseCommand("", ctx);
         }
@@ -4584,7 +4890,7 @@ export function createPiSwarmExtension(
           await handlePauseCommand(parsed.rest, ctx);
           return;
         case "resume":
-          await handleResumeCommand(ctx);
+          await handleResumeCommand(parsed.rest, ctx);
           return;
         case "cancel":
           await handleCancelCommand(ctx);
@@ -4680,6 +4986,16 @@ export function createPiSwarmExtension(
         }
         const run = getSnapshotSafe().run;
         if (run) {
+          for (const ch of Object.keys(run.channels)) {
+            const hashCh = `#${ch}`;
+            if (hashCh.toLowerCase().startsWith(lowerActive) || ch.toLowerCase().startsWith(lowerActive)) {
+              items.push({
+                value: `${sub} ${hashCh}`,
+                label: hashCh,
+                description: `Open Board tab filtered to #${ch}`,
+              });
+            }
+          }
           for (const member of getOrderedMembers(run)) {
             if (member.name.toLowerCase().startsWith(lowerActive)) {
               items.push({
@@ -4827,12 +5143,38 @@ export function createPiSwarmExtension(
               });
             }
           }
+          if ("default".startsWith(lowerActive)) {
+            items.push({
+              value: `${cmdWord} ${target} ${modelId} default`,
+              label: "default",
+              description: "Reset thinking level to role/model default",
+            });
+          }
           for (const flag of ["--global", "--project"]) {
             if (flag.startsWith(lowerActive)) {
               items.push({
                 value: `${cmdWord} ${target} ${modelId} ${flag}`,
                 label: flag,
                 description: flag === "--global" ? "Save to ~/.pi/agent/pi-swarm-settings.json" : "Save to .pi/pi-swarm-settings.json",
+              });
+            }
+          }
+          return items.length > 0 ? items : null;
+        }
+
+        if (completedCount === 3) {
+          const prior = rawTokens.slice(0, 3).join(" ");
+          const lowerActive = activeToken.toLowerCase();
+          const items: AutocompleteItem[] = [];
+          for (const flag of ["--global", "--project"]) {
+            if (flag.startsWith(lowerActive) && !rawTokens.slice(0, 3).includes(flag)) {
+              items.push({
+                value: `${cmdWord} ${prior} ${flag}`,
+                label: flag,
+                description:
+                  flag === "--global"
+                    ? "Save to ~/.pi/agent/pi-swarm-settings.json"
+                    : "Save to .pi/pi-swarm-settings.json",
               });
             }
           }
@@ -4875,24 +5217,30 @@ export function createPiSwarmExtension(
       }
 
       if (sub === "kill") {
+        const hasTrailingSpace = /\s$/.test(prefix);
+        const rawTokens = argPrefix ? argPrefix.split(/\s+/).filter(Boolean) : [];
+        const priorTokens = hasTrailingSpace ? rawTokens : rawTokens.slice(0, -1);
+        const activeToken = hasTrailingSpace ? "" : (rawTokens[rawTokens.length - 1] ?? "");
+        const valuePrefix = priorTokens.length > 0 ? `kill ${priorTokens.join(" ")} ` : "kill ";
+        const lowerActive = activeToken.toLowerCase();
+        const usedTokens = new Set(priorTokens.map((t) => t.toLowerCase()));
         const run = getSnapshotSafe().run;
-        const lowerActive = argPrefix.toLowerCase();
         const items: AutocompleteItem[] = [];
-        if (run) {
+        if (run && !priorTokens.some((t) => !t.startsWith("-"))) {
           for (const entry of getOrderedMembers(run)) {
             if (entry.state === "killed") continue;
             if (entry.name.toLowerCase().startsWith(lowerActive)) {
               items.push({
-                value: `kill ${entry.name}`,
+                value: `${valuePrefix}${entry.name}`,
                 label: entry.name,
                 description: `${entry.role} [${entry.state}]`,
               });
             }
           }
         }
-        if ("--force".startsWith(lowerActive)) {
+        if ("--force".startsWith(lowerActive) && !usedTokens.has("--force")) {
           items.push({
-            value: "kill --force",
+            value: `${valuePrefix}--force`,
             label: "--force",
             description: "Force-kill even if member worktree has uncommitted changes",
           });
@@ -4901,27 +5249,82 @@ export function createPiSwarmExtension(
       }
 
       if (sub === "teardown") {
+        const hasTrailingSpace = /\s$/.test(prefix);
+        const rawTokens = argPrefix ? argPrefix.split(/\s+/).filter(Boolean) : [];
+        const priorTokens = hasTrailingSpace ? rawTokens : rawTokens.slice(0, -1);
+        const activeToken = hasTrailingSpace ? "" : (rawTokens[rawTokens.length - 1] ?? "");
+        const valuePrefix =
+          priorTokens.length > 0 ? `teardown ${priorTokens.join(" ")} ` : "teardown ";
+        const usedTokens = new Set(priorTokens.map((t) => t.toLowerCase()));
         const flags = [
           {
-            value: "teardown --force",
             label: "--force",
             description: "Stop active members and force-remove dirty worktrees",
           },
           {
-            value: "teardown --delete-branches",
             label: "--delete-branches",
             description: "Also delete local member branches for removed worktrees",
           },
         ];
-        const items = flags.filter((f) =>
-          f.label.startsWith(argPrefix.toLowerCase()),
-        );
+        const items = flags
+          .filter(
+            (f) =>
+              !usedTokens.has(f.label) &&
+              f.label.startsWith(activeToken.toLowerCase()),
+          )
+          .map((f): AutocompleteItem => ({
+            value: `${valuePrefix}${f.label}`,
+            label: f.label,
+            description: f.description,
+          }));
+        return items.length > 0 ? items : null;
+      }
+
+      if (sub === "resume") {
+        const hasTrailingSpace = /\s$/.test(prefix);
+        const rawTokens = argPrefix ? argPrefix.split(/\s+/).filter(Boolean) : [];
+        const priorTokens = hasTrailingSpace ? rawTokens : rawTokens.slice(0, -1);
+        const activeToken = hasTrailingSpace ? "" : (rawTokens[rawTokens.length - 1] ?? "");
+        const valuePrefix =
+          priorTokens.length > 0 ? `resume ${priorTokens.join(" ")} ` : "resume ";
+        const lowerActive = activeToken.toLowerCase();
+        const usedTokens = new Set(priorTokens.map((t) => t.toLowerCase()));
+        const items: AutocompleteItem[] = [];
+        for (const flag of [
+          { label: "--continue", description: "Always trigger an Orchestrator continuation turn" },
+          { label: "--quiet", description: "Attach & unpause without waking the Orchestrator" },
+        ]) {
+          if (!usedTokens.has(flag.label) && flag.label.startsWith(lowerActive)) {
+            items.push({
+              value: `${valuePrefix}${flag.label}`,
+              label: flag.label,
+              description: flag.description,
+            });
+          }
+        }
+        if (activeStore && !priorTokens.some((t) => !t.startsWith("-"))) {
+          try {
+            const runs = await listRunsCached(activeStore);
+            for (const r of runs) {
+              if (isTerminalRunStatus(r.status)) continue;
+              if (r.id.toLowerCase().startsWith(lowerActive)) {
+                items.push({
+                  value: `${valuePrefix}${r.id}`,
+                  label: r.id,
+                  description: `[${r.status}] ${(r.title || r.objective).slice(0, 48)}`,
+                });
+              }
+            }
+          } catch {
+            // ignore autocomplete store errors
+          }
+        }
         return items.length > 0 ? items : null;
       }
 
       if (sub === "focus" && activeStore) {
         try {
-          const runs = await activeStore.listRuns();
+          const runs = await listRunsCached(activeStore);
           const items: AutocompleteItem[] = runs
             .filter((r) => r.id.toLowerCase().startsWith(argPrefix.toLowerCase()))
             .map((r) => ({
@@ -4950,7 +5353,7 @@ export function createPiSwarmExtension(
     // ------------------------------------------------------------------------
     pi.registerCommand("swarm", {
       description:
-        "Pi Swarm v0.4.0 — Dynamic Antigravity Swarm orchestrator (Droid Mission-style model & effort picker, shared #seq board, non-blocking swarm_wait, warm disk sessions, fork & worktrees/clones)",
+        "Pi Swarm v0.5.0 — Dynamic Antigravity Swarm orchestrator (Droid Mission-style model/effort picker & cross-session resume, shared #seq board, non-blocking swarm_wait, warm disk sessions, fork & worktrees/clones)",
       getArgumentCompletions: getSwarmCompletions,
       handler: handleSwarmCommand,
     });
@@ -4983,6 +5386,32 @@ export function createPiSwarmExtension(
       await rehydrateSessionState(ctx);
       await mountUI(ctx);
       void refreshAvailableModels(ctx, true);
+
+      if (
+        !activeEngine?.getSnapshot().activeRunId &&
+        !draftController.isActive() &&
+        activeStore &&
+        ctx.hasUI
+      ) {
+        try {
+          const allRuns = await listRunsCached(activeStore);
+          const unfinished = allRuns.filter((r) => !isTerminalRunStatus(r.status));
+          if (unfinished.length === 1) {
+            const r = unfinished[0]!;
+            ctx.ui.notify(
+              `Unfinished Swarm Mission "${r.title}" (${r.id}, ${r.status}) — run /swarm or /swarm resume to continue.`,
+              "info",
+            );
+          } else if (unfinished.length > 1) {
+            ctx.ui.notify(
+              `${unfinished.length} unfinished Swarm Missions found — run /swarm or /swarm resume to continue.`,
+              "info",
+            );
+          }
+        } catch {
+          // best-effort startup hint
+        }
+      }
     });
 
     pi.on("session_tree", async (_event, ctx) => {

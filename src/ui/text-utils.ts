@@ -1,7 +1,12 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import {
+  decodeKittyPrintable,
+  isKeyRelease,
+  Key,
+  matchesKey,
   sliceByColumn,
   stripTerminalSequences,
+  type TUI,
   truncateToWidth,
   visibleWidth,
   wrapTextWithAnsi,
@@ -10,9 +15,11 @@ import { ORCHESTRATOR_NAME } from "../constants.js";
 import type {
   BoardMessage,
   BoardMessageKind,
+  RoleModelOrigin,
   SwarmMemberRecord,
   SwarmMemberRole,
   SwarmMemberState,
+  SwarmModelRole,
   SwarmRoleModels,
   SwarmRunState,
   SwarmRunStatus,
@@ -63,6 +70,8 @@ export interface RoleModelsLineOptions {
   theme?: StyleTheme;
   /** Include thinking level suffix when configured and width allows (default: true). */
   includeThinking?: boolean;
+  /** Optional origin labels (`project` | `global` | `host`) included when space permits. */
+  origins?: Partial<Record<SwarmModelRole, RoleModelOrigin>>;
 }
 
 export interface SwarmGraphOptions {
@@ -448,9 +457,12 @@ export function formatRoleModelsLine(
     return parts.join(sep);
   };
 
-  const fullLabels = entries.map((e) =>
-    includeThinking && e.thinking ? `${e.raw}(${e.thinking})` : e.raw,
-  );
+  const fullLabels = entries.map((e, idx) => {
+    const base = includeThinking && e.thinking ? `${e.raw}(${e.thinking})` : e.raw;
+    const role: SwarmModelRole = idx === 0 ? "orchestrator" : idx === 1 ? "worker" : "validator";
+    const origin = options?.origins?.[role];
+    return origin ? `${base} [${origin}]` : base;
+  });
   const fullLine = assemble(fullLabels);
 
   if (options?.maxWidth === undefined) {
@@ -461,6 +473,16 @@ export function formatRoleModelsLine(
   if (maxW === 0) return "";
   if (visibleWidth(fullLine) <= maxW) {
     return fullLine;
+  }
+
+  if (options?.origins) {
+    const noOriginLabels = entries.map((e) =>
+      includeThinking && e.thinking ? `${e.raw}(${e.thinking})` : e.raw,
+    );
+    const noOriginLine = assemble(noOriginLabels);
+    if (visibleWidth(noOriginLine) <= maxW) {
+      return noOriginLine;
+    }
   }
 
   // Pass 1: strip provider prefixes while preserving thinking suffix if it fits
@@ -640,6 +662,138 @@ export function formatBoardKindBadge(
       return theme.fg("error", raw);
     case "chat":
       return theme.fg("dim", raw);
+  }
+}
+
+export function formatOriginBadge(
+  origin: RoleModelOrigin | undefined,
+  theme?: StyleTheme,
+): string {
+  if (!origin) return "";
+  const label = origin === "project" ? "[project]" : origin === "global" ? "[global]" : "[host]";
+  if (!theme) return label;
+  if (origin === "project") return theme.fg("warning", label);
+  if (origin === "global") return theme.fg("muted", label);
+  return theme.fg("dim", label);
+}
+
+export function formatClock(isoTimestamp: string): string {
+  const ms = Date.parse(isoTimestamp);
+  if (!Number.isFinite(ms)) return "--:--:--";
+  const d = new Date(ms);
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
+  return `${hh}:${mm}:${ss}`;
+}
+
+export function formatBoardTargets(
+  msg: Pick<BoardMessage, "mentions" | "channelMentions">,
+): string {
+  const parts: string[] = [];
+  for (const m of msg.mentions ?? []) {
+    const clean = sanitizePlainText(m);
+    if (clean) parts.push(clean.startsWith("@") ? clean : `@${clean}`);
+  }
+  for (const c of msg.channelMentions ?? []) {
+    const clean = sanitizePlainText(c).replace(/^@#?/, "");
+    if (clean) parts.push(`@#${clean}`);
+  }
+  return parts.length > 0 ? ` -> ${parts.join(", ")}` : "";
+}
+
+export function computeBoxInnerWidth(width: number, paddingX = 1): number {
+  const targetWidth = Math.max(1, Math.floor(width));
+  if (targetWidth < 12) return targetWidth;
+  const effectivePad = targetWidth < 24 ? 0 : Math.max(0, paddingX);
+  return Math.max(1, targetWidth - 2 - effectivePad * 2);
+}
+
+export function isKeyReleaseSafe(data: string): boolean {
+  return Boolean(data && isKeyRelease(data));
+}
+
+export function isEscapeKey(data: string): boolean {
+  if (!data || isKeyReleaseSafe(data)) return false;
+  return matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("["));
+}
+
+export function isBackspaceKey(data: string): boolean {
+  if (!data || isKeyReleaseSafe(data)) return false;
+  return (
+    matchesKey(data, Key.backspace) ||
+    (data !== "\r" && data !== "\n" && matchesKey(data, Key.ctrl("h")))
+  );
+}
+
+export function isTabKey(data: string): boolean {
+  if (!data || isKeyReleaseSafe(data)) return false;
+  return (
+    matchesKey(data, Key.tab) ||
+    data === "\x1b[27;1;9~" ||
+    (data !== "\t" && matchesKey(data, Key.ctrl("i")))
+  );
+}
+
+export function decodeModifyOtherKeysPrintable(data: string): string | undefined {
+  const m = /^\x1b\[27;(\d+);(\d+)~$/.exec(data);
+  if (!m) return undefined;
+  const mod = Number.parseInt(m[1]!, 10);
+  const cp = Number.parseInt(m[2]!, 10);
+  if (mod !== 1 && mod !== 2) return undefined;
+  if (!Number.isFinite(cp) || cp < 0x20 || cp === 0x7f || cp > 0x10ffff) {
+    return undefined;
+  }
+  return String.fromCodePoint(cp);
+}
+
+export function decodePrintableInput(data: string): string | undefined {
+  if (!data || isKeyReleaseSafe(data)) return undefined;
+  if (data.length === 1) {
+    const code = data.charCodeAt(0);
+    if (code >= 0x20 && code !== 0x7f) {
+      return data;
+    }
+    return undefined;
+  }
+  const kitty = decodeKittyPrintable(data);
+  if (kitty) return kitty;
+  return decodeModifyOtherKeysPrintable(data);
+}
+
+export function normalizeEditorInput(data: string): string {
+  if (!data || isKeyReleaseSafe(data)) return "";
+  if (data !== "\x1b" && matchesKey(data, Key.ctrl("["))) {
+    return "\x1b";
+  }
+  if (data !== "\b" && data !== "\x7f" && matchesKey(data, Key.ctrl("h"))) {
+    return "\x7f";
+  }
+  return decodeModifyOtherKeysPrintable(data) ?? data;
+}
+
+export class HardwareCursorController {
+  private prev: boolean | null = null;
+
+  sync(tui: TUI | undefined, show: boolean): void {
+    if (!tui || typeof tui.setShowHardwareCursor !== "function") {
+      return;
+    }
+    if (this.prev !== show) {
+      this.prev = show;
+      tui.setShowHardwareCursor(show);
+    }
+  }
+
+  restore(tui: TUI | undefined): void {
+    if (!tui || typeof tui.setShowHardwareCursor !== "function") {
+      this.prev = null;
+      return;
+    }
+    if (this.prev === true) {
+      tui.setShowHardwareCursor(false);
+    }
+    this.prev = null;
   }
 }
 
@@ -894,7 +1048,7 @@ export function renderTable<T>(
 // Pure Swarm Collaboration Graph Builder (Spawn Tree + Peer @mentions)
 // ============================================================================
 
-function getOrderedRunMembers(run: SwarmRunState): SwarmMemberRecord[] {
+export function getOrderedMembers(run: SwarmRunState): SwarmMemberRecord[] {
   const seen = new Set<string>();
   const out: SwarmMemberRecord[] = [];
   for (const name of run.memberOrder) {
@@ -911,6 +1065,8 @@ function getOrderedRunMembers(run: SwarmRunState): SwarmMemberRecord[] {
   }
   return out;
 }
+
+const getOrderedRunMembers = getOrderedMembers;
 
 function styleMemberStateIcon(
   state: SwarmMemberState,

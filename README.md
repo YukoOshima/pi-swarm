@@ -1,9 +1,9 @@
-# 🐝 pi-swarm (`v0.4.0`)
+# 🐝 pi-swarm (`v0.5.0`)
 
 **`pi-swarm`** is a **Dynamic Antigravity Swarm** multi-agent orchestration extension for [Pi](https://github.com/earendil-works/pi) (`v1.5.2+`).
 面向 [Pi](https://github.com/earendil-works/pi) (`v1.5.2+`) 的**动态蜂群（Dynamic Antigravity Swarm）多 Agent 协作与编排扩展**。
 
-Instead of locking work into a rigid upfront DAG, `pi-swarm` v0.4.0 pairs **`pi-goal-x`-style upfront clarification** and **Droid Mission-style interactive 3-role Model & Reasoning Effort configuration** with **Antigravity-Swarm-grade dynamic orchestration**: unified Mission Hub (`/swarm`), searchable provider-grouped Model Picker (`/swarm models`, `Ctrl+Shift+M`), automatic live role propagation (`Running agents switch on their next turn; Inherit applies only to new agents`), non-blocking `swarm_wait`, disk-persisted member sessions (`SessionManager.create`/`open`), hot model switching, Smart LLM Monitor (`@monitor`), and true isolated `git clone` for `workspace:"branch"`.
+Instead of locking work into a rigid upfront DAG, `pi-swarm` v0.5.0 pairs **`pi-goal-x`-style upfront clarification** and **Droid Mission-style Model & Effort Configuration + Cross-Session Mission Resume** (`/swarm resume`) with **Antigravity-Swarm-grade dynamic orchestration**: unified Mission Hub (`/swarm` with `🔄 Resume Mission`), searchable provider-grouped Model Picker (`/swarm models`, `Ctrl+Shift+M`, `Alt+M`), automatic live role propagation (`Running agents switch on their next turn; Inherit applies only to new agents`), non-blocking `swarm_wait`, disk-persisted member sessions (`SessionManager.create`/`open`), hot model switching, Smart LLM Monitor (`@monitor`), and true isolated `git clone` for `workspace:"branch"`.
 
 ---
 
@@ -122,7 +122,7 @@ Merged in order: **`DEFAULT_SWARM_SETTINGS` ← Global (`~/.pi/agent/pi-swarm-se
 - **Interactive Model & Reasoning Effort Picker (`/swarm models` or `Ctrl+Shift+M`)**:
   - **4 Tabs (`Tab` / `Shift+Tab`)**: **`[Orchestrator]`** · **`[Worker]`** · **`[Validator]`** · **`[Fallbacks]`**
   - **2-Step Selection**: Search provider-grouped models → press `Enter` → select Reasoning Effort (`Default` | `Off` | `Minimal` | `Low` | `Medium` | `High ★` | `Extra high (xhigh)` | `Max`).
-  - **Quick Shortcuts**: `Ctrl+S` toggles Save Scope (`Global ~/.pi/agent` vs `Project .pi/`, automatically unmasking stale project overrides when saving to Global) · `Ctrl+E` cycles effort inline · `Ctrl+X` resets role to `Inherit Host Session Model` · `Space` / `[` / `]` toggles and reorders `fallbackModels`.
+  - **Quick Shortcuts**: `Ctrl+S` toggles Save Scope (`Global ~/.pi/agent` vs `Project .pi/`, automatically unmasking stale project overrides when saving to Global) · `Ctrl+E` cycles effort inline · `Ctrl+X` resets role to `Inherit Host Session Model` · `Space` / `[` / `]` toggles and reorders `fallbackModels` · `Alt+M` / `Ctrl+M` opens inline Model Picker inside Mission Hub (`Enter` launches Direct Swarm cleanly).
 - **Live Propagation (`Running agents switch at their next turn; Inherit applies only to new agents`)**:
   - Changing `worker` or `validator` updates `run.roleModels`, silently updates parked `waiting` / `stopped` members tracking the role default, and queues a turn-end switch for `working` members without disturbing explicit per-member overrides.
 
@@ -147,7 +147,7 @@ Merged in order: **`DEFAULT_SWARM_SETTINGS` ← Global (`~/.pi/agent/pi-swarm-se
 /swarm model author google/gemini-2.5-pro:high
 ```
 
-On provider HTTP 429 / quota exhaustion, `SwarmEngine` also automatically tries the next untried model in `fallbackModels` on warm `waiting` members before falling back to shared exponential backoff (`RateLimitBreaker`).
+On provider HTTP 429 / quota exhaustion, `SwarmEngine` also automatically tries the next untried model in `fallbackModels` (including `:thinking` specs on both warm `waiting` and cold `stopped` members when `keepWorkersWarm: false`) before falling back to shared exponential backoff (`RateLimitBreaker`).
 
 ---
 
@@ -185,7 +185,7 @@ Only **`/swarm`** and **`/swarm-direct`** are registered on Pi.
 | Command (`命令`) | Description (`说明`) | LLM Turn? |
 | --- | --- | :---: |
 | `/swarm <goal>` | Interactive `pi-goal-x` drafting (`orchestratorModel` → Q&A → plan confirm → Dynamic Swarm) | Yes |
-| `/swarm` (bare) | Open **Swarm Mission Hub** in TUI (Goal composer, Mission Models card, `Ctrl+M` inline picker, previous runs & quick actions) | No (until launched) |
+| `/swarm` (bare) | Open **Swarm Mission Hub** in TUI (`🔄 Resume Mission` when unfinished, Goal composer, `Alt+M` / `Ctrl+M` inline Mission Models picker, previous runs & quick actions) | No (until launched) |
 | `/swarm direct <goal>` <br> `/swarm-direct <goal>` | Fast-path: skip Q&A (`autoConfirm: true`), propose plan and launch Dynamic Swarm immediately | Yes |
 | `/swarm tweak [guidance]` | Revise the focused active/paused Swarm plan, strategy, or spawn additional members interactively | Yes |
 | `/swarm status` | Zero-turn dashboard: 3-role models, channels, roster table, recent board & events | **No** |
@@ -198,7 +198,8 @@ Only **`/swarm`** and **`/swarm-direct`** are registered on Pi.
 | `/swarm merge <member>` | Land a member's clean `share` worktree or `branch` clone onto `baseBranch` (`autoRebase` + `--no-ff`) | **No** |
 | `/swarm kill <member> [--force] [reason]` | Permanently kill a member and remove its clean worktree (`--force` overrides dirty guard) | **No** |
 | `/swarm done [summary]` | Complete the active run, dispose warm handles, silence watchdog & restore `idle` tools | **No** |
-| `/swarm pause [reason]` / `/swarm resume` | Pause or resume member launches and board wakeups | **No** |
+| `/swarm pause [reason]` | Pause member launches and board wakeups | **No** |
+| `/swarm resume [run-id] [--continue\|-c] [--quiet\|-q] [guidance]` | Zero-turn unpause (same focused session) OR Droid-style **Cross-Session Mission Resume** (auto-discovers active/paused runs, restores `orchestratorModel`, wakes Orchestrator cleanly) | No (same session / `--quiet`) · Yes (cross-session / guided) |
 | `/swarm cancel` | Cancel active draft (restores tools) or abandon focused run (preserves worktrees & `.pi/swarm/runs/`) | **No** |
 | `/swarm teardown [--force] [--delete-branches]` | Safely remove clean idle worktrees while preserving `.pi/swarm/runs/` audit & board logs | **No** |
 | `/swarm runs` | List all runs in `.pi/swarm/runs/` with status, active/waiting counts & board head | **No** |

@@ -7,6 +7,7 @@ import {
   mkdtemp,
   readFile,
   rm,
+  stat,
   symlink,
   utimes,
   writeFile,
@@ -52,6 +53,7 @@ import {
   loadSwarmSettings,
   parseChannelMentions,
   parseMentions,
+  sanitizeSettingsPatch,
   sanitizeSwarmSettings,
   saveSwarmSettings,
   validateChannelName,
@@ -2804,5 +2806,104 @@ describe("v0.3.7 store, board, ledger, settings & worktree regression fixes", ()
 
     const layered2 = await loadLayeredSwarmSettings(tmpRoot, { globalPath, projectPath });
     assert.equal(getRoleModelOrigin("validator", layered2), "global");
+  });
+
+  it("v0.5.0: normalizes :thinking specs & fallbacks, caches ROSTER.md diffs, and excludes .pi/swarm inside branch clones", async () => {
+    const normalized = sanitizeSwarmSettings({
+      orchestratorModel: "openai/gpt-5:high",
+      workerModel: "google/gemini-2.5-pro medium",
+      validatorModel: "anthropic/claude-opus-4-6:xhigh",
+      validatorThinkingLevel: "low",
+      fallbackModels: [
+        "openai/gpt-5:low",
+        "openai/gpt-5:high",
+        "google/gemini-2.5-pro:high",
+      ],
+    });
+    assert.equal(normalized.orchestratorModel, "openai/gpt-5");
+    assert.equal(normalized.orchestratorThinkingLevel, "high");
+    assert.equal(normalized.workerModel, "google/gemini-2.5-pro");
+    assert.equal(normalized.workerThinkingLevel, "medium");
+    assert.equal(normalized.validatorModel, "anthropic/claude-opus-4-6");
+    assert.equal(
+      normalized.validatorThinkingLevel,
+      "low",
+      "Explicit validatorThinkingLevel must take precedence over model suffix",
+    );
+    assert.deepEqual(normalized.fallbackModels, [
+      "openai/gpt-5:low",
+      "google/gemini-2.5-pro:high",
+    ]);
+
+    const patch = sanitizeSettingsPatch({
+      workerModel: "openai/gpt-5:xhigh",
+      fallbackModels: ["openai/gpt-5:low", "openai/gpt-5"],
+    });
+    assert.equal(patch.workerModel, "openai/gpt-5");
+    assert.equal(patch.workerThinkingLevel, "xhigh");
+    assert.deepEqual(patch.fallbackModels, ["openai/gpt-5:low"]);
+
+    // ROSTER.md write-skip on telemetry-only updates, rewriting on semantic changes
+    const repoDir = await makeTempDir("pi-swarm-v050-roster-");
+    const wtMgr = new WorktreeManager(repoDir);
+    const store = new SwarmStore(repoDir);
+    await wtMgr.ensureRepoReady("main");
+
+    await store.createRun({
+      id: "run-v050-r",
+      title: "Roster Cache",
+      objective: "Skip redundant ROSTER.md disk writes",
+      baseBranch: "main",
+      ownerSessionId: "sess-r",
+    });
+    await store.addMember("run-v050-r", {
+      name: "alpha",
+      agentId: "a-1",
+      role: "worker",
+      parentName: "orchestrator",
+      brief: "Work",
+      workspace: "inherit",
+      cwd: repoDir,
+    });
+    const rosterPath = path.join(store.getRunDir("run-v050-r"), SWARM_ROSTER_FILE);
+    const oldDate = new Date(Date.now() - 60_000);
+    await utimes(rosterPath, oldDate, oldDate);
+    const beforeMtime = (await stat(rosterPath)).mtimeMs;
+
+    await store.updateMember("run-v050-r", "alpha", {
+      logLine: "Progress line 1",
+      tokens: 250,
+      cost: 0.002,
+    });
+    const afterTelemetryMtime = (await stat(rosterPath)).mtimeMs;
+    assert.equal(
+      afterTelemetryMtime,
+      beforeMtime,
+      "ROSTER.md must not be rewritten when only logLine/tokens/cost change",
+    );
+
+    await store.updateMember("run-v050-r", "alpha", { state: "waiting" });
+    const afterStateMtime = (await stat(rosterPath)).mtimeMs;
+    assert.ok(
+      afterStateMtime > beforeMtime,
+      "ROSTER.md must be rewritten when member state changes",
+    );
+    assert.match(await readFile(rosterPath, "utf8"), /waiting/);
+
+    // Standalone branch clone excludes .pi/swarm/ inside its own .git/info/exclude
+    const clonePath = store.getWorktreePath("run-v050-r", "cloner");
+    await wtMgr.createWorktree({
+      branch: deriveMemberBranch("run-v050-r", "cloner"),
+      baseBranch: "main",
+      worktreePath: clonePath,
+      mode: "branch",
+    });
+    await mkdir(path.join(clonePath, SWARM_DIR), { recursive: true });
+    await writeFile(path.join(clonePath, SWARM_DIR, "scratch.txt"), "ignored\n", "utf8");
+    assert.equal(
+      await wtMgr.isWorktreeDirty(clonePath),
+      false,
+      "Branch clone must exclude .pi/swarm/ so runtime artifacts never mark it dirty",
+    );
   });
 });

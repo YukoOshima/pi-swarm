@@ -600,6 +600,12 @@ export interface SwarmStoreOptions {
   isPidAlive?: (pid: number) => boolean;
 }
 
+function canonicalizeRosterForDiff(markdown: string): string {
+  return markdown
+    .replace(/^- \*\*(?:Revision|Updated At):\*\* .*$/gm, "")
+    .replace(/\n{3,}/g, "\n\n");
+}
+
 // ============================================================================
 // SwarmStore Implementation (Dynamic Antigravity Swarm v2)
 // ============================================================================
@@ -1043,12 +1049,16 @@ export class SwarmStore implements ISwarmStore {
           { runId: safeRunId },
         );
       }
+      const existingCached = this.stateCache.get(safeRunId);
       const backfilled = backfillRunState(parsed);
       this.stateCache.set(safeRunId, {
         ino: st.ino,
         size: st.size,
         mtimeMs: st.mtimeMs,
         state: structuredClone(backfilled),
+        ...(existingCached?.lastRosterBody !== undefined
+          ? { lastRosterBody: existingCached.lastRosterBody }
+          : {}),
       });
       return backfilled;
     } catch (err) {
@@ -1091,7 +1101,10 @@ export class SwarmStore implements ISwarmStore {
     const json = `${JSON.stringify(state, null, 2)}\n`;
     const rosterBody = this.renderRosterMarkdown(state);
     const cached = this.stateCache.get(state.id);
-    const shouldWriteRoster = rosterBody !== cached?.lastRosterBody;
+    const shouldWriteRoster =
+      !cached?.lastRosterBody ||
+      canonicalizeRosterForDiff(rosterBody) !==
+        canonicalizeRosterForDiff(cached.lastRosterBody);
 
     await assertLeafNotSymlink(statePath);
     if (shouldWriteRoster) {
@@ -1111,7 +1124,7 @@ export class SwarmStore implements ISwarmStore {
       size: stateStat.size,
       mtimeMs: stateStat.mtimeMs,
       state: cachedState,
-      lastRosterBody: rosterBody,
+      lastRosterBody: shouldWriteRoster ? rosterBody : cached.lastRosterBody,
     });
     return structuredClone(cachedState);
   }
@@ -1588,6 +1601,9 @@ export class SwarmStore implements ISwarmStore {
         ...(member.thinkingLevel !== undefined
           ? { thinkingLevel: member.thinkingLevel }
           : {}),
+        ...(member.modelExplicit !== undefined
+          ? { modelExplicit: member.modelExplicit }
+          : {}),
         lastReadSeq:
           typeof member.lastReadSeq === "number" &&
           Number.isFinite(member.lastReadSeq)
@@ -1719,6 +1735,9 @@ export class SwarmStore implements ISwarmStore {
         delete record.thinkingLevel;
       } else if (patch.thinkingLevel !== undefined) {
         record.thinkingLevel = patch.thinkingLevel;
+      }
+      if (patch.modelExplicit !== undefined) {
+        record.modelExplicit = patch.modelExplicit;
       }
       if (
         patch.lastReadSeq !== undefined &&
@@ -2263,11 +2282,9 @@ export class SwarmStore implements ISwarmStore {
   // --------------------------------------------------------------------------
 
   async appendEvent(event: SwarmEventInput): Promise<SwarmEvent> {
-    return this.withRunLock(event.runId, async () => {
-      const eventsPath = this.getEventsPath(event.runId);
-      await assertNoSymlinksWithin(this.projectRoot, eventsPath);
-      return appendLedgerEvent(eventsPath, event);
-    });
+    const eventsPath = this.getEventsPath(event.runId);
+    await assertNoSymlinksWithin(this.projectRoot, eventsPath);
+    return appendLedgerEvent(eventsPath, event);
   }
 
   async getRecentEvents(runId: string, limit = 50): Promise<SwarmEvent[]> {

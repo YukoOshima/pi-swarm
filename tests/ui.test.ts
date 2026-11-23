@@ -2936,3 +2936,350 @@ describe("v0.4.0 Droid Mission Model Picker, Hub & Overlay Upgrades", () => {
     unbind();
   });
 });
+
+describe("v0.5.0 TUI Protocol, Responsive Bounds & Mission Hub Resume", () => {
+  it("ignores Kitty key-release events and host-streaming Esc in bindSwarmShortcuts", () => {
+    const listeners: Array<(d: string) => unknown> = [];
+    let toggles = 0;
+    let collapses = 0;
+    let modelOpened = 0;
+    let streaming = true;
+
+    const fakeCtx = {
+      mode: "tui",
+      hasUI: true,
+      ui: {
+        onTerminalInput(fn: (d: string) => unknown) {
+          listeners.push(fn);
+          return () => {};
+        },
+      },
+    } as unknown as ExtensionContext;
+
+    const unbind = bindSwarmShortcuts(fakeCtx, {
+      isModalOpen: () => false,
+      isExpanded: () => true,
+      isHostStreaming: () => streaming,
+      onToggleExpand: () => {
+        toggles += 1;
+      },
+      onCollapse: () => {
+        collapses += 1;
+      },
+      onOpenModelPicker: () => {
+        modelOpened += 1;
+      },
+    });
+
+    const dispatch = (seq: string) => {
+      for (const fn of listeners) fn(seq);
+    };
+
+    // Kitty release events (:3u) must be ignored cleanly
+    dispatch("\x1b[77;6:3u");
+    dispatch("\x1b[84;6:3u");
+    dispatch("\x1b[27;1:3u");
+    assert.equal(modelOpened, 0);
+    assert.equal(toggles, 0);
+    assert.equal(collapses, 0);
+
+    // Esc while host is streaming must NOT collapse so Pi can abort cleanly
+    dispatch("\x1b");
+    assert.equal(collapses, 0);
+
+    streaming = false;
+    dispatch("\x1b");
+    assert.equal(collapses, 1);
+    unbind();
+  });
+
+  it("supports SwarmModelPickerView bracketed paste, fuzzy matching, [host] badge, and 85% height cap", () => {
+    const theme = createMockTheme();
+    const tuiHandle = createMockTUI(16, 60);
+    const models = [
+      {
+        id: "claude-opus-4-6",
+        provider: "anthropic",
+        fullId: "anthropic/claude-opus-4-6",
+        name: "Claude Opus 4.6",
+      },
+      {
+        id: "gpt-5.4",
+        provider: "openai",
+        fullId: "openai/gpt-5.4",
+        name: "GPT 5.4",
+      },
+    ];
+    let selectedModel: string | undefined;
+    const baseState: ModelPickerSettingsState = {
+      settings: {
+        ...DEFAULT_SWARM_SETTINGS,
+        fallbackModels: [],
+      },
+      origins: {
+        orchestrator: "host",
+        worker: "host",
+        validator: "host",
+      },
+      hostModel: "openai/gpt-5.4",
+    };
+    const picker = new SwarmModelPickerView(tuiHandle.tui, theme, {
+      mode: "roles",
+      initialTab: "orchestrator",
+      availableModels: models,
+      state: baseState,
+      onClose: () => {},
+      onApplyRole: async (sel) => {
+        selectedModel = sel.model;
+        return baseState;
+      },
+    });
+
+    try {
+      for (const [w, h] of [
+        [40, 16],
+        [60, 16],
+        [80, 24],
+        [120, 24],
+      ] as const) {
+        (tuiHandle.tui.terminal as unknown as { columns: number; rows: number }).columns = w;
+        (tuiHandle.tui.terminal as unknown as { columns: number; rows: number }).rows = h;
+        const lines = picker.render(w);
+        const cap = Math.max(10, Math.floor(h * 0.85));
+        assert.ok(
+          lines.length <= cap,
+          `Expected <= ${cap} rows at h=${h}, got ${lines.length}`,
+        );
+        for (const line of lines) {
+          assert.ok(visibleWidth(line) <= w, `Line exceeded width ${w}: ${visibleWidth(line)}`);
+        }
+      }
+
+      const plainInitial = stripTerminalSequences(picker.render(80).join("\n"));
+      assert.match(plainInitial, /\[host\]/);
+
+      // Bracketed paste + fuzzy match (no separators) -> selects Claude Opus 4.6 -> Enter to effort -> Enter default
+      picker.handleInput("\x1b[200~claudeopus46\x1b[201~");
+      const afterFilter = stripTerminalSequences(picker.render(80).join("\n"));
+      assert.match(afterFilter, /claude-opus-4-6/);
+      picker.handleInput("\r"); // enter effort step
+      picker.handleInput("\r"); // apply Default effort
+      assert.equal(selectedModel, "anthropic/claude-opus-4-6");
+    } finally {
+      picker.dispose();
+    }
+  });
+
+  it("places Resume Mission first in SwarmHubView when unfinished runs exist and keeps Enter vs Alt+M distinct", () => {
+    const theme = createMockTheme();
+    const tuiHandle = createMockTUI(24, 90);
+    let hubResult: unknown;
+    const snap = makeSampleSnapshot({ empty: true });
+    const hubState: ModelPickerSettingsState = {
+      settings: {
+        ...DEFAULT_SWARM_SETTINGS,
+        fallbackModels: [],
+      },
+      origins: { orchestrator: "host", worker: "host", validator: "host" },
+      hostModel: "openai/gpt-5.4",
+    };
+    const hub = new SwarmHubView(tuiHandle.tui, theme, {
+      snapshot: snap,
+      runs: [
+        {
+          id: "run-paused-1",
+          title: "Paused Feature",
+          objective: "Finish Auth Refactor",
+          baseBranch: "main",
+          status: "paused",
+          memberCount: 2,
+          workingCount: 0,
+          waitingCount: 2,
+          boardHead: 9,
+          ownerSessionId: "old-sess",
+          ownerPid: 0,
+          createdAt: "2026-11-22T00:00:00.000Z",
+          updatedAt: "2026-11-22T01:00:00.000Z",
+        },
+      ],
+      availableModels: [],
+      state: hubState,
+      onApplyRole: async () => hubState,
+      onComplete: (action) => {
+        hubResult = action;
+      },
+    });
+
+    try {
+      const rendered = stripTerminalSequences(hub.render(90).join("\n"));
+      assert.match(rendered, /Resume Mission/);
+      assert.match(rendered, /Alt\+M/);
+
+      // Alt+M opens inline Model Picker rather than Enter launching
+      hub.handleInput("\x1bm");
+      const withPicker = stripTerminalSequences(hub.render(90).join("\n"));
+      assert.match(withPicker, /Mission Models/);
+      hub.handleInput("\x1b"); // close inline picker
+
+      // Enter on #1 action immediately resumes the unfinished Mission
+      hub.handleInput("\r");
+      assert.deepEqual(hubResult, {
+        kind: "resume",
+        runId: "run-paused-1",
+        kickoff: true,
+      });
+    } finally {
+      hub.dispose();
+    }
+  });
+
+  it("isolates expandedPost keys in SwarmOverlay and fits MultiQuestionComponent inside 16 rows", async () => {
+    const theme = createMockTheme();
+    const snap = makeSampleSnapshot();
+    const tui = createMockTUI(24, 90).tui;
+    let channelCycled = false;
+    let posted = false;
+
+    const fakeEngine: ISwarmEngine = {
+      startRun: async () => snap.run!,
+      attachRun: async () => snap,
+      setTitle: async () => snap.run!,
+      updateDirection: async () => snap.run!,
+      addMembers: async () => [],
+      postMessage: async () => {
+        posted = true;
+        return snap.recentBoard[0]!;
+      },
+      readBoard: async () => ({ messages: snap.recentBoard, head: snap.boardHead }),
+      waitForBoard: async () => ({ wokeBy: "timeout", messages: [], head: 0, summary: "" }),
+      parkOrchestratorWait: async () => ({
+        parked: false,
+        messages: [],
+        head: 0,
+        activeMembers: [],
+        summary: "",
+      }),
+      clearOrchestratorWait: () => {},
+      steerMember: async () => ({ delivery: "steered" }),
+      switchModel: async (o) => ({ targetName: o.targetName ?? "", model: o.model ?? "" }),
+      stopMember: async () => {},
+      killMember: async () => {},
+      mergeMember: async () => null,
+      manageChannel: async () => ({
+        action: "create",
+        name: "main",
+        topic: "",
+        createdBy: ORCHESTRATOR_NAME,
+        createdAt: "",
+        subscribers: [],
+        archived: false,
+        summary: "ok",
+      }),
+      completeRun: async () => snap.run!,
+      pause: async () => snap.run!,
+      resume: async () => snap.run!,
+      teardown: async () => ({ removed: [], skipped: [], errors: [] }),
+      listModels: async () => [],
+      getSnapshot: () => snap,
+      subscribe: () => () => {},
+      dispose: async () => {},
+    };
+
+    const fakeWorktree = {
+      getDiffSummary: async () => ({
+        baseBranch: "main",
+        branch: "swarm/b",
+        commitsAhead: 0,
+        changedFiles: [],
+        stat: "",
+      }),
+    } as unknown as IWorktreeManager;
+
+    await openSwarmOverlay(
+      {
+        mode: "tui",
+        hasUI: true,
+        ui: {
+          theme,
+          notify() {},
+          async custom<T>(
+            factory: (
+              t: TUI,
+              th: Theme,
+              kb: unknown,
+              done: (r: T) => void,
+            ) => Component & { dispose?(): void },
+          ): Promise<T> {
+            return new Promise<T>((resolve) => {
+              const comp = factory(tui, theme, {}, resolve);
+              comp.handleInput?.("\r"); // open expandedPost on Board
+              comp.handleInput?.("p"); // must NOT open post composer while reading post
+              comp.handleInput?.("c"); // must NOT cycle channel while reading post
+              const outWhileOpen = stripTerminalSequences(comp.render(90).join("\n"));
+              if (outWhileOpen.includes("Channel filter")) channelCycled = true;
+              comp.handleInput?.("\x1b"); // exit expandedPost back to Board
+              comp.handleInput?.("q"); // close overlay
+            });
+          },
+        },
+      } as unknown as ExtensionContext,
+      fakeEngine,
+      fakeWorktree,
+    );
+    assert.equal(posted, false);
+    assert.equal(channelCycled, false);
+
+    // MultiQuestionComponent tight 16-row viewport shows Custom answer mode cleanly
+    const compactTui = createMockTUI(16, 72).tui;
+    const qui = createQuestionnaireUI();
+    const qOutcome = await qui.askQuestionnaire(
+      {
+        mode: "tui",
+        hasUI: true,
+        ui: {
+          theme,
+          notify() {},
+          async custom<T>(
+            factory: (
+              t: TUI,
+              th: Theme,
+              kb: unknown,
+              done: (r: T) => void,
+            ) => Component & { dispose?(): void },
+          ): Promise<T> {
+            return new Promise<T>((resolve) => {
+              const comp = factory(compactTui, theme, {}, resolve);
+              const lines = comp.render(72);
+              assert.ok(lines.length <= 16, `Expected <= 16 lines, got ${lines.length}`);
+              for (const line of lines) assert.ok(visibleWidth(line) <= 72);
+              comp.handleInput?.("\r"); // select Q1 option 1 -> advance to Q2
+              comp.handleInput?.("\r"); // select Q2 option 1 -> advance to Review
+              comp.handleInput?.("\r"); // submit from review tab
+            });
+          },
+        },
+      } as unknown as ExtensionContext,
+      [
+        {
+          id: "scope",
+          question: "Scope of work?",
+          options: [
+            { label: "Full", value: "full", description: "Complete implementation" },
+            { label: "Minimal", value: "minimal", description: "Small change" },
+          ],
+          allowCustom: true,
+        },
+        {
+          id: "tests",
+          question: "Include E2E tests?",
+          options: [
+            { label: "Yes", value: "yes" },
+            { label: "No", value: "no" },
+          ],
+          allowCustom: true,
+        },
+      ],
+    );
+    assert.equal(qOutcome.cancelled, false);
+  });
+});
