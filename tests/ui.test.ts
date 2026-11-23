@@ -1195,7 +1195,7 @@ describe("dashboard-widget", () => {
     });
     assert.match(boardMd, /#1.*\[main\].*@orchestrator\*\* -> @worker-1/);
     assert.match(boardMd, /#3.*\[backend\].*@validator\*\* -> @worker-1/);
-    assert.match(boardMd, /#5.*\[main\].*@worker-2\*\* -> @worker-1, @#backend/);
+    assert.match(boardMd, /#5.*\[main\].*@worker-2\*\* -> @worker-1, #backend/);
 
     const modelsMd = formatZeroTurnModelsView(
       settings,

@@ -1,11 +1,19 @@
-# 🐝 pi-swarm (`v0.6.0`)
+# 🐝 pi-swarm (`v0.7.0`)
 
-**`pi-swarm`** is a **Dynamic Antigravity Swarm** multi-agent orchestration extension for [Pi](https://github.com/earendil-works/pi) (`v1.5.2+`).
-面向 [Pi](https://github.com/earendil-works/pi) (`v1.5.2+`) 的**动态蜂群（Dynamic Antigravity Swarm）多 Agent 协作与编排扩展**。
+**`pi-swarm`** is a **Dynamic Antigravity Swarm** multi-agent orchestration extension for [Pi](https://github.com/earendil-works/pi) (`v1.5.2+`, verified on `v1.6.0`).
+面向 [Pi](https://github.com/earendil-works/pi) (`v1.5.2+`，已验证 `v1.6.0`) 的**动态蜂群（Dynamic Antigravity Swarm）多 Agent 协作与编排扩展**。
 
-Instead of locking work into a rigid upfront DAG, `pi-swarm` v0.6.0 pairs **`pi-goal-x`-style upfront clarification** and **Droid Mission-style Model & Effort Configuration + Cross-Session Mission Resume** (`/swarm resume`) with **Antigravity-Swarm-grade dynamic orchestration**: unified Mission Hub (`/swarm` with `🔄 Resume Mission`), searchable provider-grouped Model Picker (`/swarm models`, `Ctrl+Shift+M`, `Alt+M`), automatic live role propagation (`Running agents switch on their next turn; Inherit applies only to new agents`), non-blocking `swarm_wait`, disk-persisted member sessions (`SessionManager.create`/`open`), hot model switching, Smart LLM Monitor (`@monitor`), and true isolated `git clone` for `workspace:"branch"`.
+Instead of locking work into a rigid upfront DAG, `pi-swarm` v0.7.0 pairs **`pi-goal-x`-style upfront clarification** and **Droid Mission-style Model & Effort Configuration + Cross-Session Mission Resume** (`/swarm resume`) with **Antigravity-Swarm-grade dynamic orchestration**: unified floating Mission Hub (`/swarm` with `🔄 Resume Mission`), searchable provider-grouped Model Picker (`/swarm models`, `Ctrl+Shift+M`, `Alt+M`), automatic live role propagation (`Running agents switch on their next turn; Inherit applies only to new agents`), non-blocking `swarm_wait`, disk-persisted member sessions (`SessionManager.create`/`open`), hot model switching, Smart LLM Monitor (`@monitor`), and true isolated `git clone` for `workspace:"branch"`.
 
-### 🆕 v0.6.0 — Usability & Orchestration Quality / 易用性与编排质量
+### 🆕 v0.7.0 — Pi 1.6.0 Polish, Floating Overlays & Live Telemetry / Pi 1.6.0 适配、悬浮面板与实时遥测
+
+- **Native Pi 1.6.0 UX & Markdown Rendering / 原生 Markdown 渲染与命令补全**: `/swarm status`, `/swarm board`, `/swarm help`, and `/swarm models --print` render via native Pi `Markdown` + `Box` with `keyHint` styling; exact subcommand completions submit on a single `Enter` (no double-Enter trap); `setWorkingMessage`/`setTitle` track active swarm progress and pre-swarm host models are automatically restored on `done`/`cancel`.
+- **Floating Hub & Model Picker Overlays / 悬浮 Hub 与模型选择器**: `/swarm` (Hub) and `/swarm models` open as centered floating overlays with terminal-aware height capping, 1-cell safe box glyphs, `* Current / Host` model pinning, and `Esc`-clears-search behavior.
+- **Live Streaming Telemetry & Mission Control Overhaul / 实时流式遥测与任务控制升级**: Real-time token/cost/tool streaming with monotonic flush on stop/pause/complete, `phase` & `milestones` progress tracking (`swarm{action:"title"}`), adaptive `Alt+W` expanded dashboard height clamping, 1-line collapsed completed runs, live 120ms overlay spinner, `j`/`k` navigation across all 4 tabs (`Shift+K` for Kill), and `[r]` direct Retry/conflict-steer action.
+- **Worktree Safety & Recovery / 工作树保护与自愈**: `teardown` protects active members and unmerged branches with commits ahead unless `force: true`; missing isolated worktrees auto-recover on revive; `DIRTY_BASE` and `missing_worktree` diagnostics guide clean recovery.
+- **Collapsible Plan Preview & On-Demand Validator Guidance / 折叠计划预览与按需验证引导**: `propose_swarm_plan` collapses cleanly with `Ctrl+O` expand hint; drafting guidance avoids eager wave-1 validator spawns and respects pre-installed scripts.
+
+### v0.6.0 — Usability & Orchestration Quality / 易用性与编排质量
 
 - **SSH-friendly shortcuts / SSH 友好快捷键**: `Alt+S` (Mission Control overlay, or Swarm Hub when idle), `Alt+M` (Model Picker), `Alt+W` (toggle expanded dashboard) work over SSH/tmux where `Ctrl+Shift+*` chords are often swallowed.
 - **New subcommand & aliases / 新命令与别名**: `/swarm stop <member>` interrupts a single member's current turn; `mc` (→ `tasks`, Mission Control), `ls`/`list` (→ `runs`), and `config` (→ `settings`) aliases.

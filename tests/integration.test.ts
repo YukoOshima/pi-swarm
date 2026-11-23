@@ -1879,7 +1879,7 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     assert.equal(spawned[0]!.killed, true);
 
     // G. Clean idempotent `session_shutdown` disposal
-    assert.ok(harness.terminalInputHandlers.size > 0);
+    assert.equal(harness.terminalInputHandlers.size, 0);
     await harness.emit("session_shutdown", {});
     await harness.emit("session_shutdown", {}); // idempotent second call
     assert.equal(harness.terminalInputHandlers.size, 0);

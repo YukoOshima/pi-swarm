@@ -976,7 +976,7 @@ function buildMissionResumePrompt(
 
 function buildHelpMarkdown(): string {
   return [
-    "### 🐝 Pi Swarm v0.6.0 (`/swarm`) — Dynamic Antigravity Swarm Commands",
+    "### 🐝 Pi Swarm v0.7.0 (`/swarm`) — Dynamic Antigravity Swarm Commands",
     "",
     "| Command | Description |",
     "| --- | --- |",
@@ -6883,7 +6883,7 @@ export function createPiSwarmExtension(
     // ------------------------------------------------------------------------
     pi.registerCommand("swarm", {
       description:
-        "Pi Swarm v0.6.0 — Dynamic Antigravity Swarm orchestrator (Droid Mission-style model/effort picker & cross-session resume, shared #seq board, non-blocking swarm_wait, warm disk sessions, fork & worktrees/clones)",
+        "Pi Swarm v0.7.0 — Dynamic Antigravity Swarm orchestrator (Droid Mission-style model/effort picker & cross-session resume, shared #seq board, non-blocking swarm_wait, warm disk sessions, fork & worktrees/clones)",
       getArgumentCompletions: getSwarmCompletions,
       handler: handleSwarmCommand,
     });
