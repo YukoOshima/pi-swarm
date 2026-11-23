@@ -460,6 +460,8 @@ interface MockHarness {
   confirmCalls: Array<{ title: string; body: string }>;
   widgetHistory: Array<{ key: string; value: unknown }>;
   statusHistory: Array<{ key: string; text: string | undefined }>;
+  workingMessageHistory: Array<string | undefined>;
+  titleHistory: string[];
   terminalInputHandlers: Set<(data: string) => unknown>;
   setModelCalls: Array<{ provider: string; id: string }>;
   thinkingLevelCalls: ThinkingLevel[];
@@ -494,6 +496,7 @@ function createMockPiHarness(
     modelRuntime?: ModelRuntime;
     initialSessionMessages?: AgentMessage[];
     initialSessionName?: string;
+    omitNativeWorkingUi?: boolean;
   },
 ): MockHarness {
   const sessionId = options?.sessionId ?? "sess-e2e-1";
@@ -515,6 +518,8 @@ function createMockPiHarness(
   const confirmCalls: Array<{ title: string; body: string }> = [];
   const widgetHistory: Array<{ key: string; value: unknown }> = [];
   const statusHistory: Array<{ key: string; text: string | undefined }> = [];
+  const workingMessageHistory: Array<string | undefined> = [];
+  const titleHistory: string[] = [];
   const terminalInputHandlers = new Set<(data: string) => unknown>();
   const setModelCalls: Array<{ provider: string; id: string }> = [];
   const thinkingLevelCalls: ThinkingLevel[] = [];
@@ -666,6 +671,16 @@ function createMockPiHarness(
       setStatus(key: string, text: string | undefined) {
         statusHistory.push({ key, text });
       },
+      ...(options?.omitNativeWorkingUi
+        ? {}
+        : {
+            setWorkingMessage(message?: string) {
+              workingMessageHistory.push(message);
+            },
+            setTitle(title: string) {
+              titleHistory.push(title);
+            },
+          }),
       onTerminalInput(fn: (data: string) => unknown) {
         terminalInputHandlers.add(fn);
         return () => {
@@ -719,6 +734,8 @@ function createMockPiHarness(
     confirmCalls,
     widgetHistory,
     statusHistory,
+    workingMessageHistory,
+    titleHistory,
     terminalInputHandlers,
     setModelCalls,
     thinkingLevelCalls,
@@ -4154,13 +4171,25 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       bold: (text: string) => text,
     } as unknown as Theme;
 
-    // Collapsed wakeup card: strips `<swarm_mission_resumed>`, renders 2-4 lines at 80/120 cols, shows `(Ctrl+O to expand full board wakeup)`
+    // Collapsed wakeup card: strips `<swarm_mission_resumed>`, renders 2-4 lines at 80/120 cols, uses `options.keyHint`
+    const keyHintCalls: Array<{ keybinding: string; description: string }> = [];
     const collapsedComp = wakeupRenderer!(
       resumeWakeupMsg.message as any,
-      { expanded: false, outputPad: 1, keyText: () => "ctrl+o", keyHint: () => "ctrl+o" },
+      {
+        expanded: false,
+        outputPad: 1,
+        keyText: () => "ctrl+o",
+        keyHint: (kb, desc) => {
+          keyHintCalls.push({ keybinding: kb, description: desc });
+          return `ctrl+o ${desc}`;
+        },
+      },
       mockTheme,
     )!;
     assert.ok(collapsedComp, "Wakeup renderer must return a Component");
+    assert.deepEqual(keyHintCalls, [
+      { keybinding: "app.tools.expand", description: "to expand" },
+    ]);
     for (const width of [40, 60, 80, 120]) {
       const rendered = collapsedComp.render(width);
       for (const line of rendered) {
@@ -4180,12 +4209,23 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     assert.ok(!collapsedPlain.includes("<swarm_mission_resumed"));
     assert.ok(!collapsedPlain.includes("</swarm_mission_resumed>"));
     assert.match(collapsedPlain, /MISSION RESUMED/);
-    assert.match(collapsedPlain, /\(Ctrl\+O to expand full board wakeup\)/);
+    assert.match(collapsedPlain, /ctrl\+o to expand/);
 
-    // Expanded wakeup view: strips XML tags and shows full clean content without truncation notice
+    // Fallback when `keyHint` is absent -> `(Ctrl+O to expand)`
+    const collapsedFallbackComp = wakeupRenderer!(
+      resumeWakeupMsg.message as any,
+      { expanded: false, outputPad: 1 } as any,
+      mockTheme,
+    )!;
+    const collapsedFallbackPlain = stripTerminalSequences(
+      collapsedFallbackComp.render(100).join("\n"),
+    );
+    assert.match(collapsedFallbackPlain, /\(Ctrl\+O to expand\)/);
+
+    // Expanded wakeup view: strips XML tags, renders Markdown cleanly without truncation notice
     const expandedComp = wakeupRenderer!(
       resumeWakeupMsg.message as any,
-      { expanded: true, outputPad: 1, keyText: () => "ctrl+o", keyHint: () => "ctrl+o" },
+      { expanded: true, outputPad: 1, keyText: () => "ctrl+o", keyHint: () => "ctrl+o to expand" },
       mockTheme,
     )!;
     const expandedPlain = stripTerminalSequences(expandedComp.render(100).join("\n"));
@@ -4193,7 +4233,9 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     assert.ok(!expandedPlain.includes("</swarm_mission_resumed>"));
     assert.match(expandedPlain, /Audit webhook retries/);
     assert.match(expandedPlain, /Webhook signature verification landed on branch/);
-    assert.ok(!expandedPlain.includes("(Ctrl+O to expand full board wakeup)"));
+    assert.ok(!expandedPlain.includes("(Ctrl+O to expand)"));
+    assert.ok(!expandedPlain.includes("(`wake: true`)"), "Resume prompt must not instruct nonexistent wake: true param");
+    assert.match(expandedPlain, /mention @<name> in text/);
 
     // Status message renderer width safety at 40/60/80/120 cols
     const statusComp = statusRenderer!(
@@ -4213,6 +4255,589 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     });
     await namedResumeHost.emit("session_shutdown", { reason: "quit" });
     await observer.emit("session_shutdown", { reason: "quit" });
+    await host.emit("session_shutdown", { reason: "quit" });
+  });
+
+  it("16. v0.7.0: fixes Double-Enter autocomplete trap, renders native Markdown + keyHint, deduplicates /swarm focus, adapts /swarm graph width, and syncs setWorkingMessage/setTitle + unfinished footer cue", async () => {
+    const repoDir = await createTempGitRepo("v070-host-ui");
+    tempDirs.push(repoDir);
+    const store = new SwarmStore(repoDir);
+
+    const makeTransport = (): ISwarmTransport => ({
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        const tracker = createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async () => ({
+            agentId: request.agentId,
+            name: request.name,
+            role: request.role,
+            outcome: "waiting",
+            summary: "Standing by",
+            tokens: 120,
+            cost: 0.002,
+          }),
+        });
+        return tracker.handle;
+      },
+    });
+
+    // Seed an unfinished resumable run before startup to verify persistent unfinished-mission footer cue
+    const unfinishedRun = await store.createRun({
+      title: "Unfinished Billing Refactor",
+      objective: "Migrate invoice pipeline",
+      strategy: "Single worker",
+      acceptanceCriteria: "Tests pass",
+      baseBranch: "main",
+      ownerSessionId: "dead-sess-v070",
+      ownerPid: 999999,
+      maxConcurrency: 4,
+      validatorEnabled: true,
+      roleModels: {},
+    });
+
+    const host = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-v070-ui",
+    });
+    createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: false,
+      }),
+    })(host.pi);
+    await host.emit("session_start", { reason: "startup" });
+
+    // 1. Unfinished-mission startup notification + persistent footer status cue
+    assert.ok(
+      host.notifications.some((n) => /Unfinished Swarm Mission/i.test(n.message)),
+      "Startup must notify on unfinished mission",
+    );
+    assert.ok(
+      host.statusHistory.some(
+        (s) =>
+          s.key === SWARM_STATUS_KEY &&
+          typeof s.text === "string" &&
+          /1 unfinished mission.*\/swarm resume/i.test(s.text),
+      ),
+      "Startup must set a persistent unfinished-mission footer status cue",
+    );
+
+    // 2. Pi 1.6.0 Double-Enter Autocomplete Trap: exact single match returns null
+    const swarmCmd = host.commands.get("swarm")!;
+    assert.equal(await swarmCmd.getArgumentCompletions?.("status"), null);
+    assert.equal(await swarmCmd.getArgumentCompletions?.("models"), null);
+    assert.equal(await swarmCmd.getArgumentCompletions?.("board"), null);
+    assert.equal(await swarmCmd.getArgumentCompletions?.("help"), null);
+    assert.equal(await swarmCmd.getArgumentCompletions?.("graph"), null);
+
+    // Partial prefix still completes cleanly
+    const statMatches = (await swarmCmd.getArgumentCompletions?.("stat")) as Array<{
+      value: string;
+    }> | null;
+    assert.deepEqual(
+      (statMatches ?? []).map((m) => m.value),
+      ["status"],
+    );
+    const modelMatches = (await swarmCmd.getArgumentCompletions?.("model")) as Array<{
+      value: string;
+    }> | null;
+    assert.deepEqual(
+      (modelMatches ?? []).map((m) => m.value),
+      ["models", "model"],
+    );
+
+    // Focus & resume runId completions: partial matches return item; exact match returns null
+    const partialFocus = (await swarmCmd.getArgumentCompletions?.("focus run_")) as Array<{
+      value: string;
+    }> | null;
+    assert.ok(
+      (partialFocus ?? []).some((m) => m.value === `focus ${unfinishedRun.id}`),
+    );
+    assert.equal(
+      await swarmCmd.getArgumentCompletions?.(`focus ${unfinishedRun.id}`),
+      null,
+      "Exact focus <runId> completion must return null to prevent Double-Enter trap",
+    );
+    assert.equal(
+      await swarmCmd.getArgumentCompletions?.("focus none"),
+      null,
+      "Exact focus none completion must return null",
+    );
+
+    const partialResume = (await swarmCmd.getArgumentCompletions?.("resume run_")) as Array<{
+      value: string;
+    }> | null;
+    assert.ok(
+      (partialResume ?? []).some((m) => m.value === `resume ${unfinishedRun.id}`),
+    );
+    assert.equal(
+      await swarmCmd.getArgumentCompletions?.(`resume ${unfinishedRun.id}`),
+      null,
+      "Exact resume <runId> completion must return null to prevent Double-Enter trap",
+    );
+    assert.equal(
+      await swarmCmd.getArgumentCompletions?.(`resume --quiet ${unfinishedRun.id}`),
+      null,
+      "Exact resume --quiet <runId> completion must return null",
+    );
+
+    // 3. Deduplicated `/swarm focus` output when ctx.hasUI === true
+    const statusMsgsBeforeFocus = host.sentMessages.filter(
+      (m) => m.message.customType === SWARM_STATUS_CUSTOM_TYPE,
+    ).length;
+    const notifsBeforeFocus = host.notifications.length;
+    await host.runCommand("swarm", `focus ${unfinishedRun.id}`);
+    assert.equal(
+      host.notifications.length - notifsBeforeFocus,
+      1,
+      "/swarm focus with UI must notify once",
+    );
+    assert.equal(
+      host.sentMessages.filter((m) => m.message.customType === SWARM_STATUS_CUSTOM_TYPE).length,
+      statusMsgsBeforeFocus,
+      "/swarm focus with UI must NOT duplicate output via emitZeroTurnMessage",
+    );
+
+    // Unfinished footer cue is cleared once a run is focused; setWorkingMessage & setTitle sync
+    assert.ok(
+      host.workingMessageHistory.some((m) => typeof m === "string" && /Swarm/i.test(m)),
+      "refreshUI must sync ctx.ui.setWorkingMessage while mission is active",
+    );
+    assert.ok(
+      host.titleHistory.some((t) => /Unfinished Billing Refactor/i.test(t)),
+      "refreshUI must sync ctx.ui.setTitle while mission is active",
+    );
+
+    // 4. Dynamic `/swarm graph` width respects process.stdout.columns
+    const origColumnsDescriptor = Object.getOwnPropertyDescriptor(
+      process.stdout,
+      "columns",
+    );
+    try {
+      Object.defineProperty(process.stdout, "columns", {
+        value: 72,
+        configurable: true,
+      });
+      await host.runCommand("swarm", "graph");
+      const graphMsg = host.sentMessages
+        .filter((m) => m.message.customType === SWARM_STATUS_CUSTOM_TYPE)
+        .pop()!;
+      const graphContent = String(graphMsg.message.content);
+      const codeBlockMatch = graphContent.match(/```text\n([\s\S]*?)\n```/);
+      assert.ok(codeBlockMatch, "Expected fenced text graph block");
+      for (const line of codeBlockMatch[1]!.split("\n")) {
+        assert.ok(
+          visibleWidth(line) <= 68,
+          `Graph line exceeded dynamic width 68 at 72 cols: ${visibleWidth(line)} ("${line}")`,
+        );
+      }
+    } finally {
+      if (origColumnsDescriptor) {
+        Object.defineProperty(process.stdout, "columns", origColumnsDescriptor);
+      } else {
+        delete (process.stdout as { columns?: number }).columns;
+      }
+    }
+
+    // 5. Native Markdown rendering for SWARM_STATUS_CUSTOM_TYPE (tables + code blocks via pi-tui Markdown)
+    const statusRenderer = host.messageRenderers.get(SWARM_STATUS_CUSTOM_TYPE)!;
+    const seenThemeColors = new Set<string>();
+    const mockTheme = {
+      fg: (color: string, text: string) => {
+        seenThemeColors.add(color);
+        return text;
+      },
+      bg: (_color: string, text: string) => text,
+      bold: (text: string) => text,
+      italic: (text: string) => text,
+      underline: (text: string) => text,
+      strikethrough: (text: string) => text,
+    } as unknown as Theme;
+
+    const mdSample = [
+      "### 🐝 Report",
+      "",
+      "| ColA | ColB |",
+      "| --- | --- |",
+      "| alpha | beta |",
+      "",
+      "```text",
+      "graph-body",
+      "```",
+    ].join("\n");
+    const mdComp = statusRenderer(
+      { customType: SWARM_STATUS_CUSTOM_TYPE, content: mdSample, display: true } as any,
+      { expanded: false, outputPad: 1, keyText: () => "", keyHint: () => "" },
+      mockTheme,
+    )!;
+    const renderedMd = stripTerminalSequences(mdComp.render(80).join("\n"));
+    assert.ok(!renderedMd.includes("| --- |"), "Markdown table separator must be rendered, not printed raw");
+    assert.ok(renderedMd.includes("┌") && renderedMd.includes("└"), "Markdown table must render native box borders");
+    assert.ok(seenThemeColors.has("mdCodeBlockBorder"), "Markdown renderer must style code block borders via MarkdownTheme");
+    assert.ok(seenThemeColors.has("mdCodeBlock"), "Markdown renderer must style code block body via MarkdownTheme");
+    assert.match(renderedMd, /alpha/);
+    assert.match(renderedMd, /graph-body/);
+
+    // Graceful Text fallback when theme is undefined (headless mock)
+    const fallbackComp = statusRenderer(
+      { customType: SWARM_STATUS_CUSTOM_TYPE, content: mdSample, display: true } as any,
+      { expanded: false, outputPad: 1 } as any,
+      undefined as any,
+    )!;
+    assert.ok(fallbackComp.render(80).join("\n").includes("alpha"));
+
+    // 6. Clearing workingMessage & title on `done` and `session_shutdown`, plus compatibility when UI lacks them
+    await host.executeTool(SWARM_TOOL, {
+      action: "done",
+      summary: "Finished billing refactor",
+    });
+    assert.equal(
+      host.workingMessageHistory[host.workingMessageHistory.length - 1],
+      undefined,
+      "completeRun must clear setWorkingMessage(undefined)",
+    );
+    assert.equal(
+      host.titleHistory[host.titleHistory.length - 1],
+      "",
+      "completeRun must clear setTitle('')",
+    );
+
+    await host.emit("session_shutdown", { reason: "quit" });
+
+    // Minimal mock UI without setWorkingMessage/setTitle never throws
+    const minimalHost = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-v070-minimal-ui",
+      omitNativeWorkingUi: true,
+    });
+    createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: false,
+      }),
+    })(minimalHost.pi);
+    await minimalHost.emit("session_start", { reason: "startup" });
+    await minimalHost.runCommand("swarm", "status");
+    await minimalHost.emit("session_shutdown", { reason: "quit" });
+  });
+
+  it("17. v0.7.0: emits Rich Mission Complete Card + smart post-run teardown confirm, enforces applyOrchestratorModel idempotency + pre-swarm model restore, and fixes run_<id> resume & rehydrate", async () => {
+    const repoDir = await createTempGitRepo("v070-lifecycle");
+    tempDirs.push(repoDir);
+    const store = new SwarmStore(repoDir);
+
+    const makeTransport = (): ISwarmTransport => ({
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        const tracker = createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async () => {
+            if (request.role === "worker" && request.workspace === "share") {
+              await writeFile(
+                path.join(request.cwd, "src", `${request.name}.ts`),
+                `export const ${request.name.replace(/-/g, "_")} = true;\n`,
+                "utf8",
+              );
+              await git(request.cwd, ["add", "."]);
+              await git(request.cwd, ["commit", "-m", `feat: add ${request.name}`]);
+              await request.engineApi?.postMessage({
+                channel: DEFAULT_CHANNEL,
+                kind: "done",
+                text: `@orchestrator [done] Implemented src/${request.name}.ts`,
+              });
+            } else if (request.role === "validator") {
+              await request.engineApi?.postMessage({
+                channel: DEFAULT_CHANNEL,
+                kind: "done",
+                text: "@orchestrator [done] PASS — all checks verified cleanly.",
+              });
+            }
+            return {
+              agentId: request.agentId,
+              name: request.name,
+              role: request.role,
+              outcome: "waiting",
+              summary: "Turn complete",
+              tokens: 2400,
+              cost: 0.015,
+            };
+          },
+        });
+        return tracker.handle;
+      },
+    });
+
+    // Start on claude-sonnet-4-5:medium; configure orchestratorModel = claude-opus-4-6:high
+    const host = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-v070-lifecycle",
+      initialHostModel: DEFAULT_TEST_MODELS[1], // anthropic/claude-sonnet-4-5
+    });
+    createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        orchestratorModel: "anthropic/claude-opus-4-6",
+        orchestratorThinkingLevel: "high",
+        autoTeardownOnComplete: false,
+        stallWatchdogEnabled: false,
+      }),
+    })(host.pi);
+    await host.emit("session_start", { reason: "startup" });
+
+    // A. `applyOrchestratorModel` idempotency across `/swarm direct` + `handlePlanConfirmed`
+    await host.runCommand("swarm-direct", "Ship auth module with validator");
+    assert.equal(host.ctx.model?.id, "claude-opus-4-6");
+    assert.equal(host.pi.getThinkingLevel(), "high");
+    const setModelCountAfterDirect = host.setModelCalls.length;
+    const thinkingCountAfterDirect = host.thinkingLevelCalls.length;
+    assert.equal(setModelCountAfterDirect, 1);
+    assert.equal(thinkingCountAfterDirect, 1);
+
+    const plan1 = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Auth Module Delivery",
+      objective: "Add auth helper and verify cleanly",
+      strategy: "Worker + Validator",
+      acceptance_criteria: "Merged and PASS",
+      base_branch: "main",
+      initial_members: [
+        {
+          name: "auth-dev",
+          role: "worker",
+          workspace: "share",
+          brief: "Implement src/auth-dev.ts",
+        },
+        {
+          name: "auth-val",
+          role: "validator",
+          workspace: "inherit",
+          brief: "Verify auth-dev changes",
+        },
+      ],
+    });
+    const run1Id: string = plan1.details.runId;
+    assert.equal(
+      host.setModelCalls.length,
+      setModelCountAfterDirect,
+      "handlePlanConfirmed must short-circuit applyOrchestratorModel when model+thinking already match",
+    );
+    assert.equal(
+      host.thinkingLevelCalls.length,
+      thinkingCountAfterDirect,
+      "handlePlanConfirmed must not flap thinking level when already matching",
+    );
+
+    // Wait for worker & validator to finish initial turns, then merge auth-dev (leaving clean merged worktree on disk)
+    await waitFor(async () => {
+      const r = await store.loadRun(run1Id);
+      return (
+        r.members["auth-dev"]?.state === "waiting" &&
+        r.members["auth-val"]?.state === "waiting"
+      );
+    });
+    await host.executeTool(SWARM_TOOL, { action: "merge", name: "auth-dev" });
+    const run1BeforeDone = await store.loadRun(run1Id);
+    const wt1Path = run1BeforeDone.members["auth-dev"]!.cwd;
+    assert.equal(await pathExists(wt1Path), true);
+
+    // B. Tool-initiated `swarm{action:"done"}` emits Rich Mission Complete Card with `/swarm teardown` & restores pre-swarm model!
+    const confirmsBeforeToolDone = host.confirmCalls.length;
+    await host.executeTool(SWARM_TOOL, {
+      action: "done",
+      summary: "Auth module merged and validated",
+    });
+    assert.equal(
+      host.confirmCalls.length,
+      confirmsBeforeToolDone,
+      "Tool-initiated done must NOT open an interactive confirm prompt",
+    );
+    assert.equal(
+      host.ctx.model?.id,
+      "claude-sonnet-4-5",
+      "Tool-initiated done must restore pre-swarm host model",
+    );
+    assert.equal(
+      host.pi.getThinkingLevel(),
+      "medium",
+      "Tool-initiated done must restore pre-swarm thinking level",
+    );
+    const toolDoneCard = host.sentMessages
+      .filter(
+        (m) =>
+          m.message.customType === SWARM_STATUS_CUSTOM_TYPE &&
+          (m.message.details as { missionCompleteCard?: boolean } | undefined)
+            ?.missionCompleteCard === true,
+      )
+      .pop()!;
+    assert.ok(toolDoneCard, "Expected structured Mission Complete Card on tool done");
+    assert.equal(toolDoneCard.options?.triggerTurn, false);
+    const toolCardText = String(toolDoneCard.message.content);
+    assert.match(toolCardText, /Mission Complete — Auth Module Delivery/);
+    assert.match(toolCardText, /Add auth helper and verify cleanly/);
+    assert.match(toolCardText, /Duration:/);
+    assert.match(toolCardText, /@auth-dev/);
+    assert.match(toolCardText, /Diff Summary \(`git diff --stat`\)/);
+    assert.match(toolCardText, /src\/auth-dev\.ts/);
+    assert.match(toolCardText, /Validator:.*PASS/);
+    assert.match(toolCardText, /4\.8k tok/);
+    assert.match(toolCardText, /1 remaining/);
+    assert.match(toolCardText, /\/swarm teardown/);
+
+    // C. Interactive `/swarm done` with clean merged worktree prompts `Remove 1 merged worktree(s) now?` & runs teardown!
+    await host.runCommand("swarm-direct", "Ship billing module");
+    const plan2 = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Billing Delivery",
+      objective: "Add billing helper",
+      strategy: "Single share worker",
+      acceptance_criteria: "Merged cleanly",
+      base_branch: "main",
+      initial_members: [
+        {
+          name: "bill-dev",
+          role: "worker",
+          workspace: "share",
+          brief: "Implement src/bill-dev.ts",
+        },
+      ],
+    });
+    const run2Id: string = plan2.details.runId;
+    await waitFor(async () => {
+      const r = await store.loadRun(run2Id);
+      return r.members["bill-dev"]?.state === "waiting";
+    });
+    await host.executeTool(SWARM_TOOL, { action: "merge", name: "bill-dev" });
+    const wt2Path = (await store.loadRun(run2Id)).members["bill-dev"]!.cwd;
+    assert.equal(await pathExists(wt2Path), true);
+
+    host.confirmCalls.length = 0;
+    host.setConfirmHandler(() => true);
+    await host.runCommand("swarm", "done Billing verified");
+    assert.ok(
+      host.confirmCalls.some((c) => /Remove 1 merged worktree\(s\) now\?/i.test(c.title)),
+      "Interactive /swarm done must prompt to remove clean merged worktrees",
+    );
+    assert.equal(
+      await pathExists(wt2Path),
+      false,
+      "Confirmed teardown prompt on /swarm done must remove the clean merged worktree",
+    );
+    assert.equal(host.ctx.model?.id, "claude-sonnet-4-5");
+    assert.equal(host.pi.getThinkingLevel(), "medium");
+    const cmdDoneCard = host.sentMessages
+      .filter(
+        (m) =>
+          m.message.customType === SWARM_STATUS_CUSTOM_TYPE &&
+          (m.message.details as { runId?: string; missionCompleteCard?: boolean } | undefined)
+            ?.runId === run2Id &&
+          (m.message.details as { missionCompleteCard?: boolean } | undefined)
+            ?.missionCompleteCard === true,
+      )
+      .pop()!;
+    assert.ok(cmdDoneCard);
+    assert.match(String(cmdDoneCard.message.content), /removed 1 merged worktree\(s\)/);
+
+    // D. `/swarm cancel` also restores pre-swarm host model
+    await host.runCommand("swarm-direct", "Cancelable run");
+    await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Cancelable Run",
+      objective: "Verify pre-swarm model restore on cancel",
+      strategy: "No workers",
+      acceptance_criteria: "Cancelled",
+      base_branch: "main",
+    });
+    assert.equal(host.ctx.model?.id, "claude-opus-4-6");
+    host.setConfirmHandler(() => true);
+    await host.runCommand("swarm", "cancel");
+    assert.equal(
+      host.ctx.model?.id,
+      "claude-sonnet-4-5",
+      "/swarm cancel must restore pre-swarm host model",
+    );
+    assert.equal(host.pi.getThinkingLevel(), "medium");
+
+    // E. `/swarm resume run_<unknown>` returns clear not-found error instead of resuming another run!
+    const otherRun = await store.createRun({
+      title: "Other Active Mission",
+      objective: "Should not be resumed by unknown run_ ID",
+      strategy: "Worker",
+      acceptanceCriteria: "Done",
+      baseBranch: "main",
+      ownerSessionId: "dead-sess-other",
+      ownerPid: 999999,
+      maxConcurrency: 4,
+      validatorEnabled: true,
+      roleModels: {
+        orchestrator: { model: "anthropic/claude-opus-4-6", thinkingLevel: "high" },
+      },
+    });
+    await store.addMember(otherRun.id, {
+      name: "crashed-worker",
+      agentId: "agent-crashed-worker",
+      role: "worker",
+      parentName: "orchestrator",
+      brief: "Was working before crash",
+      workspace: "inherit",
+      cwd: repoDir,
+      state: "working",
+    });
+
+    const notifsBeforeUnknown = host.notifications.length;
+    await host.runCommand("swarm", "resume run_99999999_deadbeef --quiet");
+    const newNotifs = host.notifications.slice(notifsBeforeUnknown);
+    assert.ok(
+      newNotifs.some(
+        (n) => n.level === "error" && /run_99999999_deadbeef.*not found/i.test(n.message),
+      ),
+      "Unknown run_<id> must report clear not-found error",
+    );
+    const otherAfterUnknown = await store.loadRun(otherRun.id);
+    assert.equal(
+      otherAfterUnknown.ownerSessionId,
+      "dead-sess-other",
+      "Unknown run_<id> must NOT silently claim/resume another run",
+    );
+
+    // F. `rehydrateSessionState` (`pi --continue` / `--session`) restores `run.roleModels.orchestrator` & notifies stopped workers
+    const rehydrateHost = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-v070-rehydrate",
+      initialHostModel: DEFAULT_TEST_MODELS[2], // claude-haiku-4-5
+    });
+    rehydrateHost.pi.appendEntry(SWARM_FOCUS_ENTRY, {
+      version: 2,
+      runId: otherRun.id,
+      ownerSessionId: "dead-sess-other",
+      reason: "plan_confirmed",
+      updatedAt: new Date().toISOString(),
+    });
+    createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: false,
+      }),
+    })(rehydrateHost.pi);
+    await rehydrateHost.emit("session_start", { reason: "resume" });
+
+    assert.equal(
+      rehydrateHost.ctx.model?.id,
+      "claude-opus-4-6",
+      "rehydrateSessionState must restore run.roleModels.orchestrator model",
+    );
+    assert.equal(
+      rehydrateHost.pi.getThinkingLevel(),
+      "high",
+      "rehydrateSessionState must restore run.roleModels.orchestrator thinkingLevel",
+    );
+    assert.ok(
+      rehydrateHost.notifications.some(
+        (n) => /normalized to stopped/i.test(n.message) && /@crashed-worker/.test(n.message),
+      ),
+      "rehydrateSessionState must notify cleanly when workers are normalized to stopped",
+    );
+
+    await rehydrateHost.emit("session_shutdown", { reason: "quit" });
     await host.emit("session_shutdown", { reason: "quit" });
   });
 });
