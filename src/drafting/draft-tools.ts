@@ -195,7 +195,7 @@ export const InitialMemberProposalSchema = Type.Object({
   role: InitialMemberRoleSchema,
   brief: Type.String({
     description:
-      "Public assignment posted on the shared Message Board: exclusive file/directory ownership, constraints, verification commands, and next-peer @mention.",
+      "Concise public assignment posted on the shared Message Board: exclusive file/directory ownership, constraints, already-installed repo verification scripts (avoid speculative 'npx -y' downloads), and next-peer @mention.",
   }),
   workspace: Type.Optional(InitialMemberWorkspaceSchema),
   channels: Type.Optional(
@@ -219,7 +219,7 @@ export const ProposeSwarmPlanParamsSchema = Type.Object({
   }),
   acceptance_criteria: Type.String({
     description:
-      'Concrete, testable definition of "what done looks like" listing exact runnable verification commands (typecheck, test commands, build checks) and behavioral checks.',
+      'Concrete, testable definition of "what done looks like" listing exact runnable verification commands using already-installed repo scripts (e.g. npm test, npm run typecheck, node --test — avoid speculative npx -y downloads) and behavioral checks.',
   }),
   base_branch: Type.Optional(
     Type.String({
@@ -243,7 +243,7 @@ export const ProposeSwarmPlanParamsSchema = Type.Object({
   initial_members: Type.Optional(
     Type.Array(InitialMemberProposalSchema, {
       description:
-        "Optional right-sized initial wave (1–2 workers for small/single-module tasks; disjoint parallel 'share' authors + independent 'validator' for multi-module work). Leave omitted/empty to spawn dynamically after launch.",
+        "Optional wave-1 workers only by default (1–2 workers for small/single-module tasks; disjoint parallel 'share' workers for multi-module work). Spawn an independent 'validator' on demand once a worker commits/posts '[done]' (only include a validator initially when reviewing already-existing code). Keep briefs concise and grounded in already-installed repo verification scripts (no speculative 'npx -y' downloads). Leave omitted/empty to spawn dynamically after launch.",
     }),
   ),
 });
@@ -720,6 +720,25 @@ function formatRoleModelsPillBar(
     : 0;
   const fbTag = fbCount > 0 ? `${sep}${theme.fg("dim", `+${fbCount} fb`)}` : "";
   return `${theme.fg("dim", "[")}${orch}${sep}${work}${sep}${val}${fbTag}${theme.fg("dim", "]")}`;
+}
+
+function formatExpandHint(
+  context:
+    | { keyHint?: (keybinding: any, description: string) => string }
+    | undefined,
+  theme: Theme,
+): string {
+  const customHint =
+    typeof context?.keyHint === "function"
+      ? context.keyHint("app.tools.expand", "to expand")
+      : undefined;
+  if (typeof customHint === "string" && customHint.trim()) {
+    const trimmed = customHint.trim();
+    return trimmed.startsWith("(") && trimmed.endsWith(")")
+      ? trimmed
+      : `${theme.fg("dim", "(")}${trimmed}${theme.fg("dim", ")")}`;
+  }
+  return theme.fg("dim", "(Ctrl+O to expand)");
 }
 
 function isRecommendedOption(
@@ -1264,7 +1283,7 @@ export function createSwarmQuestionnaireTool(
 
       if (!isExpanded && safeQuestions.length > 4) {
         lines.push(
-          `  ${theme.fg("dim", `… +${safeQuestions.length - 4} more question(s) (Ctrl+O to expand)`)}`,
+          `  ${theme.fg("dim", `… +${safeQuestions.length - 4} more question(s)`)} ${formatExpandHint(context, theme)}`,
         );
       }
 
@@ -1336,7 +1355,7 @@ export function createSwarmQuestionnaireTool(
           ? theme.fg("muted", ` (of ${totalCount})`)
           : "";
       const expandHint =
-        answeredCount > 0 ? ` ${theme.fg("dim", "(Ctrl+O to expand)")}` : "";
+        answeredCount > 0 ? ` ${formatExpandHint(context, theme)}` : "";
       const lines: string[] = [
         `${theme.fg("success", "✓ [RECORDED]")} ${theme.fg("toolOutput", `Recorded ${answeredCount} questionnaire answer(s).`)}${totalSuffix}${expandHint}`,
       ];
@@ -1372,11 +1391,11 @@ export function createProposeSwarmPlanTool(
     name: PROPOSE_SWARM_PLAN_TOOL,
     label: "Swarm Plan",
     description:
-      "Validate a Flexible Dynamic Swarm Plan, render the full formatted strategy, acceptance criteria, 3-role models, and optional initial members into scrollback, and ask the user to Confirm, Continue refining, or Cancel.",
+      "Validate a Flexible Dynamic Swarm Plan, render a compact expandable summary card (with full strategy, acceptance criteria, 3-role models, and optional initial members on expand), and ask the user to Confirm, Continue refining, or Cancel.",
     promptSnippet:
       "Validate and present a Flexible Dynamic Swarm Plan (title, objective, strategy, acceptance criteria, optional initial members) for user confirmation before launching.",
     promptGuidelines: [
-      `Call \`${PROPOSE_SWARM_PLAN_TOOL}\` once requirements are clear with wave-by-wave disjoint file/directory ownership in \`strategy\` and exact runnable verification commands in \`acceptance_criteria\`; do NOT duplicate the full plan in prose beforehand because \`${PROPOSE_SWARM_PLAN_TOOL}\` renders the full formatted proposal into scrollback automatically.`,
+      `Call \`${PROPOSE_SWARM_PLAN_TOOL}\` once requirements are clear with wave-by-wave disjoint file/directory ownership in \`strategy\`, exact runnable verification commands using already-installed repo scripts (no speculative \`npx -y\` downloads) in \`acceptance_criteria\`, and wave-1 workers only in \`initial_members\` (spawn \`validator\` on demand once workers commit/post \`[done]\`); do NOT duplicate the full plan in prose beforehand because the expandable proposal card and confirmation modal present it automatically.`,
     ],
     exposure: "model-only",
     defaultActive: false,
@@ -1666,7 +1685,9 @@ export function createProposeSwarmPlanTool(
         } satisfies ProposeSwarmPlanToolDetails,
       };
     },
-    renderCall(args: ProposeSwarmPlanParams, theme: Theme) {
+    renderCall(args: ProposeSwarmPlanParams, theme: Theme, context) {
+      const isExpanded = Boolean(context?.expanded);
+      const isPartial = Boolean(context?.isPartial);
       const settings = deps.getSettings();
       const draft = draftController.getDraft();
       const rawMembers = Array.isArray(args?.initial_members)
@@ -1734,8 +1755,43 @@ export function createProposeSwarmPlanTool(
         `(${previewPlan.baseBranch} · max:${previewPlan.maxConcurrency} · validator:${previewPlan.validatorEnabled ? "ON" : "OFF"}${memberMeta})`,
       );
       const modelPills = formatRoleModelsPillBar(previewPlan.roleModels, theme);
+      const titleLine = `${theme.fg("accent", "🗺")} ${theme.fg("toolTitle", theme.bold("Swarm Plan"))} ${theme.fg("muted", `(${PROPOSE_SWARM_PLAN_TOOL})`)} ${modeBadge} ${metaPill}`;
+
+      if (!isExpanded) {
+        const titleSnippet =
+          formatInlineSnippet(previewPlan.title, 72) ||
+          (isPartial ? "Drafting…" : "(pending)");
+        const streamingTag = isPartial
+          ? previewPlan.title
+            ? ` ${theme.fg("warning", "⏳ streaming…")}`
+            : ` ${theme.fg("warning", "⏳")}`
+          : "";
+        const expandHint = formatExpandHint(context, theme);
+        const lines: string[] = [
+          titleLine,
+          `  ${theme.fg("muted", "Title:")} ${theme.fg("accent", titleSnippet)}${streamingTag} ${expandHint}`,
+          `  ${theme.fg("muted", "Role Models:")} ${modelPills}`,
+        ];
+        if (previewMembers.length > 0) {
+          const memberTags = previewMembers
+            .slice(0, 4)
+            .map((m) => {
+              const name = formatInlineSnippet(m.name, 24) || "(unnamed)";
+              const ws = m.workspace ?? "inherit";
+              return `${theme.fg("accent", name)}${theme.fg("dim", `(${m.role}/${ws})`)}`;
+            })
+            .join(theme.fg("dim", " · "));
+          const moreTag =
+            previewMembers.length > 4
+              ? theme.fg("dim", ` · +${previewMembers.length - 4} more`)
+              : "";
+          lines.push(`  ${theme.fg("muted", "Initial Wave:")} ${memberTags}${moreTag}`);
+        }
+        return new Text(lines.join("\n"), 0, 0);
+      }
+
       const summary = formatProposalTranscriptSummary(previewPlan);
-      const header = `${theme.fg("accent", "🗺")} ${theme.fg("toolTitle", theme.bold("Swarm Plan"))} ${theme.fg("muted", `(${PROPOSE_SWARM_PLAN_TOOL})`)} ${modeBadge} ${metaPill}\n  ${theme.fg("muted", "Role Models:")} ${modelPills}`;
+      const header = `${titleLine}\n  ${theme.fg("muted", "Role Models:")} ${modelPills}`;
       return new Text(`${header}\n\n${theme.fg("toolOutput", summary)}`, 0, 0);
     },
     renderResult(result, options, theme: Theme, context) {
@@ -1810,7 +1866,7 @@ export function createProposeSwarmPlanTool(
         const flagsSuffix = details.plan
           ? ` (Validator: ${details.plan.validatorEnabled ? "ON" : "OFF"}, concurrency: ${details.plan.maxConcurrency})`
           : "";
-        const expandHint = ` ${theme.fg("dim", "(Ctrl+O to expand)")}`;
+        const expandHint = ` ${formatExpandHint(context, theme)}`;
         const lines: string[] = [
           `${statusBadge} ${theme.fg("toolOutput", `Swarm Plan confirmed${autoTag} — launched run ${details.runId ?? ""}${flagsSuffix}`)}${expandHint}`,
         ];
@@ -1863,7 +1919,7 @@ export function createProposeSwarmPlanTool(
           concurrency !== undefined
             ? `Validator: ${validator}, concurrency: ${concurrency}`
             : `Validator: ${validator}`;
-        const expandHint = ` ${theme.fg("dim", "(Ctrl+O to expand)")}`;
+        const expandHint = ` ${formatExpandHint(context, theme)}`;
         const lines: string[] = [
           `${theme.fg("warning", "✎ [REFINING]")} ${theme.fg("toolOutput", `Continuing Swarm Plan refinement (${suffix}).`)}${expandHint}`,
         ];

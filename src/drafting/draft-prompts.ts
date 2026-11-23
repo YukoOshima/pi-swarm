@@ -232,7 +232,7 @@ export function buildDraftingKickoffPrompt(
     "   - **1–2 workers** for small, localized, or single-module tasks (do not over-spawn).",
   );
   lines.push(
-    "   - **Disjoint parallel `share` authors + independent `validator`** for multi-module work (e.g. 1 read-only `validator` auditing peer branches/worktrees per 2–4 parallel authors).",
+    "   - **Disjoint parallel `share` authors + independent `validator`** for multi-module work (spawn the read-only `validator` on demand once workers commit/post `[done]` — e.g. 1 `validator` auditing peer branches/worktrees per 2–4 parallel authors — rather than waking an idle validator before any code exists).",
   );
   lines.push(
     `5. **Flexible Dynamic Swarm Plan:** Once clear, call \`${PROPOSE_SWARM_PLAN_TOOL}\` with:`,
@@ -243,13 +243,13 @@ export function buildDraftingKickoffPrompt(
     "   - `strategy`: **wave-by-wave execution with disjoint file/directory ownership boundaries** (assign non-overlapping files/directories per parallel `share`/`branch` worker so zero two-worker collisions occur on the same file, plus `@mention` -> `validator` review and merge gates on the shared Message Board). Keep wave transitions adaptive on the live board — do NOT invent a rigid pre-locked file-level DAG.",
   );
   lines.push(
-    '   - `acceptance_criteria`: concrete, testable definition of "what done looks like" listing **exact runnable verification commands** (`typecheck`, targeted test commands, build checks) and behavioral invariants.',
+    '   - `acceptance_criteria`: concrete, testable definition of "what done looks like" listing **exact runnable verification commands** using **already-installed** repo scripts discovered during recon (`npm test`, `npm run typecheck`, `node --test`, build checks — explicitly avoid speculative `npx -y` network package downloads) and behavioral invariants.',
   );
   lines.push(
-    `   - \`initial_members\` (optional): right-sized initial wave — e.g. read-only scout (\`workspace: "inherit"\`) or disjoint parallel workers (\`workspace: "share"\` / \`"branch"\` with explicit file ownership & verification commands in each \`brief\`) plus an optional \`validator\`. Each name must match \`${MEMBER_NAME_PATTERN.source}\`, be unique, and avoid reserved names (${RESERVED_MEMBER_NAMES.join(", ")}). Leave omitted/empty to spawn wave 1 dynamically after launch.`,
+    `   - \`initial_members\` (optional): populate with **wave-1 workers only** by default — e.g. read-only scout (\`workspace: "inherit"\`) or disjoint parallel workers (\`workspace: "share"\` / \`"branch"\`). Spawn an independent \`validator\` on demand once a worker commits/posts \`[done]\` (only include a \`validator\` initially when reviewing already-existing code). Keep each \`brief\` concise with exclusive file ownership and **already-installed** repo verification scripts (no speculative \`npx -y\` downloads). Each name must match \`${MEMBER_NAME_PATTERN.source}\`, be unique, and avoid reserved names (${RESERVED_MEMBER_NAMES.join(", ")}). Leave omitted/empty to spawn wave 1 dynamically after launch.`,
   );
   lines.push(
-    `6. Do NOT dump the full plan in prose before calling \`${PROPOSE_SWARM_PLAN_TOOL}\` — its tool renderer already prints the full formatted proposal into scrollback before opening the confirmation modal.`,
+    `6. Do NOT dump the full plan in prose before calling \`${PROPOSE_SWARM_PLAN_TOOL}\` — the expandable proposal card and confirmation modal already display the full formatted plan.`,
   );
   lines.push("</instructions>");
   lines.push("</swarm_drafting_kickoff>");
@@ -265,7 +265,7 @@ export function buildDraftingSystemOverlay(draft: ActiveSwarmDraft): string {
   const autoConfirmAttr = draft.autoConfirm ? ' auto_confirm="true"' : "";
   const lines: string[] = [
     `<swarm_drafting_active mode="${escapeXml(draft.mode)}" base_branch="${escapeXml(draft.baseBranch ?? "auto")}" max_concurrency="${draft.maxConcurrency}" validator_enabled="${draft.validatorEnabled ? "true" : "false"}"${autoConfirmAttr}>`,
-    `Active \`pi-swarm\` draft for a **Dynamic Antigravity Swarm** (Orchestrator dynamically spawns/steers warm Workers & read-only Validators on the shared \`#seq\` Message Board with \`@mention\` wakeups). Rules: (1) Run fast targeted read-only recon (\`ls\`, \`find\`, \`grep\`, \`read\` key entrypoints/\`package.json\`) FIRST — do NOT edit files or implement code yet; (2) Ask **0 questions** when clear, or **at most 1–3 high-leverage trade-off questions** via \`${SWARM_QUESTIONNAIRE_TOOL}\` (or \`${SWARM_QUESTION_TOOL}\`) with the best option placed first and prefixed \`(Recommended)\` — never interrogate on obvious details; (3) Right-size the swarm (1–2 workers for small/single-module tasks; disjoint parallel \`share\` authors + independent \`validator\` for multi-module work); (4) Finalize via \`${PROPOSE_SWARM_PLAN_TOOL}\` with \`title\`, \`objective\`, \`strategy\` specifying **wave-by-wave execution with disjoint file/directory ownership boundaries** (zero same-file collisions; not a rigid pre-locked file-level DAG), \`acceptance_criteria\` listing **exact runnable verification commands** (\`typecheck\`, test commands, build checks), and optional valid \`initial_members\`; (5) Do not repeat the full plan in prose before calling \`${PROPOSE_SWARM_PLAN_TOOL}\`.`,
+    `Active \`pi-swarm\` draft for a **Dynamic Antigravity Swarm** (Orchestrator dynamically spawns/steers warm Workers & read-only Validators on the shared \`#seq\` Message Board with \`@mention\` wakeups). Rules: (1) Run fast targeted read-only recon (\`ls\`, \`find\`, \`grep\`, \`read\` key entrypoints/\`package.json\`) FIRST — do NOT edit files or implement code yet; (2) Ask **0 questions** when clear, or **at most 1–3 high-leverage trade-off questions** via \`${SWARM_QUESTIONNAIRE_TOOL}\` (or \`${SWARM_QUESTION_TOOL}\`) with the best option placed first and prefixed \`(Recommended)\` — never interrogate on obvious details; (3) Right-size the swarm (1–2 workers for small/single-module tasks; disjoint parallel \`share\` authors + independent \`validator\` spawned on demand once workers commit/post \`[done]\` for multi-module work); (4) Finalize via \`${PROPOSE_SWARM_PLAN_TOOL}\` with \`title\`, \`objective\`, \`strategy\` specifying **wave-by-wave execution with disjoint file/directory ownership boundaries** (zero same-file collisions; not a rigid pre-locked file-level DAG), \`acceptance_criteria\` listing **exact runnable verification commands** using **already-installed** repo scripts (avoid speculative \`npx -y\` network downloads), and optional valid \`initial_members\` populated with **wave-1 workers only** by default (concise briefs; only include a \`validator\` initially when reviewing already-existing code); (5) Do not repeat the full plan in prose before calling \`${PROPOSE_SWARM_PLAN_TOOL}\`.`,
   ];
 
   if (draft.seed.trim()) {
@@ -308,12 +308,12 @@ export function buildDirectPlanPrompt(
     "Fast-path `pi-swarm` launch (`/swarm direct`) as the **Orchestrator** (`autoConfirm: true`):",
     `1. Skip interactive Q&A — do NOT call \`${SWARM_QUESTION_TOOL}\` or \`${SWARM_QUESTIONNAIRE_TOOL}\`.`,
     "2. Run fast targeted read-only recon (`ls`, `find`, `grep`, `read` key entrypoints/`package.json`) FIRST so your slice boundaries and verification commands are grounded in real code — do NOT edit or implement code directly.",
-    "3. Right-size the swarm (1–2 workers for small/single-module tasks; disjoint parallel `share` authors + independent `validator` for multi-module work).",
+    "3. Right-size the swarm (1–2 workers for small/single-module tasks; disjoint parallel `share` authors + independent `validator` spawned on demand once workers commit/post `[done]` for multi-module work).",
     `4. Immediately call \`${PROPOSE_SWARM_PLAN_TOOL}\` with a **Flexible Dynamic Swarm Plan** (not a rigid pre-locked file-level DAG):`,
     baseBranchRule,
     "   - `strategy`: **wave-by-wave execution with disjoint file/directory ownership boundaries** (zero two-worker collisions on the same file) plus board review/merge gates.",
-    "   - `acceptance_criteria`: **exact runnable verification commands** (`typecheck`, test commands, build checks) plus behavioral invariants.",
-    `   - Provide \`title\`, \`objective\`, and optional right-sized \`initial_members\` (unique lowercase names matching \`${MEMBER_NAME_PATTERN.source}\`, avoiding ${RESERVED_MEMBER_NAMES.join(", ")}, with explicit file ownership in each brief).`,
+    "   - `acceptance_criteria`: **exact runnable verification commands** using **already-installed** repo scripts discovered during recon (`npm test`, `npm run typecheck`, `node --test`, build checks — explicitly avoid speculative `npx -y` network package downloads) plus behavioral invariants.",
+    `   - Provide \`title\`, \`objective\`, and optional right-sized \`initial_members\` with **wave-1 workers only** by default (spawn \`validator\` on demand once a worker commits/posts \`[done]\`; only include a \`validator\` initially when reviewing already-existing code). Keep each \`brief\` concise with exclusive file ownership and already-installed repo verification scripts; use unique lowercase names matching \`${MEMBER_NAME_PATTERN.source}\`, avoiding ${RESERVED_MEMBER_NAMES.join(", ")}.`,
     `5. Because this draft runs with \`autoConfirm: true\`, calling \`${PROPOSE_SWARM_PLAN_TOOL}\` validates and launches the Dynamic Swarm immediately without a confirmation modal. Do NOT dump the full plan in prose beforehand.`,
     "</instructions>",
     "</swarm_direct_plan>",

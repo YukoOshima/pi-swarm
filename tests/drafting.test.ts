@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
 import type {
   ExtensionAPI,
   ExtensionToolContext,
@@ -36,12 +38,16 @@ import {
   formatProposalTranscriptSummary,
   getSwarmToolsForMode,
   IDLE_SWARM_TOOLS,
+  InitialMemberProposalSchema,
   isDraftActive,
   ProposeSwarmPlanParamsSchema,
   registerDraftingTools,
   rehydrateDraft,
   startDraft,
   startOrResolveDraft,
+  SwarmQuestionnaireItemSchema,
+  SwarmQuestionnaireParamsSchema,
+  SwarmQuestionParamsSchema,
   updateDraft,
   validateProposedSwarmPlan,
   type DraftingDeps,
@@ -1587,8 +1593,19 @@ describe("draft-tools: propose_swarm_plan", () => {
 
     const proposeTool = harness.registeredTools.get(PROPOSE_SWARM_PLAN_TOOL);
     const theme = createMockTheme();
-    const rendered = proposeTool
+    const collapsedRendered = proposeTool
       .renderCall(makeSamplePlanParams(), theme, {} as any)
+      .render(160)
+      .join("\n");
+    assert.match(collapsedRendered, /Swarm Plan/);
+    assert.match(collapsedRendered, /propose_swarm_plan/);
+    assert.match(collapsedRendered, /Title: OAuth & Audit Rollout/);
+    assert.match(collapsedRendered, /validator:ON/);
+    assert.match(collapsedRendered, /\(Ctrl\+O to expand\)/);
+    assert.ok(!collapsedRendered.includes("### Dynamic Strategy"));
+
+    const rendered = proposeTool
+      .renderCall(makeSamplePlanParams(), theme, { expanded: true } as any)
       .render(160)
       .join("\n");
 
@@ -1608,12 +1625,22 @@ describe("draft-tools: propose_swarm_plan", () => {
     assert.match(rendered, /\| \*\*oauth-dev\*\* \| `worker` \| `share` \|/);
     assert.match(rendered, /\| \*\*verifier\*\* \| `validator` \| `inherit` \|/);
 
-    // Explicit validator_enabled: false reflected in renderCall
-    const validatorOffRendered = proposeTool
+    // Explicit validator_enabled: false reflected in renderCall (collapsed & expanded)
+    const validatorOffCollapsed = proposeTool
       .renderCall(
         makeSamplePlanParams({ validator_enabled: false }),
         theme,
         {} as any,
+      )
+      .render(160)
+      .join("\n");
+    assert.match(validatorOffCollapsed, /validator:OFF/);
+
+    const validatorOffRendered = proposeTool
+      .renderCall(
+        makeSamplePlanParams({ validator_enabled: false }),
+        theme,
+        { expanded: true } as any,
       )
       .render(160)
       .join("\n");
@@ -2247,8 +2274,13 @@ describe("v0.3.7 drafting regression fixes", () => {
 
     const proposeTool = harness.registeredTools.get(PROPOSE_SWARM_PLAN_TOOL);
     const theme = createMockTheme();
-    const rendered = proposeTool
+    const collapsed = proposeTool
       .renderCall(makeSamplePlanParams({ max_concurrency: 999 }), theme, {} as any)
+      .render(120)
+      .join("\n");
+    assert.match(collapsed, /max:64/);
+    const rendered = proposeTool
+      .renderCall(makeSamplePlanParams({ max_concurrency: 999 }), theme, { expanded: true } as any)
       .render(120)
       .join("\n");
     assert.match(rendered, /\*\*Max Concurrency:\*\* 64/);
@@ -3026,5 +3058,272 @@ describe("v0.6.0 drafting prompts & polished TUI renderers", () => {
         `${tool.name} must render ✗ [ERROR] when context.isError is true`,
       );
     }
+  });
+});
+
+// ============================================================================
+// 10. v0.7.0 Collapsible Proposal Preview, Wave-1 Guidance & Schema Invariants
+// ============================================================================
+
+describe("v0.7.0 collapsible proposal renderCall, wave-1 prompt guidance & schema invariants", () => {
+  it("propose_swarm_plan.renderCall renders crisp 3–4 line summary when collapsed and full plan when expanded, honoring keyHint & isPartial", () => {
+    const harness = new MockPiHarness();
+    const controller = registerDraftingTools(harness.api, {
+      worktree: createMockWorktree(),
+      ui: {
+        askQuestion: async () => ({ cancelled: true, isCustom: false }),
+        askQuestionnaire: async () => ({ cancelled: true, answers: {}, items: [] }),
+        confirmProposal: async () => ({
+          action: "cancel",
+          validatorEnabled: true,
+          maxConcurrency: 3,
+        }),
+      },
+      getSettings: () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        orchestratorModel: "anthropic/claude-opus-4-6",
+        orchestratorThinkingLevel: "high",
+        workerModel: "anthropic/claude-sonnet-4-5",
+        workerThinkingLevel: "medium",
+        validatorModel: "openai/gpt-5",
+        validatorThinkingLevel: "low",
+      }),
+      onPlanConfirmed: async (plan) => createMockRun(plan),
+    });
+
+    controller.start({
+      mode: "swarm",
+      seed: "Ship v0.7.0 upgrades",
+      baseBranch: "main",
+      maxConcurrency: 4,
+      validatorEnabled: true,
+    });
+
+    const proposeTool = harness.registeredTools.get(PROPOSE_SWARM_PLAN_TOOL);
+    const theme = createMockTheme();
+
+    // 1. Collapsed with no initial_members -> crisp 3-line summary card + fallback Ctrl+O hint
+    const noMembersLines = proposeTool
+      .renderCall(
+        makeSamplePlanParams({
+          title: "Compact Card Plan",
+          base_branch: "release/v0.7",
+          max_concurrency: 5,
+          initial_members: undefined,
+        }),
+        theme,
+        { expanded: false } as any,
+      )
+      .render(160);
+    assert.equal(noMembersLines.length, 3);
+    const noMembersText = noMembersLines.join("\n");
+    assert.match(
+      noMembersText,
+      /🗺 Swarm Plan \(propose_swarm_plan\) \[PROPOSAL\] \(release\/v0\.7 · max:5 · validator:ON · dynamic waves\)/,
+    );
+    assert.match(noMembersText, /Title: Compact Card Plan \(Ctrl\+O to expand\)/);
+    assert.match(noMembersText, /Role Models: \[Orch:claude-opus-4-6\(high\)/);
+    assert.ok(!noMembersText.includes("Implement OAuth2 PKCE login"));
+    assert.ok(!noMembersText.includes("### Dynamic Strategy"));
+    assert.ok(!noMembersText.includes("### Acceptance Criteria"));
+
+    // 2. Collapsed with >4 initial_members -> crisp 4-line summary card with +N more overflow & custom keyHint
+    const keyHintCalls: Array<[string, string]> = [];
+    const fiveMemberLines = proposeTool
+      .renderCall(
+        makeSamplePlanParams({
+          initial_members: [
+            { name: "alpha", role: "worker", workspace: "share", brief: "Own src/a.ts" },
+            { name: "beta", role: "worker", workspace: "share", brief: "Own src/b.ts" },
+            { name: "gamma", role: "worker", workspace: "share", brief: "Own src/c.ts" },
+            { name: "delta", role: "worker", workspace: "share", brief: "Own src/d.ts" },
+            { name: "epsilon", role: "worker", workspace: "branch", brief: "Own src/e.ts" },
+          ],
+        }),
+        theme,
+        {
+          expanded: false,
+          keyHint: (kb: string, desc: string) => {
+            keyHintCalls.push([kb, desc]);
+            return "Alt+E to expand";
+          },
+        } as any,
+      )
+      .render(200);
+    assert.equal(fiveMemberLines.length, 4);
+    assert.deepEqual(keyHintCalls, [["app.tools.expand", "to expand"]]);
+    const fiveMemberText = fiveMemberLines.join("\n");
+    assert.match(fiveMemberText, /5 members/);
+    assert.match(fiveMemberText, /Title: OAuth & Audit Rollout \(Alt\+E to expand\)/);
+    assert.match(
+      fiveMemberText,
+      /Initial Wave: alpha\(worker\/share\) · beta\(worker\/share\) · gamma\(worker\/share\) · delta\(worker\/share\) · \+1 more/,
+    );
+    assert.ok(!fiveMemberText.includes("Own src/a.ts"));
+
+    // Already-parenthesized keyHint is not double-wrapped
+    const preWrappedText = proposeTool
+      .renderCall(makeSamplePlanParams({ initial_members: undefined }), theme, {
+        expanded: false,
+        keyHint: () => "(Space to expand)",
+      } as any)
+      .render(160)
+      .join("\n");
+    assert.match(preWrappedText, /\(Space to expand\)/);
+    assert.ok(!preWrappedText.includes("((Space to expand))"));
+
+    // 3. Partial streaming handling (empty args vs partial title) stays compact and never throws
+    const partialEmpty = proposeTool
+      .renderCall({} as any, theme, { expanded: false, isPartial: true } as any)
+      .render(160)
+      .join("\n");
+    assert.match(partialEmpty, /Title: Drafting… ⏳ \(Ctrl\+O to expand\)/);
+
+    const partialWithTitle = proposeTool
+      .renderCall({ title: "Half-streamed Plan" } as any, theme, {
+        expanded: false,
+        isPartial: true,
+      } as any)
+      .render(160)
+      .join("\n");
+    assert.match(
+      partialWithTitle,
+      /Title: Half-streamed Plan ⏳ streaming… \(Ctrl\+O to expand\)/,
+    );
+
+    // 4. Expanded mode renders the full plan details cleanly
+    const expandedText = proposeTool
+      .renderCall(makeSamplePlanParams(), theme, { expanded: true } as any)
+      .render(160)
+      .join("\n");
+    assert.match(expandedText, /## Swarm Plan Proposal: OAuth & Audit Rollout/);
+    assert.match(expandedText, /\*\*Objective:\*\* Implement OAuth2 PKCE login/);
+    assert.match(expandedText, /### Dynamic Strategy \(Waves & Disjoint Ownership\)/);
+    assert.match(expandedText, /### Acceptance Criteria & Verification/);
+    assert.match(expandedText, /\| \*\*oauth-dev\*\* \| `worker` \| `share` \|/);
+
+    // 5. renderResult also respects context.keyHint with graceful Ctrl+O fallback
+    const confirmedWithHint = proposeTool
+      .renderResult(
+        {
+          content: [{ type: "text", text: "Full proposal" }],
+          details: {
+            outcome: "confirmed",
+            runId: "run-hint-1",
+            plan: {
+              title: "Hint Check",
+              objective: "Check keyHint",
+              strategy: "Wave 1",
+              acceptanceCriteria: "npm test",
+              baseBranch: "main",
+              maxConcurrency: 3,
+              validatorEnabled: true,
+            },
+          } satisfies ProposeSwarmPlanToolDetails,
+        },
+        { expanded: false, isPartial: false },
+        theme,
+        { keyHint: () => "F2 to expand" } as any,
+      )
+      .render(160)
+      .join("\n");
+    assert.match(confirmedWithHint, /\(F2 to expand\)/);
+  });
+
+  it("guides orchestrators to spawn wave-1 workers only (on-demand validator) and use already-installed repo scripts instead of npx -y", () => {
+    const kickoff = buildDraftingKickoffPrompt("Implement slugify helper", "swarm", {
+      baseBranch: "main",
+      maxConcurrency: 3,
+      validatorEnabled: true,
+    });
+    const overlay = buildDraftingSystemOverlay({
+      version: 2,
+      mode: "swarm",
+      seed: "Implement slugify helper",
+      startedAt: new Date().toISOString(),
+      validatorEnabled: true,
+      maxConcurrency: 3,
+      baseBranch: "main",
+    });
+    const direct = buildDirectPlanPrompt("Implement slugify helper", "main", {
+      maxConcurrency: 3,
+      validatorEnabled: true,
+    });
+
+    for (const [label, text] of [
+      ["kickoff", kickoff],
+      ["overlay", overlay],
+      ["direct", direct],
+    ] as const) {
+      assert.match(text, /wave-1 workers only/i, `${label} must recommend wave-1 workers only`);
+      assert.match(
+        text,
+        /validator.*on demand/i,
+        `${label} must recommend spawning validator on demand`,
+      );
+      assert.match(
+        text,
+        /already-installed/i,
+        `${label} must reference already-installed verification scripts`,
+      );
+      assert.match(
+        text,
+        /npx -y/i,
+        `${label} must explicitly warn against speculative npx -y downloads`,
+      );
+    }
+
+    const initialMembersDesc = String(
+      (ProposeSwarmPlanParamsSchema.properties.initial_members as { description?: string })
+        ?.description ?? "",
+    );
+    assert.match(initialMembersDesc, /wave-1 workers only/i);
+    assert.match(initialMembersDesc, /on demand/i);
+    assert.match(initialMembersDesc, /already-installed/i);
+    assert.match(initialMembersDesc, /npx -y/i);
+
+    const briefDesc = String(
+      (InitialMemberProposalSchema.properties.brief as { description?: string })?.description ??
+        "",
+    );
+    assert.match(briefDesc, /concise/i);
+    assert.match(briefDesc, /already-installed/i);
+    assert.match(briefDesc, /npx -y/i);
+  });
+
+  it("enforces zero Type.Union, anyOf, and oneOf in drafting tool schemas and draft-tools.ts source", () => {
+    const forbiddenKeys: string[] = [];
+    const visitSchema = (node: unknown, path: string): void => {
+      if (!node || typeof node !== "object") {
+        return;
+      }
+      if (Array.isArray(node)) {
+        for (let i = 0; i < node.length; i++) {
+          visitSchema(node[i], `${path}[${i}]`);
+        }
+        return;
+      }
+      for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+        if (k === "anyOf" || k === "oneOf") {
+          forbiddenKeys.push(`${path}.${k}`);
+        }
+        visitSchema(v, `${path}.${k}`);
+      }
+    };
+
+    visitSchema(SwarmQuestionParamsSchema, "SwarmQuestionParamsSchema");
+    visitSchema(SwarmQuestionnaireItemSchema, "SwarmQuestionnaireItemSchema");
+    visitSchema(SwarmQuestionnaireParamsSchema, "SwarmQuestionnaireParamsSchema");
+    visitSchema(InitialMemberProposalSchema, "InitialMemberProposalSchema");
+    visitSchema(ProposeSwarmPlanParamsSchema, "ProposeSwarmPlanParamsSchema");
+    assert.deepEqual(forbiddenKeys, []);
+
+    const draftToolsPath = fileURLToPath(
+      new URL("../src/drafting/draft-tools.ts", import.meta.url),
+    );
+    const source = readFileSync(draftToolsPath, "utf8");
+    assert.equal(/\bType\.Union\b/.test(source), false, "draft-tools.ts must not use Type.Union");
+    assert.equal(/\banyOf\b/.test(source), false, "draft-tools.ts must not contain anyOf");
+    assert.equal(/\boneOf\b/.test(source), false, "draft-tools.ts must not contain oneOf");
   });
 });
