@@ -10,6 +10,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { SWARM_SETTINGS_BOUNDS } from "../store/index.js";
 import type {
+  ConfirmProposalOptions,
   InitialMemberProposal,
   IQuestionnaireUI,
   ProposalDialogAction,
@@ -20,6 +21,7 @@ import type {
   QuestionOption,
   QuestionSpec,
   SwarmDraftMode,
+  SwarmRoleModels,
 } from "../types.js";
 import {
   fitLine,
@@ -1215,10 +1217,17 @@ class MultiQuestionComponent implements Component, Focusable {
   }
 }
 
-class ConfirmProposalComponent implements Component {
+class ConfirmProposalComponent implements Component, Focusable {
+  focused = false;
   private selectedIndex = 0;
   private validatorEnabled: boolean;
   private maxConcurrency: number;
+  private roleModels: SwarmRoleModels | undefined;
+  private modelsChanged = false;
+  private commentText = "";
+  private editingComment = false;
+  private readonly commentInput = new Input();
+  private modelPickerComponent: Component | null = null;
   private settled = false;
   private readonly onAbort?: () => void;
 
@@ -1248,12 +1257,7 @@ class ConfirmProposalComponent implements Component {
     private readonly tui: TUI,
     private readonly theme: Theme,
     private readonly plan: ProposedSwarmPlan,
-    private readonly options:
-      | {
-          mode?: SwarmDraftMode;
-          signal?: AbortSignal;
-        }
-      | undefined,
+    private readonly options: ConfirmProposalOptions | undefined,
     private readonly done: (result: ProposalDialogOutcome) => void,
   ) {
     this.validatorEnabled = plan.validatorEnabled;
@@ -1261,6 +1265,23 @@ class ConfirmProposalComponent implements Component {
       MIN_CONCURRENCY,
       Math.min(MAX_CONCURRENCY, Math.round(plan.maxConcurrency || 6)),
     );
+    this.roleModels = plan.roleModels
+      ? {
+          ...plan.roleModels,
+          ...(plan.roleModels.orchestrator
+            ? { orchestrator: { ...plan.roleModels.orchestrator } }
+            : {}),
+          ...(plan.roleModels.worker
+            ? { worker: { ...plan.roleModels.worker } }
+            : {}),
+          ...(plan.roleModels.validator
+            ? { validator: { ...plan.roleModels.validator } }
+            : {}),
+          ...(plan.roleModels.fallbackModels
+            ? { fallbackModels: [...plan.roleModels.fallbackModels] }
+            : {}),
+        }
+      : undefined;
 
     const signal = options?.signal;
     if (signal) {
@@ -1281,6 +1302,8 @@ class ConfirmProposalComponent implements Component {
       action,
       validatorEnabled: this.validatorEnabled,
       maxConcurrency: this.maxConcurrency,
+      ...(this.commentText ? { feedback: this.commentText } : {}),
+      ...(this.modelsChanged && this.roleModels ? { roleModels: this.roleModels } : {}),
     });
   }
 
@@ -1291,11 +1314,35 @@ class ConfirmProposalComponent implements Component {
   }
 
   invalidate(): void {
-    // No cached rendering state
+    this.modelPickerComponent?.invalidate();
   }
 
   handleInput(data: string): void {
     if (this.settled) return;
+
+    if (this.modelPickerComponent) {
+      this.modelPickerComponent.handleInput?.(data);
+      return;
+    }
+
+    if (this.editingComment) {
+      if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+        this.editingComment = false;
+        this.commentInput.focused = false;
+        this.tui.requestRender();
+        return;
+      }
+      if (matchesKey(data, Key.enter) || matchesKey(data, Key.return)) {
+        this.commentText = this.commentInput.getValue().trim();
+        this.editingComment = false;
+        this.commentInput.focused = false;
+        this.tui.requestRender();
+        return;
+      }
+      this.commentInput.handleInput(data);
+      this.tui.requestRender();
+      return;
+    }
 
     // Esc always maps to "continue" so the user is never trapped
     if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
@@ -1304,6 +1351,35 @@ class ConfirmProposalComponent implements Component {
     }
 
     const ch = decodePrintableChar(data);
+
+    if ((ch === "m" || ch === "M") && this.options?.onOpenModelPicker) {
+      const comp = this.options.onOpenModelPicker(
+        this.tui,
+        this.theme,
+        this.roleModels,
+        (updated) => {
+          if (updated) {
+            this.roleModels = updated;
+            this.modelsChanged = true;
+          }
+          this.modelPickerComponent = null;
+          this.tui.requestRender();
+        },
+      );
+      if (comp && typeof (comp as Component).render === "function") {
+        this.modelPickerComponent = comp as Component;
+        this.tui.requestRender();
+      }
+      return;
+    }
+
+    if (ch === "c" || ch === "C") {
+      this.editingComment = true;
+      this.commentInput.setValue(this.commentText);
+      this.commentInput.focused = true;
+      this.tui.requestRender();
+      return;
+    }
 
     if (ch === "v" || ch === "V") {
       this.validatorEnabled = !this.validatorEnabled;
@@ -1351,10 +1427,14 @@ class ConfirmProposalComponent implements Component {
   }
 
   private renderModelsLine(innerWidth: number): string {
-    const rm = this.plan.roleModels;
-    const orch = sanitizePlainText(rm?.orchestrator?.model ?? "") || "host default";
-    const work = sanitizePlainText(rm?.worker?.model ?? "") || "host default";
-    const val = sanitizePlainText(rm?.validator?.model ?? "") || "host default";
+    const rm = this.roleModels;
+    const fmt = (cfg?: { model?: string; thinkingLevel?: string }) => {
+      const m = sanitizePlainText(cfg?.model ?? "") || "host default";
+      return cfg?.thinkingLevel ? `${m} · ${cfg.thinkingLevel}` : m;
+    };
+    const orch = fmt(rm?.orchestrator);
+    const work = fmt(rm?.worker);
+    const val = fmt(rm?.validator);
 
     const styleVal = (raw: string, hasExplicit: boolean) =>
       hasExplicit ? this.theme.fg("accent", raw) : this.theme.fg("dim", raw);
@@ -1381,6 +1461,10 @@ class ConfirmProposalComponent implements Component {
   }
 
   render(width: number): string[] {
+    if (this.modelPickerComponent) {
+      return this.modelPickerComponent.render(width);
+    }
+
     const targetWidth = Math.max(1, Math.floor(width));
     const innerWidth = computeInnerWidth(targetWidth);
     const maxTotalLines = computeDialogMaxLines(this.tui);
@@ -1442,8 +1526,9 @@ class ConfirmProposalComponent implements Component {
       );
     }
 
-    // Reserve lines for bottom rule + 3 choices + hint
-    const bottomReserved = 1 + this.choices.length + 1;
+    // Reserve lines for bottom rule + optional comment row + 3 choices + hint
+    const hasCommentRow = this.editingComment || this.commentText.length > 0 ? 1 : 0;
+    const bottomReserved = 1 + hasCommentRow + this.choices.length + 1;
     let previewBudget = Math.max(0, maxInnerLines - body.length - bottomReserved);
 
     // Compact Strategy & Acceptance Criteria preview
@@ -1498,6 +1583,23 @@ class ConfirmProposalComponent implements Component {
 
     body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
 
+    if (this.editingComment) {
+      const inputRendered = this.commentInput.render(Math.max(10, innerWidth - 10))[0] ?? "";
+      body.push(
+        fitLine(
+          `${this.theme.fg("accent", "Comment: ")}${inputRendered}`,
+          innerWidth,
+        ),
+      );
+    } else if (this.commentText) {
+      body.push(
+        fitLine(
+          `${this.theme.fg("muted", "Comment: ")}${this.theme.fg("accent", sanitizePlainText(this.commentText))}`,
+          innerWidth,
+        ),
+      );
+    }
+
     // 3 Clear Choices
     for (let i = 0; i < this.choices.length; i++) {
       const choice = this.choices[i]!;
@@ -1515,15 +1617,10 @@ class ConfirmProposalComponent implements Component {
       body.push(fitLine(`${ptr}${num}${label}${badge}`, innerWidth));
     }
 
-    body.push(
-      fitLine(
-        this.theme.fg(
-          "dim",
-          "[↑↓] [Enter] · [v] validator policy · [+/-] concurrency · [Esc] refine",
-        ),
-        innerWidth,
-      ),
-    );
+    const hintsText = this.editingComment
+      ? "[Enter] save comment · [Esc] cancel comment"
+      : `${this.options?.onOpenModelPicker ? "[m] models · " : ""}[c] comment · [v] validator policy · [+/-] concurrency · [Esc] refine`;
+    body.push(fitLine(this.theme.fg("dim", hintsText), innerWidth));
 
     const titleText =
       this.options?.mode === "tweak"

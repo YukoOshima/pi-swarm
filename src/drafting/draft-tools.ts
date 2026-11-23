@@ -21,6 +21,7 @@ import {
 import { SWARM_SETTINGS_BOUNDS, isPrototypeKey } from "../store/index.js";
 import {
   isSwarmProtocolError,
+  type ConfirmProposalOptions,
   type InitialMemberProposal,
   type IQuestionnaireUI,
   type ISwarmStore,
@@ -60,6 +61,11 @@ export interface DraftingDeps {
   draftController?: DraftStateController;
   /** Optional hook fired when active draft state changes (for widget/status sync). */
   onDraftChanged?: (draft: SwarmDraftState | null, ctx: ExtensionContext) => void;
+  /** Optional extra modal options (e.g. inline `[m]` Mission Model Picker). */
+  confirmProposalOptions?: (
+    ctx: ExtensionContext,
+    plan: ProposedSwarmPlan,
+  ) => Partial<ConfirmProposalOptions>;
 }
 
 export interface DraftPlanValidationIssue {
@@ -1150,8 +1156,10 @@ export function createProposeSwarmPlanTool(
           maxConcurrency,
         };
       } else {
+        const extraOpts = deps.confirmProposalOptions?.(ctx, proposedPlan);
         outcome = await withModalGuard(deps, () =>
           deps.ui.confirmProposal(ctx, proposedPlan, {
+            ...extraOpts,
             mode: currentDraft?.mode ?? "swarm",
             signal,
           }),
@@ -1160,8 +1168,13 @@ export function createProposeSwarmPlanTool(
 
       // Step 4: Execute user's decision
       if (outcome.action === "confirm") {
+        const launchComment = outcome.feedback?.trim();
         const finalPlan: ProposedSwarmPlan = {
           ...proposedPlan,
+          strategy: launchComment
+            ? `${proposedPlan.strategy}\n\nUser launch guidance: ${launchComment}`
+            : proposedPlan.strategy,
+          ...(outcome.roleModels ? { roleModels: outcome.roleModels } : {}),
           validatorEnabled: outcome.validatorEnabled,
           maxConcurrency: sanitizePositiveInt(
             outcome.maxConcurrency,
@@ -1216,12 +1229,15 @@ export function createProposeSwarmPlanTool(
           run.memberOrder.length || finalPlan.initialMembers?.length || 0;
         const memberLabel =
           memberCount > 0 ? `, ${memberCount} initial member(s)` : "";
+        const guidanceLine = launchComment
+          ? `\nUser guidance: ${launchComment}`
+          : "";
 
         return {
           content: [
             {
               type: "text",
-              text: `${summary}\n\n---\nStatus: CONFIRMED — Swarm run \`${run.id}\` ("${run.title}") created and launched on \`${run.baseBranch}\` (concurrency: ${finalPlan.maxConcurrency}, Validator: ${finalPlan.validatorEnabled ? "ON" : "OFF"}${memberLabel}).`,
+              text: `${summary}\n\n---\nStatus: CONFIRMED — Swarm run \`${run.id}\` ("${run.title}") created and launched on \`${run.baseBranch}\` (concurrency: ${finalPlan.maxConcurrency}, Validator: ${finalPlan.validatorEnabled ? "ON" : "OFF"}${memberLabel}).${guidanceLine}`,
             },
           ],
           details: {

@@ -7,6 +7,8 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 export type SwarmModelRole = "orchestrator" | "worker" | "validator";
 
+export type RoleModelOrigin = "project" | "global" | "host";
+
 export type StallMonitorMode = "llm" | "deterministic";
 
 export interface SwarmRoleModelConfig {
@@ -385,6 +387,19 @@ export interface ProposalDialogOutcome {
   validatorEnabled: boolean;
   maxConcurrency: number;
   feedback?: string;
+  roleModels?: SwarmRoleModels;
+}
+
+export interface ConfirmProposalOptions {
+  mode?: SwarmDraftMode;
+  signal?: AbortSignal;
+  roleModelOrigins?: Partial<Record<SwarmModelRole, RoleModelOrigin>>;
+  onOpenModelPicker?: (
+    tui: unknown,
+    theme: unknown,
+    initialRoleModels: SwarmRoleModels | undefined,
+    onDone: (updatedRoleModels?: SwarmRoleModels) => void,
+  ) => unknown;
 }
 
 export interface IQuestionnaireUI {
@@ -401,10 +416,7 @@ export interface IQuestionnaireUI {
   confirmProposal(
     ctx: ExtensionContext,
     plan: ProposedSwarmPlan,
-    options?: {
-      mode?: SwarmDraftMode;
-      signal?: AbortSignal;
-    },
+    options?: ConfirmProposalOptions,
   ): Promise<ProposalDialogOutcome>;
 }
 
@@ -1036,9 +1048,25 @@ export interface SwitchModelOptions {
   thinkingLevel?: ThinkingLevel;
   reason?: string;
   autoResume?: boolean;
+  /** When true for orchestrator/human callers, defer switching a working member until its current turn finishes. */
+  deferIfWorking?: boolean;
   callerName?: string;
   callerRole?: CallerRole;
   hostContext?: ExtensionContext;
+}
+
+export interface PropagateRoleModelOptions {
+  role: "worker" | "validator";
+  model?: string;
+  thinkingLevel?: ThinkingLevel;
+  previousModel?: string;
+  hostContext?: ExtensionContext;
+}
+
+export interface PropagateRoleModelResult {
+  roleModels: SwarmRoleModels;
+  switched: string[];
+  deferred: string[];
 }
 
 export interface StopMemberOptions {
@@ -1141,6 +1169,9 @@ export interface ISwarmEngine {
   ): Promise<ParkOrchestratorWaitResult>;
   clearOrchestratorWait(reason?: string): void;
   switchModel(options: SwitchModelOptions): Promise<SwitchModelResult>;
+  propagateRoleModel?(
+    options: PropagateRoleModelOptions,
+  ): Promise<PropagateRoleModelResult>;
   steerMember(
     memberName: string,
     message: string,

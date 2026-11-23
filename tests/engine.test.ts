@@ -5494,4 +5494,166 @@ describe("SwarmEngine & Runtime — v0.3.7 Fixes", () => {
       await engine.dispose();
     }
   });
+
+  it("v0.4.0: propagateRoleModel silently switches waiting/working role-tracking members while leaving custom overrides and Inherit clears untouched", async () => {
+    const store = new MockSwarmStore();
+    const worktree = new MockWorktreeManager();
+    const transport = new ScriptedTransport();
+    transport.availableModels.push(
+      { id: "claude-opus-5-5", provider: "magpie/bp", fullId: "magpie/bp/claude-opus-5-5", reasoning: true },
+      { id: "gpt-6.2-astra", provider: "magpie/bp", fullId: "magpie/bp/gpt-6.2-astra", reasoning: true },
+      { id: "gpt-5.4", provider: "openai", fullId: "openai/gpt-5.4", reasoning: true },
+      { id: "gemini-4-neon", provider: "google", fullId: "google/gemini-4-neon", reasoning: true },
+    );
+    const currentSettings: SwarmSettings = {
+      ...DEFAULT_SWARM_SETTINGS,
+      stallWatchdogEnabled: false,
+      validatorModel: "magpie/bp/claude-opus-5-5",
+      validatorThinkingLevel: "xhigh",
+    };
+
+    let releaseBusyTurn1!: () => void;
+    const busyGate1 = new Promise<void>((r) => {
+      releaseBusyTurn1 = r;
+    });
+    let releaseBusyTurn2!: () => void;
+    const busyGate2 = new Promise<void>((r) => {
+      releaseBusyTurn2 = r;
+    });
+    const busyTurnModels: string[] = [];
+
+    transport.onMember("val-busy", async (ctx) => {
+      busyTurnModels.push(ctx.model ?? "");
+      if (ctx.turnIndex === 1) {
+        await busyGate1;
+      } else {
+        await busyGate2;
+      }
+      return { outcome: "waiting", summary: "ok" };
+    });
+
+    const engine = new SwarmEngine({
+      store,
+      worktree,
+      transport,
+      getSettings: () => currentSettings,
+    });
+
+    try {
+      const run = await store.createRun({
+        id: "run-v040-prop",
+        title: "Role Model Propagation",
+        objective: "Verify Droid missionSettings behavior",
+        baseBranch: "main",
+        ownerSessionId: "s1",
+        roleModels: {
+          validator: {
+            model: "magpie/bp/claude-opus-5-5",
+            thinkingLevel: "xhigh",
+          },
+        },
+      });
+      await engine.startRun(run.id);
+
+      await engine.addMembers({
+        name: "val-wait",
+        role: "validator",
+        brief: "Audit waiting",
+      });
+      await engine.addMembers({
+        name: "val-custom",
+        role: "validator",
+        model: "openai/gpt-5.4",
+        thinkingLevel: "medium",
+        brief: "Custom model override",
+      });
+      await engine.addMembers({
+        name: "val-busy",
+        role: "validator",
+        brief: "Audit busy",
+      });
+
+      await waitUntil(
+        () =>
+          transport.handles.get("val-wait")?.handle.getState() === "waiting" &&
+          transport.handles.get("val-custom")?.handle.getState() === "waiting" &&
+          transport.handles.has("val-busy"),
+      );
+
+      // Update validator role default: opus-5-5:xhigh -> gpt-6.2-astra:high
+      currentSettings.validatorModel = "magpie/bp/gpt-6.2-astra";
+      currentSettings.validatorThinkingLevel = "high";
+      const propRes = await engine.propagateRoleModel({
+        role: "validator",
+        model: "magpie/bp/gpt-6.2-astra",
+        thinkingLevel: "high",
+        previousModel: "magpie/bp/claude-opus-5-5",
+      });
+
+      assert.deepEqual(propRes.switched, ["val-wait"]);
+      assert.deepEqual(propRes.deferred, ["val-busy"]);
+      assert.equal(transport.handles.get("val-wait")?.handle.getModel(), "magpie/bp/gpt-6.2-astra");
+      assert.equal(transport.handles.get("val-wait")?.handle.getThinkingLevel(), "high");
+      assert.equal(
+        transport.handles.get("val-wait")?.wakePrompts.length,
+        0,
+        "Waiting member switched via role propagation must NOT receive an extra wake turn",
+      );
+      assert.equal(
+        transport.handles.get("val-custom")?.handle.getModel(),
+        "openai/gpt-5.4",
+        "Explicit per-member override must NOT be clobbered by role propagation",
+      );
+
+      // Finish val-busy turn with no pending wakes -> switches silently and parks (turns === 1)
+      releaseBusyTurn1();
+      await waitUntil(() => transport.handles.get("val-busy")?.handle.getState() === "waiting");
+      assert.equal(transport.handles.get("val-busy")?.handle.getModel(), "magpie/bp/gpt-6.2-astra");
+      assert.equal(transport.handles.get("val-busy")?.handle.getThinkingLevel(), "high");
+      assert.equal(engine.getSnapshot().run?.members["val-busy"]?.turns, 1);
+
+      // Clear validator role to Inherit -> leaves existing members untouched
+      currentSettings.validatorModel = undefined;
+      currentSettings.validatorThinkingLevel = undefined;
+      const clearRes = await engine.propagateRoleModel({
+        role: "validator",
+        model: undefined,
+        thinkingLevel: undefined,
+        previousModel: "magpie/bp/gpt-6.2-astra",
+      });
+      assert.deepEqual(clearRes.switched, []);
+      assert.deepEqual(clearRes.deferred, []);
+      assert.equal(transport.handles.get("val-wait")?.handle.getModel(), "magpie/bp/gpt-6.2-astra");
+
+      // Deferred human switch with pending wakes queued mid-turn drains wake on the NEW model
+      await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        text: "@val-busy check phase 2",
+      });
+      await waitUntil(() => engine.getSnapshot().run?.members["val-busy"]?.state === "working");
+      const deferredSwitch = await engine.switchModel({
+        targetName: "val-busy",
+        model: "google/gemini-4-neon",
+        thinkingLevel: "high",
+        autoResume: false,
+        deferIfWorking: true,
+        callerName: "human",
+        callerRole: "human",
+      });
+      assert.equal(deferredSwitch.deferred, true);
+
+      // Queue wake BEFORE val-busy finishes its working turn
+      await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        text: "@val-busy new review while finishing",
+      });
+      releaseBusyTurn2();
+      await waitUntil(() => busyTurnModels.length === 3);
+      assert.equal(busyTurnModels[2], "google/gemini-4-neon");
+    } finally {
+      await engine.dispose();
+    }
+  });
 });

@@ -5,12 +5,16 @@ import path from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { DEFAULT_SWARM_SETTINGS, SWARM_SETTINGS_FILE } from "../constants.js";
 import {
+  type RoleModelOrigin,
   type StallMonitorMode,
+  type SwarmModelRole,
   SwarmProtocolError,
   type SwarmSettings,
 } from "../types.js";
 
-const VALID_THINKING_LEVELS: ReadonlySet<ThinkingLevel> = new Set<ThinkingLevel>([
+export type { RoleModelOrigin } from "../types.js";
+
+export const VALID_THINKING_LEVELS: ReadonlySet<ThinkingLevel> = new Set<ThinkingLevel>([
   "off",
   "minimal",
   "low",
@@ -19,6 +23,94 @@ const VALID_THINKING_LEVELS: ReadonlySet<ThinkingLevel> = new Set<ThinkingLevel>
   "xhigh",
   "max",
 ]);
+
+/**
+ * Parses model specification strings supporting both Droid/Pi colon shorthand
+ * (`provider/model:high`) and space-separated syntax (`provider/model high`).
+ * Preserves arbitrary colons inside model IDs (e.g. `ollama/qwen3:32b`) when
+ * the trailing segment is not a valid thinking level.
+ */
+export function parseModelSpec(raw: string): {
+  model: string;
+  thinkingLevel?: ThinkingLevel;
+} {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return { model: "" };
+  }
+
+  let modelCandidate = trimmed;
+  let thinkingLevel: ThinkingLevel | undefined;
+
+  const spaceMatch = trimmed.match(/^(.*\S)\s+(\S+)$/);
+  if (spaceMatch) {
+    const candidateTail = spaceMatch[2]!.trim().toLowerCase();
+    if (VALID_THINKING_LEVELS.has(candidateTail as ThinkingLevel)) {
+      modelCandidate = spaceMatch[1]!.trim();
+      thinkingLevel = candidateTail as ThinkingLevel;
+    }
+  }
+
+  const colonIdx = modelCandidate.lastIndexOf(":");
+  if (colonIdx > 0) {
+    const prefix = modelCandidate.slice(0, colonIdx).trim();
+    const suffix = modelCandidate.slice(colonIdx + 1).trim().toLowerCase();
+    if (prefix.length > 0 && VALID_THINKING_LEVELS.has(suffix as ThinkingLevel)) {
+      modelCandidate = prefix;
+      if (thinkingLevel === undefined) {
+        thinkingLevel = suffix as ThinkingLevel;
+      }
+    }
+  }
+
+  return {
+    model: modelCandidate,
+    ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
+  };
+}
+
+/**
+ * Determines which configuration layer (`project`, `global`, or `host` fallback)
+ * currently supplies the effective model/thinking for a Swarm role.
+ */
+export function getRoleModelOrigin(
+  role: SwarmModelRole,
+  layered?: Pick<LayeredSettingsResult, "globalOverrides" | "projectOverrides">,
+): RoleModelOrigin {
+  if (!layered) {
+    return "host";
+  }
+  const modelKey: RoleModelKey =
+    role === "orchestrator"
+      ? "orchestratorModel"
+      : role === "worker"
+        ? "workerModel"
+        : "validatorModel";
+  const thinkingKey: RoleThinkingKey =
+    role === "orchestrator"
+      ? "orchestratorThinkingLevel"
+      : role === "worker"
+        ? "workerThinkingLevel"
+        : "validatorThinkingLevel";
+
+  if (layered.projectOverrides[modelKey]) {
+    return "project";
+  }
+  if (modelKey in layered.projectOverrides) {
+    // Explicit null/empty clear in project settings masks global back to host default.
+    return "host";
+  }
+  if (layered.globalOverrides[modelKey]) {
+    return "global";
+  }
+  if (layered.projectOverrides[thinkingKey]) {
+    return "project";
+  }
+  if (layered.globalOverrides[thinkingKey]) {
+    return "global";
+  }
+  return "host";
+}
 
 export const SWARM_SETTINGS_BOUNDS = Object.freeze({
   maxConcurrency: { min: 1, max: 64 },
@@ -736,5 +828,52 @@ export async function saveSwarmSettings(
       return loadSwarmSettings(options.projectRoot, options);
     }
     return sanitizeSwarmSettings(nextLayer, DEFAULT_SWARM_SETTINGS);
+  });
+}
+
+/**
+ * Removes specific override keys from the project settings file (`.pi/pi-swarm-settings.json`)
+ * so that global overrides can shine through when saving to global scope. Deletes the file if empty.
+ */
+export async function deleteProjectSettingsKeys(
+  projectRoot: string,
+  keys: ReadonlyArray<keyof SwarmSettings>,
+  options?: SettingsPathOptions,
+): Promise<SwarmSettings> {
+  const targetPath = getProjectSettingsPath(projectRoot, options);
+  return enqueueSettingsWrite(targetPath, async () => {
+    const sym = await findSymlinkWithinRoot(projectRoot, targetPath);
+    if (sym) {
+      throw new SwarmProtocolError(
+        "PERMISSION_DENIED",
+        `Refusing to write settings through symlinked path: ${sym}`,
+        { path: sym },
+      );
+    }
+
+    const warnings: string[] = [];
+    const existingLayer = await readSettingsLayer(targetPath, warnings, projectRoot);
+    let changed = false;
+    const nextLayer: Record<string, unknown> = { ...existingLayer };
+    for (const key of keys) {
+      if (key in nextLayer) {
+        delete nextLayer[key];
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      if (Object.keys(nextLayer).length === 0) {
+        await unlink(targetPath).catch((err) => {
+          if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+            throw err;
+          }
+        });
+      } else {
+        await writeSettingsFileAtomic(targetPath, nextLayer, projectRoot);
+      }
+    }
+
+    return loadSwarmSettings(projectRoot, options);
   });
 }

@@ -6,6 +6,7 @@ import {
   type ExtensionContext,
   type ExtensionFactory,
   type SessionStartEvent,
+  type Theme,
   ModelRuntime,
   getAgentDir,
   resolveCliModel,
@@ -50,12 +51,18 @@ import {
   SwarmStore,
   WorktreeManager,
   assertOwnerSession,
+  deleteProjectSettingsKeys,
+  getRoleModelOrigin,
   isProcessAlive,
   loadLayeredSwarmSettings,
   loadSwarmSettings,
+  parseModelSpec,
   saveSwarmSettings,
+  type LayeredSettingsResult,
+  type SettingsPathOptions,
 } from "./store/index.js";
 import {
+  type AvailableModelInfo,
   type BoardMessage,
   type IQuestionnaireUI,
   type ISwarmEngine,
@@ -63,6 +70,7 @@ import {
   type ISwarmTransport,
   type IWorktreeManager,
   type ProposedSwarmPlan,
+  type RoleModelOrigin,
   type SafeTeardownResult,
   type SwarmEngineEvent,
   type SwarmFocusEntry,
@@ -76,10 +84,15 @@ import {
   isSwarmProtocolError,
 } from "./types.js";
 import {
+  SwarmModelPickerView,
+  type ModelPickerSettingsState,
+  type ModelPickerTab,
+  type ModelSaveScope,
   type SwarmOverlayTab,
   type SwarmWidgetOptions,
   type SwarmWidgetState,
   bindSwarmShortcuts,
+  buildRoleModelsFromPickerState,
   createQuestionnaireUI,
   createSwarmWidget,
   createSwarmWidgetState,
@@ -89,6 +102,8 @@ import {
   formatZeroTurnModelsView,
   formatZeroTurnStatusDashboard,
   isModalOpen,
+  openSwarmHub,
+  openSwarmModelPicker,
   openSwarmOverlay,
   sanitizePlainText,
 } from "./ui/index.js";
@@ -110,6 +125,8 @@ export interface PiSwarmExtensionOverrides {
     patch: Partial<SwarmSettings>,
     projectRoot: string,
   ) => Promise<SwarmSettings>;
+  /** Optional settings path overrides (used by tests to isolate global/project files). */
+  settingsPathOptions?: SettingsPathOptions;
   /** Override store construction (defaults to real SwarmStore). */
   storeFactory?: (projectRoot: string) => ISwarmStore;
   /** Override git worktree manager construction (defaults to real WorktreeManager). */
@@ -136,10 +153,13 @@ export const SWARM_SUBCOMMANDS: ReadonlyArray<{
   { name: "graph", description: "Zero-turn Spawn Tree & Peer @mention interaction graph" },
   { name: "tasks", description: "Open 4-tab Swarm UI overlay (Board / Members / Graph / Search)" },
   { name: "ui", description: "Open 4-tab Swarm UI overlay (alias for /swarm tasks)" },
-  { name: "models", description: "Zero-turn 3-role defaults & live member models overview" },
+  {
+    name: "models",
+    description: "Open interactive Mission Model Picker or print 3-role overview (--print)",
+  },
   {
     name: "model",
-    description: "Set role default or hot-switch waiting member (<target> <model|default> [thinking])",
+    description: "Set role default or switch member (<target> <model[:thinking]|default> [--global])",
   },
   {
     name: "steer",
@@ -164,7 +184,6 @@ export const SWARM_SUBCOMMANDS: ReadonlyArray<{
 const SINGLE_WORD_SUBCOMMANDS = new Set([
   "status",
   "graph",
-  "models",
   "resume",
   "cancel",
   "runs",
@@ -178,6 +197,7 @@ const ARG_SUBCOMMANDS = new Set([
   "board",
   "tasks",
   "ui",
+  "models",
   "model",
   "steer",
   "merge",
@@ -259,6 +279,7 @@ export function parseSwarmCommand(rawArgs: string): ParsedSwarmInvocation {
         | "board"
         | "tasks"
         | "ui"
+        | "models"
         | "model"
         | "steer"
         | "merge"
@@ -276,7 +297,6 @@ export function parseSwarmCommand(rawArgs: string): ParsedSwarmInvocation {
       kind: head as
         | "status"
         | "graph"
-        | "models"
         | "resume"
         | "cancel"
         | "runs"
@@ -740,19 +760,20 @@ function buildRunKickoffMessage(
 
 function buildHelpMarkdown(): string {
   return [
-    "### 🐝 Pi Swarm v0.3.7 (`/swarm`) — Dynamic Antigravity Swarm Commands",
+    "### 🐝 Pi Swarm v0.4.0 (`/swarm`) — Dynamic Antigravity Swarm Commands",
     "",
     "| Command | Description |",
     "| --- | --- |",
-    "| `/swarm [goal]` | Interactive upfront Q&A → Flexible Dynamic Swarm Plan confirmation (or 0-turn action menu when a run is focused) |",
+    "| `/swarm` | Open Droid-style Mission Hub (TUI) or interactive drafting / status menu |",
+    "| `/swarm <goal>` | Interactive upfront Q&A → Flexible Dynamic Swarm Plan confirmation (`[m]` models, `[c]` comment) |",
     "| `/swarm direct <goal>` · `/swarm-direct <goal>` | Fast-path: skip Q&A, propose plan with auto-confirm, and launch Dynamic Swarm immediately |",
     "| `/swarm tweak [guidance]` | Revise the focused Swarm plan, strategy, or add members interactively |",
     "| `/swarm status` | Zero-LLM-turn dashboard: 3-role models, channels, member roster, recent board & events |",
     "| `/swarm board [limit] [--channel <ch>] [--search <q>]` | Zero-LLM-turn shared `#seq` Message Board feed (filterable by channel or substring) |",
     "| `/swarm graph` | Zero-LLM-turn ASCII/Unicode Spawn Tree & Peer `@mention` / `#channel` interaction graph |",
-    "| `/swarm tasks [tab\\|member\\|#ch]` · `/swarm ui` | Open interactive 4-tab Swarm Overlay (**Board** / **Members** / **Graph** / **Search**) |",
-    "| `/swarm models` | Zero-LLM-turn 3-role defaults (`orchestrator` / `worker` / `validator`) + live member models |",
-    "| `/swarm model <target> <model\\|default> [thinking]` | Set a role default (`orchestrator` / `worker` / `validator`) OR switch & resume a waiting/stopped member |",
+    "| `/swarm tasks [tab\\|member\\|#ch]` · `/swarm ui` | Open interactive 4-tab Mission Control (`[M]` models, `[P]` pause/resume, `[?]` help) |",
+    "| `/swarm models [role\\|--print]` | Open interactive Mission Model Picker (`Orchestrator` / `Worker` / `Validator` / `Fallbacks`), or `--print` overview |",
+    "| `/swarm model <target> <model[:thinking]\\|default> [thinking] [--global]` | Set role default (propagates to live members) OR hot-switch a live member (`@name`) |",
     "| `/swarm steer <member> <message>` | Redirect a working member immediately or wake a parked member with new direction |",
     "| `/swarm merge <member>` | Merge a member's `share` worktree or `branch` clone onto `baseBranch` (`autoRebase` + `--no-ff`) |",
     "| `/swarm kill <member> [--force] [reason]` | Permanently kill a member and remove its clean worktree (`--force` overrides dirty worktree guard) |",
@@ -762,11 +783,11 @@ function buildHelpMarkdown(): string {
     "| `/swarm teardown [--force] [--delete-branches]` | Safely remove clean idle worktrees while preserving `.pi/swarm/runs/` audit & board history |",
     "| `/swarm runs` | List all runs stored in `.pi/swarm/runs/` |",
     "| `/swarm focus [run-id\\|none]` | Switch or detach session-local run focus |",
-    "| `/swarm settings` | Inspect or adjust 3-role models, warm pool, smart LLM monitor, & git settings |",
+    "| `/swarm settings` | Configure Mission Models, warm pool, smart LLM monitor, concurrency & git settings |",
     "| `/swarm help` | Print this command reference (zero LLM turn) |",
     "",
     "**Mid-Flight Redirection:** While workers run after Orchestrator calls `swarm_wait`, simply type any message directly to the Orchestrator to adjust direction, or run `/swarm steer <member> <msg>`.",
-    "**TUI Shortcuts:** `Ctrl+Shift+T` toggles expanded above-editor dashboard · `Esc` collapses expanded dashboard.",
+    "**TUI Shortcuts:** `Ctrl+Shift+M` opens Mission Model Picker · `Ctrl+Shift+S` opens Mission Control / Hub · `Ctrl+Shift+T` toggles expanded above-editor dashboard · `Esc` collapses expanded dashboard.",
   ].join("\n");
 }
 
@@ -872,6 +893,8 @@ export function createPiSwarmExtension(
       ...DEFAULT_SWARM_SETTINGS,
       fallbackModels: [...DEFAULT_SWARM_SETTINGS.fallbackModels],
     };
+    let lastLayeredSettings: LayeredSettingsResult | undefined;
+    let cachedAvailableModels: AvailableModelInfo[] = [];
     let boundCwd: string | undefined;
     let lastCtx: ExtensionContext | undefined;
     let fallbackModelRuntimePromise: Promise<ModelRuntime> | undefined;
@@ -1167,12 +1190,71 @@ export function createPiSwarmExtension(
       refreshUI(ctx);
     }
 
+    function canUseCustomTui(ctx?: ExtensionContext): boolean {
+      return Boolean(
+        ctx?.hasUI &&
+          ctx.mode === "tui" &&
+          typeof ctx.ui.custom === "function",
+      );
+    }
+
+    function getModelSettingsState(ctx?: ExtensionContext): ModelPickerSettingsState {
+      const targetCtx = ctx ?? lastCtx;
+      const hostModel = formatHostModelId(targetCtx?.model);
+      const origins: Partial<Record<SwarmModelRole, RoleModelOrigin>> = {
+        orchestrator: getRoleModelOrigin("orchestrator", lastLayeredSettings),
+        worker: getRoleModelOrigin("worker", lastLayeredSettings),
+        validator: getRoleModelOrigin("validator", lastLayeredSettings),
+      };
+      return {
+        settings: currentSettings,
+        origins,
+        hostModel,
+      };
+    }
+
+    function getPreferredSaveScope(): ModelSaveScope {
+      if (
+        lastLayeredSettings &&
+        Object.keys(lastLayeredSettings.projectOverrides).length > 0
+      ) {
+        return "project";
+      }
+      return "global";
+    }
+
+    async function refreshAvailableModels(
+      ctx?: ExtensionContext,
+      all = true,
+    ): Promise<AvailableModelInfo[]> {
+      try {
+        const engine = activeEngine;
+        if (!engine) return cachedAvailableModels;
+        const models = await engine.listModels({
+          all,
+          hostContext: ctx ?? lastCtx,
+        });
+        cachedAvailableModels = models;
+        return models;
+      } catch {
+        return cachedAvailableModels;
+      }
+    }
+
     async function reloadSettings(cwd: string): Promise<SwarmSettings> {
       try {
-        currentSettings = overrides.settingsLoader
-          ? await overrides.settingsLoader(cwd)
-          : await loadSwarmSettings(cwd);
+        if (overrides.settingsLoader) {
+          lastLayeredSettings = undefined;
+          currentSettings = await overrides.settingsLoader(cwd);
+        } else {
+          lastLayeredSettings = await loadLayeredSwarmSettings(
+            cwd,
+            overrides.settingsPathOptions,
+          );
+          currentSettings = lastLayeredSettings.settings;
+        }
       } catch {
+        lastLayeredSettings = undefined;
         currentSettings = {
           ...DEFAULT_SWARM_SETTINGS,
           fallbackModels: [...DEFAULT_SWARM_SETTINGS.fallbackModels],
@@ -1192,7 +1274,12 @@ export function createPiSwarmExtension(
       } else {
         currentSettings = await saveSwarmSettings(scope, patch, {
           projectRoot: cwd,
+          ...overrides.settingsPathOptions,
         });
+        lastLayeredSettings = await loadLayeredSwarmSettings(
+          cwd,
+          overrides.settingsPathOptions,
+        ).catch(() => lastLayeredSettings);
       }
       activeWorktree?.setGitTimeoutMs?.(currentSettings.gitTimeoutMs);
       return currentSettings;
@@ -1214,6 +1301,16 @@ export function createPiSwarmExtension(
       }
     }
 
+    function getRoleSettingsKeys(role: SwarmModelRole): Array<keyof SwarmSettings> {
+      if (role === "orchestrator") {
+        return ["orchestratorModel", "orchestratorThinkingLevel"];
+      }
+      if (role === "worker") {
+        return ["workerModel", "workerThinkingLevel"];
+      }
+      return ["validatorModel", "validatorThinkingLevel"];
+    }
+
     async function applyRoleModelChange(
       role: SwarmModelRole,
       modelValue: string | undefined,
@@ -1223,12 +1320,33 @@ export function createPiSwarmExtension(
     ): Promise<{
       settings: SwarmSettings;
       orchestratorApply?: ApplyOrchestratorModelResult;
+      propagated?: { switched: string[]; deferred: string[] };
     }> {
       const targetCtx = ctx ?? lastCtx;
       const cwd = targetCtx?.cwd ?? boundCwd ?? process.cwd();
       const scope = options.scope ?? "project";
       const trimmed = modelValue?.trim();
       const isClearing = !trimmed || CLEAR_MODEL_TOKENS.has(trimmed.toLowerCase());
+      const previousModel =
+        role === "orchestrator"
+          ? currentSettings.orchestratorModel
+          : role === "worker"
+            ? currentSettings.workerModel
+            : currentSettings.validatorModel;
+
+      let resolvedModelValue = trimmed;
+      let resolvedThinking = thinkingLevel;
+      if (!isClearing && resolvedModelValue && activeTransport?.resolveModel) {
+        const res = await activeTransport.resolveModel(
+          resolvedModelValue,
+          thinkingLevel,
+          targetCtx,
+        );
+        resolvedModelValue = res.model;
+        if (resolvedThinking === undefined && res.thinkingLevel !== undefined) {
+          resolvedThinking = res.thinkingLevel;
+        }
+      }
 
       // In real saveSwarmSettings("project", ...), explicit `null` writes `null` to JSON
       // so global overrides are cleanly cleared at the project layer.
@@ -1238,27 +1356,27 @@ export function createPiSwarmExtension(
       const clearThinkingVal = overrides.settingsSaver
         ? undefined
         : (null as unknown as ThinkingLevel);
-      const nextModelPatchVal = isClearing ? clearModelVal : trimmed;
+      const nextModelPatchVal = isClearing ? clearModelVal : resolvedModelValue;
 
       const patch: Partial<SwarmSettings> = {};
       if (role === "orchestrator") {
         patch.orchestratorModel = nextModelPatchVal;
-        if (thinkingLevel !== undefined) {
-          patch.orchestratorThinkingLevel = thinkingLevel;
+        if (resolvedThinking !== undefined) {
+          patch.orchestratorThinkingLevel = resolvedThinking;
         } else if (isClearing) {
           patch.orchestratorThinkingLevel = clearThinkingVal;
         }
       } else if (role === "worker") {
         patch.workerModel = nextModelPatchVal;
-        if (thinkingLevel !== undefined) {
-          patch.workerThinkingLevel = thinkingLevel;
+        if (resolvedThinking !== undefined) {
+          patch.workerThinkingLevel = resolvedThinking;
         } else if (isClearing) {
           patch.workerThinkingLevel = clearThinkingVal;
         }
       } else {
         patch.validatorModel = nextModelPatchVal;
-        if (thinkingLevel !== undefined) {
-          patch.validatorThinkingLevel = thinkingLevel;
+        if (resolvedThinking !== undefined) {
+          patch.validatorThinkingLevel = resolvedThinking;
         } else if (isClearing) {
           patch.validatorThinkingLevel = clearThinkingVal;
         }
@@ -1266,7 +1384,41 @@ export function createPiSwarmExtension(
 
       await persistSettingsPatch(scope, patch, cwd);
 
+      // If user explicitly saves to global scope while `.pi/pi-swarm-settings.json` has shadowing
+      // keys for this role, unmask global by deleting those project keys.
+      if (scope === "global" && !overrides.settingsSaver && lastLayeredSettings) {
+        const roleKeys = getRoleSettingsKeys(role);
+        const hasProjectShadow = roleKeys.some(
+          (k) => k in lastLayeredSettings!.projectOverrides,
+        );
+        if (hasProjectShadow) {
+          currentSettings = await deleteProjectSettingsKeys(
+            cwd,
+            roleKeys,
+            overrides.settingsPathOptions,
+          );
+          lastLayeredSettings = await loadLayeredSwarmSettings(
+            cwd,
+            overrides.settingsPathOptions,
+          ).catch(() => lastLayeredSettings);
+        }
+      }
+
+      let propagated: { switched: string[]; deferred: string[] } | undefined;
       if (options.updateRun !== false) {
+        if ((role === "worker" || role === "validator") && activeEngine?.propagateRoleModel) {
+          const propRes = await activeEngine.propagateRoleModel({
+            role,
+            model: isClearing ? undefined : resolvedModelValue,
+            thinkingLevel: resolvedThinking,
+            previousModel,
+            hostContext: targetCtx,
+          });
+          propagated = {
+            switched: propRes.switched,
+            deferred: propRes.deferred,
+          };
+        }
         await syncActiveRunRoleModels(targetCtx);
       }
 
@@ -1281,7 +1433,93 @@ export function createPiSwarmExtension(
       }
 
       refreshUI(targetCtx);
-      return { settings: currentSettings, orchestratorApply };
+      return { settings: currentSettings, orchestratorApply, propagated };
+    }
+
+    async function applyFallbackModelsChange(
+      scope: "project" | "global",
+      fallbackModels: string[],
+      ctx?: ExtensionContext,
+    ): Promise<SwarmSettings> {
+      const targetCtx = ctx ?? lastCtx;
+      const cwd = targetCtx?.cwd ?? boundCwd ?? process.cwd();
+      await persistSettingsPatch(scope, { fallbackModels }, cwd);
+      if (
+        scope === "global" &&
+        !overrides.settingsSaver &&
+        lastLayeredSettings &&
+        "fallbackModels" in lastLayeredSettings.projectOverrides
+      ) {
+        currentSettings = await deleteProjectSettingsKeys(
+          cwd,
+          ["fallbackModels"],
+          overrides.settingsPathOptions,
+        );
+        lastLayeredSettings = await loadLayeredSwarmSettings(
+          cwd,
+          overrides.settingsPathOptions,
+        ).catch(() => lastLayeredSettings);
+      }
+      await syncActiveRunRoleModels(targetCtx);
+      refreshUI(targetCtx);
+      return currentSettings;
+    }
+
+    function makeModelPickerCallbacks(ctx?: ExtensionContext) {
+      return {
+        onApplyRole: async (sel: {
+          scope: ModelSaveScope;
+          role: SwarmModelRole;
+          model?: string;
+          thinkingLevel?: ThinkingLevel;
+        }) => {
+          const { propagated, orchestratorApply } = await applyRoleModelChange(
+            sel.role,
+            sel.model ?? "default",
+            sel.thinkingLevel,
+            ctx ?? lastCtx,
+            { scope: sel.scope, updateRun: true },
+          );
+          const parts: string[] = [];
+          if (!sel.model) {
+            parts.push(`Reset ${sel.role} -> host default [${sel.scope}]`);
+          } else {
+            parts.push(
+              `Saved ${sel.role} -> ${sel.model}${sel.thinkingLevel ? ` (${sel.thinkingLevel})` : ""} [${sel.scope}]`,
+            );
+          }
+          if (propagated && propagated.switched.length > 0) {
+            parts.push(`switched: ${propagated.switched.map((n) => `@${n}`).join(", ")}`);
+          }
+          if (propagated && propagated.deferred.length > 0) {
+            parts.push(`queued at turn end: ${propagated.deferred.map((n) => `@${n}`).join(", ")}`);
+          }
+          if (orchestratorApply?.warning) {
+            parts.push(`⚠ ${orchestratorApply.warning}`);
+          }
+          return {
+            ...getModelSettingsState(ctx ?? lastCtx),
+            notice: parts.join(" · "),
+          };
+        },
+        onApplyFallbacks: async (sel: {
+          scope: ModelSaveScope;
+          fallbackModels: string[];
+        }) => {
+          await applyFallbackModelsChange(
+            sel.scope,
+            sel.fallbackModels,
+            ctx ?? lastCtx,
+          );
+          return {
+            ...getModelSettingsState(ctx ?? lastCtx),
+            notice:
+              sel.fallbackModels.length > 0
+                ? `Saved ${sel.fallbackModels.length} fallback(s) [${sel.scope}]`
+                : `Cleared fallbacks [${sel.scope}]`,
+          };
+        },
+      };
     }
 
     function purgePendingWakeupsForRun(runId?: string | null): void {
@@ -1663,6 +1901,16 @@ export function createPiSwarmExtension(
           if (widgetState.expanded) {
             widgetState.expanded = false;
             refreshUI(ctx);
+          }
+        },
+        onOpenModelPicker: () => {
+          void handleModelsCommand("", ctx);
+        },
+        onOpenMissionControl: () => {
+          if (getSnapshotSafe().run) {
+            void handleOverlayCommand("", ctx);
+          } else {
+            void handleBareCommand(ctx);
           }
         },
       });
@@ -2072,7 +2320,7 @@ export function createPiSwarmExtension(
           acceptanceCriteria: plan.acceptanceCriteria,
           maxConcurrency: plan.maxConcurrency,
           validatorEnabled: plan.validatorEnabled,
-          roleModels: buildRoleModelsFromSettings(currentSettings),
+          roleModels: plan.roleModels ?? buildRoleModelsFromSettings(currentSettings),
           ownerSessionId,
           ownerPid: process.pid,
           actor: ORCHESTRATOR_NAME,
@@ -2231,6 +2479,36 @@ export function createPiSwarmExtension(
       onModalEnter,
       onModalExit,
       draftController,
+      confirmProposalOptions: (toolCtx) => {
+        if (!canUseCustomTui(toolCtx)) {
+          return {};
+        }
+        const origins: Partial<Record<SwarmModelRole, RoleModelOrigin>> = {
+          orchestrator: getRoleModelOrigin("orchestrator", lastLayeredSettings),
+          worker: getRoleModelOrigin("worker", lastLayeredSettings),
+          validator: getRoleModelOrigin("validator", lastLayeredSettings),
+        };
+        const callbacks = makeModelPickerCallbacks(toolCtx);
+        return {
+          roleModelOrigins: origins,
+          onOpenModelPicker: (tui, theme, _initial, onDone) => {
+            return new SwarmModelPickerView(tui as TUI, theme as Theme, {
+              mode: "roles",
+              initialScope: getPreferredSaveScope(),
+              state: getModelSettingsState(toolCtx),
+              availableModels: cachedAvailableModels,
+              ...callbacks,
+              onClose: (res) => {
+                onDone(
+                  res?.changed
+                    ? buildRoleModelsFromPickerState(res.state)
+                    : undefined,
+                );
+              },
+            });
+          },
+        };
+      },
       onDraftChanged: (draft, toolCtx) => {
         syncDraftWidgetState(draft);
         if (!draft) {
@@ -2309,10 +2587,11 @@ export function createPiSwarmExtension(
 
     async function startInteractiveDrafting(
       seed: string,
-      ctx: ExtensionCommandContext,
+      ctx: ExtensionContext,
     ): Promise<void> {
       const { worktree } = await ensureBound(ctx);
       await reloadSettings(ctx.cwd);
+      void refreshAvailableModels(ctx);
       await applyOrchestratorModel(
         pi,
         ctx,
@@ -2359,10 +2638,11 @@ export function createPiSwarmExtension(
 
     async function startDirectSwarm(
       rawGoal: string,
-      ctx: ExtensionCommandContext,
+      ctx: ExtensionContext,
     ): Promise<void> {
       const { worktree } = await ensureBound(ctx);
       await reloadSettings(ctx.cwd);
+      void refreshAvailableModels(ctx);
 
       let goal = rawGoal.trim();
       if (!goal && ctx.hasUI) {
@@ -2429,10 +2709,11 @@ export function createPiSwarmExtension(
 
     async function handleTweakCommand(
       rawSeed: string,
-      ctx: ExtensionCommandContext,
+      ctx: ExtensionContext,
     ): Promise<void> {
       const { store, engine } = await ensureBound(ctx);
       await reloadSettings(ctx.cwd);
+      void refreshAvailableModels(ctx);
 
       const snapshot = engine.getSnapshot();
       if (!snapshot.run) {
@@ -2509,7 +2790,7 @@ export function createPiSwarmExtension(
       });
     }
 
-    async function handleStatusCommand(ctx: ExtensionCommandContext): Promise<void> {
+    async function handleStatusCommand(ctx: ExtensionContext): Promise<void> {
       const { engine } = await ensureBound(ctx);
       const current = engine.getSnapshot();
       const snapshot = current.activeRunId
@@ -2530,7 +2811,7 @@ export function createPiSwarmExtension(
 
     async function handleBoardCommand(
       rawArgs: string,
-      ctx: ExtensionCommandContext,
+      ctx: ExtensionContext,
     ): Promise<void> {
       const { engine } = await ensureBound(ctx);
       const snapshot = engine.getSnapshot();
@@ -2572,7 +2853,7 @@ export function createPiSwarmExtension(
       }
     }
 
-    async function handleGraphCommand(ctx: ExtensionCommandContext): Promise<void> {
+    async function handleGraphCommand(ctx: ExtensionContext): Promise<void> {
       const { engine } = await ensureBound(ctx);
       const current = engine.getSnapshot();
       const snapshot = current.activeRunId
@@ -2600,7 +2881,7 @@ export function createPiSwarmExtension(
 
     async function handleOverlayCommand(
       rawArg: string,
-      ctx: ExtensionCommandContext,
+      ctx: ExtensionContext,
     ): Promise<void> {
       const { store, engine, worktree } = await ensureBound(ctx);
       if (!ctx.hasUI) {
@@ -2659,6 +2940,11 @@ export function createPiSwarmExtension(
         },
       });
 
+      const availableModels = canUseCustomTui(ctx)
+        ? await refreshAvailableModels(ctx, true)
+        : cachedAvailableModels;
+      const modelCallbacks = makeModelPickerCallbacks(ctx);
+
       await openSwarmOverlay(ctx, overlayEngine, worktree, {
         onModalEnter,
         onModalExit,
@@ -2666,98 +2952,273 @@ export function createPiSwarmExtension(
         ...(initialMemberName ? { initialMemberName } : {}),
         ...(initialChannel ? { initialChannel } : {}),
         hostModel: formatHostModelId(ctx.model),
+        availableModels,
+        getModelSettingsState: () => getModelSettingsState(ctx),
+        onApplyRoleModel: modelCallbacks.onApplyRole,
+        onApplyFallbacks: modelCallbacks.onApplyFallbacks,
         now: overrides.now,
       });
       refreshUI(ctx);
     }
 
-    async function handleModelsCommand(ctx: ExtensionCommandContext): Promise<void> {
+    async function handleModelsCommand(
+      rawArgs: string,
+      ctx: ExtensionContext,
+    ): Promise<void> {
       const { engine } = await ensureBound(ctx);
       await reloadSettings(ctx.cwd);
-      const current = engine.getSnapshot();
-      const snapshot = current.activeRunId
-        ? await engine.attachRun(current.activeRunId, ctx).catch(() => current)
-        : current;
-      const hostModel = formatHostModelId(ctx.model);
-      const markdown = formatZeroTurnModelsView(currentSettings, snapshot, hostModel);
-      emitZeroTurnMessage(ctx, markdown, {
-        runId: snapshot.activeRunId,
-        hostModel,
-        roleModels: buildRoleModelsFromSettings(currentSettings),
-      });
+
+      const tokens = tokenizeCommandArgs(rawArgs.trim());
+      let printOnly = false;
+      const positional: string[] = [];
+      let hasClear = false;
+      for (const tok of tokens) {
+        const lower = tok.toLowerCase();
+        if (lower === "--print" || lower === "-p") {
+          printOnly = true;
+        } else if (lower === "--clear") {
+          hasClear = true;
+        } else if (
+          lower === "--global" ||
+          lower === "-g" ||
+          lower === "--project"
+        ) {
+          // passed through when delegating to handleModelCommand
+        } else {
+          positional.push(tok);
+        }
+      }
+
+      if (positional.length >= 2 || (positional.length >= 1 && hasClear)) {
+        await handleModelCommand(rawArgs, ctx);
+        return;
+      }
+
+      if (printOnly || !canUseCustomTui(ctx)) {
+        const current = engine.getSnapshot();
+        const snapshot = current.activeRunId
+          ? await engine.attachRun(current.activeRunId, ctx).catch(() => current)
+          : current;
+        const hostModel = formatHostModelId(ctx.model);
+        const markdown = formatZeroTurnModelsView(currentSettings, snapshot, hostModel);
+        emitZeroTurnMessage(ctx, markdown, {
+          runId: snapshot.activeRunId,
+          hostModel,
+          roleModels: buildRoleModelsFromSettings(currentSettings),
+        });
+        return;
+      }
+
+      const availableModels = await refreshAvailableModels(ctx, true);
+      const callbacks = makeModelPickerCallbacks(ctx);
+      const arg = positional[0]?.replace(/^@/, "").trim();
+      const argLower = arg?.toLowerCase();
+
+      const run = engine.getSnapshot().run;
+      const matchedMember =
+        arg && run
+          ? Object.values(run.members).find(
+              (m) => m.name.toLowerCase() === argLower && m.state !== "killed",
+            )
+          : undefined;
+
+      if (matchedMember && (!isSwarmModelRole(argLower ?? "") || positional[0]?.startsWith("@"))) {
+        await withModalGuard(() =>
+          openSwarmModelPicker(ctx, {
+            mode: "member",
+            member: matchedMember,
+            state: getModelSettingsState(ctx),
+            availableModels,
+            onApplyMember: async (sel) => {
+              const res = await engine.switchModel({
+                targetName: sel.memberName,
+                model: sel.model,
+                thinkingLevel: sel.thinkingLevel,
+                callerName: "human",
+                callerRole: "human",
+                deferIfWorking: true,
+                hostContext: ctx,
+              });
+              refreshUI(ctx);
+              return {
+                notice: res.deferred
+                  ? `Queued @${res.targetName} -> ${res.model} at turn end`
+                  : `Switched @${res.targetName} -> ${res.model}`,
+              };
+            },
+          }),
+        );
+        return;
+      }
+
+      const initialTab: ModelPickerTab =
+        argLower === "worker" ||
+        argLower === "validator" ||
+        argLower === "fallbacks" ||
+        argLower === "orchestrator"
+          ? argLower
+          : "orchestrator";
+
+      await withModalGuard(() =>
+        openSwarmModelPicker(ctx, {
+          mode: "roles",
+          initialTab,
+          initialScope: getPreferredSaveScope(),
+          state: getModelSettingsState(ctx),
+          availableModels,
+          ...callbacks,
+        }),
+      );
+      refreshUI(ctx);
     }
 
     async function handleModelCommand(
       rawArgs: string,
-      ctx: ExtensionCommandContext,
+      ctx: ExtensionContext,
     ): Promise<void> {
       const { store, engine } = await ensureBound(ctx);
+      await reloadSettings(ctx.cwd);
       const tokens = tokenizeCommandArgs(rawArgs.trim());
 
-      if (tokens.length === 0) {
-        await handleModelsCommand(ctx);
+      let explicitScope: "project" | "global" | undefined;
+      let clearFlag = false;
+      const words: string[] = [];
+      for (const tok of tokens) {
+        const lower = tok.toLowerCase();
+        if (lower === "--global" || lower === "-g") {
+          explicitScope = "global";
+        } else if (lower === "--project") {
+          explicitScope = "project";
+        } else if (lower === "--clear") {
+          clearFlag = true;
+        } else {
+          words.push(tok);
+        }
+      }
+
+      if (words.length === 0) {
+        await handleModelsCommand("", ctx);
         return;
       }
 
-      const [rawTarget, modelArg, thinkingArg] = tokens;
-      const target = rawTarget?.replace(/^@/, "").trim();
-      if (!target || !modelArg) {
+      if (words.length === 1 && !clearFlag) {
+        if (canUseCustomTui(ctx)) {
+          await handleModelsCommand(words[0]!, ctx);
+          return;
+        }
         const usage =
-          "Usage: `/swarm model <orchestrator|worker|validator|member-name> <model-id|default> [thinking]`";
+          "Usage: `/swarm model <orchestrator|worker|validator|@member> <model[:thinking]|default> [thinking] [--global]`";
         if (ctx.hasUI) ctx.ui.notify(usage, "warning");
         emitZeroTurnMessage(ctx, usage);
         return;
       }
 
+      const rawTarget = words[0]!;
+      const hasExplicitAt = rawTarget.startsWith("@");
+      const target = rawTarget.replace(/^@/, "").trim();
+      const rawModelAndThinking = clearFlag ? "default" : words.slice(1).join(" ").trim();
+      if (!target || !rawModelAndThinking) {
+        const usage =
+          "Usage: `/swarm model <orchestrator|worker|validator|@member> <model[:thinking]|default> [thinking] [--global]`";
+        if (ctx.hasUI) ctx.ui.notify(usage, "warning");
+        emitZeroTurnMessage(ctx, usage);
+        return;
+      }
+
+      let modelArg = rawModelAndThinking;
       let thinkingLevel: ThinkingLevel | undefined;
-      if (thinkingArg !== undefined) {
-        const lowerThinking = thinkingArg.toLowerCase();
-        if (!isThinkingLevel(lowerThinking)) {
-          const msg = `Invalid thinking level "${thinkingArg}". Valid values: off, minimal, low, medium, high, xhigh, max.`;
-          if (ctx.hasUI) ctx.ui.notify(msg, "error");
-          else emitZeroTurnMessage(ctx, msg);
-          return;
+      const isClearing = CLEAR_MODEL_TOKENS.has(rawModelAndThinking.toLowerCase());
+
+      if (!isClearing) {
+        const spaceParts = rawModelAndThinking.split(/\s+/).filter(Boolean);
+        if (spaceParts.length >= 2) {
+          const tail = spaceParts[spaceParts.length - 1]!;
+          if (!isThinkingLevel(tail.toLowerCase())) {
+            const msg = `Invalid thinking level "${tail}". Valid values: off, minimal, low, medium, high, xhigh, max.`;
+            if (ctx.hasUI) ctx.ui.notify(msg, "error");
+            else emitZeroTurnMessage(ctx, msg);
+            return;
+          }
         }
-        thinkingLevel = lowerThinking;
+        const parsedSpec = parseModelSpec(rawModelAndThinking);
+        modelArg = parsedSpec.model;
+        thinkingLevel = parsedSpec.thinkingLevel;
       }
 
       const targetLower = target.toLowerCase();
-      if (isSwarmModelRole(targetLower)) {
+      const snapshot = engine.getSnapshot();
+      const runMemberMatch = snapshot.run
+        ? Object.values(snapshot.run.members).find(
+            (m) => m.name.toLowerCase() === targetLower && m.state !== "killed",
+          )
+        : undefined;
+      const treatAsRole =
+        isSwarmModelRole(targetLower) && !(hasExplicitAt && runMemberMatch);
+
+      if (treatAsRole) {
+        const scope = explicitScope ?? "project";
         try {
-          const isClearing = CLEAR_MODEL_TOKENS.has(modelArg.toLowerCase());
-          const { orchestratorApply } = await applyRoleModelChange(
-            targetLower,
-            isClearing ? undefined : modelArg,
-            thinkingLevel,
-            ctx,
-            { scope: "project", updateRun: true },
-          );
+          const { settings: updatedSettings, orchestratorApply, propagated } =
+            await applyRoleModelChange(
+              targetLower,
+              isClearing ? undefined : modelArg,
+              thinkingLevel,
+              ctx,
+              { scope, updateRun: true },
+            );
+
+          const appliedModelId =
+            targetLower === "orchestrator"
+              ? updatedSettings.orchestratorModel
+              : targetLower === "worker"
+                ? updatedSettings.workerModel
+                : updatedSettings.validatorModel;
+          const appliedThinking =
+            targetLower === "orchestrator"
+              ? updatedSettings.orchestratorThinkingLevel
+              : targetLower === "worker"
+                ? updatedSettings.workerThinkingLevel
+                : updatedSettings.validatorThinkingLevel;
 
           const modelDesc = isClearing
             ? "host default"
-            : `\`${modelArg}\`${thinkingLevel ? ` (thinking: \`${thinkingLevel}\`)` : ""}`;
+            : `\`${appliedModelId ?? modelArg}\`${appliedThinking ? ` (thinking: \`${appliedThinking}\`)` : ""}`;
           const applySuffix =
             targetLower === "orchestrator" && orchestratorApply?.warning
               ? `\n- ⚠ ${orchestratorApply.warning}`
               : "";
+          const propParts: string[] = [];
+          if (propagated && propagated.switched.length > 0) {
+            propParts.push(
+              `Switched ${propagated.switched.map((n) => `\`@${n}\``).join(", ")}.`,
+            );
+          }
+          if (propagated && propagated.deferred.length > 0) {
+            propParts.push(
+              `Queued turn-end switch for ${propagated.deferred.map((n) => `\`@${n}\``).join(", ")}.`,
+            );
+          }
+          const propSuffix = propParts.length > 0 ? ` ${propParts.join(" ")}` : "";
           const msg = isClearing
-            ? `Cleared \`${targetLower}\` role model back to **host default** (saved to project settings).`
-            : `Updated \`${targetLower}\` role default model to ${modelDesc} (saved to project settings).${applySuffix}`;
+            ? `Cleared \`${targetLower}\` role model back to **host default** (saved to ${scope} settings).`
+            : `Updated \`${targetLower}\` role default model to ${modelDesc} (saved to ${scope} settings).${propSuffix}${applySuffix}`;
 
           if (ctx.hasUI) {
             ctx.ui.notify(
               isClearing
-                ? `Cleared ${targetLower} model to host default.`
-                : `Set ${targetLower} model -> ${modelArg}${thinkingLevel ? ` (${thinkingLevel})` : ""}.`,
+                ? `Cleared ${targetLower} model to host default (${scope}).`
+                : `Set ${targetLower} model -> ${appliedModelId ?? modelArg}${appliedThinking ? ` (${appliedThinking})` : ""} (${scope}).`,
               "info",
             );
           }
           emitZeroTurnMessage(ctx, `✓ ${msg}`, {
             target: targetLower,
             scope: "role_default",
-            model: isClearing ? null : modelArg,
-            thinkingLevel,
+            saveScope: scope,
+            model: isClearing ? null : (appliedModelId ?? modelArg),
+            thinkingLevel: appliedThinking,
             appliedToHost: orchestratorApply?.applied,
+            propagated,
           });
         } catch (err) {
           const msg = `Failed to update ${targetLower} model: ${formatError(err)}`;
@@ -2768,9 +3229,8 @@ export function createPiSwarmExtension(
       }
 
       // Live member hot model switch (preserves warm session conversation history)
-      const snapshot = engine.getSnapshot();
       if (!snapshot.run) {
-        const msg = `No focused Swarm run to switch live member "${target}". To set a role default, use \`/swarm model <orchestrator|worker|validator> <model-id>\`.`;
+        const msg = `No focused Swarm run to switch live member "${target}". To set a role default, use \`/swarm model <orchestrator|worker|validator> <model[:thinking]>\`.`;
         if (ctx.hasUI) ctx.ui.notify(msg, "warning");
         else emitZeroTurnMessage(ctx, msg);
         return;
@@ -2784,6 +3244,7 @@ export function createPiSwarmExtension(
           thinkingLevel,
           callerName: "human",
           callerRole: "human",
+          deferIfWorking: true,
           hostContext: ctx,
         });
         refreshUI(ctx);
@@ -2791,10 +3252,14 @@ export function createPiSwarmExtension(
         const thinkPart = switched.thinkingLevel
           ? ` (thinking: \`${switched.thinkingLevel}\`)`
           : "";
-        const msg = `Hot-switched live member \`@${switched.targetName}\` to \`${appliedModel}\`${thinkPart} — conversation history preserved.`;
+        const msg = switched.deferred
+          ? `Queued hot-switch for working member \`@${switched.targetName}\` to \`${appliedModel}\`${thinkPart} at turn end.`
+          : `Hot-switched live member \`@${switched.targetName}\` to \`${appliedModel}\`${thinkPart} — conversation history preserved.`;
         if (ctx.hasUI) {
           ctx.ui.notify(
-            `Switched @${switched.targetName} -> ${appliedModel} (history preserved).`,
+            switched.deferred
+              ? `Queued @${switched.targetName} -> ${appliedModel} at turn end.`
+              : `Switched @${switched.targetName} -> ${appliedModel} (history preserved).`,
             "info",
           );
         }
@@ -2803,6 +3268,7 @@ export function createPiSwarmExtension(
           scope: "live_member",
           model: appliedModel,
           thinkingLevel: switched.thinkingLevel,
+          deferred: switched.deferred,
         });
       } catch (err) {
         const msg = `Failed to switch model for "${target}": ${formatError(err)}`;
@@ -3051,7 +3517,7 @@ export function createPiSwarmExtension(
 
     async function handleDoneCommand(
       rawSummary: string,
-      ctx: ExtensionCommandContext,
+      ctx: ExtensionContext,
     ): Promise<void> {
       const { store, engine } = await ensureBound(ctx);
       const snapshot = engine.getSnapshot();
@@ -3137,7 +3603,7 @@ export function createPiSwarmExtension(
 
     async function handlePauseCommand(
       reason: string,
-      ctx: ExtensionCommandContext,
+      ctx: ExtensionContext,
     ): Promise<void> {
       const { store, engine } = await ensureBound(ctx);
       const snapshot = engine.getSnapshot();
@@ -3172,7 +3638,7 @@ export function createPiSwarmExtension(
       }
     }
 
-    async function handleResumeCommand(ctx: ExtensionCommandContext): Promise<void> {
+    async function handleResumeCommand(ctx: ExtensionContext): Promise<void> {
       const { store, engine } = await ensureBound(ctx);
       const snapshot = engine.getSnapshot();
       if (!snapshot.run) {
@@ -3343,7 +3809,7 @@ export function createPiSwarmExtension(
 
     async function handleTeardownCommand(
       rawArgs: string,
-      ctx: ExtensionCommandContext,
+      ctx: ExtensionContext,
     ): Promise<void> {
       const { engine, store } = await ensureBound(ctx);
       const snapshot = engine.getSnapshot();
@@ -3424,7 +3890,7 @@ export function createPiSwarmExtension(
       }
     }
 
-    async function handleRunsCommand(ctx: ExtensionCommandContext): Promise<void> {
+    async function handleRunsCommand(ctx: ExtensionContext): Promise<void> {
       const { store, engine } = await ensureBound(ctx);
       const runs = await store.listRuns();
       const focusedId = engine.getSnapshot().activeRunId;
@@ -3459,7 +3925,7 @@ export function createPiSwarmExtension(
 
     async function handleFocusCommand(
       rawTarget: string,
-      ctx: ExtensionCommandContext,
+      ctx: ExtensionContext,
     ): Promise<void> {
       const { store, engine } = await ensureBound(ctx);
       const target = rawTarget.trim();
@@ -3563,13 +4029,18 @@ export function createPiSwarmExtension(
       }
     }
 
-    async function handleSettingsCommand(ctx: ExtensionCommandContext): Promise<void> {
+    async function handleSettingsCommand(ctx: ExtensionContext): Promise<void> {
       await ensureBound(ctx);
       let layeredPaths: { globalPath: string; projectPath: string } | undefined;
       if (overrides.settingsLoader) {
+        lastLayeredSettings = undefined;
         currentSettings = await overrides.settingsLoader(ctx.cwd);
       } else {
-        const layered = await loadLayeredSwarmSettings(ctx.cwd);
+        const layered = await loadLayeredSwarmSettings(
+          ctx.cwd,
+          overrides.settingsPathOptions,
+        );
+        lastLayeredSettings = layered;
         currentSettings = layered.settings;
         layeredPaths = {
           globalPath: layered.globalPath,
@@ -3583,10 +4054,28 @@ export function createPiSwarmExtension(
         return;
       }
 
-      let saveScope: "project" | "global" = "project";
+      let saveScope: "project" | "global" = getPreferredSaveScope();
+      const useModelPicker = canUseCustomTui(ctx);
 
       const persistPatch = async (patch: Partial<SwarmSettings>): Promise<void> => {
         await persistSettingsPatch(saveScope, patch, ctx.cwd);
+        refreshUI(ctx);
+      };
+
+      const openSettingsModelPicker = async (initialTab: ModelPickerTab): Promise<void> => {
+        const availableModels = await refreshAvailableModels(ctx, true);
+        const callbacks = makeModelPickerCallbacks(ctx);
+        await withModalGuard(() =>
+          openSwarmModelPicker(ctx, {
+            mode: "roles",
+            initialTab,
+            initialScope: saveScope,
+            state: getModelSettingsState(ctx),
+            availableModels,
+            ...callbacks,
+          }),
+        );
+        saveScope = getPreferredSaveScope();
         refreshUI(ctx);
       };
 
@@ -3596,14 +4085,18 @@ export function createPiSwarmExtension(
         currentValue: string | undefined,
         currentThinking: ThinkingLevel | undefined,
       ): Promise<void> => {
+        if (useModelPicker) {
+          await openSettingsModelPicker(role);
+          return;
+        }
         const defaultInput = currentValue
           ? currentThinking
-            ? `${currentValue} ${currentThinking}`
+            ? `${currentValue}:${currentThinking}`
             : currentValue
           : "";
         const raw = await withModalGuard(() =>
           ctx.ui.input(
-            `Set ${label} (model ID [thinking], or "default" / empty to inherit host)`,
+            `Set ${label} (model ID[:thinking], or "default" / empty to inherit host)`,
             defaultInput,
           ),
         );
@@ -3626,11 +4119,10 @@ export function createPiSwarmExtension(
               );
               return;
             }
-            modelValue = parts.slice(0, -1).join(" ");
-            thinkingLevel = lastLower;
-          } else {
-            modelValue = trimmed;
           }
+          const parsedSpec = parseModelSpec(trimmed);
+          modelValue = parsedSpec.model;
+          thinkingLevel = parsedSpec.thinkingLevel;
         }
         await applyRoleModelChange(
           role,
@@ -3647,8 +4139,11 @@ export function createPiSwarmExtension(
         );
       };
 
+      const interactiveModelsItem = "🎛 Configure Mission Models & Effort (Interactive Picker)…";
+
       while (true) {
         const items = [
+          ...(useModelPicker ? [interactiveModelsItem] : []),
           `orchestratorModel: ${formatModelSettingCell(currentSettings.orchestratorModel, currentSettings.orchestratorThinkingLevel)}`,
           `workerModel: ${formatModelSettingCell(currentSettings.workerModel, currentSettings.workerThinkingLevel)}`,
           `validatorModel: ${formatModelSettingCell(currentSettings.validatorModel, currentSettings.validatorThinkingLevel)}`,
@@ -3677,7 +4172,9 @@ export function createPiSwarmExtension(
         }
 
         try {
-          if (picked.startsWith("orchestratorModel:")) {
+          if (picked === interactiveModelsItem) {
+            await openSettingsModelPicker("orchestrator");
+          } else if (picked.startsWith("orchestratorModel:")) {
             await promptRoleModel(
               "orchestrator",
               "orchestratorModel",
@@ -3699,6 +4196,10 @@ export function createPiSwarmExtension(
               currentSettings.validatorThinkingLevel,
             );
           } else if (picked.startsWith("fallbackModels:")) {
+            if (useModelPicker) {
+              await openSettingsModelPicker("fallbacks");
+              continue;
+            }
             const raw = await withModalGuard(() =>
               ctx.ui.input(
                 'Set fallbackModels (comma/space-separated model IDs, or "clear" for none)',
@@ -3884,9 +4385,63 @@ export function createPiSwarmExtension(
       }
     }
 
-    async function handleBareCommand(ctx: ExtensionCommandContext): Promise<void> {
-      const { engine } = await ensureBound(ctx);
+    async function handleBareCommand(ctx: ExtensionContext): Promise<void> {
+      const { store, engine } = await ensureBound(ctx);
+      await reloadSettings(ctx.cwd);
       const snapshot = engine.getSnapshot();
+
+      if (canUseCustomTui(ctx)) {
+        const [availableModels, runs] = await Promise.all([
+          refreshAvailableModels(ctx, true),
+          store.listRuns().catch(() => []),
+        ]);
+        const callbacks = makeModelPickerCallbacks(ctx);
+        const action = await withModalGuard(() =>
+          openSwarmHub(ctx, {
+            state: getModelSettingsState(ctx),
+            snapshot,
+            runs,
+            availableModels,
+            initialScope: getPreferredSaveScope(),
+            ...callbacks,
+          }),
+        );
+        switch (action.kind) {
+          case "draft":
+            await startInteractiveDrafting(action.goal, ctx);
+            return;
+          case "direct":
+            await startDirectSwarm(action.goal, ctx);
+            return;
+          case "ui":
+            await handleOverlayCommand("", ctx);
+            return;
+          case "tweak":
+            await handleTweakCommand("", ctx);
+            return;
+          case "pause":
+            await handlePauseCommand("", ctx);
+            return;
+          case "resume":
+            await handleResumeCommand(ctx);
+            return;
+          case "done":
+            await handleDoneCommand("", ctx);
+            return;
+          case "focus":
+            await handleFocusCommand(action.runId, ctx);
+            return;
+          case "settings":
+            await handleSettingsCommand(ctx);
+            return;
+          case "teardown":
+            await handleTeardownCommand("", ctx);
+            return;
+          case "cancel":
+            refreshUI(ctx);
+            return;
+        }
+      }
 
       if (!snapshot.run) {
         await startInteractiveDrafting("", ctx);
@@ -3948,7 +4503,7 @@ export function createPiSwarmExtension(
       } else if (choice === graphLabel) {
         await handleGraphCommand(ctx);
       } else if (choice === modelsLabel) {
-        await handleModelsCommand(ctx);
+        await handleModelsCommand("", ctx);
       } else if (choice === tweakLabel) {
         await handleTweakCommand("", ctx);
       } else if (choice === pauseOrResumeLabel) {
@@ -4008,7 +4563,7 @@ export function createPiSwarmExtension(
           await handleOverlayCommand(parsed.rest, ctx);
           return;
         case "models":
-          await handleModelsCommand(ctx);
+          await handleModelsCommand(parsed.rest, ctx);
           return;
         case "model":
           await handleModelCommand(parsed.rest, ctx);
@@ -4138,7 +4693,8 @@ export function createPiSwarmExtension(
         return items.length > 0 ? items : null;
       }
 
-      if (sub === "model") {
+      if (sub === "model" || sub === "models") {
+        const cmdWord = sub;
         const hasTrailingSpace = /\s$/.test(prefix);
         const rawTokens = argPrefix ? argPrefix.split(/\s+/).filter(Boolean) : [];
         const completedCount = hasTrailingSpace
@@ -4152,20 +4708,38 @@ export function createPiSwarmExtension(
           for (const role of MODEL_ROLES) {
             if (role.startsWith(lowerActive)) {
               items.push({
-                value: `model ${role}`,
+                value: `${cmdWord} ${role}`,
                 label: role,
                 description: `Configure ${role} role default model`,
               });
             }
           }
+          if (sub === "models" && "fallbacks".startsWith(lowerActive)) {
+            items.push({
+              value: "models fallbacks",
+              label: "fallbacks",
+              description: "Open Model Picker on Fallbacks tab",
+            });
+          }
+          if (sub === "models" && "--print".startsWith(lowerActive)) {
+            items.push({
+              value: "models --print",
+              label: "--print",
+              description: "Print zero-turn Markdown overview",
+            });
+          }
           const run = getSnapshotSafe().run;
           if (run) {
             for (const entry of getOrderedMembers(run)) {
               if (entry.state === "killed") continue;
-              if (entry.name.toLowerCase().startsWith(lowerActive)) {
+              const atName = `@${entry.name}`;
+              if (
+                entry.name.toLowerCase().startsWith(lowerActive) ||
+                atName.toLowerCase().startsWith(lowerActive)
+              ) {
                 items.push({
-                  value: `model ${entry.name}`,
-                  label: entry.name,
+                  value: `${cmdWord} ${atName}`,
+                  label: atName,
                   description: `${entry.role} [${entry.state}] ${entry.model ?? "default"}`,
                 });
               }
@@ -4176,23 +4750,65 @@ export function createPiSwarmExtension(
 
         if (completedCount === 1) {
           const target = rawTokens[0]!;
+          const targetClean = target.replace(/^@/, "").toLowerCase();
           const lowerActive = activeToken.toLowerCase();
           const items: AutocompleteItem[] = [];
-          if (isSwarmModelRole(target.toLowerCase()) && "default".startsWith(lowerActive)) {
+
+          // Colon thinking suffix completion when user typed `<model>:`
+          const colonIdx = activeToken.lastIndexOf(":");
+          if (colonIdx > 0) {
+            const modelPrefix = activeToken.slice(0, colonIdx);
+            const effortPrefix = activeToken.slice(colonIdx + 1).toLowerCase();
+            for (const lvl of VALID_THINKING_LEVELS) {
+              if (lvl.startsWith(effortPrefix)) {
+                items.push({
+                  value: `${cmdWord} ${target} ${modelPrefix}:${lvl}`,
+                  label: `${modelPrefix}:${lvl}`,
+                  description: `Set reasoning effort to ${lvl}`,
+                });
+              }
+            }
+            if (items.length > 0) return items;
+          }
+
+          if (isSwarmModelRole(targetClean) && "default".startsWith(lowerActive)) {
             items.push({
-              value: `model ${target} default`,
+              value: `${cmdWord} ${target} default`,
               label: "default",
               description: "Clear override and inherit host model",
             });
           }
+
+          const seenModels = new Set<string>();
+          const pushCandidate = (id: string, desc: string) => {
+            if (!id || seenModels.has(id.toLowerCase())) return;
+            if (!id.toLowerCase().includes(lowerActive)) return;
+            seenModels.add(id.toLowerCase());
+            items.push({
+              value: `${cmdWord} ${target} ${id}`,
+              label: id,
+              description: desc,
+            });
+          };
+
           for (const fb of currentSettings.fallbackModels) {
-            if (fb.toLowerCase().startsWith(lowerActive)) {
-              items.push({
-                value: `model ${target} ${fb}`,
-                label: fb,
-                description: "Configured fallback model",
-              });
-            }
+            pushCandidate(fb, "Configured fallback model");
+          }
+          for (const m of [
+            currentSettings.orchestratorModel,
+            currentSettings.workerModel,
+            currentSettings.validatorModel,
+          ]) {
+            if (m) pushCandidate(m, "Configured role model");
+          }
+          for (const avail of cachedAvailableModels) {
+            pushCandidate(
+              avail.fullId,
+              avail.name && avail.name !== avail.id
+                ? `${avail.name} (${avail.provider})`
+                : avail.provider,
+            );
+            if (items.length >= 25) break;
           }
           return items.length > 0 ? items : null;
         }
@@ -4201,13 +4817,25 @@ export function createPiSwarmExtension(
           const target = rawTokens[0]!;
           const modelId = rawTokens[1]!;
           const lowerActive = activeToken.toLowerCase();
-          const items = Array.from(VALID_THINKING_LEVELS)
-            .filter((lvl) => lvl.startsWith(lowerActive))
-            .map((lvl): AutocompleteItem => ({
-              value: `model ${target} ${modelId} ${lvl}`,
-              label: lvl,
-              description: `Set thinking level to ${lvl}`,
-            }));
+          const items: AutocompleteItem[] = [];
+          for (const lvl of VALID_THINKING_LEVELS) {
+            if (lvl.startsWith(lowerActive)) {
+              items.push({
+                value: `${cmdWord} ${target} ${modelId} ${lvl}`,
+                label: lvl,
+                description: `Set thinking level to ${lvl}`,
+              });
+            }
+          }
+          for (const flag of ["--global", "--project"]) {
+            if (flag.startsWith(lowerActive)) {
+              items.push({
+                value: `${cmdWord} ${target} ${modelId} ${flag}`,
+                label: flag,
+                description: flag === "--global" ? "Save to ~/.pi/agent/pi-swarm-settings.json" : "Save to .pi/pi-swarm-settings.json",
+              });
+            }
+          }
           return items.length > 0 ? items : null;
         }
 
@@ -4322,7 +4950,7 @@ export function createPiSwarmExtension(
     // ------------------------------------------------------------------------
     pi.registerCommand("swarm", {
       description:
-        "Pi Swarm v0.3.7 — Dynamic Antigravity Swarm orchestrator (shared #seq board, non-blocking swarm_wait, warm disk sessions, fork, 3-role models & git worktrees/clones)",
+        "Pi Swarm v0.4.0 — Dynamic Antigravity Swarm orchestrator (Droid Mission-style model & effort picker, shared #seq board, non-blocking swarm_wait, warm disk sessions, fork & worktrees/clones)",
       getArgumentCompletions: getSwarmCompletions,
       handler: handleSwarmCommand,
     });
@@ -4354,6 +4982,7 @@ export function createPiSwarmExtension(
       await ensureBound(ctx);
       await rehydrateSessionState(ctx);
       await mountUI(ctx);
+      void refreshAvailableModels(ctx, true);
     });
 
     pi.on("session_tree", async (_event, ctx) => {

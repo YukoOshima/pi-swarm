@@ -1469,25 +1469,31 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     assert.match(String(boardView.message.content), /\[#backend\]/);
     assert.match(String(boardView.message.content), /error envelope schema/);
 
-    // D. Hot Model Switch via `/swarm model` (role default + null clear + live waiting member) & `swarm{action:"model"}`
-    // 1) Set role default persisted to project `.pi/pi-swarm-settings.json`
+    // D. Hot Model Switch & Role Propagation via `/swarm model` & `swarm{action:"model"}`
+    // 1) Set role default persisted to project `.pi/pi-swarm-settings.json` (also silently switches role-tracking waiting workers!)
+    const api1Tracker = spawnedByName.get("api-1")!;
+    const msgCountBeforeSwitch = api1Tracker.conversationMessages.length;
     await harness.runCommand("swarm", "model worker google/gemini-2.5-pro high");
     const projSettingsPath = path.join(repoDir, ".pi", SWARM_SETTINGS_FILE);
     const saved1 = JSON.parse(await readFile(projSettingsPath, "utf8"));
     assert.equal(saved1.workerModel, "google/gemini-2.5-pro");
     assert.equal(saved1.workerThinkingLevel, "high");
+    assert.equal(api1Tracker.modelSwitches.length, 1);
+    assert.deepEqual(api1Tracker.modelSwitches[0], {
+      model: "google/gemini-2.5-pro",
+      thinkingLevel: "high",
+    });
 
-    // 2) Clear role default with `default` -> writes explicit `null` in project JSON!
+    // 2) Clear role default with `default` -> writes explicit `null` in project JSON and leaves running agents untouched!
     await harness.runCommand("swarm", "model worker default");
     const saved2 = JSON.parse(await readFile(projSettingsPath, "utf8"));
     assert.equal(saved2.workerModel, null, "Clearing role default must persist null in project settings");
+    assert.equal(api1Tracker.modelSwitches.length, 1, "Inherit clear must apply only to new agents");
 
     // 3) Hot-switch live waiting member via `/swarm model api-1 openai/gpt-5.2 high`
-    const api1Tracker = spawnedByName.get("api-1")!;
-    const msgCountBeforeSwitch = api1Tracker.conversationMessages.length;
     await harness.runCommand("swarm", "model api-1 openai/gpt-5.2 high");
-    assert.equal(api1Tracker.modelSwitches.length, 1);
-    assert.deepEqual(api1Tracker.modelSwitches[0], {
+    assert.equal(api1Tracker.modelSwitches.length, 2);
+    assert.deepEqual(api1Tracker.modelSwitches[1], {
       model: "openai/gpt-5.2",
       thinkingLevel: "high",
     });
@@ -3137,6 +3143,163 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     assert.match(lastText, new RegExp(`\\[#${postedSeqs[1]}\\]`));
     assert.ok(!lastText.includes(`[#${postedSeqs[6]}]`), "Already-returned #seq must be pruned");
     assert.ok(!lastText.includes("update #7"), "Already-returned message body must be pruned");
+
+    await harness.executeTool(SWARM_TOOL, { action: "done", summary: "Done" });
+    await harness.emit("session_shutdown", { reason: "quit" });
+  });
+
+  it("11. v0.4.0: /swarm models role:thinking --global unmasks project shadow, propagates to live validator, and disambiguates @validator", async () => {
+    const repoDir = await createTempGitRepo("v040-mission-models");
+    tempDirs.push(repoDir);
+    const isolatedGlobalPath = path.join(repoDir, ".tmp-global-pi-swarm-settings.json");
+    const isolatedProjectPath = path.join(repoDir, ".pi", SWARM_SETTINGS_FILE);
+
+    // Seed global + shadowing project override (`xhigh` Opus validator in project)
+    await mkdir(path.dirname(isolatedProjectPath), { recursive: true });
+    await writeFile(
+      isolatedGlobalPath,
+      JSON.stringify({
+        orchestratorModel: "magpie/bp/claude-fable-5-2",
+        orchestratorThinkingLevel: "high",
+        workerModel: "magpie/auto/gemini-4-neon",
+        workerThinkingLevel: "high",
+        validatorModel: "magpie/bp/claude-opus-5-5",
+        validatorThinkingLevel: "xhigh",
+      }),
+      "utf8",
+    );
+    await writeFile(
+      isolatedProjectPath,
+      JSON.stringify({
+        validatorModel: "magpie/bp/claude-opus-5-5",
+        validatorThinkingLevel: "xhigh",
+      }),
+      "utf8",
+    );
+
+    const spawnedByName = new Map<string, MockMemberTracker>();
+    const mockTransport: ISwarmTransport = {
+      async listAvailableModels() {
+        return [
+          {
+            id: "claude-fable-5-2",
+            provider: "magpie/bp",
+            fullId: "magpie/bp/claude-fable-5-2",
+            name: "Claude Fable 5.2",
+          },
+          {
+            id: "gpt-6.2-astra",
+            provider: "magpie/bp",
+            fullId: "magpie/bp/gpt-6.2-astra",
+            name: "GPT-6.2 Astra",
+          },
+        ];
+      },
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        const tracker = createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async () => ({
+            agentId: request.agentId,
+            name: request.name,
+            role: request.role,
+            outcome: "waiting",
+            summary: `${request.name} ready`,
+            tokens: 10,
+            cost: 0.0001,
+          }),
+        });
+        spawnedByName.set(request.name, tracker);
+        return tracker.handle;
+      },
+    };
+
+    const harness = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "v040-e2e",
+    });
+    const ext = createPiSwarmExtension({
+      transportFactory: () => mockTransport,
+      settingsPathOptions: {
+        globalPath: isolatedGlobalPath,
+        projectPath: isolatedProjectPath,
+      },
+    });
+    ext(harness.pi);
+    await harness.emit("session_start", { reason: "startup" });
+
+    // Launch run with live validator named `validator`
+    await harness.runCommand("swarm-direct", "Ship v0.4.0 model UX");
+    await harness.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "v0.4.0 Models E2E",
+      objective: "Verify live propagation and @member disambiguation",
+      strategy: "Spawn validator and update validator role",
+      acceptance_criteria: "Validator updates smoothly",
+      base_branch: "main",
+      initial_members: [
+        {
+          name: "validator",
+          role: "validator",
+          workspace: "inherit",
+          brief: "Independent verifier",
+        },
+      ],
+    });
+    await waitFor(() => spawnedByName.get("validator")?.handle.getState() === "waiting");
+    const valTracker = spawnedByName.get("validator")!;
+    assert.equal(valTracker.spawnModel, "magpie/bp/claude-opus-5-5");
+    assert.equal(valTracker.spawnThinkingLevel, "xhigh");
+
+    // 1) `/swarm models validator magpie/bp/gpt-6.2-astra:high --global`
+    //    - parses `:high` colon shorthand
+    //    - unmasks shadowing project keys so global value takes effect
+    //    - silently propagates to waiting `@validator`
+    await harness.runCommand(
+      "swarm",
+      "models validator magpie/bp/gpt-6.2-astra:high --global",
+    );
+    const savedGlobal = JSON.parse(await readFile(isolatedGlobalPath, "utf8"));
+    assert.equal(savedGlobal.validatorModel, "magpie/bp/gpt-6.2-astra");
+    assert.equal(savedGlobal.validatorThinkingLevel, "high");
+    await assert.rejects(() => readFile(isolatedProjectPath, "utf8"), /ENOENT/);
+
+    assert.equal(valTracker.modelSwitches.length, 1);
+    assert.deepEqual(valTracker.modelSwitches[0], {
+      model: "magpie/bp/gpt-6.2-astra",
+      thinkingLevel: "high",
+    });
+    assert.equal(valTracker.wakeCount, 0, "Role propagation must not spuriously wake waiting validator");
+
+    // 2) `/swarm model @validator magpie/bp/claude-opus-5-5:medium`
+    //    explicit `@` targets the live member instead of the `validator` role default!
+    await harness.runCommand(
+      "swarm",
+      "model @validator magpie/bp/claude-opus-5-5:medium",
+    );
+    const savedGlobalAfter = JSON.parse(await readFile(isolatedGlobalPath, "utf8"));
+    assert.equal(
+      savedGlobalAfter.validatorModel,
+      "magpie/bp/gpt-6.2-astra",
+      "Targeting @validator must NOT overwrite validator role default",
+    );
+    assert.equal(valTracker.modelSwitches.length, 2);
+    assert.deepEqual(valTracker.modelSwitches[1], {
+      model: "magpie/bp/claude-opus-5-5",
+      thinkingLevel: "medium",
+    });
+
+    // 3) Autocomplete supports both `models` & `model` plus `:thinking` suffix completion
+    const swarmCmd = harness.commands.get("swarm")!;
+    const colonCompletions = (await swarmCmd.getArgumentCompletions?.(
+      "models validator magpie/bp/gpt-6.2-astra:h",
+    )) as Array<{ label: string; value: string }>;
+    assert.ok(
+      colonCompletions.some((c) => c.value === "models validator magpie/bp/gpt-6.2-astra:high"),
+    );
+
+    const memberCompletions = (await swarmCmd.getArgumentCompletions?.("model @v")) as Array<{
+      label: string;
+    }>;
+    assert.ok(memberCompletions.some((c) => c.label === "@validator"));
 
     await harness.executeTool(SWARM_TOOL, { action: "done", summary: "Done" });
     await harness.emit("session_shutdown", { reason: "quit" });

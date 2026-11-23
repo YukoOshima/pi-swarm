@@ -38,11 +38,14 @@ import {
   SwarmStore,
   WorktreeManager,
   assertOwnerSession,
+  deleteProjectSettingsKeys,
   deriveMemberBranch,
   formatBoardMessage,
   formatBoardMessages,
   formatLedgerActivity,
   formatLedgerEvent,
+  getRoleModelOrigin,
+  parseModelSpec,
   getGlobalSettingsPath,
   getProjectSettingsPath,
   loadLayeredSwarmSettings,
@@ -2740,5 +2743,66 @@ describe("v0.3.7 store, board, ledger, settings & worktree regression fixes", ()
 
     await subMgr.removeWorktree(brokenNonEmpty, { force: true });
     await subMgr.deleteBranch("swarm/run-b/broken");
+  });
+
+  it("v0.4.0: parseModelSpec, getRoleModelOrigin, and deleteProjectSettingsKeys unmasking", async () => {
+    // parseModelSpec supports colon & space thinking syntax while preserving arbitrary colons
+    assert.deepEqual(parseModelSpec("magpie/bp/gpt-6.2-astra:high"), {
+      model: "magpie/bp/gpt-6.2-astra",
+      thinkingLevel: "high",
+    });
+    assert.deepEqual(parseModelSpec("magpie/bp/gpt-6.2-astra xhigh"), {
+      model: "magpie/bp/gpt-6.2-astra",
+      thinkingLevel: "xhigh",
+    });
+    assert.deepEqual(parseModelSpec("ollama/qwen3:32b"), {
+      model: "ollama/qwen3:32b",
+    });
+    assert.deepEqual(parseModelSpec("ollama/qwen3:32b:medium"), {
+      model: "ollama/qwen3:32b",
+      thinkingLevel: "medium",
+    });
+
+    const tmpRoot = await mkdtemp(path.join(os.tmpdir(), "pi-swarm-v040-settings-"));
+    tempDirs.push(tmpRoot);
+    const globalPath = path.join(tmpRoot, "global-settings.json");
+    const projectPath = path.join(tmpRoot, ".pi", SWARM_SETTINGS_FILE);
+
+    await saveSwarmSettings(
+      "global",
+      {
+        orchestratorModel: "magpie/bp/claude-fable-5-2",
+        orchestratorThinkingLevel: "high",
+        validatorModel: "magpie/bp/claude-opus-5-5",
+        validatorThinkingLevel: "xhigh",
+      },
+      { globalPath, projectPath, projectRoot: tmpRoot },
+    );
+    await saveSwarmSettings(
+      "project",
+      {
+        validatorModel: "magpie/bp/gpt-6.2-astra",
+        validatorThinkingLevel: "high",
+      },
+      { globalPath, projectPath, projectRoot: tmpRoot },
+    );
+
+    const layered1 = await loadLayeredSwarmSettings(tmpRoot, { globalPath, projectPath });
+    assert.equal(getRoleModelOrigin("orchestrator", layered1), "global");
+    assert.equal(getRoleModelOrigin("worker", layered1), "host");
+    assert.equal(getRoleModelOrigin("validator", layered1), "project");
+
+    // Deleting project keys unmasks global & deletes project file when empty
+    const effectiveAfterDelete = await deleteProjectSettingsKeys(
+      tmpRoot,
+      ["validatorModel", "validatorThinkingLevel"],
+      { globalPath, projectPath },
+    );
+    assert.equal(effectiveAfterDelete.validatorModel, "magpie/bp/claude-opus-5-5");
+    assert.equal(effectiveAfterDelete.validatorThinkingLevel, "xhigh");
+    await assert.rejects(() => access(projectPath), /ENOENT/);
+
+    const layered2 = await loadLayeredSwarmSettings(tmpRoot, { globalPath, projectPath });
+    assert.equal(getRoleModelOrigin("validator", layered2), "global");
   });
 });

@@ -73,6 +73,8 @@ export interface SwarmShortcutCallbacks {
   isExpanded: () => boolean;
   onToggleExpand: () => void;
   onCollapse: () => void;
+  onOpenMissionControl?: () => void;
+  onOpenModelPicker?: () => void;
 }
 
 export interface StatusDashboardOptions {
@@ -1212,6 +1214,16 @@ export function bindSwarmShortcuts(
 
     if (matchesKey(data, Key.ctrlShift("t"))) {
       callbacks.onToggleExpand();
+      return { consume: true };
+    }
+
+    if (matchesKey(data, Key.ctrlShift("m")) && callbacks.onOpenModelPicker) {
+      callbacks.onOpenModelPicker();
+      return { consume: true };
+    }
+
+    if (matchesKey(data, Key.ctrlShift("s")) && callbacks.onOpenMissionControl) {
+      callbacks.onOpenMissionControl();
       return { consume: true };
     }
 

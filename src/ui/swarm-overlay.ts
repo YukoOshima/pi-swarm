@@ -10,7 +10,9 @@ import {
   type TUI,
 } from "@earendil-works/pi-tui";
 import { DEFAULT_CHANNEL, ORCHESTRATOR_NAME } from "../constants.js";
+import { parseModelSpec } from "../store/index.js";
 import type {
+  AvailableModelInfo,
   BoardMessage,
   DiffSummary,
   ISwarmEngine,
@@ -19,6 +21,11 @@ import type {
   SwarmRunState,
   SwarmSnapshot,
 } from "../types.js";
+import {
+  SwarmModelPickerView,
+  type ModelPickerSettingsState,
+  type SwarmModelPickerViewOptions,
+} from "./model-picker.js";
 import {
   buildSwarmGraphLines,
   fitLine,
@@ -54,6 +61,14 @@ export interface SwarmOverlayOptions {
   initialChannel?: string;
   /** Optional host session model fallback for 3-role display. */
   hostModel?: string;
+  /** Available models catalog for interactive `[m]` / `[M]` Mission Model Picker. */
+  availableModels?: readonly AvailableModelInfo[];
+  /** Current 3-role settings & origin metadata getter for `[M]` Mission Models view. */
+  getModelSettingsState?: () => ModelPickerSettingsState;
+  /** Handler called when updating a role default from `[M]` Mission Models view. */
+  onApplyRoleModel?: SwarmModelPickerViewOptions["onApplyRole"];
+  /** Handler called when updating fallback models from `[M]` Mission Models view. */
+  onApplyFallbacks?: SwarmModelPickerViewOptions["onApplyFallbacks"];
   /** Clock override for deterministic tests. */
   now?: () => number;
 }
@@ -64,16 +79,6 @@ const TAB_ORDER: readonly SwarmOverlayTab[] = [
   "graph",
   "search",
 ];
-
-const VALID_THINKING_LEVELS: ReadonlySet<ThinkingLevel> = new Set([
-  "off",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-]);
 
 type MemberDetailMode = "info" | "logs" | "diff";
 
@@ -154,17 +159,7 @@ function parseModelAndThinking(raw: string): {
   model: string;
   thinkingLevel?: ThinkingLevel;
 } {
-  const parts = raw.trim().split(/\s+/).filter(Boolean);
-  if (parts.length >= 2) {
-    const last = parts[parts.length - 1]!.toLowerCase();
-    if (VALID_THINKING_LEVELS.has(last as ThinkingLevel)) {
-      return {
-        model: parts.slice(0, -1).join(" "),
-        thinkingLevel: last as ThinkingLevel,
-      };
-    }
-  }
-  return { model: raw.trim() };
+  return parseModelSpec(raw);
 }
 
 function matchesSearchQuery(msg: BoardMessage, query: string): boolean {
@@ -238,6 +233,8 @@ class SwarmOverlayComponent implements Component, Focusable {
 
   private prevHardwareCursor: boolean | null = null;
   private feedback: FeedbackMessage | undefined;
+  private subComponent: Component | null = null;
+  private showHelp = false;
   private unsubscribe: (() => void) | undefined;
   private closed = false;
   private currentRunId: string | null;
@@ -679,6 +676,141 @@ class SwarmOverlayComponent implements Component, Focusable {
     }
   }
 
+  private async runTogglePauseResume(): Promise<void> {
+    const run = this.snapshot.run;
+    if (!run) return;
+    try {
+      if (run.status === "paused") {
+        await this.engine.resume(run.id, this.ctx);
+        if (this.closed) return;
+        this.snapshot = this.engine.getSnapshot();
+        this.setFeedback("success", `Resumed Swarm ${run.id}.`);
+      } else if (run.status === "active") {
+        await this.engine.pause(run.id, "Paused by user via Mission Control");
+        if (this.closed) return;
+        this.snapshot = this.engine.getSnapshot();
+        this.setFeedback("warning", `Paused Swarm ${run.id}.`);
+      } else {
+        this.setFeedback("info", `Swarm ${run.id} is already ${run.status}.`);
+      }
+    } catch (err) {
+      this.setFeedback("error", `Pause/resume failed: ${formatErrorMessage(err)}`);
+    }
+  }
+
+  private openMissionModelsPicker(): void {
+    const run = this.snapshot.run;
+    const baseState: ModelPickerSettingsState = this.options?.getModelSettingsState
+      ? this.options.getModelSettingsState()
+      : {
+          settings: {
+            orchestratorModel: run?.roleModels?.orchestrator?.model,
+            orchestratorThinkingLevel: run?.roleModels?.orchestrator?.thinkingLevel,
+            workerModel: run?.roleModels?.worker?.model,
+            workerThinkingLevel: run?.roleModels?.worker?.thinkingLevel,
+            validatorModel: run?.roleModels?.validator?.model,
+            validatorThinkingLevel: run?.roleModels?.validator?.thinkingLevel,
+            fallbackModels: [...(run?.roleModels?.fallbackModels ?? [])],
+            maxConcurrency: run?.maxConcurrency ?? 6,
+            validatorEnabled: run?.validatorEnabled ?? true,
+            keepWorkersWarm: run?.keepWorkersWarm ?? true,
+            stallWatchdogEnabled: true,
+            stallMonitorMode: "llm",
+            stallTimeoutMs: 45_000,
+            maxRetries: 2,
+            rateLimitBaseBackoffMs: 5_000,
+            rateLimitMaxBackoffMs: 60_000,
+            gitTimeoutMs: 30_000,
+            autoRebase: true,
+            autoTeardownOnComplete: false,
+          },
+          hostModel: this.hostModel,
+        };
+
+    this.subComponent = new SwarmModelPickerView(this.tui, this.theme, {
+      mode: "roles",
+      state: baseState,
+      availableModels: this.options?.availableModels ?? [],
+      onApplyRole: this.options?.onApplyRoleModel,
+      onApplyFallbacks: this.options?.onApplyFallbacks,
+      onClose: (res) => {
+        this.subComponent = null;
+        if (!this.closed) {
+          this.snapshot = this.engine.getSnapshot();
+          if (res?.changed) {
+            this.setFeedback("success", "Updated Swarm Mission models.");
+          }
+          this.tui.requestRender();
+        }
+      },
+    });
+    this.tui.requestRender();
+  }
+
+  private openMemberModelPicker(member: SwarmMemberRecord): void {
+    const run = this.snapshot.run;
+    const baseState: ModelPickerSettingsState = this.options?.getModelSettingsState
+      ? this.options.getModelSettingsState()
+      : {
+          settings: {
+            orchestratorModel: run?.roleModels?.orchestrator?.model,
+            orchestratorThinkingLevel: run?.roleModels?.orchestrator?.thinkingLevel,
+            workerModel: run?.roleModels?.worker?.model,
+            workerThinkingLevel: run?.roleModels?.worker?.thinkingLevel,
+            validatorModel: run?.roleModels?.validator?.model,
+            validatorThinkingLevel: run?.roleModels?.validator?.thinkingLevel,
+            fallbackModels: [...(run?.roleModels?.fallbackModels ?? [])],
+            maxConcurrency: run?.maxConcurrency ?? 6,
+            validatorEnabled: run?.validatorEnabled ?? true,
+            keepWorkersWarm: run?.keepWorkersWarm ?? true,
+            stallWatchdogEnabled: true,
+            stallMonitorMode: "llm",
+            stallTimeoutMs: 45_000,
+            maxRetries: 2,
+            rateLimitBaseBackoffMs: 5_000,
+            rateLimitMaxBackoffMs: 60_000,
+            gitTimeoutMs: 30_000,
+            autoRebase: true,
+            autoTeardownOnComplete: false,
+          },
+          hostModel: this.hostModel,
+        };
+
+    this.subComponent = new SwarmModelPickerView(this.tui, this.theme, {
+      mode: "member",
+      member,
+      state: baseState,
+      availableModels: this.options?.availableModels ?? [],
+      onApplyMember: async (sel) => {
+        const result = await this.engine.switchModel({
+          targetName: sel.memberName,
+          model: sel.model,
+          thinkingLevel: sel.thinkingLevel,
+          reason: "Hot-switched by user via Swarm overlay",
+          callerName: ORCHESTRATOR_NAME,
+          callerRole: "human",
+          deferIfWorking: true,
+          hostContext: this.ctx,
+        });
+        if (!this.closed) {
+          this.snapshot = this.engine.getSnapshot();
+          const suffix = result.thinkingLevel ? ` (${result.thinkingLevel})` : "";
+          const actionMsg = result.deferred
+            ? `Queued switch for @${sel.memberName} -> ${result.model}${suffix} at turn end.`
+            : `Switched @${sel.memberName} to ${result.model}${suffix}.`;
+          this.setFeedback("success", actionMsg);
+        }
+      },
+      onClose: () => {
+        this.subComponent = null;
+        if (!this.closed) {
+          this.tui.requestRender();
+        }
+      },
+    });
+    this.tui.requestRender();
+  }
+
   private async runSwitchModel(
     member: SwarmMemberRecord,
     rawInput: string,
@@ -867,6 +999,11 @@ class SwarmOverlayComponent implements Component, Focusable {
   handleInput(data: string): void {
     if (this.closed) return;
 
+    if (this.subComponent) {
+      this.subComponent.handleInput?.(data);
+      return;
+    }
+
     // 1. Inline IME action input (Board [p] post, Members [w] wake / [m] model)
     if (this.inlineMode) {
       if (matchesKey(data, Key.ctrl("c"))) {
@@ -997,6 +1134,22 @@ class SwarmOverlayComponent implements Component, Focusable {
       }
     }
 
+    if (this.showHelp) {
+      if (matchesKey(data, Key.ctrl("c")) || ch === "q" || ch === "Q") {
+        this.close();
+        return;
+      }
+      if (
+        matchesKey(data, Key.escape) ||
+        matchesKey(data, Key.enter) ||
+        ch === "?"
+      ) {
+        this.showHelp = false;
+        this.tui.requestRender();
+      }
+      return;
+    }
+
     if (
       matchesKey(data, Key.escape) ||
       matchesKey(data, Key.ctrl("c")) ||
@@ -1004,6 +1157,22 @@ class SwarmOverlayComponent implements Component, Focusable {
       ch === "Q"
     ) {
       this.close();
+      return;
+    }
+
+    if (ch === "?") {
+      this.showHelp = true;
+      this.tui.requestRender();
+      return;
+    }
+
+    if (ch === "M" && (this.options?.onApplyRoleModel || this.options?.getModelSettingsState)) {
+      this.openMissionModelsPicker();
+      return;
+    }
+
+    if (ch === "P") {
+      void this.runTogglePauseResume();
       return;
     }
 
@@ -1111,7 +1280,7 @@ class SwarmOverlayComponent implements Component, Focusable {
       return;
     }
 
-    if (ch === "p" || ch === "P") {
+    if (ch === "p") {
       const targetChannel =
         this.channelFilter === "*" ? DEFAULT_CHANNEL : this.channelFilter;
       this.enterInlineMode(
@@ -1187,7 +1356,15 @@ class SwarmOverlayComponent implements Component, Focusable {
       return;
     }
 
-    if (ch === "m" || ch === "M") {
+    if (ch === "m") {
+      if ((this.options?.availableModels?.length ?? 0) > 0) {
+        if (selected.state === "killed") {
+          this.setFeedback("warning", `Cannot switch model on killed member ${selected.name}.`);
+          return;
+        }
+        this.openMemberModelPicker(selected);
+        return;
+      }
       if (selected.state !== "waiting" && selected.state !== "stopped") {
         this.setFeedback(
           "warning",
@@ -1198,7 +1375,7 @@ class SwarmOverlayComponent implements Component, Focusable {
       this.enterInlineMode(
         { kind: "model", member: selected },
         "› ",
-        `New model for ${selected.name} (e.g. openai/gpt-5.4 high)…`,
+        `New model for ${selected.name} (e.g. openai/gpt-5.4:high)…`,
       );
       this.tui.requestRender();
       return;
@@ -1990,18 +2167,17 @@ class SwarmOverlayComponent implements Component, Focusable {
       );
     }
     let text: string;
+    const globalSuffix = " · [M] models · [P] pause · [?] help · [Esc/q] close";
     if (this.activeTab === "board") {
-      text =
-        "[Enter] read · [p] post · [c] channel · [↑↓] scroll · [1-4/Tab] tabs · [Esc/q] close";
+      text = `[Enter] read · [p] post · [c] channel · [1-4/Tab] tabs${globalSuffix}`;
     } else if (this.activeTab === "members") {
-      text =
-        "[w] steer · [m] model · [x] stop · [k] kill · [g] merge · [l] logs · [d] diff · [Esc/q] close";
+      text = `[w] steer · [m] model · [x] stop · [k] kill · [g] merge · [l] logs · [d] diff${globalSuffix}`;
     } else if (this.activeTab === "graph") {
-      text = "[↑↓] scroll · [1-4/Tab] tabs · [Esc/q] close";
+      text = `[↑↓] scroll · [1-4/Tab] tabs${globalSuffix}`;
     } else {
       text = this.searchFocused
         ? "Type to search · [↑↓] select · [Tab] switch tab · [Esc] finish typing"
-        : "[/] search · [Enter] read · [↑↓] select · [1-4/Tab] tabs · [Esc/q] close";
+        : `[/] search · [Enter] read · [↑↓] select · [1-4/Tab] tabs${globalSuffix}`;
     }
     return fitLine(this.theme.fg("dim", text), innerWidth);
   }
@@ -2011,11 +2187,37 @@ class SwarmOverlayComponent implements Component, Focusable {
   // ==========================================================================
 
   render(width: number): string[] {
+    if (this.subComponent) {
+      return this.subComponent.render(width);
+    }
+
     const targetWidth = Math.max(1, Math.floor(width));
     const innerWidth = computeInnerWidth(targetWidth);
     const termRows = this.tui.terminal?.rows ?? 30;
     const maxTotalLines = Math.max(14, Math.min(34, Math.floor(termRows * 0.85)));
     const maxInnerLines = Math.max(10, maxTotalLines - 2);
+
+    if (this.showHelp) {
+      const helpBody = [
+        fitLine(this.theme.fg("accent", this.theme.bold("Global Shortcuts")), innerWidth),
+        fitLine("  1-4 / Tab / Shift+Tab   Switch Board, Members, Graph, Search tabs", innerWidth),
+        fitLine("  M (Shift+M)             Configure 3-Role Mission Models & Effort", innerWidth),
+        fitLine("  P (Shift+P)             Pause or Resume active Swarm run", innerWidth),
+        fitLine("  ?                       Toggle this shortcuts help view", innerWidth),
+        fitLine("  Esc / q                 Close Mission Control overlay", innerWidth),
+        renderHorizontalRule(innerWidth, undefined, this.theme),
+        fitLine(this.theme.fg("accent", this.theme.bold("Members Tab [2]")), innerWidth),
+        fitLine("  m                       Switch selected member model (keeps history)", innerWidth),
+        fitLine("  w / x / k / g           Steer / Stop / Kill / Merge worktree", innerWidth),
+        fitLine("  l / d                   Toggle full Logs or Git Diff view", innerWidth),
+        renderHorizontalRule(innerWidth, undefined, this.theme),
+        fitLine(this.theme.fg("dim", "Press Esc, Enter or ? to return"), innerWidth),
+      ];
+      return renderBox(helpBody.slice(0, maxInnerLines), targetWidth, {
+        title: this.theme.fg("accent", this.theme.bold("🐝 Mission Control Shortcuts")),
+        borderColor: (s) => this.theme.fg("borderAccent", s),
+      });
+    }
 
     const run = this.snapshot.run;
     if (!run) {

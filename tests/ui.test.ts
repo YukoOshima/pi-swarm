@@ -33,6 +33,9 @@ import type {
   SwitchModelOptions,
 } from "../src/types.js";
 import {
+  SwarmHubView,
+  SwarmModelPickerView,
+  type ModelPickerSettingsState,
   bindSwarmShortcuts,
   buildInitialMembersSummaryLines,
   buildSwarmGraphLines,
@@ -2489,5 +2492,447 @@ describe("v0.3.7 UI enhancements", () => {
 
     await openSwarmOverlay(ctx, engine, worktree);
     assert.deepEqual(killed, [{ name: "worker-1", force: true }]);
+  });
+});
+
+describe("v0.4.0 Droid Mission Model Picker, Hub & Overlay Upgrades", () => {
+  const sampleModels = [
+    {
+      id: "claude-fable-5-2",
+      provider: "magpie/bp",
+      fullId: "magpie/bp/claude-fable-5-2",
+      name: "Claude Fable 5.2",
+      contextWindow: 1_000_000,
+    },
+    {
+      id: "gemini-4-neon",
+      provider: "magpie/auto",
+      fullId: "magpie/auto/gemini-4-neon",
+      name: "Gemini 4 Neon",
+      contextWindow: 1_000_000,
+    },
+    {
+      id: "gpt-6.2-astra",
+      provider: "magpie/bp",
+      fullId: "magpie/bp/gpt-6.2-astra",
+      name: "GPT-6.2 Astra",
+      contextWindow: 400_000,
+    },
+    {
+      id: "claude-opus-5-5",
+      provider: "magpie/bp",
+      fullId: "magpie/bp/claude-opus-5-5",
+      name: "Claude Opus 5.5",
+      contextWindow: 200_000,
+    },
+  ];
+
+  it("SwarmModelPickerView supports Role Tabs, Search, 2-step Effort Selection, Fallbacks Reorder, Ctrl+S Scope, and strict 40/60/80/120 & 16-row bounds", async () => {
+    const theme = createMockTheme();
+    const { tui } = createMockTUI(16, 80);
+    let state: ModelPickerSettingsState = {
+      settings: {
+        ...DEFAULT_SWARM_SETTINGS,
+        orchestratorModel: "magpie/bp/claude-fable-5-2",
+        orchestratorThinkingLevel: "high",
+        workerModel: "magpie/auto/gemini-4-neon",
+        workerThinkingLevel: "high",
+        validatorModel: "magpie/bp/claude-opus-5-5",
+        validatorThinkingLevel: "xhigh",
+        fallbackModels: ["magpie/bp/claude-opus-5-5", "magpie/auto/gemini-4-neon"],
+      },
+      origins: { orchestrator: "global", worker: "global", validator: "global" },
+      hostModel: "magpie/bp/claude-fable-5-2",
+    };
+
+    const appliedRoles: Array<{
+      scope: string;
+      role: string;
+      model?: string;
+      thinkingLevel?: string;
+    }> = [];
+    const appliedFallbacks: Array<{
+      scope: string;
+      fallbackModels: string[];
+    }> = [];
+    let closedResult: unknown;
+
+    const picker = new SwarmModelPickerView(tui, theme, {
+      mode: "roles",
+      initialTab: "orchestrator",
+      initialScope: "global",
+      state,
+      availableModels: sampleModels,
+      onApplyRole: async (sel) => {
+        appliedRoles.push(sel);
+        const nextSettings = { ...state.settings };
+        if (sel.role === "validator") {
+          nextSettings.validatorModel = sel.model;
+          nextSettings.validatorThinkingLevel = sel.thinkingLevel;
+        } else if (sel.role === "worker") {
+          nextSettings.workerModel = sel.model;
+          nextSettings.workerThinkingLevel = sel.thinkingLevel;
+        }
+        state = {
+          ...state,
+          settings: nextSettings,
+          origins: { ...state.origins, [sel.role]: sel.model ? sel.scope : "host" },
+        };
+        return { ...state, notice: `Updated ${sel.role}` };
+      },
+      onApplyFallbacks: async (sel) => {
+        appliedFallbacks.push(sel);
+        state = {
+          ...state,
+          settings: { ...state.settings, fallbackModels: sel.fallbackModels },
+        };
+        return { ...state, notice: "Updated fallbacks" };
+      },
+      onClose: (res) => {
+        closedResult = res;
+      },
+    });
+
+    for (const w of [40, 60, 80, 120]) {
+      const lines = picker.render(w);
+      assertAllLinesFit(lines, w, `picker-list@${w}`);
+      assert.ok(lines.length <= 16, `16-row terminal bound exceeded at width ${w}: ${lines.length}`);
+    }
+
+    // Tab -> Worker -> Validator, Ctrl+S -> Project Scope
+    picker.handleInput("\t");
+    picker.handleInput("\t");
+    picker.handleInput("\x13"); // Ctrl+S
+    const validatorView = stripTerminalSequences(picker.render(90).join("\n"));
+    assert.match(validatorView, /Scope: Project/);
+
+    // Filter for "astra" -> Enter -> Effort Step -> select High -> Enter
+    for (const ch of "astra") {
+      picker.handleInput(ch);
+    }
+    picker.handleInput("\r"); // opens Step 2: Select Reasoning Effort
+    const effortLines = picker.render(80);
+    assertAllLinesFit(effortLines, 80, "picker-effort@80");
+    assert.ok(effortLines.length <= 16, `Effort step exceeded 16 rows: ${effortLines.length}`);
+    const effortPlain = stripTerminalSequences(effortLines.join("\n"));
+    assert.match(effortPlain, /Select Reasoning Effort — magpie\/bp\/gpt-6\.2-astra/);
+
+    picker.handleInput("6"); // explicitly pick '6' for High ★
+    picker.handleInput("\r");
+    // Wait: let's flush async & verify
+    await new Promise((r) => setTimeout(r, 15));
+    assert.equal(appliedRoles.length, 1);
+    assert.equal(appliedRoles[0]!.role, "validator");
+    assert.equal(appliedRoles[0]!.scope, "project");
+    assert.equal(appliedRoles[0]!.model, "magpie/bp/gpt-6.2-astra");
+    assert.equal(appliedRoles[0]!.thinkingLevel, "high");
+
+    // Ctrl+X clears role back to host Inherit
+    picker.handleInput("\x18");
+    await new Promise((r) => setTimeout(r, 15));
+    assert.equal(appliedRoles.length, 2);
+    assert.equal(appliedRoles[1]!.model, undefined);
+
+    // Tab -> Fallbacks tab: toggle & reorder `[` / `]`
+    picker.handleInput("\t");
+    picker.handleInput(" "); // toggles highlighted fallback (claude-fable-5-2) ON at #3
+    await new Promise((r) => setTimeout(r, 15));
+    assert.equal(appliedFallbacks.length, 1);
+    assert.deepEqual(appliedFallbacks[0]!.fallbackModels, [
+      "magpie/bp/claude-opus-5-5",
+      "magpie/auto/gemini-4-neon",
+      "magpie/bp/claude-fable-5-2",
+    ]);
+
+    picker.handleInput("["); // move #3 -> #2
+    await new Promise((r) => setTimeout(r, 15));
+    assert.deepEqual(appliedFallbacks[1]!.fallbackModels, [
+      "magpie/bp/claude-opus-5-5",
+      "magpie/bp/claude-fable-5-2",
+      "magpie/auto/gemini-4-neon",
+    ]);
+
+    picker.handleInput("\x1b"); // Esc closes picker
+    assert.ok((closedResult as { changed?: boolean })?.changed);
+  });
+
+  it("SwarmHubView composes Mission Models card, inline Ctrl+M picker, Goal input, and Launch", async () => {
+    const theme = createMockTheme();
+    const { tui } = createMockTUI(28, 90);
+    const snap = makeSampleSnapshot({ empty: true });
+    let completed: unknown;
+
+    const hub = new SwarmHubView(tui, theme, {
+      state: {
+        settings: {
+          ...DEFAULT_SWARM_SETTINGS,
+          orchestratorModel: "magpie/bp/claude-fable-5-2",
+          orchestratorThinkingLevel: "high",
+          workerModel: "magpie/auto/gemini-4-neon",
+          workerThinkingLevel: "high",
+          validatorModel: "magpie/bp/gpt-6.2-astra",
+          validatorThinkingLevel: "high",
+        },
+        origins: { orchestrator: "global", worker: "global", validator: "global" },
+      },
+      snapshot: snap,
+      runs: [],
+      availableModels: sampleModels,
+      onComplete: (act) => {
+        completed = act;
+      },
+    });
+
+    for (const w of [40, 80, 120]) {
+      assertAllLinesFit(hub.render(w), w, `hub@${w}`);
+    }
+
+    // Type goal text, open Ctrl+M picker inline & Esc back, then select Direct Swarm
+    for (const ch of "Ship Hub UI") {
+      hub.handleInput(ch);
+    }
+    hub.handleInput("\x1b[109;5u"); // CSI-u Ctrl+M opens inline Model Picker
+    assert.match(stripTerminalSequences(hub.render(90).join("\n")), /Swarm Mission Models/);
+    hub.handleInput("\x1b"); // Esc returns to Hub
+    assert.match(stripTerminalSequences(hub.render(90).join("\n")), /Pi Swarm Mission Hub/);
+
+    hub.handleInput("\x1b[B"); // Down -> Start Direct Swarm
+    hub.handleInput("\r"); // Enter launches direct
+    assert.deepEqual(completed, { kind: "direct", goal: "Ship Hub UI" });
+  });
+
+  it("ConfirmProposalComponent [m] model picker + [c] comment, SwarmOverlay [M]/[m]/[P]/[?], and bindSwarmShortcuts Ctrl+Shift+M/S", async () => {
+    const theme = createMockTheme();
+    const { tui } = createMockTUI(30, 100);
+    const ui = createQuestionnaireUI();
+    const plan: ProposedSwarmPlan = {
+      title: "v0.4.0 Proposal",
+      objective: "Verify [m] and [c] inside proposal modal",
+      strategy: "Parallel slices",
+      acceptanceCriteria: "Tests green",
+      baseBranch: "main",
+      maxConcurrency: 4,
+      validatorEnabled: true,
+      roleModels: {
+        orchestrator: { model: "magpie/bp/claude-fable-5-2", thinkingLevel: "high" },
+        worker: { model: "magpie/auto/gemini-4-neon", thinkingLevel: "high" },
+        validator: { model: "magpie/bp/gpt-6.2-astra", thinkingLevel: "high" },
+      },
+    };
+
+    const updatedRoleModels: SwarmRoleModels = {
+      ...plan.roleModels,
+      validator: { model: "magpie/bp/gpt-6.2-astra", thinkingLevel: "medium" },
+    };
+
+    const propCtx = {
+      mode: "tui",
+      hasUI: true,
+      ui: {
+        theme,
+        notify() {},
+        async custom<T>(
+          factory: (
+            t: TUI,
+            th: Theme,
+            kb: unknown,
+            done: (r: T) => void,
+          ) => Component & { dispose?(): void },
+        ): Promise<T> {
+          return new Promise<T>((resolve) => {
+            const comp = factory(tui, theme, {}, resolve);
+            const initialPlain = stripTerminalSequences(comp.render(100).join("\n"));
+            assert.match(initialPlain, /claude-fable-5-2\(high\)/);
+            assert.match(initialPlain, /\[m\] models/);
+            assert.match(initialPlain, /\[c\] comment/);
+
+            comp.handleInput?.("m");
+            assert.match(stripTerminalSequences(comp.render(100).join("\n")), /Inline Picker Mock/);
+            comp.handleInput?.("\x1b"); // closes inline mock picker and applies updatedRoleModels
+
+            comp.handleInput?.("c");
+            for (const ch of "Focus on edge cases") {
+              comp.handleInput?.(ch);
+            }
+            comp.handleInput?.("\r"); // save comment
+            comp.handleInput?.("\r"); // confirm proposal
+          });
+        },
+      },
+    } as unknown as ExtensionContext;
+
+    const outcome = await ui.confirmProposal(propCtx, plan, {
+      onOpenModelPicker: (_t, _th, _init, onDone) => ({
+        render: () => ["Inline Picker Mock"],
+        invalidate: () => {},
+        handleInput: (d: string) => {
+          if (d === "\x1b") onDone(updatedRoleModels);
+        },
+      }),
+    });
+    assert.equal(outcome.action, "confirm");
+    assert.equal(outcome.feedback, "Focus on edge cases");
+    assert.deepEqual(outcome.roleModels, updatedRoleModels);
+
+    // SwarmOverlay [?], [P] pause, [M] Mission Models, and [m] working member picker
+    const snap = makeSampleSnapshot();
+    const pausedCalls: Array<{ runId?: string; reason?: string }> = [];
+    const switched: SwitchModelOptions[] = [];
+    const overlayEngine: ISwarmEngine = {
+      startRun: async () => snap.run!,
+      attachRun: async () => snap,
+      setTitle: async () => snap.run!,
+      updateDirection: async () => snap.run!,
+      addMembers: async () => [],
+      postMessage: async () => ({
+        seq: 1,
+        runId: snap.run!.id,
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        channel: "main",
+        kind: "chat",
+        text: "ok",
+        mentions: [],
+        channelMentions: [],
+        timestamp: new Date().toISOString(),
+      }),
+      readBoard: async () => ({ messages: snap.recentBoard, head: snap.boardHead }),
+      waitForBoard: async () => ({ wokeBy: "timeout", messages: [], head: 0, summary: "" }),
+      parkOrchestratorWait: async () => ({
+        parked: false,
+        messages: [],
+        head: 0,
+        activeMembers: [],
+        summary: "",
+      }),
+      clearOrchestratorWait: () => {},
+      steerMember: async () => ({ delivery: "steered" }),
+      switchModel: async (opts) => {
+        switched.push(opts);
+        return {
+          targetName: opts.targetName ?? "worker-1",
+          model: opts.model ?? "",
+          thinkingLevel: opts.thinkingLevel,
+          deferred: true,
+        };
+      },
+      stopMember: async () => {},
+      killMember: async () => {},
+      mergeMember: async () => null,
+      manageChannel: async () => ({
+        action: "create",
+        name: "main",
+        topic: "",
+        createdBy: ORCHESTRATOR_NAME,
+        createdAt: new Date().toISOString(),
+        subscribers: [],
+        archived: false,
+        summary: "ok",
+      }),
+      completeRun: async () => snap.run!,
+      pause: async (runId, reason) => {
+        pausedCalls.push({ runId, reason });
+        return { ...snap.run!, status: "paused" };
+      },
+      resume: async () => snap.run!,
+      teardown: async () => ({ removed: [], skipped: [], errors: [] }),
+      listModels: async () => sampleModels,
+      getSnapshot: () => snap,
+      subscribe: () => () => {},
+      dispose: async () => {},
+    };
+
+    const overlayCtx = {
+      mode: "tui",
+      hasUI: true,
+      ui: {
+        theme,
+        notify() {},
+        async custom<T>(
+          factory: (
+            t: TUI,
+            th: Theme,
+            kb: unknown,
+            done: (r: T) => void,
+          ) => Component & { dispose?(): void },
+        ): Promise<T> {
+          return new Promise<T>((resolve) => {
+            const comp = factory(tui, theme, {}, resolve);
+            if (isFocusable(comp)) comp.focused = true;
+            void (async () => {
+              await new Promise((r) => setTimeout(r, 10));
+              comp.handleInput?.("?");
+              assert.match(stripTerminalSequences(comp.render(100).join("\n")), /Mission Control Shortcuts/);
+              comp.handleInput?.("\x1b");
+
+              comp.handleInput?.("P");
+              await new Promise((r) => setTimeout(r, 10));
+              assert.equal(pausedCalls.length, 1);
+
+              comp.handleInput?.("M");
+              assert.match(stripTerminalSequences(comp.render(100).join("\n")), /Swarm Mission Models/);
+              comp.handleInput?.("\x1b");
+
+              // Tab 2 [Members] -> m opens interactive member picker even on working worker-1
+              comp.handleInput?.("2");
+              comp.handleInput?.("m");
+              assert.match(stripTerminalSequences(comp.render(100).join("\n")), /Switch Model — @worker-1/);
+              comp.handleInput?.("\r"); // select model -> step 2 effort
+              comp.handleInput?.("\r"); // apply with deferIfWorking: true
+              await new Promise((r) => setTimeout(r, 15));
+              assert.equal(switched.length, 1);
+              assert.equal(switched[0]!.deferIfWorking, true);
+
+              comp.handleInput?.("q");
+            })();
+          });
+        },
+      },
+    } as unknown as ExtensionContext;
+
+    await openSwarmOverlay(overlayCtx, overlayEngine, undefined, {
+      availableModels: sampleModels,
+      onApplyRoleModel: async () => ({ settings: DEFAULT_SWARM_SETTINGS }),
+    });
+
+    // Global shortcuts Ctrl+Shift+M and Ctrl+Shift+S
+    const listeners = new Set<(data: string) => unknown>();
+    let modal = false;
+    let modelOpened = 0;
+    let mcOpened = 0;
+    const unbind = bindSwarmShortcuts(
+      {
+        mode: "tui",
+        ui: {
+          onTerminalInput: (fn: (d: string) => unknown) => {
+            listeners.add(fn);
+            return () => listeners.delete(fn);
+          },
+        },
+      } as unknown as ExtensionContext,
+      {
+        isModalOpen: () => modal,
+        isExpanded: () => false,
+        onToggleExpand: () => {},
+        onCollapse: () => {},
+        onOpenModelPicker: () => {
+          modelOpened += 1;
+        },
+        onOpenMissionControl: () => {
+          mcOpened += 1;
+        },
+      },
+    );
+    const dispatch = (seq: string) => {
+      for (const l of listeners) l(seq);
+    };
+    dispatch("\x1b[77;6u"); // Ctrl+Shift+M
+    dispatch("\x1b[83;6u"); // Ctrl+Shift+S
+    assert.equal(modelOpened, 1);
+    assert.equal(mcOpened, 1);
+    modal = true;
+    dispatch("\x1b[77;6u");
+    assert.equal(modelOpened, 1, "Shortcuts must be ignored when modal is open");
+    unbind();
   });
 });

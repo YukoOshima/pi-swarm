@@ -39,6 +39,8 @@ import {
   type ParkOrchestratorWaitResult,
   type PersistentAgentHandle,
   type PostBoardMessageInput,
+  type PropagateRoleModelOptions,
+  type PropagateRoleModelResult,
   type ReadBoardOptions,
   type ReadBoardResult,
   type SafeTeardownResult,
@@ -313,13 +315,14 @@ interface LiveMember {
   currentActivity?: string;
   /** Latest swarm_wait request captured during current turn. */
   lastWaitRequest?: { since: number; mentionsOnly: boolean };
-  /** Pending deferred self model switch scheduled by the member while working. */
+  /** Pending deferred model switch scheduled while working (self-switch or human role propagation). */
   pendingSelfModelSwitch?: {
     model: string;
     thinkingLevel?: ThinkingLevel;
     reason?: string;
     callerName: string;
     callerRole: CallerRole;
+    autoResume?: boolean;
   };
   /** AbortController for cancelling in-flight concurrency/backoff waits on stop/kill/dispose. */
   launchAbort?: AbortController;
@@ -1874,18 +1877,25 @@ export class SwarmEngine implements ISwarmEngine {
     }
     const live = this.liveMembers.get(member.name);
     const liveState = live?.handle?.getState() ?? member.state;
+    const isMemberWorking =
+      member.state === "working" ||
+      liveState === "working" ||
+      Boolean(live?.turnActive) ||
+      Boolean(live?.spawning) ||
+      Boolean(live?.waking);
     const isWorkingSelfSwitch =
       (callerRole === "worker" || callerRole === "validator") &&
       member.name === callerName &&
-      (member.state === "working" ||
-        liveState === "working" ||
-        Boolean(live?.turnActive) ||
-        Boolean(live?.spawning) ||
-        Boolean(live?.waking));
+      isMemberWorking;
+    const isDeferredHumanSwitch =
+      options.deferIfWorking === true &&
+      isOrchestratorOrHuman(callerRole) &&
+      isMemberWorking;
 
-    // Deferred Self Model Switch (Defect #3): when a worker/validator calls `swarm{action:"model"}`
-    // on itself while running, validate the target model now, schedule switch + immediate resume for turn end.
-    if (isWorkingSelfSwitch && live) {
+    // Deferred Model Switch: when a worker/validator switches itself while running,
+    // or a human role-model update queues a turn-end switch via `deferIfWorking: true`,
+    // validate the target model now and schedule the switch for turn end.
+    if ((isWorkingSelfSwitch || isDeferredHumanSwitch) && live) {
       let validatedModel = modelOverride;
       let validatedThinking = options.thinkingLevel;
       if (this.transport.resolveModel) {
@@ -1903,6 +1913,7 @@ export class SwarmEngine implements ISwarmEngine {
         reason: options.reason,
         callerName,
         callerRole,
+        autoResume: options.autoResume ?? true,
       };
       return {
         targetName: member.name,
@@ -2121,6 +2132,117 @@ export class SwarmEngine implements ISwarmEngine {
         }
       }
     }
+  }
+
+  /**
+   * Droid `missionSettings`-style role propagation:
+   * - Updates `run.roleModels` for the focused run.
+   * - When setting a concrete model for `worker` or `validator` on an active/paused run,
+   *   switches existing non-killed members that track the role default (silent on waiting/stopped,
+   *   deferred until turn end on working). When cleared to Inherit (`model` empty), applies only to new agents.
+   */
+  async propagateRoleModel(
+    options: PropagateRoleModelOptions,
+  ): Promise<PropagateRoleModelResult> {
+    if (options.hostContext) {
+      this.hostContext = options.hostContext;
+    }
+    const run = this.cachedRun;
+    const trimmedModel = options.model?.trim() || undefined;
+    const prevModels = new Set<string>();
+    if (options.previousModel?.trim()) {
+      prevModels.add(options.previousModel.trim());
+    }
+    const runPrevModel = run?.roleModels?.[options.role]?.model?.trim();
+    if (runPrevModel) {
+      prevModels.add(runPrevModel);
+    }
+
+    if (!run || this.activeRunId !== run.id) {
+      return {
+        roleModels: {
+          [options.role]: {
+            ...(trimmedModel ? { model: trimmedModel } : {}),
+            ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
+          },
+        },
+        switched: [],
+        deferred: [],
+      };
+    }
+
+    const nextRoleModels: SwarmRoleModels = {
+      ...run.roleModels,
+      [options.role]: {
+        ...(trimmedModel ? { model: trimmedModel } : {}),
+        ...(options.thinkingLevel ? { thinkingLevel: options.thinkingLevel } : {}),
+      },
+    };
+    const updatedRun = await this.store.updateRun(run.id, {
+      roleModels: nextRoleModels,
+      actor: ORCHESTRATOR_NAME,
+    });
+    await this.refreshCache(updatedRun);
+    this.emitEngineEvent(
+      "snapshot_changed",
+      `Updated ${options.role} role model configuration.`,
+    );
+
+    const switched: string[] = [];
+    const deferred: string[] = [];
+
+    if (!trimmedModel || (updatedRun.status !== "active" && updatedRun.status !== "paused")) {
+      return {
+        roleModels: updatedRun.roleModels,
+        switched,
+        deferred,
+      };
+    }
+
+    for (const member of Object.values(updatedRun.members)) {
+      if (member.state === "killed" || member.role !== options.role) {
+        continue;
+      }
+      const tracksDefault =
+        !member.model ||
+        prevModels.has(member.model) ||
+        member.model === trimmedModel;
+      if (!tracksDefault) {
+        continue;
+      }
+      if (
+        member.model === trimmedModel &&
+        member.thinkingLevel === options.thinkingLevel
+      ) {
+        continue;
+      }
+      try {
+        const res = await this.switchModel({
+          targetName: member.name,
+          model: trimmedModel,
+          thinkingLevel: options.thinkingLevel,
+          callerName: "human",
+          callerRole: "human",
+          autoResume: false,
+          deferIfWorking: true,
+          reason: `${options.role} role updated`,
+          hostContext: options.hostContext,
+        });
+        if (res.deferred) {
+          deferred.push(member.name);
+        } else {
+          switched.push(member.name);
+        }
+      } catch {
+        // Best-effort per member; explicit per-member overrides can still be adjusted individually
+      }
+    }
+
+    return {
+      roleModels: this.cachedRun?.roleModels ?? updatedRun.roleModels,
+      switched,
+      deferred,
+    };
   }
 
   async steerMember(
@@ -3771,14 +3893,18 @@ export class SwarmEngine implements ISwarmEngine {
             this.maybeArmStallWatchdog();
             return;
           }
-          live.waking = true;
           live.switchingModel = false;
-          this.cancelStallWatchdog();
-          void this.cancelActiveMonitor("Swarm activity resumed");
-          const reasonNote = pendingSwitch.reason ? ` (${pendingSwitch.reason})` : "";
-          const resumeMsg = `Self model hot-switch to "${switched.model}"${switched.thinkingLevel ? ` (${switched.thinkingLevel})` : ""} completed${reasonNote} with full conversation history preserved. Continue your work immediately.`;
-          void this.drainMemberPendingWakes(runId, memberName, resumeMsg);
-          return;
+          if (pendingSwitch.autoResume !== false) {
+            live.waking = true;
+            this.cancelStallWatchdog();
+            void this.cancelActiveMonitor("Swarm activity resumed");
+            const reasonNote = pendingSwitch.reason ? ` (${pendingSwitch.reason})` : "";
+            const resumeMsg = `Self model hot-switch to "${switched.model}"${switched.thinkingLevel ? ` (${switched.thinkingLevel})` : ""} completed${reasonNote} with full conversation history preserved. Continue your work immediately.`;
+            void this.drainMemberPendingWakes(runId, memberName, resumeMsg);
+            return;
+          }
+          // When autoResume is false (e.g. human role-level propagation), fall through
+          // to drain any queued wakes on the new model or park cleanly in waiting.
         } catch (err) {
           live.switchingModel = false;
           const switchErr = err instanceof Error ? err.message : String(err);

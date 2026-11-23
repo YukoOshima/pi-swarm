@@ -17,15 +17,20 @@ export {
 
 export {
   SWARM_SETTINGS_BOUNDS,
+  VALID_THINKING_LEVELS,
+  deleteProjectSettingsKeys,
   getDefaultGlobalAgentDir,
   getGlobalSettingsPath,
   getProjectSettingsPath,
+  getRoleModelOrigin,
   loadLayeredSwarmSettings,
   loadSwarmSettings,
+  parseModelSpec,
   sanitizeSettingsPatch,
   sanitizeSwarmSettings,
   saveSwarmSettings,
   type LayeredSettingsResult,
+  type RoleModelOrigin,
   type SaveSwarmSettingsOptions,
   type SettingsPathOptions,
 } from "./settings.js";

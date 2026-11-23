@@ -1,9 +1,9 @@
-# 🐝 pi-swarm (`v0.3.7`)
+# 🐝 pi-swarm (`v0.4.0`)
 
 **`pi-swarm`** is a **Dynamic Antigravity Swarm** multi-agent orchestration extension for [Pi](https://github.com/earendil-works/pi) (`v1.5.2+`).
 面向 [Pi](https://github.com/earendil-works/pi) (`v1.5.2+`) 的**动态蜂群（Dynamic Antigravity Swarm）多 Agent 协作与编排扩展**。
 
-Instead of locking work into a rigid upfront DAG, `pi-swarm` v0.3.7 pairs **`pi-goal-x`-style upfront clarification** with **Antigravity-Swarm-grade dynamic orchestration**: non-blocking turn-ending `swarm_wait`, instant mid-flight user redirection (`swarm{action:"steer"|"stop"|"title"}`), interactive plan revision (`/swarm tweak`), disk-persisted member sessions (`SessionManager.create`/`open`), hot model switching with auto-resume (including self-switch deferral), Smart LLM Monitor (`@monitor`), true isolated `git clone` for `workspace:"branch"`, and 3-role model routing.
+Instead of locking work into a rigid upfront DAG, `pi-swarm` v0.4.0 pairs **`pi-goal-x`-style upfront clarification** and **Droid Mission-style interactive 3-role Model & Reasoning Effort configuration** with **Antigravity-Swarm-grade dynamic orchestration**: unified Mission Hub (`/swarm`), searchable provider-grouped Model Picker (`/swarm models`, `Ctrl+Shift+M`), automatic live role propagation (`Running agents switch on their next turn; Inherit applies only to new agents`), non-blocking `swarm_wait`, disk-persisted member sessions (`SessionManager.create`/`open`), hot model switching, Smart LLM Monitor (`@monitor`), and true isolated `git clone` for `workspace:"branch"`.
 
 ---
 
@@ -117,22 +117,34 @@ Merged in order: **`DEFAULT_SWARM_SETTINGS` ← Global (`~/.pi/agent/pi-swarm-se
 }
 ```
 
-### 2) Live Control & Hot-Switching (`/swarm model`)
+### 2) Droid Mission-Style Model Picker & Live Control (`/swarm models`, `/swarm model`)
+
+- **Interactive Model & Reasoning Effort Picker (`/swarm models` or `Ctrl+Shift+M`)**:
+  - **4 Tabs (`Tab` / `Shift+Tab`)**: **`[Orchestrator]`** · **`[Worker]`** · **`[Validator]`** · **`[Fallbacks]`**
+  - **2-Step Selection**: Search provider-grouped models → press `Enter` → select Reasoning Effort (`Default` | `Off` | `Minimal` | `Low` | `Medium` | `High ★` | `Extra high (xhigh)` | `Max`).
+  - **Quick Shortcuts**: `Ctrl+S` toggles Save Scope (`Global ~/.pi/agent` vs `Project .pi/`, automatically unmasking stale project overrides when saving to Global) · `Ctrl+E` cycles effort inline · `Ctrl+X` resets role to `Inherit Host Session Model` · `Space` / `[` / `]` toggles and reorders `fallbackModels`.
+- **Live Propagation (`Running agents switch at their next turn; Inherit applies only to new agents`)**:
+  - Changing `worker` or `validator` updates `run.roleModels`, silently updates parked `waiting` / `stopped` members tracking the role default, and queues a turn-end switch for `working` members without disturbing explicit per-member overrides.
 
 ```text
-# Inspect 3-role defaults, fallbackModels & live member models (zero LLM turn)
+# Open Interactive Mission Model Picker (or jump directly to a role tab / @member)
 /swarm models
+/swarm models validator
 
-# Persist role defaults to project .pi/pi-swarm-settings.json
+# Print zero-turn Markdown overview instead of opening the TUI picker
+/swarm models --print
+
+# One-line CLI with Pi/Droid `:thinking` shorthand (global or project scope)
+/swarm model validator magpie/bp/gpt-6.2-astra:high --global
+/swarm models worker magpie/auto/gemini-4-neon:high
 /swarm model orchestrator anthropic/claude-opus-4-6 high
-/swarm model worker anthropic/claude-sonnet-4-5 medium
-/swarm model validator openai/gpt-5.2 high
 
 # Clear a role override back to host default (writes null in project layer to clear global override)
 /swarm model worker default
 
-# Hot-switch a `waiting` or `stopped` member while keeping 100% of its conversation history!
-/swarm model author google/gemini-2.5-pro high
+# Hot-switch a specific live member (`@name` disambiguates members named `validator` / `worker`)
+/swarm model @validator magpie/bp/gpt-6.2-astra:high
+/swarm model author google/gemini-2.5-pro:high
 ```
 
 On provider HTTP 429 / quota exhaustion, `SwarmEngine` also automatically tries the next untried model in `fallbackModels` on warm `waiting` members before falling back to shared exponential backoff (`RateLimitBreaker`).
@@ -173,15 +185,15 @@ Only **`/swarm`** and **`/swarm-direct`** are registered on Pi.
 | Command (`命令`) | Description (`说明`) | LLM Turn? |
 | --- | --- | :---: |
 | `/swarm <goal>` | Interactive `pi-goal-x` drafting (`orchestratorModel` → Q&A → plan confirm → Dynamic Swarm) | Yes |
-| `/swarm` (bare) | No focused run: start drafting. Focused run: open 0-turn action menu (UI / Status / Board / Graph / Models / Pause-Resume / Done / New / Focus / Settings / Teardown) | No (with run) |
+| `/swarm` (bare) | Open **Swarm Mission Hub** in TUI (Goal composer, Mission Models card, `Ctrl+M` inline picker, previous runs & quick actions) | No (until launched) |
 | `/swarm direct <goal>` <br> `/swarm-direct <goal>` | Fast-path: skip Q&A (`autoConfirm: true`), propose plan and launch Dynamic Swarm immediately | Yes |
 | `/swarm tweak [guidance]` | Revise the focused active/paused Swarm plan, strategy, or spawn additional members interactively | Yes |
 | `/swarm status` | Zero-turn dashboard: 3-role models, channels, roster table, recent board & events | **No** |
 | `/swarm board [limit] [--channel <ch>] [--search <q>]` | Zero-turn shared `#seq` Message Board feed with optional channel & substring filters | **No** |
 | `/swarm graph` | Zero-turn ASCII/Unicode Spawn Tree & Peer `@mention` / `#channel` Interaction Graph | **No** |
-| `/swarm tasks [tab\|member\|#ch]` <br> `/swarm ui [tab\|member\|#ch]` | Open the live 4-tab Swarm Overlay (**Board** / **Members** / **Graph** / **Search**) | **No** |
-| `/swarm models` | Zero-turn overview of 3-role defaults, `fallbackModels`, and every live member's model | **No** |
-| `/swarm model <target> <model\|default> [thinking]` | Set role default (`orchestrator`/`worker`/`validator`) OR hot-switch & resume a `waiting` / `stopped` member | **No** |
+| `/swarm tasks [tab\|member\|#ch]` <br> `/swarm ui [tab\|member\|#ch]` | Open the live 4-tab Mission Control Overlay (**Board** / **Members** / **Graph** / **Search**; `[M]` models, `[P]` pause/resume, `[?]` help) | **No** |
+| `/swarm models [role\|--print]` | Open interactive Mission Model Picker (`Orchestrator`/`Worker`/`Validator`/`Fallbacks`), or `--print` Markdown overview | **No** |
+| `/swarm model <target> <model[:thinking]\|default> [thinking] [--global]` | Set role default (propagates to live role-tracking members) OR switch live `@member` | **No** |
 | `/swarm steer <member> <message>` | Steer a working member mid-turn or wake a parked member with new user direction | **No** |
 | `/swarm merge <member>` | Land a member's clean `share` worktree or `branch` clone onto `baseBranch` (`autoRebase` + `--no-ff`) | **No** |
 | `/swarm kill <member> [--force] [reason]` | Permanently kill a member and remove its clean worktree (`--force` overrides dirty guard) | **No** |
@@ -198,20 +210,25 @@ Only **`/swarm`** and **`/swarm-direct`** are registered on Pi.
 
 ## TUI 快捷键与 4-Tab 浮层 / TUI Shortcuts & 4-Tab Overlay
 
-### Above-Editor Live Dashboard Widget
+### Above-Editor Live Dashboard Widget & Global Shortcuts
+- **`Ctrl+Shift+M`**: Open the interactive **Mission Model & Reasoning Effort Picker**.
+- **`Ctrl+Shift+S`**: Open **Mission Control** (when a run is focused) or **Swarm Mission Hub** (when idle).
 - **`Ctrl+Shift+T`**: Toggle between compact beacon (status badge, `O/W/V` model pills, working/waiting counts, latest board line) and expanded live dashboard.
 - **`Esc`**: Collapse expanded dashboard (automatically suspended while any modal/overlay is open).
 
-### `/swarm tasks` (`/swarm ui`) 4-Tab Interactive Overlay
+### `/swarm tasks` (`/swarm ui`) 4-Tab Interactive Mission Control Overlay
 - **`1` / `2` / `3` / `4`** or **`Tab` / `Shift+Tab`**: Switch tabs — **[1] Board** · **[2] Members** · **[3] Graph** · **[4] Search**
+- **`M` (`Shift+M`)**: Open **Mission Models Picker** inline (`Orchestrator` / `Worker` / `Validator` / `Fallbacks`) · **`P` (`Shift+P`)**: Pause or Resume Swarm · **`?`**: Toggle Shortcuts Help
 - **`↑` / `↓`** (plus **`j` / `k`** on Board / Graph / Search tabs): Navigate messages or scroll (on Members tab, **`↑` / `↓`** navigates and **`k`** kills the selected member)
 - **Board Tab `[1]`**: **`Enter`** open full scrollable `#seq` post reader (**`↑`/`↓`/`j`/`k`/`PgUp`/`PgDn`** scroll, **`Enter`/`Esc`** back) · **`p`** post a board message (`@mention` / `@#channel`) · **`c`** cycle channel filter (`*` / `#main` / custom channels)
-- **Members Tab `[2]`**: **`w`** wake/message selected member · **`m`** hot-switch model (`waiting` or `stopped` member, keeps full history) · **`x`** human-stop member · **`k`** kill member (opens inline **`[y/Enter]`** confirm / **`[f]`** force dirty toggle / **`[n/Esc]`** cancel) · **`g`** merge `share`/`branch` worktree · **`l`** toggle full `brief` + `logTail` view (**`[`/`]`/`PgUp`/`PgDn`** scroll) · **`d`** toggle member details vs scrollable Git diff summary (**`[`/`]`/`PgUp`/`PgDn`** scroll)
+- **Members Tab `[2]`**: **`w`** wake/message selected member · **`m`** open interactive Member Model & Effort Picker (supports queued turn-end switch on `working` members, keeps 100% history) · **`x`** human-stop member · **`k`** kill member (opens inline **`[y/Enter]`** confirm / **`[f]`** force dirty toggle / **`[n/Esc]`** cancel) · **`g`** merge `share`/`branch` worktree · **`l`** toggle full `brief` + `logTail` view (**`[`/`]`/`PgUp`/`PgDn`** scroll) · **`d`** toggle member details vs scrollable Git diff summary (**`[`/`]`/`PgUp`/`PgDn`** scroll)
 - **Graph Tab `[3]`**: Live Spawn Tree (with `fork:@from` / `✓merged` badges) & Peer `@mention` / `#channel` Interaction Graph (`buildSwarmGraphLines`)
 - **Search Tab `[4]`**: Live IME substring search across every `#seq` message on the board (**`Enter`** opens full scrollable post reader after finishing query)
 - **`Esc` / `q`**: Close overlay cleanly (unsubscribes engine listener & restores terminal cursor)
 
 ### Plan Confirmation Modal (`propose_swarm_plan`)
+- **`m`**: Open inline **Mission Model Picker** to adjust `O` / `W` / `V` / `Fallbacks` before launching
+- **`c`**: Attach optional launch guidance / comment
 - **`v`**: Toggle Independent Validator Policy (`ON` / `OFF`)
 - **`+` / `-`**: Adjust `maxConcurrency`
 - **`Enter`**: Confirm & Launch / Continue refining / Cancel
