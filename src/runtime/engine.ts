@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
 import path from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -43,6 +44,7 @@ import {
   type PropagateRoleModelResult,
   type ReadBoardOptions,
   type ReadBoardResult,
+  type RunUpdateInput,
   type SafeTeardownResult,
   type SafeTeardownTarget,
   type StopMemberOptions,
@@ -53,6 +55,7 @@ import {
   type SwarmMemberRecord,
   type SwarmMemberRole,
   type SwarmMemberStatusEntry,
+  type SwarmMilestone,
   type SwarmModelRole,
   SwarmProtocolError,
   type SwarmRoleModels,
@@ -63,6 +66,7 @@ import {
   type SwarmWorkspaceMode,
   type SwitchModelOptions,
   type SwitchModelResult,
+  type TeardownEntryResult,
   type TeardownOptions,
   type TokenUsage,
   type WaitForBoardOptions,
@@ -206,6 +210,27 @@ function validateChannelName(rawName: string): string {
     );
   }
   return name;
+}
+
+function normalizeOptionalChannel(raw: unknown): string | undefined {
+  if (typeof raw !== "string") {
+    return undefined;
+  }
+  const cleaned = raw.trim().replace(/^#+/, "");
+  if (!cleaned) {
+    return undefined;
+  }
+  const lower = cleaned.toLowerCase();
+  if (lower === "null" || lower === "undefined") {
+    return undefined;
+  }
+  return cleaned;
+}
+
+function isIsolatedWorktreeWorkspace(
+  workspace: SwarmWorkspaceMode,
+): workspace is "share" | "branch" {
+  return workspace === "share" || workspace === "branch";
 }
 
 function isOrchestratorOrHuman(role: CallerRole | undefined): boolean {
@@ -367,6 +392,10 @@ interface LiveMember {
   liveTokenBreakdown?: TokenUsage;
   /** Monotonic live cost observed via telemetry/turn completion (survives cache refreshes). */
   liveCost?: number;
+  /** Monotonic live LLM turn count incremented on turn_end telemetry events. */
+  liveLlmTurns?: number;
+  /** ISO timestamp when the currently active turn started (cleared on wait/stop/kill). */
+  turnStartedAt?: string;
   /** Monotonic last read sequence observed via readBoard/turn completion (survives cache refreshes). */
   lastReadSeq?: number;
 }
@@ -574,6 +603,7 @@ export class SwarmEngine implements ISwarmEngine {
           run = await this.store.updateMember(run.id, m.name, {
             state: "stopped",
             currentActivity: null,
+            turnStartedAt: null,
             parkedOn: "stopped (reloaded; @mention to revive)",
           });
         }
@@ -638,6 +668,8 @@ export class SwarmEngine implements ISwarmEngine {
       objective?: string;
       strategy?: string;
       acceptanceCriteria?: string;
+      phase?: string | null;
+      milestones?: SwarmMilestone[] | null;
     },
     options?: { callerRole?: CallerRole; actor?: string },
   ): Promise<SwarmRunState> {
@@ -648,13 +680,7 @@ export class SwarmEngine implements ISwarmEngine {
       );
     }
     const run = this.requireActiveRun();
-    const updatePatch: {
-      title?: string;
-      objective?: string;
-      strategy?: string;
-      acceptanceCriteria?: string;
-      actor?: string;
-    } = {
+    const updatePatch: RunUpdateInput = {
       actor: options?.actor ?? ORCHESTRATOR_NAME,
     };
 
@@ -677,6 +703,55 @@ export class SwarmEngine implements ISwarmEngine {
     }
     if (patch.acceptanceCriteria !== undefined) {
       updatePatch.acceptanceCriteria = patch.acceptanceCriteria.trim();
+    }
+    if (patch.phase !== undefined) {
+      if (patch.phase === null) {
+        updatePatch.phase = null;
+      } else {
+        const trimmed = patch.phase.trim();
+        updatePatch.phase = trimmed.length > 0 ? trimmed : null;
+      }
+    }
+    if (patch.milestones !== undefined) {
+      if (patch.milestones === null) {
+        updatePatch.milestones = null;
+      } else {
+        const normalized: SwarmMilestone[] = [];
+        for (const item of patch.milestones) {
+          if (!item || typeof item !== "object") {
+            throw new SwarmProtocolError(
+              "INVALID_INPUT",
+              "Each milestone must be an object with label and status.",
+            );
+          }
+          const label = typeof item.label === "string" ? item.label.trim() : "";
+          if (!label) {
+            throw new SwarmProtocolError(
+              "INVALID_INPUT",
+              "Milestone label must be non-empty.",
+            );
+          }
+          if (
+            item.status !== "pending" &&
+            item.status !== "in_progress" &&
+            item.status !== "done" &&
+            item.status !== "blocked"
+          ) {
+            throw new SwarmProtocolError(
+              "INVALID_INPUT",
+              `Invalid milestone status "${String(item.status)}". Expected pending, in_progress, done, or blocked.`,
+            );
+          }
+          const owner =
+            typeof item.owner === "string" ? item.owner.trim().replace(/^@/, "") : "";
+          normalized.push({
+            label,
+            status: item.status,
+            ...(owner ? { owner } : {}),
+          });
+        }
+        updatePatch.milestones = normalized;
+      }
     }
 
     const updated = await this.store.updateRun(run.id, updatePatch);
@@ -710,6 +785,7 @@ export class SwarmEngine implements ISwarmEngine {
             state: "stopped",
             ...(member.sessionFile ? { sessionFile: member.sessionFile } : {}),
             currentActivity: null,
+            turnStartedAt: null,
             parkedOn: reason ?? "paused",
             actor: ORCHESTRATOR_NAME,
           });
@@ -739,6 +815,7 @@ export class SwarmEngine implements ISwarmEngine {
       live.lastWaitRequest = undefined;
       live.lastSilentSummary = undefined;
       live.currentActivity = undefined;
+      live.turnStartedAt = undefined;
       live.pendingWakes.length = 0;
       live.releaseSlot?.();
       live.releaseSlot = undefined;
@@ -786,11 +863,24 @@ export class SwarmEngine implements ISwarmEngine {
 
     for (const member of Object.values(updated.members)) {
       if (member.state === "working") {
+        const live = this.liveMembers.get(member.name);
         const sessionFile = capturedSessionFiles.get(member.name) ?? member.sessionFile;
+        const flushedBreakdown = maxTokenBreakdown(
+          member.tokenBreakdown,
+          live?.liveTokenBreakdown,
+        );
+        const flushedLlmTurns = Math.max(member.llmTurns ?? 0, live?.liveLlmTurns ?? 0);
         updated = await this.store.updateMember(targetRunId, member.name, {
           state: "stopped",
+          tokens: Math.max(member.tokens, live?.liveTokens ?? 0),
+          cost: Math.max(member.cost, live?.liveCost ?? 0),
+          ...(flushedBreakdown ? { tokenBreakdown: flushedBreakdown } : {}),
+          logTail: live && live.logTail.length > 0 ? [...live.logTail] : member.logTail,
+          ...(flushedLlmTurns > 0 ? { llmTurns: flushedLlmTurns } : {}),
+          ...(live?.lastTool !== undefined ? { lastTool: live.lastTool } : {}),
           ...(sessionFile ? { sessionFile } : {}),
           currentActivity: null,
+          turnStartedAt: null,
           parkedOn: reason ?? "paused",
           actor: ORCHESTRATOR_NAME,
         });
@@ -891,6 +981,9 @@ export class SwarmEngine implements ISwarmEngine {
       seq: doneMsg.seq,
     });
 
+    // Snapshot live usage before disposing handles so working members never drop accumulated tokens/cost
+    const liveSnapshots = new Map<string, LiveMember>(this.liveMembers);
+
     // Dispose all warm/live AgentSession handles cleanly (preserving worktrees safely!)
     await this.disposeLiveHandles("Run completed");
 
@@ -899,9 +992,22 @@ export class SwarmEngine implements ISwarmEngine {
     const nowIso = new Date(this.nowFn()).toISOString();
     for (const member of Object.values(latestRun.members)) {
       if (member.state === "working" || member.state === "waiting") {
+        const live = liveSnapshots.get(member.name);
+        const flushedBreakdown = maxTokenBreakdown(
+          member.tokenBreakdown,
+          live?.liveTokenBreakdown,
+        );
+        const flushedLlmTurns = Math.max(member.llmTurns ?? 0, live?.liveLlmTurns ?? 0);
         await this.store.updateMember(run.id, member.name, {
           state: "stopped",
+          tokens: Math.max(member.tokens, live?.liveTokens ?? 0),
+          cost: Math.max(member.cost, live?.liveCost ?? 0),
+          ...(flushedBreakdown ? { tokenBreakdown: flushedBreakdown } : {}),
+          logTail: live && live.logTail.length > 0 ? [...live.logTail] : member.logTail,
+          ...(flushedLlmTurns > 0 ? { llmTurns: flushedLlmTurns } : {}),
+          ...(live?.lastTool !== undefined ? { lastTool: live.lastTool } : {}),
           currentActivity: null,
+          turnStartedAt: null,
           parkedOn: "run completed",
           endedAt: nowIso,
           actor,
@@ -1263,6 +1369,8 @@ export class SwarmEngine implements ISwarmEngine {
           priorHandlesTokens: 0,
           priorHandlesBreakdown: undefined,
           priorHandlesCost: 0,
+          liveLlmTurns: 0,
+          turnStartedAt: new Date(this.nowFn()).toISOString(),
         };
         this.liveMembers.set(spec.name, live);
         preRegisteredLiveNames.push(spec.name);
@@ -1286,6 +1394,8 @@ export class SwarmEngine implements ISwarmEngine {
             thinkingLevel: effectiveThinking,
             modelExplicit: Boolean(input.model?.trim()),
             lastReadSeq: this.cachedRun?.boardHead ?? run.boardHead,
+            turnStartedAt: live.turnStartedAt,
+            llmTurns: 0,
           },
           { actor: callerName },
         );
@@ -1294,12 +1404,18 @@ export class SwarmEngine implements ISwarmEngine {
         }
 
         // Post public brief on the shared board as callerName
+        const briefKnownMembers = this.collectKnownMentionHandles(this.cachedRun ?? run);
+        briefKnownMembers.add(spec.name.toLowerCase());
+        if (spec.groupPrefix) {
+          briefKnownMembers.add(spec.groupPrefix.toLowerCase());
+        }
         const briefMsg = await this.store.postBoardMessage(run.id, {
           from: callerName,
           fromRole: callerRole,
           channel: primaryChannel,
           kind: "brief",
           text: `@${spec.name} ${spec.brief}`,
+          knownMembers: briefKnownMembers,
         });
         this.recordBoardMessageInCache(briefMsg);
         live.deliveredSeqs.add(briefMsg.seq);
@@ -1407,13 +1523,13 @@ export class SwarmEngine implements ISwarmEngine {
       }
     }
 
-    // Resolve and validate target post channel
+    // Resolve and validate target post channel (sanitize null/"null"/"undefined"/"" as omitted)
     const senderMember = this.findMember(run, input.from);
-    const channel = (
-      input.channel?.trim().toLowerCase() ||
+    const sanitizedChannel = normalizeOptionalChannel(input.channel)?.toLowerCase();
+    const channel =
+      sanitizedChannel ||
       senderMember?.channels[0] ||
-      DEFAULT_CHANNEL
-    );
+      DEFAULT_CHANNEL;
     const channelRecord = getOwnChannel(run, channel);
     if (!channelRecord) {
       throw new SwarmProtocolError(
@@ -1430,8 +1546,11 @@ export class SwarmEngine implements ISwarmEngine {
       );
     }
 
-    // Parse handle mentions (`@name`, `@prefix`, `@all`) ignoring emails and `@#channel`
-    const parsedMentions = mergeUniqueLower([parseHandleMentions(text), input.mentions]);
+    // Parse handle mentions (`@name`, `@prefix`, `@all`) filtered against the active roster
+    const knownMembers = this.collectKnownMentionHandles(run);
+    const parsedMentions = mergeUniqueLower([parseHandleMentions(text), input.mentions]).filter(
+      (handle) => knownMembers.has(handle),
+    );
 
     const msg = await this.store.postBoardMessage(run.id, {
       ...input,
@@ -1439,13 +1558,16 @@ export class SwarmEngine implements ISwarmEngine {
       channel,
       mentions: parsedMentions,
       channelMentions: parsedChMentions,
+      knownMembers,
     });
 
     // Ensure consistent normalized mentions on returned object even with minimal mock stores
     const normalizedMsg: BoardMessage = {
       ...msg,
       channel: msg.channel || channel,
-      mentions: mergeUniqueLower([msg.mentions, parsedMentions]),
+      mentions: mergeUniqueLower([msg.mentions, parsedMentions]).filter((handle) =>
+        knownMembers.has(handle),
+      ),
       channelMentions: mergeUniqueLower([msg.channelMentions, parsedChMentions]),
     };
 
@@ -1636,7 +1758,14 @@ export class SwarmEngine implements ISwarmEngine {
 
   async readBoard(options?: ReadBoardOptions): Promise<ReadBoardResult> {
     const run = this.requireActiveRun();
-    const res = await this.store.readBoard(run.id, options);
+    const sanitizedChannel = normalizeOptionalChannel(options?.channel);
+    const sanitizedOptions: ReadBoardOptions | undefined = options
+      ? {
+          ...options,
+          ...(options.channel !== undefined ? { channel: sanitizedChannel } : {}),
+        }
+      : undefined;
+    const res = await this.store.readBoard(run.id, sanitizedOptions);
     return res;
   }
 
@@ -2080,6 +2209,7 @@ export class SwarmEngine implements ISwarmEngine {
         priorHandlesTokens: member.tokens,
         priorHandlesBreakdown: member.tokenBreakdown ? { ...member.tokenBreakdown } : undefined,
         priorHandlesCost: member.cost,
+        liveLlmTurns: member.llmTurns ?? 0,
       };
       this.liveMembers.set(member.name, activeLive);
     }
@@ -2515,6 +2645,7 @@ export class SwarmEngine implements ISwarmEngine {
       live.lastSilentSummary = undefined;
       live.parkedMentionsOnly = true;
       live.currentActivity = undefined;
+      live.turnStartedAt = undefined;
       live.pendingWakes.length = 0;
       if (live.handle) {
         const handle = live.handle;
@@ -2536,11 +2667,23 @@ export class SwarmEngine implements ISwarmEngine {
     }
 
     const humanStopped = options?.humanStopped ?? callerRole === "human";
+    const flushedBreakdown = maxTokenBreakdown(
+      member.tokenBreakdown,
+      live?.liveTokenBreakdown,
+    );
+    const flushedLlmTurns = Math.max(member.llmTurns ?? 0, live?.liveLlmTurns ?? 0);
     const updated = await this.store.updateMember(run.id, member.name, {
       state: "stopped",
       humanStopped,
+      tokens: Math.max(member.tokens, live?.liveTokens ?? 0),
+      cost: Math.max(member.cost, live?.liveCost ?? 0),
+      ...(flushedBreakdown ? { tokenBreakdown: flushedBreakdown } : {}),
+      logTail: live && live.logTail.length > 0 ? [...live.logTail] : member.logTail,
+      ...(flushedLlmTurns > 0 ? { llmTurns: flushedLlmTurns } : {}),
+      ...(live?.lastTool !== undefined ? { lastTool: live.lastTool } : {}),
       ...(capturedSessionFile ? { sessionFile: capturedSessionFile } : {}),
       currentActivity: null,
+      turnStartedAt: null,
       parkedOn: options?.reason ?? (humanStopped ? "stopped by user" : "stopped"),
       actor: callerName,
     });
@@ -2661,9 +2804,21 @@ export class SwarmEngine implements ISwarmEngine {
     }
 
     const nowIso = new Date(this.nowFn()).toISOString();
+    const flushedKillBreakdown = maxTokenBreakdown(
+      member.tokenBreakdown,
+      live?.liveTokenBreakdown,
+    );
+    const flushedKillLlmTurns = Math.max(member.llmTurns ?? 0, live?.liveLlmTurns ?? 0);
     const updated = await this.store.updateMember(run.id, member.name, {
       state: "killed",
+      tokens: Math.max(member.tokens, live?.liveTokens ?? 0),
+      cost: Math.max(member.cost, live?.liveCost ?? 0),
+      ...(flushedKillBreakdown ? { tokenBreakdown: flushedKillBreakdown } : {}),
+      logTail: live && live.logTail.length > 0 ? [...live.logTail] : member.logTail,
+      ...(flushedKillLlmTurns > 0 ? { llmTurns: flushedKillLlmTurns } : {}),
+      ...(live?.lastTool !== undefined ? { lastTool: live.lastTool } : {}),
       currentActivity: null,
+      turnStartedAt: null,
       parkedOn: options?.reason ?? "killed",
       endedAt: nowIso,
       actor: callerName,
@@ -2745,6 +2900,7 @@ export class SwarmEngine implements ISwarmEngine {
 
     // 3. Auto-rebase onto baseBranch when enabled and worktree is live
     const settings = this.getEffectiveSettings();
+    let skipSourceWorktree = false;
     if (
       settings.autoRebase &&
       member.state !== "killed" &&
@@ -2752,7 +2908,10 @@ export class SwarmEngine implements ISwarmEngine {
       member.cwd !== this.worktree.repoRoot
     ) {
       const rebaseRes = await this.worktree.autoRebase(member.cwd, run.baseBranch);
-      if (rebaseRes.status === "conflict") {
+      if (rebaseRes.status === "missing_worktree") {
+        // Worktree directory is absent on disk; skip auto-rebase and merge branch ref directly.
+        skipSourceWorktree = true;
+      } else if (rebaseRes.status === "conflict") {
         const conflictFiles = rebaseRes.conflictFiles ?? [];
         const fileList = conflictFiles.length > 0 ? conflictFiles.join(", ") : "";
         const baseMsg = rebaseRes.message
@@ -2772,8 +2931,7 @@ export class SwarmEngine implements ISwarmEngine {
             conflictFiles,
           },
         );
-      }
-      if (rebaseRes.status === "skipped_dirty") {
+      } else if (rebaseRes.status === "skipped_dirty") {
         throw new SwarmProtocolError(
           "DIRTY_WORKTREE",
           rebaseRes.message ?? `Worktree for "@${member.name}" is dirty.`,
@@ -2789,7 +2947,7 @@ export class SwarmEngine implements ISwarmEngine {
       commitMessage:
         options?.commitMessage ?? `swarm(${member.name}): merge ${member.branch}`,
       noFf: options?.noFf ?? true,
-      sourceWorktreePath: member.cwd,
+      ...(skipSourceWorktree ? {} : { sourceWorktreePath: member.cwd }),
     });
 
     const actor = options?.callerName ?? ORCHESTRATOR_NAME;
@@ -3014,11 +3172,14 @@ export class SwarmEngine implements ISwarmEngine {
         assertOwnerSession(run, sid);
       }
     }
+    const force = Boolean(options?.force);
+    const isLiveRun = run.status === "active" || run.status === "paused";
     const targets: SafeTeardownTarget[] = [];
+    const preSkipped: TeardownEntryResult[] = [];
 
     for (const member of Object.values(run.members)) {
       if (
-        (member.workspace === "share" || member.workspace === "branch") &&
+        isIsolatedWorktreeWorkspace(member.workspace) &&
         member.cwd &&
         member.branch &&
         member.cwd !== this.worktree.repoRoot
@@ -3031,6 +3192,42 @@ export class SwarmEngine implements ISwarmEngine {
           Boolean(live?.turnActive) ||
           Boolean(live?.switchingModel) ||
           live?.handle?.getState() === "working";
+
+        if (!force && member.state !== "killed") {
+          if (hasActiveAgent || isLiveRun) {
+            preSkipped.push({
+              memberName: member.name,
+              worktreePath: path.resolve(member.cwd),
+              branch: member.branch,
+              action: "skipped_active",
+              reason: hasActiveAgent
+                ? `Member "@${member.name}" has an active running agent.`
+                : `Member "@${member.name}" is still ${member.state} in ${run.status} run; kill the member or pass force=true to tear down.`,
+            });
+            continue;
+          }
+          if (!member.mergedCommitSha) {
+            let commitsAhead = await this.worktree
+              .getCommitCountAhead(run.baseBranch, member.branch)
+              .catch(() => 0);
+            if (commitsAhead === 0 && member.workspace === "branch" && existsSync(member.cwd)) {
+              commitsAhead = await this.worktree
+                .getCommitCountAhead(run.baseBranch, member.branch, member.cwd)
+                .catch(() => 0);
+            }
+            if (commitsAhead > 0) {
+              preSkipped.push({
+                memberName: member.name,
+                worktreePath: path.resolve(member.cwd),
+                branch: member.branch,
+                action: "skipped_dirty",
+                reason: `Branch "${member.branch}" for "@${member.name}" has ${commitsAhead} unmerged commit(s) ahead of "${run.baseBranch}"; merge or pass force=true to tear down.`,
+              });
+              continue;
+            }
+          }
+        }
+
         targets.push({
           memberName: member.name,
           worktreePath: member.cwd,
@@ -3040,10 +3237,15 @@ export class SwarmEngine implements ISwarmEngine {
       }
     }
 
-    const result = await this.worktree.safeTeardown(targets, {
+    const worktreeResult = await this.worktree.safeTeardown(targets, {
       deleteBranches: options?.deleteBranches ?? false,
-      force: options?.force ?? false,
+      force,
     });
+    const result: SafeTeardownResult = {
+      removed: worktreeResult.removed,
+      skipped: [...preSkipped, ...worktreeResult.skipped],
+      errors: worktreeResult.errors,
+    };
 
     await this.store.appendEvent({
       runId: run.id,
@@ -3317,7 +3519,9 @@ export class SwarmEngine implements ISwarmEngine {
 
       const startActivity =
         member.role === "validator" ? "validating" : "working on assignment";
+      const turnStartedAt = new Date(this.nowFn()).toISOString();
       live.currentActivity = startActivity;
+      live.turnStartedAt = turnStartedAt;
 
       const updated = await this.store.updateMember(runId, memberName, {
         state: "working",
@@ -3325,6 +3529,7 @@ export class SwarmEngine implements ISwarmEngine {
         thinkingLevel: handle.getThinkingLevel() ?? member.thinkingLevel ?? null,
         ...(sessionFile ? { sessionFile } : {}),
         currentActivity: startActivity,
+        turnStartedAt,
       });
 
       if (isCancelled()) {
@@ -3471,14 +3676,17 @@ export class SwarmEngine implements ISwarmEngine {
           ? `${directPrompt}\n\n${buildWakeupPrompt(member, batch, run.boardHead)}`
           : (directPrompt ?? buildWakeupPrompt(member, batch, run.boardHead));
 
+      const wakeTurnStartedAt = new Date(this.nowFn()).toISOString();
       live.parkedMentionsOnly = true;
       live.currentActivity = "woken by board";
+      live.turnStartedAt = wakeTurnStartedAt;
 
       const updated = await this.store.updateMember(runId, memberName, {
         state: "working",
         humanStopped: false,
         lastReadSeq: Math.max(member.lastReadSeq, maxSeq),
         currentActivity: "woken by board",
+        turnStartedAt: wakeTurnStartedAt,
         error: null,
       });
 
@@ -3712,6 +3920,33 @@ export class SwarmEngine implements ISwarmEngine {
 
       let handle: PersistentAgentHandle;
       try {
+        // Auto-recover missing isolated worktree from existing branch before spawning replacement session
+        if (
+          isIsolatedWorktreeWorkspace(member.workspace) &&
+          member.cwd &&
+          member.cwd !== this.worktree.repoRoot &&
+          member.branch &&
+          !existsSync(member.cwd)
+        ) {
+          await this.worktree.createWorktree({
+            branch: member.branch,
+            baseBranch: run.baseBranch,
+            worktreePath: member.cwd,
+            reuseExistingBranch: true,
+            mode: member.workspace,
+          });
+          if (isCancelled()) {
+            if (isCurrentAttempt()) {
+              live.waking = false;
+              if (batch.length > 0 && this.cachedRun?.status === "active") {
+                live.pendingWakes.unshift(...batch);
+              }
+            }
+            this.checkAllIdleAndNotifyWaiters();
+            this.maybeArmStallWatchdog();
+            return;
+          }
+        }
         handle = await this.transport.spawnMember({
           agentId: member.agentId,
           name: member.name,
@@ -3758,11 +3993,13 @@ export class SwarmEngine implements ISwarmEngine {
       for (const m of batch) {
         live.deliveredSeqs.add(m.seq);
       }
+      const reviveTurnStartedAt = new Date(this.nowFn()).toISOString();
       live.handle = handle;
       live.turnActive = true;
       live.waking = false;
       live.parkedMentionsOnly = true;
       live.currentActivity = "revived by board";
+      live.turnStartedAt = reviveTurnStartedAt;
       const latestSessionFile = handle.getSessionFile?.() ?? member.sessionFile;
 
       const updated = await this.store.updateMember(runId, memberName, {
@@ -3771,6 +4008,7 @@ export class SwarmEngine implements ISwarmEngine {
         lastReadSeq: Math.max(member.lastReadSeq, maxSeq),
         ...(latestSessionFile ? { sessionFile: latestSessionFile } : {}),
         currentActivity: "revived by board",
+        turnStartedAt: reviveTurnStartedAt,
         error: null,
       });
 
@@ -3861,6 +4099,7 @@ export class SwarmEngine implements ISwarmEngine {
         const reverted = await this.store.updateMember(runId, memberName, {
           state: "stopped",
           currentActivity: null,
+          turnStartedAt: null,
         });
         this.setCachedRun(reverted);
       }
@@ -3949,9 +4188,11 @@ export class SwarmEngine implements ISwarmEngine {
     if (live) {
       live.lastWaitRequest = undefined;
       live.currentActivity = undefined;
+      live.turnStartedAt = undefined;
     }
 
     const nextTurns = member.turns + 1;
+    const nextLlmTurns = Math.max(member.llmTurns ?? 0, live?.liveLlmTurns ?? 0);
     const nextTokens = Math.max(
       member.tokens,
       live?.liveTokens ?? 0,
@@ -3976,6 +4217,7 @@ export class SwarmEngine implements ISwarmEngine {
       live.liveTokens = nextTokens;
       live.liveTokenBreakdown = nextTokenBreakdown;
       live.liveCost = nextCost;
+      live.liveLlmTurns = nextLlmTurns;
     }
     const effectiveModel = result.model ?? live?.handle?.getModel() ?? member.model;
     const effectiveThinking =
@@ -3983,6 +4225,8 @@ export class SwarmEngine implements ISwarmEngine {
     const latestSessionFile =
       (currentLive?.handle ?? live?.handle)?.getSessionFile?.() ?? member.sessionFile;
     const persistedTelemetry = {
+      ...(nextLlmTurns > 0 ? { llmTurns: nextLlmTurns } : {}),
+      turnStartedAt: null as null,
       ...(latestSessionFile ? { sessionFile: latestSessionFile } : {}),
       ...(live && live.logTail.length > 0 ? { logTail: [...live.logTail] } : {}),
       ...(live?.lastTool !== undefined ? { lastTool: live.lastTool } : {}),
@@ -4594,9 +4838,13 @@ export class SwarmEngine implements ISwarmEngine {
         return;
       }
       const nextState = live?.handle?.getState() === "waiting" ? "waiting" : "stopped";
+      if (live) {
+        live.turnStartedAt = undefined;
+      }
       const updated = await this.store.updateMember(runId, memberName, {
         state: nextState,
         currentActivity: null,
+        turnStartedAt: null,
         parkedOn: `launch error: ${errMsg.slice(0, 100)}`,
         error: errMsg,
       });
@@ -4824,6 +5072,7 @@ export class SwarmEngine implements ISwarmEngine {
         priorHandlesTokens: member.tokens,
         priorHandlesBreakdown: member.tokenBreakdown ? { ...member.tokenBreakdown } : undefined,
         priorHandlesCost: member.cost,
+        liveLlmTurns: member.llmTurns ?? 0,
       };
       this.liveMembers.set(memberName, live);
     }
@@ -5605,7 +5854,7 @@ export class SwarmEngine implements ISwarmEngine {
     const live = this.liveMembers.get(evt.name);
     if (live) {
       if (evt.activity !== undefined) {
-        live.currentActivity = evt.activity;
+        live.currentActivity = evt.activity.length > 0 ? evt.activity : undefined;
       }
       if (evt.toolName !== undefined) {
         live.lastTool = evt.toolName;
@@ -5624,6 +5873,9 @@ export class SwarmEngine implements ISwarmEngine {
 
     const existingMember = getOwnMember(this.cachedRun, evt.name);
     if (live) {
+      if (evt.type === "turn_end") {
+        live.liveLlmTurns = Math.max(live.liveLlmTurns ?? 0, existingMember?.llmTurns ?? 0) + 1;
+      }
       if (evt.tokens !== undefined) {
         live.liveTokens = Math.max(
           live.liveTokens ?? 0,
@@ -5650,10 +5902,19 @@ export class SwarmEngine implements ISwarmEngine {
     if (existingMember && this.cachedRun) {
       const member: SwarmMemberRecord = { ...existingMember };
       if (evt.activity !== undefined) {
-        member.currentActivity = evt.activity;
+        if (evt.activity.length > 0) {
+          member.currentActivity = evt.activity;
+        } else {
+          delete member.currentActivity;
+        }
       }
       if (evt.toolName !== undefined) {
         member.lastTool = evt.toolName;
+      }
+      if (evt.type === "turn_end") {
+        member.llmTurns = live
+          ? live.liveLlmTurns
+          : (member.llmTurns ?? 0) + 1;
       }
       if (evt.tokens !== undefined) {
         member.tokens = Math.max(
@@ -5683,7 +5944,7 @@ export class SwarmEngine implements ISwarmEngine {
 
     this.emitEngineEvent(
       "snapshot_changed",
-      evt.logLine ?? evt.activity ?? `${evt.name}: ${evt.type}`,
+      evt.logLine ?? (evt.activity || `${evt.name}: ${evt.type}`),
       { memberName: evt.name },
     );
   }
@@ -5713,15 +5974,23 @@ export class SwarmEngine implements ISwarmEngine {
       postMessage: async ({ text, channel, kind }) => {
         const latest = assertBridgeActive();
         const isDonePost = kind === "done" || /^\s*\[done\]/i.test(text);
+        const knownMembers = this.cachedRun
+          ? this.collectKnownMentionHandles(this.cachedRun)
+          : undefined;
+        const handleMentions = parseHandleMentions(text);
+        const hasValidHandleMention = knownMembers
+          ? handleMentions.some((h) => knownMembers.has(h.toLowerCase()))
+          : handleMentions.length > 0;
         const hasAnyMention =
-          parseHandleMentions(text).length > 0 || parseChannelMentions(text).length > 0;
+          hasValidHandleMention || parseChannelMentions(text).length > 0;
         const effectiveText =
           isDonePost && !hasAnyMention ? `@${latest.parentName} ${text.trimStart()}` : text;
+        const normalizedChannel = normalizeOptionalChannel(channel);
         return this.postMessage({
           from: latest.name,
           fromRole: latest.role,
           text: effectiveText,
-          channel: channel ?? latest.channels[0] ?? DEFAULT_CHANNEL,
+          channel: normalizedChannel ?? latest.channels[0] ?? DEFAULT_CHANNEL,
           kind,
           ...(isDonePost && !hasAnyMention ? { mentions: [latest.parentName] } : {}),
         });
@@ -5729,9 +5998,11 @@ export class SwarmEngine implements ISwarmEngine {
 
       readBoard: async (options?: ReadBoardOptions) => {
         const latest = assertBridgeActive();
+        const normalizedChannel = normalizeOptionalChannel(options?.channel);
         const effectiveOptions: ReadBoardOptions = {
           ...options,
-          ...(options?.channel === undefined
+          ...(options?.channel !== undefined ? { channel: normalizedChannel } : {}),
+          ...(normalizedChannel === undefined
             ? { memberChannels: latest.channels }
             : {}),
         };
@@ -5739,7 +6010,7 @@ export class SwarmEngine implements ISwarmEngine {
         const isUnfilteredFeedRead =
           !options?.seqs &&
           !options?.search &&
-          (!options?.channel || options.channel === "*") &&
+          (!normalizedChannel || normalizedChannel === "*") &&
           (options?.limit === undefined || options.limit > 0);
         if (isUnfilteredFeedRead && this.activeRunId === runId) {
           let readUpToSeq = 0;
@@ -5888,6 +6159,19 @@ export class SwarmEngine implements ISwarmEngine {
     return Object.values(run.members).find((m) => m.name.toLowerCase() === lower);
   }
 
+  private collectKnownMentionHandles(run: SwarmRunState): Set<string> {
+    const known = new Set<string>([ALL_MENTION_NAME, ORCHESTRATOR_NAME, "coordinator"]);
+    for (const member of Object.values(run.members)) {
+      if (member.name) {
+        known.add(member.name.toLowerCase());
+      }
+      if (member.groupPrefix) {
+        known.add(member.groupPrefix.toLowerCase());
+      }
+    }
+    return known;
+  }
+
   private buildRosterStatus(run: SwarmRunState): SwarmRosterStatus {
     const members: Array<SwarmMemberStatusEntry & { cwd?: string; mergedCommitSha?: string }> =
       run.memberOrder
@@ -5911,6 +6195,8 @@ export class SwarmEngine implements ISwarmEngine {
           lastPostSeq: m.lastPostSeq,
           lastPostTime: m.lastPostTime,
           turns: m.turns,
+          ...(m.llmTurns !== undefined ? { llmTurns: m.llmTurns } : {}),
+          ...(m.turnStartedAt !== undefined ? { turnStartedAt: m.turnStartedAt } : {}),
           tokens: m.tokens,
           cost: m.cost,
         }));
@@ -5991,6 +6277,12 @@ export class SwarmEngine implements ISwarmEngine {
           isWorking && live.currentActivity ? live.currentActivity : m.currentActivity;
         const preserveTokens = Math.max(m.tokens, live.liveTokens ?? 0);
         const preserveCost = Math.max(m.cost, live.liveCost ?? 0);
+        const preserveLlmTurns = Math.max(m.llmTurns ?? 0, live.liveLlmTurns ?? 0);
+        const llmTurnsChanged =
+          (preserveLlmTurns > 0 || m.llmTurns !== undefined) &&
+          preserveLlmTurns !== m.llmTurns;
+        const preserveTurnStartedAt =
+          isWorking && live.turnStartedAt ? live.turnStartedAt : m.turnStartedAt;
         const preserveLastReadSeq = Math.max(m.lastReadSeq, live.lastReadSeq ?? 0);
         const preserveBreakdown = maxTokenBreakdown(m.tokenBreakdown, live.liveTokenBreakdown);
         const breakdownAdvanced = Boolean(
@@ -6003,6 +6295,8 @@ export class SwarmEngine implements ISwarmEngine {
           preserveActivity !== m.currentActivity ||
           preserveTokens !== m.tokens ||
           preserveCost !== m.cost ||
+          llmTurnsChanged ||
+          preserveTurnStartedAt !== m.turnStartedAt ||
           preserveLastReadSeq !== m.lastReadSeq ||
           breakdownAdvanced
         ) {
@@ -6013,6 +6307,10 @@ export class SwarmEngine implements ISwarmEngine {
             currentActivity: preserveActivity,
             tokens: preserveTokens,
             cost: preserveCost,
+            ...(llmTurnsChanged ? { llmTurns: preserveLlmTurns } : {}),
+            ...(preserveTurnStartedAt !== undefined
+              ? { turnStartedAt: preserveTurnStartedAt }
+              : {}),
             lastReadSeq: preserveLastReadSeq,
             ...(breakdownAdvanced ? { tokenBreakdown: preserveBreakdown } : {}),
           };
@@ -6086,9 +6384,26 @@ export class SwarmEngine implements ISwarmEngine {
       for (const m of Object.values(currentRun.members)) {
         if (m.state === "killed") continue;
         if (m.state === "working" || liveWorkingNames.has(m.name)) {
+          const live = this.liveMembers.get(m.name);
+          const flushedTokens = Math.max(m.tokens, live?.liveTokens ?? 0);
+          const flushedCost = Math.max(m.cost, live?.liveCost ?? 0);
+          const flushedBreakdown = maxTokenBreakdown(
+            m.tokenBreakdown,
+            live?.liveTokenBreakdown,
+          );
+          const flushedLogTail =
+            live && live.logTail.length > 0 ? [...live.logTail] : m.logTail;
+          const flushedLlmTurns = Math.max(m.llmTurns ?? 0, live?.liveLlmTurns ?? 0);
           await this.store.updateMember(runId, m.name, {
             state: "stopped",
+            tokens: flushedTokens,
+            cost: flushedCost,
+            ...(flushedBreakdown ? { tokenBreakdown: flushedBreakdown } : {}),
+            logTail: flushedLogTail,
+            ...(flushedLlmTurns > 0 ? { llmTurns: flushedLlmTurns } : {}),
+            ...(live?.lastTool !== undefined ? { lastTool: live.lastTool } : {}),
             currentActivity: null,
+            turnStartedAt: null,
             parkedOn,
           });
         }
@@ -6114,6 +6429,7 @@ export class SwarmEngine implements ISwarmEngine {
         live.lastSilentSummary = undefined;
         live.parkedMentionsOnly = true;
         live.currentActivity = undefined;
+        live.turnStartedAt = undefined;
         live.pendingWakes.length = 0;
         live.releaseSlot?.();
         live.releaseSlot = undefined;

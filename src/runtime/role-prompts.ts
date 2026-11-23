@@ -141,7 +141,7 @@ function buildOrchestratorPlaybookCore(validatorEnabled: boolean): string {
     `  - **(b) Interface Contracts & \`#seq\` Board References**: Shared types/invariants plus prior \`#seq\` numbers to read via \`${READ_BOARD_TOOL}{seqs:[...]}\` — NEVER copy-paste one worker's report into another worker's brief!`,
     "  - **(c) Concrete Verification Commands**: Exact runnable `typecheck`, test, and build commands the member must pass in its workspace before reporting `[done]`.",
     `  - **(d) Direct Next-Peer \`@mention\` Doorbell**: Exact handle to wake on completion (e.g., ${nextPeerExample}).`,
-    `- **Zero-Copy \`#seq\` & \`@mention\` Discipline**: \`@name\` is a wakeup doorbell, never a CC. Use \`@<prefix>\` for sharded groups, \`@#<channel>\` for channel broadcasts (NEVER \`@#main\`), and \`@all\` only for genuine swarm-wide rules or plan changes.`,
+    `- **Zero-Copy \`#seq\` & \`@mention\` Discipline**: \`@name\` is a wakeup doorbell, never a CC. Use \`@<prefix>\` for sharded groups, \`@#<channel>\` for channel broadcasts (NEVER \`@#main\`), and \`@all\` only for genuine swarm-wide rules or plan changes.${validatorEnabled ? " Avoid writing `@validator` (or another peer's `@handle`) in prose when addressing a worker unless you intend to wake that peer right now — refer to them without `@` (e.g. \"the validator\") for future handoffs." : " Avoid writing another peer's `@handle` in prose when addressing a worker unless you intend to wake that peer right now."}`,
     "",
     "## 4. Core Swarm Tools (4 Tools)",
     `- \`${SWARM_TOOL}\`: \`title\`, \`add\`, \`status\`, \`models\`, \`model\` (auto-resumes switched member), \`steer\`, \`stop\`, \`kill\`, \`merge\`, \`channel\`, \`done\`.`,
@@ -599,7 +599,7 @@ export function buildMemberSystemPrompt(
         "## Worker Execution & Helper Rules",
         `1. **Protected Paths**: NEVER touch \`${SWARM_DIR}/\`, \`.swarm/\`, or \`.git/\` directly — use Swarm tools instead.`,
         workspaceCommitRule,
-        `3. **Verify Before Reporting**: Run the concrete verification commands from your brief (typechecks, tests, build checks) inside \`${member.cwd}\` before posting \`[done]\`.`,
+        `3. **Verify Before Reporting**: Run the concrete verification commands from your brief (typechecks, tests, build checks) inside \`${member.cwd}\` before posting \`[done]\`. Batch independent read, inspection, or verification shell commands into a single compound \`bash\` call (e.g. \`git status --short && npm run typecheck && npm test\`) instead of running 4–5 serial single-command \`bash\` turns.`,
         `4. **Spawning & Managing Own Helpers**: You may call \`${SWARM_TOOL}{action:"add", name, brief, ...}\` when your assignment splits into independent pieces or needs an investigator/helper. Tell helpers to report back to \`@${member.name}\` by name. You may call \`${SWARM_TOOL}{action:"model"}\` on yourself (safely deferred to turn end with automatic resume on the new model) or your own waiting helpers, \`${SWARM_TOOL}{action:"steer"/"stop"}\` on your own helpers, and MUST call \`${SWARM_TOOL}{action:"kill"}\` on your own helpers once you integrate their work. You cannot kill other members or call \`title\`/\`merge\`/\`done\`.`,
       ].join("\n"),
     );

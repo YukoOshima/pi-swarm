@@ -33,8 +33,10 @@ import {
   type SwarmChannelAction,
   type SwarmMemberRecord,
   type SwarmMemberRole,
+  type SwarmMilestone,
   SwarmProtocolError,
   type SwarmRosterStatus,
+  type SwarmRunState,
   type SwarmSnapshot,
   type SwitchModelResult,
 } from "../types.js";
@@ -88,6 +90,33 @@ const BOARD_MESSAGE_KINDS = [
   "stall",
 ] as const;
 
+const MILESTONE_STATUSES = [
+  "pending",
+  "in_progress",
+  "done",
+  "blocked",
+] as const;
+
+function normalizeOptionalChannel(raw: unknown): string | undefined {
+  if (typeof raw !== "string") {
+    return undefined;
+  }
+  const cleaned = raw.trim().replace(/^#+/, "");
+  if (!cleaned) {
+    return undefined;
+  }
+  const lower = cleaned.toLowerCase();
+  if (lower === "null" || lower === "undefined") {
+    return undefined;
+  }
+  return cleaned;
+}
+
+type DirectionUpdatePatch = Parameters<ISwarmEngine["updateDirection"]>[0] & {
+  phase?: string | null;
+  milestones?: SwarmMilestone[] | null;
+};
+
 function stringEnum<const T extends readonly string[]>(
   values: T,
   options?: { description?: string; default?: T[number] },
@@ -121,6 +150,32 @@ export const SwarmToolParamsSchema = Type.Object({
     Type.String({
       description: 'Optional updated acceptance criteria when updating direction via action="title".',
     }),
+  ),
+  phase: Type.Optional(
+    Type.String({
+      description:
+        'Optional current swarm phase label (e.g. "discovery", "implementation", "verification") for action="title".',
+    }),
+  ),
+  milestones: Type.Optional(
+    Type.Array(
+      Type.Object({
+        label: Type.String({
+          description: "Short milestone description.",
+        }),
+        status: stringEnum(MILESTONE_STATUSES, {
+          description: 'Milestone status: "pending" | "in_progress" | "done" | "blocked".',
+        }),
+        owner: Type.Optional(
+          Type.String({
+            description: "Optional owner handle (e.g. member name).",
+          }),
+        ),
+      }),
+      {
+        description: 'Optional list of run milestones for action="title".',
+      },
+    ),
   ),
   name: Type.Optional(
     Type.String({
@@ -431,6 +486,8 @@ function snapshotToRosterStatus(snapshot: SwarmSnapshot): SwarmRosterStatus | nu
       lastPostSeq: m.lastPostSeq,
       lastPostTime: m.lastPostTime,
       turns: m.turns,
+      ...(m.llmTurns !== undefined ? { llmTurns: m.llmTurns } : {}),
+      ...(m.turnStartedAt !== undefined ? { turnStartedAt: m.turnStartedAt } : {}),
       tokens: m.tokens,
       cost: m.cost,
     }));
@@ -515,6 +572,35 @@ function normalizeChannelAction(raw?: string): SwarmChannelAction {
 interface RenderContextLike {
   expanded?: boolean;
   isError?: boolean;
+  keyHint?: (keybinding: "app.tools.expand", description: string) => string;
+}
+
+function formatExpandHint(
+  options: ToolRenderResultOptions | undefined,
+  theme: Theme,
+  context?: RenderContextLike,
+): string {
+  const optionsWithKeyHint = options as
+    | (ToolRenderResultOptions & {
+        keyHint?: (keybinding: "app.tools.expand", description: string) => string;
+      })
+    | undefined;
+  const keyHintFn = optionsWithKeyHint?.keyHint ?? context?.keyHint;
+  if (typeof keyHintFn === "function") {
+    try {
+      const hint = keyHintFn("app.tools.expand", "to expand");
+      if (typeof hint === "string" && hint.trim().length > 0) {
+        const trimmed = hint.trim();
+        if (trimmed.startsWith("(")) {
+          return ` ${trimmed}`;
+        }
+        return `${theme.fg("dim", " (")}${hint}${theme.fg("dim", ")")}`;
+      }
+    } catch {
+      // Fall back to static hint
+    }
+  }
+  return theme.fg("dim", " (Ctrl+O to expand)");
 }
 
 function extractFirstText(
@@ -749,10 +835,18 @@ function renderSwarmCall(
     }
 
     case "title": {
-      const titleText =
-        typeof args?.title === "string" && args.title.trim()
-          ? ` "${clipInline(args.title, 52)}"`
-          : " (update direction)";
+      const parts: string[] = [];
+      if (typeof args?.title === "string" && args.title.trim()) {
+        parts.push(`"${clipInline(args.title, 48)}"`);
+      }
+      if (typeof args?.phase === "string" && args.phase.trim()) {
+        parts.push(`phase="${clipInline(args.phase, 28)}"`);
+      }
+      if (Array.isArray(args?.milestones) && args.milestones.length > 0) {
+        const doneCount = args.milestones.filter((m) => m?.status === "done").length;
+        parts.push(`milestones=${doneCount}/${args.milestones.length}`);
+      }
+      const titleText = parts.length > 0 ? ` ${parts.join(" · ")}` : " (update direction)";
       return new Text(
         `🏷 ${theme.fg("toolTitle", theme.bold("swarm title"))}${theme.fg("accent", titleText)}`,
         0,
@@ -792,7 +886,7 @@ function renderSwarmResult(
     .map((l) => l.trim())
     .filter((l) => l.length > 0);
   const expandHint =
-    lines.length > 1 ? theme.fg("dim", " (Ctrl+O to expand)") : "";
+    lines.length > 1 ? formatExpandHint(options, theme, context) : "";
 
   if (lines.length === 0) {
     return new Text(`${theme.fg("success", "✓")} ${theme.fg("muted", "OK")}`, 0, 0);
@@ -815,7 +909,7 @@ function renderSwarmResult(
   const warningLine = lines.find((l) => l.startsWith("⚠"));
   if (warningLine) {
     const moreHint =
-      lines.length > 2 ? theme.fg("dim", " (Ctrl+O to expand)") : expandHint;
+      lines.length > 2 ? formatExpandHint(options, theme, context) : expandHint;
     return new Text(
       `${theme.fg("success", "✓")} ${theme.fg("toolOutput", clipInline(lines[0]!, 92))}${moreHint}\n${theme.fg("warning", clipInline(warningLine, 96))}`,
       0,
@@ -924,10 +1018,7 @@ function renderPostMessageCall(
   defaultChannel: string,
   context?: RenderContextLike,
 ): Text {
-  const channel =
-    typeof args?.channel === "string" && args.channel.trim()
-      ? args.channel.trim().replace(/^#/, "")
-      : defaultChannel;
+  const channel = normalizeOptionalChannel(args?.channel) ?? defaultChannel;
   const rawText = typeof args?.text === "string" ? args.text : "";
   const targets = extractTargetsFromText(rawText);
   const targetDisplay = targets.length > 0 ? targets.join(", ") : "board";
@@ -987,7 +1078,7 @@ function renderPostMessageResult(
     }
     const isMultiLineOrLong = msg.text.includes("\n") || msg.text.length > 76;
     const expandHint = isMultiLineOrLong
-      ? theme.fg("dim", " (Ctrl+O to expand)")
+      ? formatExpandHint(options, theme, context)
       : "";
     return new Text(
       `${theme.fg("success", "✓")} ${theme.fg("toolOutput", `#${msg.seq} (#${channel}${route}):`)} ${theme.fg("muted", clipInline(msg.text, 72))}${expandHint}`,
@@ -1014,9 +1105,9 @@ function renderReadBoardCall(
   if (args?.status === true) {
     parts.push("status");
   } else {
-    if (typeof args?.channel === "string" && args.channel.trim()) {
-      const ch = args.channel.trim();
-      parts.push(ch === "*" ? "all channels" : `#${ch.replace(/^#/, "")}`);
+    const ch = normalizeOptionalChannel(args?.channel);
+    if (ch) {
+      parts.push(ch === "*" ? "all channels" : `#${ch}`);
     }
     const validSeqs = Array.isArray(args?.seqs)
       ? args.seqs.filter((s): s is number => typeof s === "number" && Number.isFinite(s))
@@ -1073,7 +1164,7 @@ function renderReadBoardResult(
     const board = details as unknown as ReadBoardResult;
     const count = board.messages.length;
     const expandHint =
-      count > 0 ? theme.fg("dim", " (Ctrl+O to expand)") : "";
+      count > 0 ? formatExpandHint(options, theme, context) : "";
     return new Text(
       `${theme.fg("success", "✓")} ${theme.fg("toolOutput", `${count} message(s) (head #${board.head})`)}${expandHint}`,
       0,
@@ -1088,7 +1179,7 @@ function renderReadBoardResult(
   ) {
     const status = details as unknown as SwarmRosterStatus;
     const expandHint = fullText.includes("\n")
-      ? theme.fg("dim", " (Ctrl+O to expand)")
+      ? formatExpandHint(options, theme, context)
       : "";
     return new Text(
       `${theme.fg("success", "✓")} ${theme.fg("toolOutput", `Roster: ${status.members.length} member(s) (head #${status.boardHead})`)}${expandHint}`,
@@ -1183,7 +1274,7 @@ function renderSwarmWaitResult(
   const meta =
     metaParts.length > 0 ? theme.fg("muted", ` · ${metaParts.join(" · ")}`) : "";
   const expandHint = fullText.includes("\n")
-    ? theme.fg("dim", " (Ctrl+O to expand)")
+    ? formatExpandHint(options, theme, context)
     : "";
   return new Text(
     `⚡ ${theme.fg("accent", `Woke (head #${head})`)}${meta}${expandHint}`,
@@ -1235,32 +1326,62 @@ export function createSwarmTool(deps: SwarmToolDeps): ToolDefinition {
             const objective = params.objective?.trim();
             const strategy = params.strategy?.trim();
             const acceptanceCriteria = params.acceptance_criteria?.trim();
-            if (!title && !objective && !strategy && !acceptanceCriteria) {
+            const hasPhase = params.phase !== undefined;
+            const phase = params.phase !== undefined ? (params.phase.trim() || null) : undefined;
+            const hasMilestones = params.milestones !== undefined;
+            const milestones: SwarmMilestone[] | undefined =
+              params.milestones !== undefined
+                ? params.milestones.map((m) => ({
+                    label: m.label.trim(),
+                    status: m.status,
+                    ...(m.owner?.trim() ? { owner: m.owner.trim().replace(/^@/, "") } : {}),
+                  }))
+                : undefined;
+            if (
+              !title &&
+              !objective &&
+              !strategy &&
+              !acceptanceCriteria &&
+              !hasPhase &&
+              !hasMilestones
+            ) {
               throw new SwarmProtocolError(
                 "INVALID_INPUT",
-                'At least one of title, objective, strategy, or acceptance_criteria is required for swarm{action:"title"}.',
+                'At least one of title, objective, strategy, acceptance_criteria, phase, or milestones is required for swarm{action:"title"}.',
               );
             }
-            const updated = await deps.engine.updateDirection(
-              {
-                ...(title ? { title } : {}),
-                ...(objective ? { objective } : {}),
-                ...(strategy ? { strategy } : {}),
-                ...(acceptanceCriteria ? { acceptanceCriteria } : {}),
-              },
-              {
-                callerRole,
-                actor: callerName,
-              },
-            );
+            const directionPatch: DirectionUpdatePatch = {
+              ...(title ? { title } : {}),
+              ...(objective ? { objective } : {}),
+              ...(strategy ? { strategy } : {}),
+              ...(acceptanceCriteria ? { acceptanceCriteria } : {}),
+              ...(hasPhase ? { phase } : {}),
+              ...(hasMilestones ? { milestones } : {}),
+            };
+            const updated = await (
+              deps.engine.updateDirection as (
+                patch: DirectionUpdatePatch,
+                options?: { callerRole?: CallerRole; actor?: string },
+              ) => Promise<SwarmRunState>
+            )(directionPatch, {
+              callerRole,
+              actor: callerName,
+            });
+            const phaseSuffix = updated.phase ? ` | phase="${updated.phase}"` : "";
+            const milestonesSuffix =
+              updated.milestones && updated.milestones.length > 0
+                ? ` | milestones=${updated.milestones.filter((m) => m.status === "done").length}/${updated.milestones.length} done`
+                : "";
             return okResult(
-              `Updated swarm direction/title ("${updated.title}").`,
+              `Updated swarm direction/title ("${updated.title}"${phaseSuffix}${milestonesSuffix}).`,
               {
                 runId: updated.id,
                 title: updated.title,
                 objective: updated.objective,
                 strategy: updated.strategy,
                 acceptanceCriteria: updated.acceptanceCriteria,
+                ...(updated.phase !== undefined ? { phase: updated.phase } : {}),
+                ...(updated.milestones !== undefined ? { milestones: updated.milestones } : {}),
               },
             );
           }
@@ -1607,7 +1728,7 @@ export function createPostMessageTool(deps: SwarmToolDeps): ToolDefinition {
           from: getCallerName(),
           fromRole: getCallerRole(),
           text,
-          channel: params.channel,
+          channel: normalizeOptionalChannel(params.channel),
           kind: params.kind as BoardMessageKind | undefined,
         });
         const targets = [
@@ -1650,7 +1771,7 @@ export function createReadBoardTool(deps: SwarmToolDeps): ToolDefinition {
           since: params.since,
           seqs: params.seqs,
           limit: params.limit,
-          channel: params.channel,
+          channel: normalizeOptionalChannel(params.channel),
           search: params.search,
         });
 
@@ -1820,7 +1941,7 @@ export function createMemberScopedTools(
         }
         const msg = await bridge.postMessage({
           text,
-          channel: params.channel,
+          channel: normalizeOptionalChannel(params.channel),
           kind: params.kind as BoardMessageKind | undefined,
         });
         const targets = [
@@ -1881,7 +2002,7 @@ export function createMemberScopedTools(
           since: params.since,
           seqs: params.seqs,
           limit: params.limit,
-          channel: params.channel,
+          channel: normalizeOptionalChannel(params.channel),
           search: params.search,
         });
         if (res.messages.length === 0) {
