@@ -35,6 +35,7 @@ import {
   formatBoardTargets,
   formatClock,
   formatCost,
+  formatElapsedSince,
   formatMemberRoleBadge,
   formatMemberStateBadge,
   formatRoleModelsLine,
@@ -83,7 +84,22 @@ export interface SwarmOverlayOptions {
   onApplyFallbacks?: SwarmModelPickerViewOptions["onApplyFallbacks"];
   /** Clock override for deterministic tests. */
   now?: () => number;
+  /** Live spinner interval in milliseconds while members are working (default: 120ms). */
+  spinnerIntervalMs?: number;
 }
+
+const OVERLAY_SPINNER_FRAMES = [
+  "⠋",
+  "⠙",
+  "⠹",
+  "⠸",
+  "⠼",
+  "⠴",
+  "⠦",
+  "⠧",
+  "⠇",
+  "⠏",
+] as const;
 
 const TAB_ORDER: readonly SwarmOverlayTab[] = [
   "board",
@@ -96,7 +112,7 @@ type MemberDetailMode = "info" | "logs" | "diff";
 
 type InlineInputMode =
   | { kind: "board_post"; channel: string }
-  | { kind: "wake"; member: SwarmMemberRecord }
+  | { kind: "wake"; member: SwarmMemberRecord; conflictRetry?: boolean }
   | { kind: "model"; member: SwarmMemberRecord };
 
 interface FeedbackMessage {
@@ -106,6 +122,91 @@ interface FeedbackMessage {
 
 const formatInnerClock = formatClock;
 const formatTargetsSuffix = formatBoardTargets;
+
+function isTerminalRunStatus(status: string): boolean {
+  return (
+    status === "completed" ||
+    status === "abandoned" ||
+    status === "cancelled" ||
+    status === "failed"
+  );
+}
+
+function countOverlayFleetStates(
+  snapshot: SwarmSnapshot,
+  run: SwarmRunState,
+): {
+  workingCount: number;
+  waitingCount: number;
+  stoppedCount: number;
+  mergedCount: number;
+} {
+  const members = getOrderedMembers(run);
+  const workingNames = new Set(snapshot.workingMemberNames);
+  let working = 0;
+  let waiting = 0;
+  let stopped = 0;
+  let merged = 0;
+  for (const m of members) {
+    if (m.mergedCommitSha && sanitizePlainText(m.mergedCommitSha).length > 0) {
+      merged += 1;
+    }
+    const isWorking =
+      m.state === "working" ||
+      (workingNames.has(m.name) &&
+        m.state !== "stopped" &&
+        m.state !== "killed");
+    if (isWorking) {
+      working += 1;
+    } else if (m.state === "waiting") {
+      waiting += 1;
+    } else if (m.state === "stopped") {
+      stopped += 1;
+    }
+  }
+  const validWorkingNames = snapshot.workingMemberNames.filter((name) => {
+    const m = run.members[name];
+    return !m || (m.state !== "stopped" && m.state !== "killed");
+  });
+  const nonWorkingWaitingNames = snapshot.waitingMemberNames.filter((name) => {
+    if (workingNames.has(name)) return false;
+    const m = run.members[name];
+    return (
+      !m ||
+      (m.state !== "working" &&
+        m.state !== "stopped" &&
+        m.state !== "killed")
+    );
+  });
+  return {
+    workingCount: Math.max(working, validWorkingNames.length),
+    waitingCount: Math.max(waiting, nonWorkingWaitingNames.length),
+    stoppedCount: stopped,
+    mergedCount: merged,
+  };
+}
+
+function formatOverlayPhaseMilestones(
+  run: SwarmRunState,
+  theme: Theme,
+): string | undefined {
+  const phase = run.phase ? sanitizePlainText(run.phase) : "";
+  const milestones = run.milestones ?? [];
+  if (!phase && milestones.length === 0) return undefined;
+
+  const doneCount = milestones.filter((m) => m.status === "done").length;
+  const totalCount = milestones.length;
+
+  if (phase && totalCount > 0) {
+    const ratio = `[${doneCount}/${totalCount}]`;
+    return `${theme.fg("muted", "Phase:")} ${theme.fg("accent", phase)} ${theme.fg(doneCount === totalCount ? "success" : "muted", ratio)}`;
+  }
+  if (phase) {
+    return `${theme.fg("muted", "Phase:")} ${theme.fg("accent", phase)}`;
+  }
+  const ratio = `[${doneCount}/${totalCount}]`;
+  return `${theme.fg("muted", "Milestones:")} ${theme.fg(doneCount === totalCount ? "success" : "accent", ratio)}`;
+}
 
 function formatErrorMessage(err: unknown): string {
   if (err instanceof Error) return sanitizePlainText(err.message);
@@ -144,10 +245,14 @@ function matchesSearchQuery(msg: BoardMessage, query: string): boolean {
 // 4-Tab Antigravity-Swarm-Inspired Interactive Overlay Component
 // ============================================================================
 
-class SwarmOverlayComponent implements Component, Focusable {
+export class SwarmOverlayComponent implements Component, Focusable {
   private _focused = false;
   private snapshot: SwarmSnapshot;
   private activeTab: SwarmOverlayTab;
+  private spinnerFrame = 0;
+  private spinnerTimer: ReturnType<typeof setInterval> | undefined;
+  private readonly spinnerIntervalMs: number;
+  private readonly now: () => number;
 
   // Board tab state
   private boardMessages: BoardMessage[] = [];
@@ -221,6 +326,8 @@ class SwarmOverlayComponent implements Component, Focusable {
     private readonly done: () => void,
   ) {
     this.hostModel = options?.hostModel;
+    this.spinnerIntervalMs = Math.max(40, options?.spinnerIntervalMs ?? 120);
+    this.now = options?.now ?? (() => Date.now());
     this.activeTab = options?.initialTab ?? "board";
     this.channelFilter = options?.initialChannel ?? "*";
     this.snapshot = engine.getSnapshot();
@@ -324,10 +431,50 @@ class SwarmOverlayComponent implements Component, Focusable {
         void this.refreshFullBoard();
       }
 
+      this.syncSpinnerTimer(this.hasWorkingMembers());
       this.tui.requestRender();
     });
 
+    this.syncSpinnerTimer(this.hasWorkingMembers());
     void this.refreshFullBoard();
+  }
+
+  private hasWorkingMembers(): boolean {
+    const run = this.snapshot.run;
+    if (!run || isTerminalRunStatus(run.status)) return false;
+    return countOverlayFleetStates(this.snapshot, run).workingCount > 0;
+  }
+
+  private syncSpinnerTimer(hasWorking: boolean): void {
+    if (this.closed) {
+      this.stopSpinnerTimer();
+      return;
+    }
+    if (hasWorking && !this.spinnerTimer) {
+      this.spinnerTimer = setInterval(() => {
+        if (this.closed) {
+          this.stopSpinnerTimer();
+          return;
+        }
+        this.spinnerFrame =
+          (this.spinnerFrame + 1) % OVERLAY_SPINNER_FRAMES.length;
+        if (!this.subComponent) {
+          this.tui.requestRender();
+        }
+      }, this.spinnerIntervalMs);
+      if (typeof this.spinnerTimer.unref === "function") {
+        this.spinnerTimer.unref();
+      }
+    } else if (!hasWorking && this.spinnerTimer) {
+      this.stopSpinnerTimer();
+    }
+  }
+
+  private stopSpinnerTimer(): void {
+    if (this.spinnerTimer) {
+      clearInterval(this.spinnerTimer);
+      this.spinnerTimer = undefined;
+    }
   }
 
   get focused(): boolean {
@@ -571,6 +718,7 @@ class SwarmOverlayComponent implements Component, Focusable {
 
   dispose(): void {
     this.closed = true;
+    this.stopSpinnerTimer();
     this.subComponent?.dispose?.();
     this.subComponent = null;
     this.inlineMode = undefined;
@@ -696,6 +844,68 @@ class SwarmOverlayComponent implements Component, Focusable {
         `Failed to message @${member.name}: ${formatErrorMessage(err)}`,
       );
     }
+  }
+
+  private isConflictFailure(member: SwarmMemberRecord): boolean {
+    const recentErrEvents = this.snapshot.recentEvents
+      .filter(
+        (e) =>
+          e.memberName === member.name &&
+          (e.type === "member_error" ||
+            e.summary.toLowerCase().includes("conflict")),
+      )
+      .slice(-3)
+      .map((e) => e.summary);
+    const haystack = [
+      member.error ?? "",
+      member.parkedOn ?? "",
+      ...member.logTail.slice(-5),
+      ...recentErrEvents,
+    ]
+      .join(" ")
+      .toLowerCase();
+    return /(?:rebase|merge)[_\s-]*conflict|conflicting files|resolve conflicts?/i.test(
+      haystack,
+    );
+  }
+
+  private handleRetryMember(member: SwarmMemberRecord): void {
+    if (member.state === "killed") {
+      this.setFeedback("warning", `Cannot retry killed member ${member.name}.`);
+      return;
+    }
+    if (member.state === "working") {
+      this.setFeedback(
+        "info",
+        `${member.name} is already working (press [w] to steer).`,
+      );
+      return;
+    }
+    if (member.state !== "stopped" && !member.error) {
+      this.setFeedback(
+        "info",
+        `${member.name} is waiting without errors (press [w] to wake).`,
+      );
+      return;
+    }
+
+    if (this.isConflictFailure(member)) {
+      const baseBranch = sanitizePlainText(this.snapshot.run?.baseBranch || "main");
+      const prefill = `Rebase onto ${baseBranch} and resolve conflicts, then re-verify and post status.`;
+      this.enterInlineMode(
+        { kind: "wake", member, conflictRetry: true },
+        "› ",
+        `Steer @${member.name} to resolve conflicts…`,
+        prefill,
+      );
+      this.tui.requestRender();
+      return;
+    }
+
+    const retryMsg = member.error
+      ? `Retry and continue your assignment after previous error (${sanitizePlainText(member.error).slice(0, 140)}). Inspect workspace and board state, then post progress.`
+      : "Resume your assignment from current workspace and board state, then post progress.";
+    void this.runWakeMember(member, retryMsg);
   }
 
   private async runTogglePauseResume(): Promise<void> {
@@ -1331,7 +1541,7 @@ class SwarmOverlayComponent implements Component, Focusable {
     const members = this.getMembers();
     const selected = this.getSelectedMember();
 
-    if (matchesKey(data, Key.up)) {
+    if (matchesKey(data, Key.up) || ch === "k") {
       if (members.length > 0) {
         this.memberSelectedIndex =
           (this.memberSelectedIndex - 1 + members.length) % members.length;
@@ -1343,7 +1553,7 @@ class SwarmOverlayComponent implements Component, Focusable {
       }
       return;
     }
-    if (matchesKey(data, Key.down)) {
+    if (matchesKey(data, Key.down) || ch === "j") {
       if (members.length > 0) {
         this.memberSelectedIndex =
           (this.memberSelectedIndex + 1) % members.length;
@@ -1376,6 +1586,11 @@ class SwarmOverlayComponent implements Component, Focusable {
         this.memberDetailScrollOffset += step;
       }
       this.tui.requestRender();
+      return;
+    }
+
+    if (ch === "r" || ch === "R") {
+      this.handleRetryMember(selected);
       return;
     }
 
@@ -1423,7 +1638,7 @@ class SwarmOverlayComponent implements Component, Focusable {
       return;
     }
 
-    if (ch === "k" || ch === "K") {
+    if (ch === "K") {
       if (selected.state === "killed") {
         this.setFeedback("warning", `${selected.name} is already killed.`);
         return;
@@ -1519,10 +1734,7 @@ class SwarmOverlayComponent implements Component, Focusable {
   private renderTabBar(run: SwarmRunState, innerWidth: number): string {
     const boardCount = Math.max(this.snapshot.boardHead, this.boardMessages.length);
     const members = getOrderedMembers(run);
-    const workingCount = Math.max(
-      this.snapshot.workingMemberNames.length,
-      members.filter((m) => m.state === "working").length,
-    );
+    const { workingCount } = countOverlayFleetStates(this.snapshot, run);
 
     const ultraCompact = innerWidth < 46;
     const compact = innerWidth < 64;
@@ -1695,19 +1907,19 @@ class SwarmOverlayComponent implements Component, Focusable {
       this.channelFilter === "*"
         ? "Channel: * (all)"
         : `Channel: #${sanitizePlainText(this.channelFilter)}`;
-    const headerRight = this.theme.fg(
-      "dim",
-      "[Enter] read · [c] filter · [p] post · [↑↓] select",
-    );
-    out.push(
-      innerWidth >= 56
-        ? joinColumns(
-            `${this.theme.fg("accent", filterLabel)} (${messages.length})`,
-            headerRight,
-            innerWidth,
-          )
-        : fitLine(`${this.theme.fg("accent", filterLabel)} (${messages.length})`, innerWidth),
-    );
+    const leftHeader = `${this.theme.fg("accent", filterLabel)} (${messages.length})`;
+    if (innerWidth >= 74) {
+      const headerRight = this.theme.fg(
+        "dim",
+        "[Enter] read · [c] filter · [p] post · [↑↓] select",
+      );
+      out.push(joinColumns(leftHeader, headerRight, innerWidth));
+    } else if (innerWidth >= 58) {
+      const shortRight = this.theme.fg("dim", "[c] ch · [p] post");
+      out.push(joinColumns(leftHeader, shortRight, innerWidth));
+    } else {
+      out.push(fitLine(leftHeader, innerWidth));
+    }
 
     const remaining = Math.max(1, budget - out.length);
     if (messages.length === 0) {
@@ -1770,15 +1982,20 @@ class SwarmOverlayComponent implements Component, Focusable {
     innerWidth: number,
   ): string {
     const ptr = isSelected ? this.theme.fg("accent", "› ") : "  ";
-    const iconRaw = memberStateIcon(member.state);
-    const icon =
-      member.state === "working"
-        ? this.theme.fg("accent", iconRaw)
+    const hasError = Boolean(member.error && sanitizePlainText(member.error));
+    const isWorking = member.state === "working";
+    const icon = isWorking
+      ? this.theme.fg(
+          member.role === "validator" ? "warning" : "accent",
+          OVERLAY_SPINNER_FRAMES[this.spinnerFrame]!,
+        )
+      : hasError
+        ? this.theme.fg("error", "✗")
         : member.state === "stopped"
-          ? this.theme.fg("warning", iconRaw)
+          ? this.theme.fg("warning", memberStateIcon(member.state))
           : member.state === "killed"
-            ? this.theme.fg("dim", iconRaw)
-            : this.theme.fg("muted", iconRaw);
+            ? this.theme.fg("dim", memberStateIcon(member.state))
+            : this.theme.fg("muted", memberStateIcon(member.state));
     const nameStr = isSelected
       ? this.theme.fg("accent", this.theme.bold(member.name))
       : member.state === "killed"
@@ -1786,9 +2003,13 @@ class SwarmOverlayComponent implements Component, Focusable {
         : this.theme.bold(member.name);
     const roleStr = formatMemberRoleBadge(member.role, this.theme);
     const stateStr = formatMemberStateBadge(member.state, this.theme);
+    const errInlineBadge = isWorking && hasError ? ` ${this.theme.fg("error", "✗")}` : "";
 
     if (innerWidth < 54) {
-      return fitLine(`${ptr}${icon} ${nameStr} (${roleStr}) ${stateStr}`, innerWidth);
+      return fitLine(
+        `${ptr}${icon} ${nameStr} (${roleStr}) ${stateStr}${errInlineBadge}`,
+        innerWidth,
+      );
     }
 
     const modelShort = member.model
@@ -1797,15 +2018,41 @@ class SwarmOverlayComponent implements Component, Focusable {
         ? `default:${member.thinkingLevel}`
         : "default";
     const modelStr = this.theme.fg("dim", `[${modelShort}]`);
-    const wsStr = formatWorkspaceBadge(member.workspace, member.branch, this.theme);
+    const wsRaw = formatWorkspaceBadge(member.workspace, member.branch);
+    const wsShort = wsRaw.length > 18 ? `${wsRaw.slice(0, 17)}…` : wsRaw;
+    const wsStr =
+      member.workspace === "inherit"
+        ? this.theme.fg("dim", wsShort)
+        : member.workspace === "share"
+          ? this.theme.fg("accent", wsShort)
+          : this.theme.fg("borderAccent", wsShort);
     const parentStr =
       member.parentName && member.parentName !== ORCHESTRATOR_NAME
         ? ` ${this.theme.fg("dim", `← ${member.parentName}`)}`
         : "";
-    const turnsStr = this.theme.fg("muted", `t:${member.turns}`);
 
-    const left = `${ptr}${icon} ${nameStr} (${roleStr}) ${stateStr} ${modelStr} ${wsStr}${parentStr}`;
-    return fitLine(joinColumns(left, turnsStr, innerWidth), innerWidth);
+    const liveActivity = isWorking
+      ? sanitizePlainText(
+          member.currentActivity ||
+            (member.lastTool ? `tool:${member.lastTool}` : ""),
+        )
+      : "";
+    const errorSnippet = hasError ? sanitizePlainText(member.error!) : "";
+    const statusDetail = liveActivity
+      ? ` ${this.theme.fg("dim", "·")} ${this.theme.fg("muted", liveActivity)}`
+      : errorSnippet
+        ? ` ${this.theme.fg("dim", "·")} ${this.theme.fg("error", errorSnippet)}`
+        : "";
+
+    const elapsedPart = isWorking
+      ? `${this.theme.fg("dim", formatElapsedSince(member.turnStartedAt ?? member.createdAt, this.now()))} `
+      : "";
+    const rightMeta = `${elapsedPart}${this.theme.fg("muted", `t:${member.turns}`)}`;
+
+    const wsSegment =
+      innerWidth >= 82 || !statusDetail ? ` ${wsStr}${parentStr}` : "";
+    const left = `${ptr}${icon} ${nameStr} (${roleStr}) ${stateStr}${errInlineBadge} ${modelStr}${wsSegment}${statusDetail}`;
+    return fitLine(joinColumns(left, rightMeta, innerWidth), innerWidth);
   }
 
   private renderMemberDetailInfo(
@@ -1921,19 +2168,21 @@ class SwarmOverlayComponent implements Component, Focusable {
       );
     }
 
+    const logHeaderIdx = allLines.length;
     allLines.push(
       this.theme.fg("muted", `Log Tail (${member.logTail.length} line(s)):`),
     );
     if (member.logTail.length === 0) {
       allLines.push(this.theme.fg("dim", "  (no log output recorded yet)"));
     } else {
+      const gutter = "  │ ";
+      const contentWidth = Math.max(1, innerWidth - visibleWidth(gutter));
       for (const line of member.logTail) {
-        allLines.push(
-          ...wrapLines(
-            this.theme.fg("toolOutput", `  │ ${sanitizePlainText(line)}`),
-            innerWidth,
-          ),
-        );
+        const clean = sanitizePlainText(line);
+        const wrapped = clean.length > 0 ? wrapLines(clean, contentWidth) : [""];
+        for (const seg of wrapped) {
+          allLines.push(this.theme.fg("toolOutput", `${gutter}${seg}`));
+        }
       }
     }
 
@@ -1942,6 +2191,25 @@ class SwarmOverlayComponent implements Component, Focusable {
       0,
       Math.min(this.memberDetailScrollOffset, maxOffset),
     );
+
+    if (this.memberDetailScrollOffset < maxOffset && budget >= 2) {
+      const sliceCount = budget - 1;
+      const visible = allLines
+        .slice(this.memberDetailScrollOffset, this.memberDetailScrollOffset + sliceCount)
+        .map((l) => fitLine(l, innerWidth));
+      const hiddenBelow = allLines.length - (this.memberDetailScrollOffset + sliceCount);
+      const logsClipped = this.memberDetailScrollOffset + sliceCount <= logHeaderIdx;
+      const cue = logsClipped
+        ? innerWidth >= 46
+          ? `  ↓ scroll (]/PgDn) for logs (+${hiddenBelow} lines)`
+          : "  ↓ scroll (]/PgDn)"
+        : innerWidth >= 44
+          ? `  ↓ scroll (]/PgDn) (+${hiddenBelow} more)`
+          : "  ↓ scroll (]/PgDn)";
+      visible.push(fitLine(this.theme.fg("accent", cue), innerWidth));
+      return visible;
+    }
+
     return allLines
       .slice(this.memberDetailScrollOffset, this.memberDetailScrollOffset + budget)
       .map((l) => fitLine(l, innerWidth));
@@ -2156,7 +2424,7 @@ class SwarmOverlayComponent implements Component, Focusable {
       ? "[Tab] switch tab · [↑↓] select · [Esc] browse"
       : "[/] edit query · [↑↓] select · [1-4] tab";
     out.push(
-      innerWidth >= 60
+      innerWidth >= 74
         ? joinColumns(
             this.theme.fg("muted", statusText),
             this.theme.fg("dim", focusHint),
@@ -2220,6 +2488,9 @@ class SwarmOverlayComponent implements Component, Focusable {
       return `Post to #${mode.channel} as ${ORCHESTRATOR_NAME} (@member to wake):`;
     }
     if (mode.kind === "wake") {
+      if (mode.conflictRetry) {
+        return `Conflict retry for @${mode.member.name} (Enter to send):`;
+      }
       return mode.member.state === "working"
         ? `Steer @${mode.member.name} mid-turn:`
         : `Wake / message @${mode.member.name}:`;
@@ -2249,37 +2520,49 @@ class SwarmOverlayComponent implements Component, Focusable {
     run: SwarmRunState,
     innerWidth: number,
   ): string {
-    const members = getOrderedMembers(run);
-    const workingCount = members.filter((m) => m.state === "working").length;
-    const readyCount = members.filter((m) => m.state === "waiting").length;
-    const mergedCount = members.filter((m) => Boolean(m.mergedCommitSha)).length;
+    const { workingCount, waitingCount, stoppedCount, mergedCount } =
+      countOverlayFleetStates(this.snapshot, run);
 
     const sep = this.theme.fg("dim", " · ");
     const workingSeg =
       workingCount > 0
         ? this.theme.fg("accent", `Working: ${workingCount}`)
         : this.theme.fg("muted", `Working: ${workingCount}`);
-    const readySeg =
-      readyCount > 0
-        ? this.theme.fg("success", `Ready: ${readyCount}`)
-        : this.theme.fg("muted", `Ready: ${readyCount}`);
+    const waitingSeg =
+      waitingCount > 0
+        ? this.theme.fg("success", `Waiting: ${waitingCount}`)
+        : this.theme.fg("muted", `Waiting: ${waitingCount}`);
+    const stoppedSeg =
+      stoppedCount > 0
+        ? `${sep}${this.theme.fg("warning", `Stopped: ${stoppedCount}`)}`
+        : "";
     const mergedSeg =
       mergedCount > 0
         ? this.theme.fg("success", `Merged: ${mergedCount}`)
         : this.theme.fg("muted", `Merged: ${mergedCount}`);
-    const pipelineRight = `${workingSeg}${sep}${readySeg}${sep}${mergedSeg}`;
+    const pipelineRight = `${workingSeg}${sep}${waitingSeg}${stoppedSeg}${sep}${mergedSeg}`;
+
+    const phasePart = formatOverlayPhaseMilestones(run, this.theme);
 
     if (innerWidth < 48) {
-      return fitLine(pipelineRight, innerWidth);
+      return fitLine(
+        phasePart ? `${phasePart}${sep}${pipelineRight}` : pipelineRight,
+        innerWidth,
+      );
     }
 
-    const objectiveRaw = sanitizePlainText(run.objective || run.title) || run.id;
-    const objectiveLeft =
-      innerWidth >= 68
-        ? `${this.theme.fg("muted", "Objective:")} ${this.theme.fg("dim", objectiveRaw)}`
-        : this.theme.fg("dim", objectiveRaw);
+    let leftPart: string;
+    if (phasePart) {
+      leftPart = phasePart;
+    } else {
+      const objectiveRaw = sanitizePlainText(run.objective || run.title) || run.id;
+      leftPart =
+        innerWidth >= 68
+          ? `${this.theme.fg("muted", "Objective:")} ${this.theme.fg("dim", objectiveRaw)}`
+          : this.theme.fg("dim", objectiveRaw);
+    }
 
-    return joinColumns(objectiveLeft, pipelineRight, innerWidth, 2);
+    return joinColumns(leftPart, pipelineRight, innerWidth, 2);
   }
 
   private renderMembersActionBar(innerWidth: number): string {
@@ -2288,44 +2571,74 @@ class SwarmOverlayComponent implements Component, Focusable {
       selected !== undefined &&
       (selected.workspace === "share" || selected.workspace === "branch") &&
       !selected.mergedCommitSha;
+    const canRetry =
+      selected !== undefined &&
+      selected.state !== "killed" &&
+      selected.state !== "working" &&
+      (selected.state === "stopped" ||
+        Boolean(selected.error && sanitizePlainText(selected.error)));
+
+    const compact = innerWidth < 74;
+    const gap = compact ? " " : "  ";
+    const enterLabel = this.memberDetailMode === "logs" ? "Info" : "Logs";
 
     let memberBar: string;
     if (selected?.state === "working") {
       memberBar = [
-        this.formatActionPill("Enter", "Logs", "primary"),
-        this.formatActionPill("w", "Steer Live", "primary"),
+        this.formatActionPill("Enter", enterLabel, "primary"),
+        this.formatActionPill("w", compact ? "Steer" : "Steer Live", "primary"),
         this.formatActionPill("d", "Diff"),
-        this.formatActionPill("m", "Queue Model"),
+        this.formatActionPill("m", compact ? "Model" : "Queue Model"),
         this.formatActionPill("x", "Stop", "danger"),
-        this.formatActionPill("k", "Kill", "danger"),
-      ].join("  ");
-    } else if (
-      selected &&
-      (selected.state === "waiting" || selected.state === "stopped") &&
-      hasUnmergedWorktree
-    ) {
+        this.formatActionPill("K", "Kill", "danger"),
+      ].join(gap);
+    } else if (canRetry && hasUnmergedWorktree) {
       memberBar = [
-        this.formatActionPill("Enter", "Logs", "primary"),
-        this.formatActionPill("g", "Merge Branch", "merge"),
-        this.formatActionPill("d", "Diff"),
-        this.formatActionPill("w", "Wake"),
+        this.formatActionPill("Enter", enterLabel, "primary"),
+        this.formatActionPill("r", "Retry", "primary"),
+        this.formatActionPill("g", compact ? "Merge" : "Merge Branch", "merge"),
+        ...(compact ? [] : [this.formatActionPill("d", "Diff")]),
+        this.formatActionPill("w", compact ? "Steer" : "Wake"),
         this.formatActionPill("m", "Model"),
-        this.formatActionPill("k", "Kill", "danger"),
-      ].join("  ");
+        this.formatActionPill("K", "Kill", "danger"),
+      ].join(gap);
+    } else if (canRetry) {
+      memberBar = [
+        this.formatActionPill("Enter", enterLabel, "primary"),
+        this.formatActionPill("r", "Retry", "primary"),
+        this.formatActionPill("w", compact ? "Steer" : "Wake"),
+        this.formatActionPill("m", "Model"),
+        this.formatActionPill("K", "Kill", "danger"),
+      ].join(gap);
+    } else if (selected && selected.state === "waiting" && hasUnmergedWorktree) {
+      memberBar = [
+        this.formatActionPill("Enter", enterLabel, "primary"),
+        this.formatActionPill("g", compact ? "Merge" : "Merge Branch", "merge"),
+        this.formatActionPill("d", "Diff"),
+        this.formatActionPill("w", compact ? "Steer" : "Wake"),
+        this.formatActionPill("m", "Model"),
+        this.formatActionPill("K", "Kill", "danger"),
+      ].join(gap);
     } else {
       memberBar = [
-        this.formatActionPill("Enter", "Logs", "primary"),
-        this.formatActionPill("w", "Wake", "primary"),
+        this.formatActionPill("Enter", enterLabel, "primary"),
+        this.formatActionPill("w", compact ? "Steer" : "Wake", "primary"),
         this.formatActionPill("m", "Model"),
-        this.formatActionPill("k", "Kill", "danger"),
-      ].join("  ");
+        this.formatActionPill("K", "Kill", "danger"),
+      ].join(gap);
     }
 
+    const fullTail = this.theme.fg(
+      "dim",
+      "  ·  [M] Models  [P] Pause  [?] Help  [q] Close",
+    );
+    const shortTail = this.theme.fg("dim", "  ·  [M] Models  [?] Help  [q] Close");
+    const barW = visibleWidth(memberBar);
     const globalTail =
-      innerWidth >= 108
-        ? this.theme.fg("dim", "  ·  [M] Models  [P] Pause  [?] Help  [q] Close")
-        : innerWidth >= 96
-          ? this.theme.fg("dim", "  ·  [M] Models  [?] Help  [q] Close")
+      barW + visibleWidth(fullTail) <= innerWidth
+        ? fullTail
+        : barW + visibleWidth(shortTail) <= innerWidth
+          ? shortTail
           : "";
     return fitLine(`${memberBar}${globalTail}`, innerWidth);
   }
@@ -2349,15 +2662,39 @@ class SwarmOverlayComponent implements Component, Focusable {
       return this.renderMembersActionBar(innerWidth);
     }
     let text: string;
-    const globalSuffix = " · [M] models · [P] pause · [?] help · [Esc/q] close";
-    if (this.activeTab === "board") {
-      text = `[Enter] read · [p] post · [c] channel · [1-4/Tab] tabs${globalSuffix}`;
-    } else if (this.activeTab === "graph") {
-      text = `[↑↓] scroll · [1-4/Tab] tabs${globalSuffix}`;
+    if (innerWidth >= 108) {
+      const globalSuffix = " · [M] models · [P] pause · [?] help · [Esc/q] close";
+      if (this.activeTab === "board") {
+        text = `[Enter] read · [p] post · [c] channel · [1-4/Tab] tabs${globalSuffix}`;
+      } else if (this.activeTab === "graph") {
+        text = `[↑↓/jk] scroll · [1-4/Tab] tabs${globalSuffix}`;
+      } else {
+        text = this.searchFocused
+          ? "Type to search · [↑↓] select · [Tab] switch tab · [Esc] finish typing"
+          : `[/] search · [Enter] read · [1-4/Tab] tabs${globalSuffix}`;
+      }
+    } else if (innerWidth >= 74) {
+      const midSuffix = " · [M] models · [P] pause · [?] help · [Esc/q] close";
+      if (this.activeTab === "board") {
+        text = `[Enter] read · [p] post · [c] ch${midSuffix}`;
+      } else if (this.activeTab === "graph") {
+        text = `[↑↓/jk] scroll · [1-4] tabs${midSuffix}`;
+      } else {
+        text = this.searchFocused
+          ? "Type to filter · [↑↓] select · [Tab] tab · [Esc] browse"
+          : `[/] find · [Enter] read${midSuffix}`;
+      }
     } else {
-      text = this.searchFocused
-        ? "Type to search · [↑↓] select · [Tab] switch tab · [Esc] finish typing"
-        : `[/] search · [Enter] read · [↑↓] select · [1-4/Tab] tabs${globalSuffix}`;
+      const tightSuffix = " · [?] help · [Esc/q] close";
+      if (this.activeTab === "board") {
+        text = `[Enter] read · [p] post · [c] ch${tightSuffix}`;
+      } else if (this.activeTab === "graph") {
+        text = `[↑↓/jk] scroll · [1-4] tabs${tightSuffix}`;
+      } else {
+        text = this.searchFocused
+          ? "Type filter · [↑↓] sel · [Tab] tab · [Esc] browse"
+          : `[/] find · [Enter] read${tightSuffix}`;
+      }
     }
     return fitLine(this.theme.fg("dim", text), innerWidth);
   }
@@ -2371,26 +2708,34 @@ class SwarmOverlayComponent implements Component, Focusable {
       return this.subComponent.render(width);
     }
 
+    this.syncSpinnerTimer(this.hasWorkingMembers());
+
     const targetWidth = Math.max(1, Math.floor(width));
     const innerWidth = computeBoxInnerWidth(targetWidth);
     const termRows = this.tui.terminal?.rows ?? 30;
-    const maxTotalLines = Math.max(12, Math.min(34, Math.floor(termRows * 0.85)));
-    const maxInnerLines = Math.max(10, maxTotalLines - 2);
+    const rowCeiling = Math.max(5, Math.floor(termRows * 0.86));
+    const maxTotalLines = Math.min(
+      rowCeiling,
+      Math.max(5, Math.min(34, Math.floor(termRows * 0.85))),
+    );
+    const maxInnerLines = Math.max(3, maxTotalLines - 2);
 
     if (this.showHelp) {
       const helpBody = [
         fitLine(this.theme.fg("accent", this.theme.bold("Global & Overlay Shortcuts")), innerWidth),
+        fitLine("  Alt+S / Alt+M / Alt+W   Mission Control / Models / Expand Dashboard", innerWidth),
         fitLine("  1-4 / Tab / Shift+Tab   Switch Board, Members, Graph, Search tabs", innerWidth),
-        fitLine("  M (Shift+M) / ^Shift+M  Configure 3-Role Mission Models & Effort", innerWidth),
-        fitLine("  P (Shift+P) / ^Shift+S  Pause/Resume Swarm · Open Mission Control/Hub", innerWidth),
-        fitLine("  ?                       Toggle this shortcuts help view", innerWidth),
-        fitLine("  Esc / q                 Close Mission Control overlay", innerWidth),
+        fitLine("  j / k or ↑ / ↓          Navigate Down / Up across all tabs", innerWidth),
+        fitLine("  M / P / ? / Esc or q    Mission Models / Pause-Resume / Help / Close", innerWidth),
+        renderHorizontalRule(innerWidth, undefined, this.theme),
+        fitLine(this.theme.fg("accent", this.theme.bold("Board [1] & Search [4]")), innerWidth),
+        fitLine("  Enter / c / p / /       Read full post / Channel filter / Post / Search", innerWidth),
         renderHorizontalRule(innerWidth, undefined, this.theme),
         fitLine(this.theme.fg("accent", this.theme.bold("Members Tab [2]")), innerWidth),
-        fitLine("  m / w / x / k / g       Switch model / Steer / Stop / Kill / Merge", innerWidth),
-        fitLine("  Enter / l / d           Toggle full Brief & Logs or Git Diff view", innerWidth),
+        fitLine("  w / r / m / g / x / K   Steer / Retry / Model / Merge / Stop / Kill", innerWidth),
+        fitLine("  Enter / l / d / [ ]     Toggle Brief & Logs / Git Diff / Scroll detail", innerWidth),
       ];
-      const maxEntries = Math.max(2, maxInnerLines - 2);
+      const maxEntries = Math.max(1, maxInnerLines - 2);
       const outHelp = helpBody.slice(0, maxEntries);
       outHelp.push(renderHorizontalRule(innerWidth, undefined, this.theme));
       outHelp.push(fitLine(this.theme.fg("dim", "Press Esc, Enter or ? to return"), innerWidth));
@@ -2420,21 +2765,22 @@ class SwarmOverlayComponent implements Component, Focusable {
     // Top 4-tab bar
     body.push(this.renderTabBar(run, innerWidth));
 
-    // Compact run & 3-role models bar
+    // Compact status + base branch & full 3-role models bar (run title is in box top border)
     const titleStr = sanitizePlainText(run.title || run.objective) || run.id;
     const statusBadge = formatRunStatusBadge(run.status, this.theme);
+    const runLeft = `[${statusBadge}] base:${sanitizePlainText(run.baseBranch)}`;
+    const modelsBudget = Math.max(12, innerWidth - visibleWidth(runLeft) - 2);
     const modelsLine = formatRoleModelsLine(
       this.snapshot.roleModels ?? run.roleModels,
       this.hostModel ?? "default",
       {
-        maxWidth: Math.max(12, Math.floor(innerWidth * 0.55)),
+        maxWidth: modelsBudget,
         theme: this.theme,
       },
     );
-    const runLeft = `[${statusBadge}] ${titleStr} · base:${sanitizePlainText(run.baseBranch)}`;
     body.push(
-      innerWidth >= 68
-        ? joinColumns(runLeft, modelsLine, innerWidth)
+      innerWidth >= 52
+        ? joinColumns(runLeft, modelsLine, innerWidth, 2)
         : fitLine(runLeft, innerWidth),
     );
 
@@ -2449,7 +2795,7 @@ class SwarmOverlayComponent implements Component, Focusable {
     const footerLinesCount = this.inlineMode ? 2 : 1;
     const bottomReserved =
       (this.feedback ? 1 : 0) + 1 /* rule */ + footerLinesCount;
-    const contentBudget = Math.max(3, maxInnerLines - body.length - bottomReserved);
+    const contentBudget = Math.max(1, maxInnerLines - body.length - bottomReserved);
 
     if (this.activeTab === "board") {
       body.push(...this.renderBoardTab(innerWidth, contentBudget));
@@ -2533,8 +2879,13 @@ async function openSwarmBasicMenu(
     const closeOpt = "Close";
     options.push(closeOpt);
 
+    const { workingCount, waitingCount, stoppedCount } = countOverlayFleetStates(
+      snapshot,
+      run,
+    );
+    const fleetHeader = `${workingCount} working · ${waitingCount} waiting${stoppedCount > 0 ? ` · ${stoppedCount} stopped` : ""}`;
     const chosen = await ctx.ui.select(
-      `🐝 ${sanitizePlainText(run.title || run.id)} (${formatRunStatusBadge(run.status)} · ${snapshot.workingMemberNames.length}w/${snapshot.waitingMemberNames.length}wait · Board:#${snapshot.boardHead})`,
+      `🐝 ${sanitizePlainText(run.title || run.id)} (${formatRunStatusBadge(run.status)} · ${fleetHeader} · Board:#${snapshot.boardHead})`,
       options,
     );
     if (!chosen || chosen === closeOpt) {

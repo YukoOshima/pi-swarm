@@ -1,10 +1,5 @@
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import {
-  type Component,
-  Key,
-  matchesKey,
-  type TUI,
-} from "@earendil-works/pi-tui";
+import type { Component, TUI } from "@earendil-works/pi-tui";
 import { ORCHESTRATOR_NAME } from "../constants.js";
 import type {
   BoardMessage,
@@ -29,7 +24,6 @@ import {
   formatCost,
   formatDuration,
   formatElapsedSince,
-  formatHumanFleetSummary,
   formatMemberRoleBadge,
   formatMemberStateBadge,
   formatMergedBadge,
@@ -38,8 +32,6 @@ import {
   formatTokens,
   formatWorkspaceBadge,
   getOrderedMembers,
-  isEscapeKey,
-  isKeyReleaseSafe,
   joinColumns,
   memberStateIcon,
   renderBox,
@@ -158,7 +150,6 @@ function getWorkingMembers(
     (m) =>
       m.state === "working" ||
       (workingNames.has(m.name) &&
-        m.state !== "waiting" &&
         m.state !== "stopped" &&
         m.state !== "killed"),
   );
@@ -172,27 +163,119 @@ function getWaitingMembers(
   const workingNames = new Set(snapshot.workingMemberNames);
   return getOrderedMembers(run).filter(
     (m) =>
-      m.state === "waiting" ||
-      (waitingNames.has(m.name) &&
-        !workingNames.has(m.name) &&
-        m.state !== "working" &&
-        m.state !== "stopped" &&
-        m.state !== "killed"),
+      !workingNames.has(m.name) &&
+      m.state !== "working" &&
+      (m.state === "waiting" ||
+        (waitingNames.has(m.name) &&
+          m.state !== "stopped" &&
+          m.state !== "killed")),
   );
+}
+
+function getStoppedMembers(
+  run: SwarmRunState,
+): SwarmMemberRecord[] {
+  return getOrderedMembers(run).filter((m) => m.state === "stopped");
 }
 
 function getWorkingCount(
   snapshot: SwarmSnapshot,
+  run: SwarmRunState,
   workingMembers: readonly SwarmMemberRecord[],
 ): number {
-  return Math.max(workingMembers.length, snapshot.workingMemberNames.length);
+  const validWorkingNames = snapshot.workingMemberNames.filter((name) => {
+    const m = run.members[name];
+    return !m || (m.state !== "stopped" && m.state !== "killed");
+  });
+  return Math.max(workingMembers.length, validWorkingNames.length);
 }
 
 function getWaitingCount(
   snapshot: SwarmSnapshot,
+  run: SwarmRunState,
   waitingMembers: readonly SwarmMemberRecord[],
 ): number {
-  return Math.max(waitingMembers.length, snapshot.waitingMemberNames.length);
+  const workingNames = new Set(snapshot.workingMemberNames);
+  const nonWorkingWaitingNames = snapshot.waitingMemberNames.filter((name) => {
+    if (workingNames.has(name)) return false;
+    const m = run.members[name];
+    return (
+      !m ||
+      (m.state !== "working" &&
+        m.state !== "stopped" &&
+        m.state !== "killed")
+    );
+  });
+  return Math.max(waitingMembers.length, nonWorkingWaitingNames.length);
+}
+
+function isTerminalRunStatus(status: string): boolean {
+  return (
+    status === "completed" ||
+    status === "abandoned" ||
+    status === "cancelled" ||
+    status === "failed"
+  );
+}
+
+function formatFleetSummary(
+  workingCount: number,
+  waitingCount: number,
+  stoppedCount = 0,
+  mergedCount = 0,
+  theme?: Theme,
+): string {
+  const sep = theme ? theme.fg("dim", " · ") : " · ";
+  const workPart = theme
+    ? theme.fg(workingCount > 0 ? "accent" : "muted", `${workingCount} working`)
+    : `${workingCount} working`;
+  const waitPart = theme
+    ? theme.fg("muted", `${waitingCount} waiting`)
+    : `${waitingCount} waiting`;
+  const parts = [workPart, waitPart];
+  if (stoppedCount > 0) {
+    parts.push(
+      theme
+        ? theme.fg("warning", `${stoppedCount} stopped`)
+        : `${stoppedCount} stopped`,
+    );
+  }
+  if (mergedCount > 0) {
+    parts.push(
+      theme
+        ? theme.fg("success", `${mergedCount} merged`)
+        : `${mergedCount} merged`,
+    );
+  }
+  return parts.join(sep);
+}
+
+function formatPhaseMilestones(
+  run: SwarmRunState,
+  theme?: Theme,
+): string | undefined {
+  const phase = run.phase ? sanitizePlainText(run.phase) : "";
+  const milestones = run.milestones ?? [];
+  if (!phase && milestones.length === 0) return undefined;
+
+  const doneCount = milestones.filter((m) => m.status === "done").length;
+  const totalCount = milestones.length;
+
+  if (phase && totalCount > 0) {
+    const ratio = `[${doneCount}/${totalCount}]`;
+    return theme
+      ? `${theme.fg("muted", "Phase:")} ${theme.fg("accent", phase)} ${theme.fg(doneCount === totalCount ? "success" : "muted", ratio)}`
+      : `Phase: ${phase} ${ratio}`;
+  }
+  if (phase) {
+    return theme
+      ? `${theme.fg("muted", "Phase:")} ${theme.fg("accent", phase)}`
+      : `Phase: ${phase}`;
+  }
+  const ratio = `[${doneCount}/${totalCount}]`;
+  return theme
+    ? `${theme.fg("muted", "Milestones:")} ${theme.fg(doneCount === totalCount ? "success" : "accent", ratio)}`
+    : `Milestones: ${ratio}`;
 }
 
 function resolveEffectiveRoleModels(
@@ -209,12 +292,14 @@ function resolveEffectiveRoleModels(
   };
 }
 
-function formatEventClock(timestamp: string): string {
-  const tIndex = timestamp.indexOf("T");
-  if (tIndex >= 0 && timestamp.length >= tIndex + 9) {
-    return timestamp.slice(tIndex + 1, tIndex + 9);
-  }
-  return timestamp.slice(0, 8);
+function formatLocalClock(timestamp: string): string {
+  const ms = Date.parse(timestamp);
+  if (!Number.isFinite(ms)) return "--:--:--";
+  const d = new Date(ms);
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
+  return `${hh}:${mm}:${ss}`;
 }
 
 function formatRoleShortBadge(role: SwarmMemberRole, theme?: Theme): string {
@@ -257,7 +342,7 @@ function formatChannelsSummaryInline(
 // Above-Editor Live Swarm Dashboard Widget
 // ============================================================================
 
-class SwarmDashboardComponent implements Component {
+export class SwarmDashboardComponent implements Component {
   private spinnerFrame = 0;
   private spinnerTimer: ReturnType<typeof setInterval> | undefined;
   private disposed = false;
@@ -359,7 +444,7 @@ class SwarmDashboardComponent implements Component {
     const activity = this.theme.fg("muted", sanitizePlainText(activityRaw));
     const elapsed = this.theme.fg(
       "dim",
-      formatElapsedSince(member.createdAt, nowMs),
+      formatElapsedSince(member.turnStartedAt ?? member.createdAt, nowMs),
     );
 
     if (width < 48) {
@@ -383,30 +468,78 @@ class SwarmDashboardComponent implements Component {
     );
   }
 
-  private renderCompact(
+  private renderCompletedCompact(
     snapshot: SwarmSnapshot,
     run: SwarmRunState,
-    workingMembers: readonly SwarmMemberRecord[],
-    waitingMembers: readonly SwarmMemberRecord[],
     width: number,
-    nowMs: number,
   ): string[] {
     const lines: string[] = [];
-
     if (this.state.draftActive) {
       lines.push(...this.renderDraftBanner(width));
     }
 
     const titleText = sanitizePlainText(run.title || run.objective) || run.id;
     const statusBadge = formatRunStatusBadge(run.status, this.theme);
-    const workingCount = getWorkingCount(snapshot, workingMembers);
-    const waitingCount = getWaitingCount(snapshot, waitingMembers);
+    const mergedCount = countMergedMembers(run);
+    const memberCount = getOrderedMembers(run).length;
+    const usage =
+      snapshot.totalTokens > 0
+        ? `${formatTokens(snapshot.totalTokens)} ${formatCost(snapshot.totalCost)}`
+        : "";
+    const leadColor = run.status === "completed" ? "success" : "muted";
+    const left = `${this.theme.fg(leadColor, "🐝")} [${statusBadge}] ${this.theme.bold(titleText)}`;
+
+    if (width < 58) {
+      const right = this.theme.fg("dim", `Board:#${snapshot.boardHead}`);
+      lines.push(fitLine(joinColumns(left, right, width), width));
+      return lines;
+    }
+
+    const metaParts: string[] = [];
+    if (mergedCount > 0) {
+      metaParts.push(this.theme.fg("success", `${mergedCount} merged`));
+    } else if (memberCount > 0) {
+      metaParts.push(this.theme.fg("muted", `${memberCount} members`));
+    }
+    if (usage) {
+      metaParts.push(this.theme.fg("dim", usage));
+    }
+    metaParts.push(this.theme.fg("dim", "Alt+W expand · Alt+S panel"));
+    const right = metaParts.join(this.theme.fg("dim", " · "));
+    lines.push(fitLine(joinColumns(left, right, width), width));
+    return lines;
+  }
+
+  private renderCompact(
+    snapshot: SwarmSnapshot,
+    run: SwarmRunState,
+    workingMembers: readonly SwarmMemberRecord[],
+    waitingMembers: readonly SwarmMemberRecord[],
+    stoppedMembers: readonly SwarmMemberRecord[],
+    width: number,
+    nowMs: number,
+  ): string[] {
+    const lines: string[] = [];
+
+    if (
+      this.state.draftActive &&
+      (run.status !== "active" || this.state.draftMode === "tweak")
+    ) {
+      lines.push(...this.renderDraftBanner(width));
+    }
+
+    const titleText = sanitizePlainText(run.title || run.objective) || run.id;
+    const statusBadge = formatRunStatusBadge(run.status, this.theme);
+    const workingCount = getWorkingCount(snapshot, run, workingMembers);
+    const waitingCount = getWaitingCount(snapshot, run, waitingMembers);
+    const stoppedCount = stoppedMembers.length;
     const mergedCount = countMergedMembers(run);
     const boardTag = this.theme.fg("accent", `Board:#${snapshot.boardHead}`);
-    const compactFleetTag = `${this.theme.fg("accent", `${workingCount}w`)}/${this.theme.fg("muted", `${waitingCount}wait`)}${mergedCount > 0 ? `/${this.theme.fg("success", `${mergedCount}m`)}` : ""}`;
-    const humanFleetTag = formatHumanFleetSummary(
+    const compactFleetTag = `${this.theme.fg("accent", `${workingCount}w`)}/${this.theme.fg("muted", `${waitingCount}wait`)}${stoppedCount > 0 ? `/${this.theme.fg("warning", `${stoppedCount}stop`)}` : ""}${mergedCount > 0 ? `/${this.theme.fg("success", `${mergedCount}m`)}` : ""}`;
+    const fleetTag = formatFleetSummary(
       workingCount,
       waitingCount,
+      stoppedCount,
       mergedCount,
       this.theme,
     );
@@ -427,7 +560,7 @@ class SwarmDashboardComponent implements Component {
       lines.push(fitLine(`  ${modelsPill}`, width));
     } else if (width < 76) {
       const left = `${this.theme.fg("accent", this.theme.bold("🐝"))} [${statusBadge}] ${this.theme.fg("accent", this.theme.bold(titleText))}`;
-      const right = `${humanFleetTag} · ${boardTag}`;
+      const right = `${fleetTag} · ${boardTag}`;
       lines.push(fitLine(joinColumns(left, right, width), width));
 
       const shortcutRaw = "[Alt+S · Alt+M · Alt+W]";
@@ -444,11 +577,7 @@ class SwarmDashboardComponent implements Component {
       lines.push(fitLine(joinColumns(`  ${modelsPill}`, shortcutTag, width), width));
     } else {
       const left = `${this.theme.fg("accent", this.theme.bold("🐝"))} [${statusBadge}] ${this.theme.fg("accent", this.theme.bold(titleText))}`;
-      const dimCompactRatio = this.theme.fg(
-        "dim",
-        `(${workingCount}w/${waitingCount}wait)`,
-      );
-      const right = `${humanFleetTag} ${dimCompactRatio} · ${boardTag}`;
+      const right = `${fleetTag} · ${boardTag}`;
       lines.push(fitLine(joinColumns(left, right, width), width));
 
       const shortcutRaw =
@@ -466,6 +595,20 @@ class SwarmDashboardComponent implements Component {
         },
       );
       lines.push(fitLine(joinColumns(`  ${modelsPill}`, shortcutTag, width), width));
+    }
+
+    // Mission phase & milestones progress (when set)
+    const phaseProgress = formatPhaseMilestones(run, this.theme);
+    if (phaseProgress) {
+      const costRight =
+        snapshot.totalCost > 0
+          ? this.theme.fg("dim", formatCost(snapshot.totalCost))
+          : "";
+      lines.push(
+        costRight && width >= 48
+          ? fitLine(joinColumns(`  ${phaseProgress}`, costRight, width), width)
+          : fitLine(`  ${phaseProgress}`, width),
+      );
     }
 
     // Active working members (up to 4 + "+N more"), or awaiting-orchestrator hint when active with 0 working
@@ -487,6 +630,9 @@ class SwarmDashboardComponent implements Component {
     } else if (run.status === "active" && workingCount === 0 && waitingCount > 0) {
       const idleHint = `  ${this.theme.fg("warning", "⏳ 0 working")}${this.theme.fg("muted", ` — awaiting @${ORCHESTRATOR_NAME} next step`)}`;
       lines.push(fitLine(idleHint, width));
+    } else if (run.status === "active" && workingCount === 0 && stoppedCount > 0) {
+      const stoppedHint = `  ${this.theme.fg("warning", `⏳ 0 working · ${stoppedCount} stopped`)}${this.theme.fg("muted", " — press Alt+S to retry or /swarm resume")}`;
+      lines.push(fitLine(stoppedHint, width));
     }
 
     // Latest board post preview
@@ -517,31 +663,35 @@ class SwarmDashboardComponent implements Component {
     run: SwarmRunState,
     workingMembers: readonly SwarmMemberRecord[],
     waitingMembers: readonly SwarmMemberRecord[],
+    stoppedMembers: readonly SwarmMemberRecord[],
     width: number,
     nowMs: number,
   ): string[] {
     const termRows = this.tui.terminal?.rows ?? 32;
-    const rawMaxTotal = Math.max(8, Math.min(36, Math.floor(termRows * 0.82)));
-    const maxTotalLines =
-      termRows >= 10 ? Math.min(termRows - 2, Math.max(10, rawMaxTotal)) : Math.max(4, termRows);
+    const maxTotalLines = Math.min(36, Math.max(8, termRows - 7));
     const innerWidth =
       width < 12 ? Math.max(1, width) : Math.max(1, width - (width < 24 ? 2 : 4));
     const maxInner = Math.max(4, maxTotalLines - 2);
 
     const body: string[] = [];
 
-    if (this.state.draftActive) {
+    if (
+      this.state.draftActive &&
+      (run.status !== "active" || this.state.draftMode === "tweak")
+    ) {
       body.push(...this.renderDraftBanner(innerWidth));
     }
 
     const titleText = sanitizePlainText(run.title || run.objective) || run.id;
     const statusBadge = formatRunStatusBadge(run.status, this.theme);
-    const workingCount = getWorkingCount(snapshot, workingMembers);
-    const waitingCount = getWaitingCount(snapshot, waitingMembers);
+    const workingCount = getWorkingCount(snapshot, run, workingMembers);
+    const waitingCount = getWaitingCount(snapshot, run, waitingMembers);
+    const stoppedCount = stoppedMembers.length;
     const mergedCount = countMergedMembers(run);
-    const fleetSummaryPlain = formatHumanFleetSummary(
+    const fleetSummaryPlain = formatFleetSummary(
       workingCount,
       waitingCount,
+      stoppedCount,
       mergedCount,
     );
     const roleModels = resolveEffectiveRoleModels(snapshot, run);
@@ -558,6 +708,12 @@ class SwarmDashboardComponent implements Component {
       body.push(fitLine(this.theme.fg("muted", summaryRight), innerWidth));
     }
 
+    // Phase & Milestones progress (when set)
+    const phaseProgress = formatPhaseMilestones(run, this.theme);
+    if (phaseProgress) {
+      body.push(fitLine(phaseProgress, innerWidth));
+    }
+
     // 3-Role Models bar
     const modelsPrefix = this.theme.fg("muted", "Models: ");
     const modelsBudget = Math.max(1, innerWidth - visibleWidth("Models: "));
@@ -571,20 +727,25 @@ class SwarmDashboardComponent implements Component {
     );
     body.push(fitLine(`${modelsPrefix}${modelsLine}`, innerWidth));
 
-    // Channels summary
+    // Channels summary (skip only on ultra-cramped heights so roster & newest board post stay visible)
     const channelsText = formatChannelsSummaryInline(run, this.theme);
-    body.push(
-      fitLine(`${this.theme.fg("muted", "Channels: ")}${channelsText}`, innerWidth),
-    );
+    if (maxInner - body.length >= 7) {
+      body.push(
+        fitLine(`${this.theme.fg("muted", "Channels: ")}${channelsText}`, innerWidth),
+      );
+    }
 
-    // Active idle status hint when 0 working and >0 ready
-    if (run.status === "active" && workingCount === 0 && waitingCount > 0) {
+    // Active idle status hint when 0 working and >0 waiting/stopped
+    if (run.status === "active" && workingCount === 0 && waitingCount > 0 && maxInner - body.length >= 6) {
       const idleHint = `${this.theme.fg("warning", "⏳ 0 working")}${this.theme.fg("muted", ` — awaiting @${ORCHESTRATOR_NAME} next step`)}`;
       body.push(fitLine(idleHint, innerWidth));
+    } else if (run.status === "active" && workingCount === 0 && stoppedCount > 0 && maxInner - body.length >= 6) {
+      const stoppedHint = `${this.theme.fg("warning", `⏳ 0 working · ${stoppedCount} stopped`)}${this.theme.fg("muted", " — press Alt+S to retry or /swarm resume")}`;
+      body.push(fitLine(stoppedHint, innerWidth));
     }
 
     // Rate-limit notice if active
-    if (snapshot.rateLimitUntil && snapshot.rateLimitUntil > nowMs) {
+    if (snapshot.rateLimitUntil && snapshot.rateLimitUntil > nowMs && maxInner - body.length >= 5) {
       const rem = formatDuration(snapshot.rateLimitUntil - nowMs);
       const reason = snapshot.rateLimitReason
         ? ` — ${sanitizePlainText(snapshot.rateLimitReason)}`
@@ -607,6 +768,8 @@ class SwarmDashboardComponent implements Component {
       ),
     );
 
+    const recentBoard = snapshot.recentBoard.slice(-this.maxRecentBoard);
+
     if (members.length === 0) {
       body.push(
         fitLine(this.theme.fg("dim", "  (no members spawned yet)"), innerWidth),
@@ -617,14 +780,16 @@ class SwarmDashboardComponent implements Component {
         {
           key: "name",
           header: "Name",
-          minWidth: 8,
+          minWidth: 11,
           maxWidth: 18,
           priority: 100,
           render: (m) => {
             const icon =
               m.state === "working"
                 ? this.theme.fg("accent", SPINNER_FRAMES[this.spinnerFrame]!)
-                : memberStateIcon(m.state);
+                : m.error
+                  ? this.theme.fg("error", "✗")
+                  : memberStateIcon(m.state);
             return `${icon} ${this.theme.bold(sanitizePlainText(m.name))}`;
           },
         },
@@ -647,30 +812,28 @@ class SwarmDashboardComponent implements Component {
         {
           key: "model",
           header: "Model",
-          minWidth: 10,
-          maxWidth: 24,
+          minWidth: 12,
+          maxWidth: 26,
           flex: 1,
           priority: 75,
           render: (m) => {
             if (!m.model) return this.theme.fg("dim", "default");
             const suffix = m.thinkingLevel ? `:${m.thinkingLevel}` : "";
-            return this.theme.fg("muted", `${shortenModelName(m.model, 16)}${suffix}`);
+            const nameBudget = Math.max(8, 22 - suffix.length);
+            return this.theme.fg("muted", `${shortenModelName(m.model, nameBudget)}${suffix}`);
           },
         },
         {
           key: "workspace",
           header: "Workspace",
-          minWidth: hasMerged ? (innerWidth >= 70 ? 25 : 18) : 9,
-          maxWidth: hasMerged ? 30 : 22,
-          flex: hasMerged ? 0 : 1,
+          minWidth: hasMerged ? 16 : 9,
+          maxWidth: 18,
+          flex: 0,
           priority: 65,
           render: (m) => {
             const mergedBadge = formatMergedBadge(m.mergedCommitSha, this.theme);
             if (mergedBadge) {
-              if (m.workspace === "inherit" || innerWidth < 68) {
-                return mergedBadge;
-              }
-              return `${formatWorkspaceBadge(m.workspace, undefined, this.theme)} ${mergedBadge}`;
+              return mergedBadge;
             }
             return formatWorkspaceBadge(m.workspace, m.branch, this.theme);
           },
@@ -687,44 +850,70 @@ class SwarmDashboardComponent implements Component {
         {
           key: "activity",
           header: "Activity",
-          minWidth: 12,
-          maxWidth: 32,
+          minWidth: 14,
+          maxWidth: 36,
           flex: 2,
           priority: 45,
           render: (m) => {
             const text =
+              m.error ||
               m.currentActivity ||
               m.parkedOn ||
               (m.lastTool ? `tool:${m.lastTool}` : m.state);
-            return this.theme.fg("dim", sanitizePlainText(text));
+            return this.theme.fg(m.error ? "error" : "dim", sanitizePlainText(text));
           },
         },
       ];
 
-      const recentBoardCount = Math.min(
-        this.maxRecentBoard,
-        snapshot.recentBoard.length,
-      );
-      const recentBoardReserve =
-        recentBoardCount > 0
-          ? Math.min(termRows <= 18 ? 3 : recentBoardCount + 1, recentBoardCount + 1)
+      const minBoardLines = recentBoard.length > 0 ? 2 : 0; // rule + at least 1 newest post
+      const desiredBoardLines =
+        recentBoard.length > 0
+          ? Math.min(
+              recentBoard.length + 1,
+              termRows <= 20 ? 3 : this.maxRecentBoard + 1,
+            )
           : 0;
-      const maxRosterRows = Math.max(
-        1,
-        Math.min(members.length, maxInner - body.length - recentBoardReserve - 2),
-      );
+      const availableAfterHeader = Math.max(0, maxInner - body.length);
+      const fullTableLines = 2 + members.length;
+      const boardReserve =
+        recentBoard.length === 0
+          ? 0
+          : fullTableLines + desiredBoardLines <= availableAfterHeader
+            ? desiredBoardLines
+            : Math.max(
+                minBoardLines,
+                Math.min(
+                  desiredBoardLines,
+                  availableAfterHeader - Math.min(fullTableLines, 4),
+                ),
+              );
+      const tableLineBudget = Math.max(3, availableAfterHeader - boardReserve);
+      const dataSlots = Math.max(1, tableLineBudget - 2);
+      // Only show "… +N more rows" when hiddenCount >= 2 (never spend a line on "… +1 more row" when that row fits directly)
+      let maxRosterRows: number;
+      if (members.length <= dataSlots) {
+        maxRosterRows = members.length;
+      } else if (dataSlots >= 2) {
+        maxRosterRows = dataSlots - 1;
+      } else {
+        maxRosterRows = 1;
+      }
       const tableLines = renderTable(members, columns, innerWidth, {
         header: true,
         theme: this.theme,
         maxRows: maxRosterRows,
-        columnGap: innerWidth < 60 ? 1 : 2,
+        columnGap: innerWidth < 60 || (innerWidth >= 88 && innerWidth < 104) ? 1 : 2,
       });
-      body.push(...tableLines);
+      // Guard against dataSlots === 1 with members.length === 2 producing an unwanted "+1 more row"
+      if (tableLines.length > tableLineBudget) {
+        body.push(...tableLines.slice(0, tableLineBudget));
+      } else {
+        body.push(...tableLines);
+      }
     }
 
-    // Recent 5 Board messages (#seq)
-    const recentBoard = snapshot.recentBoard.slice(-this.maxRecentBoard);
-    if (recentBoard.length > 0 && body.length < maxInner - 1) {
+    // Recent Board messages (#seq) — always keep the newest posts within remaining budget
+    if (recentBoard.length > 0 && body.length <= maxInner - 2) {
       body.push(
         renderHorizontalRule(
           innerWidth,
@@ -745,8 +934,8 @@ class SwarmDashboardComponent implements Component {
     const footer = this.theme.fg(
       "dim",
       innerWidth >= 82
-        ? "Alt+W / Esc collapse · Alt+S panel · Alt+M models · /swarm board · /swarm graph"
-        : "Alt+W / Esc collapse · Alt+S panel · Alt+M models",
+        ? "Alt+W collapse · Alt+S panel · Alt+M models · /swarm board · /swarm graph"
+        : "Alt+W collapse · Alt+S panel · Alt+M models",
     );
 
     return renderBox(body.slice(0, maxInner), width, {
@@ -773,7 +962,9 @@ class SwarmDashboardComponent implements Component {
 
     const workingMembers = getWorkingMembers(snapshot, run);
     const waitingMembers = getWaitingMembers(snapshot, run);
-    this.syncSpinnerTimer(workingMembers.length > 0);
+    const stoppedMembers = getStoppedMembers(run);
+    const isTerminal = isTerminalRunStatus(run.status);
+    this.syncSpinnerTimer(!isTerminal && workingMembers.length > 0);
 
     const nowMs = this.now();
 
@@ -783,15 +974,20 @@ class SwarmDashboardComponent implements Component {
         run,
         workingMembers,
         waitingMembers,
+        stoppedMembers,
         targetWidth,
         nowMs,
       );
+    }
+    if (isTerminal) {
+      return this.renderCompletedCompact(snapshot, run, targetWidth);
     }
     return this.renderCompact(
       snapshot,
       run,
       workingMembers,
       waitingMembers,
+      stoppedMembers,
       targetWidth,
       nowMs,
     );
@@ -822,22 +1018,21 @@ export function formatStatusLine(
 
   const workingMembers = getWorkingMembers(snapshot, run);
   const waitingMembers = getWaitingMembers(snapshot, run);
-  const workingCount = getWorkingCount(snapshot, workingMembers);
-  const waitingCount = getWaitingCount(snapshot, waitingMembers);
+  const stoppedMembers = getStoppedMembers(run);
+  const workingCount = getWorkingCount(snapshot, run, workingMembers);
+  const waitingCount = getWaitingCount(snapshot, run, waitingMembers);
+  const stoppedCount = stoppedMembers.length;
   const mergedCount = countMergedMembers(run);
 
   const statusLabel = formatRunStatusBadge(run.status);
-  const leadTokens: string[] = [
-    `🐝 swarm:${statusLabel}`,
-    `${workingCount}w/${waitingCount}wait`,
-  ];
+  const leadTokens: string[] = [`🐝 swarm:${statusLabel}`];
   if (snapshot.boardHead > 0) {
     leadTokens.push(`#${snapshot.boardHead}`);
   }
 
   const parts: string[] = [
     leadTokens.join(" "),
-    formatHumanFleetSummary(workingCount, waitingCount, mergedCount),
+    formatFleetSummary(workingCount, waitingCount, stoppedCount, mergedCount),
   ];
   if (run.status === "active" && workingCount === 0 && waitingCount > 0) {
     parts.push(`⏳ awaiting @${ORCHESTRATOR_NAME}`);
@@ -845,7 +1040,7 @@ export function formatStatusLine(
   if (snapshot.totalTokens > 0) {
     parts.push(`${formatTokens(snapshot.totalTokens)} tok`);
   }
-  if (draftActive) {
+  if (draftActive && run.status !== "active") {
     parts.push("draft");
   }
 
@@ -886,12 +1081,15 @@ export function formatZeroTurnStatusDashboard(
   const members = getSortedMembers(run);
   const workingMembers = getWorkingMembers(snapshot, run);
   const waitingMembers = getWaitingMembers(snapshot, run);
-  const workingCount = getWorkingCount(snapshot, workingMembers);
-  const waitingCount = getWaitingCount(snapshot, waitingMembers);
+  const stoppedMembers = getStoppedMembers(run);
+  const workingCount = getWorkingCount(snapshot, run, workingMembers);
+  const waitingCount = getWaitingCount(snapshot, run, waitingMembers);
+  const stoppedCount = stoppedMembers.length;
   const mergedCount = countMergedMembers(run);
-  const fleetSummary = formatHumanFleetSummary(
+  const fleetSummary = formatFleetSummary(
     workingCount,
     waitingCount,
+    stoppedCount,
     mergedCount,
   );
   const roleModels = resolveEffectiveRoleModels(snapshot, run);
@@ -905,6 +1103,10 @@ export function formatZeroTurnStatusDashboard(
   );
   out.push("");
   out.push(`- **Objective:** ${sanitizePlainText(run.objective)}`);
+  const phaseProgress = formatPhaseMilestones(run);
+  if (phaseProgress) {
+    out.push(`- **${phaseProgress.replace(/^([^:]+):/, "$1:**")}`);
+  }
   if (run.strategy) {
     out.push(`- **Strategy:** ${sanitizePlainText(run.strategy)}`);
   }
@@ -1018,7 +1220,7 @@ export function formatZeroTurnStatusDashboard(
       );
     } else {
       for (const msg of recentBoard) {
-        const clock = formatEventClock(msg.timestamp);
+        const clock = formatLocalClock(msg.timestamp);
         const ch = sanitizePlainText(msg.channel || "main");
         const targets = formatBoardTargets(msg);
         out.push(
@@ -1034,7 +1236,7 @@ export function formatZeroTurnStatusDashboard(
     out.push("");
     out.push("#### Recent Activity");
     for (const ev of recent) {
-      const clock = formatEventClock(ev.timestamp);
+      const clock = formatLocalClock(ev.timestamp);
       const memberTag = ev.memberName ? ` [\`${ev.memberName}\`]` : "";
       const chTag = ev.channel ? ` [#${ev.channel}]` : "";
       out.push(
@@ -1078,7 +1280,7 @@ export function formatZeroTurnBoardView(
   out.push("");
 
   for (const msg of messages) {
-    const clock = formatEventClock(msg.timestamp);
+    const clock = formatLocalClock(msg.timestamp);
     const ch = sanitizePlainText(msg.channel || "main");
     const kindBadge = formatBoardKindBadge(msg.kind);
     const sender = sanitizePlainText(msg.from);
@@ -1231,53 +1433,21 @@ export function formatZeroTurnGraphView(
 }
 
 // ============================================================================
-// Global Terminal Input Shortcut Bindings (Modal-Depth Guarded)
+// Global Terminal Input Shortcut Bindings (Pi 1.6.0 Safe No-Op)
 // ============================================================================
 
+/**
+ * Retained for API compatibility.
+ *
+ * Pi 1.6.0 routes `Alt+S`, `Alt+M`, and `Alt+W` cleanly at editor focus via
+ * `pi.registerShortcut(...)` in `src/index.ts`. Hooking raw
+ * `ctx.ui.onTerminalInput` intercepts keys before Pi's native dialogs
+ * (`/model`, `/settings`, `/tree`, `/hotkeys`) and swallows `Esc` inside them,
+ * so this binder intentionally does not attach a global terminal listener.
+ */
 export function bindSwarmShortcuts(
-  ctx: ExtensionContext,
-  callbacks: SwarmShortcutCallbacks,
+  _ctx: ExtensionContext,
+  _callbacks: SwarmShortcutCallbacks,
 ): () => void {
-  if (ctx.mode !== "tui") {
-    return () => {};
-  }
-
-  return ctx.ui.onTerminalInput((data: string) => {
-    if (isKeyReleaseSafe(data)) {
-      return undefined;
-    }
-
-    // Strictly never hijack input while any modal/dialog/overlay is open
-    if (callbacks.isModalOpen()) {
-      return undefined;
-    }
-
-    if (matchesKey(data, Key.ctrlShift("t")) || matchesKey(data, Key.alt("w"))) {
-      callbacks.onToggleExpand();
-      return { consume: true };
-    }
-
-    if (
-      (matchesKey(data, Key.ctrlShift("m")) || matchesKey(data, Key.alt("m"))) &&
-      callbacks.onOpenModelPicker
-    ) {
-      callbacks.onOpenModelPicker();
-      return { consume: true };
-    }
-
-    if (
-      (matchesKey(data, Key.ctrlShift("s")) || matchesKey(data, Key.alt("s"))) &&
-      callbacks.onOpenMissionControl
-    ) {
-      callbacks.onOpenMissionControl();
-      return { consume: true };
-    }
-
-    if (isEscapeKey(data) && callbacks.isExpanded() && !callbacks.isHostStreaming?.()) {
-      callbacks.onCollapse();
-      return { consume: true };
-    }
-
-    return undefined;
-  });
+  return () => {};
 }

@@ -34,8 +34,10 @@ import type {
 } from "../src/types.js";
 import {
   HardwareCursorController,
+  SwarmDashboardComponent,
   SwarmHubView,
   SwarmModelPickerView,
+  SwarmOverlayComponent,
   type ModelPickerSettingsState,
   bindSwarmShortcuts,
   buildInitialMembersSummaryLines,
@@ -47,6 +49,7 @@ import {
   fitLine,
   fitLines,
   formatBoardKindBadge,
+  formatClock,
   formatCost,
   formatDuration,
   formatElapsedSince,
@@ -1074,13 +1077,19 @@ describe("dashboard-widget", () => {
         const plain = stripTerminalSequences(lines.join("\n"));
         assert.match(plain, /Live/);
         assert.match(plain, /Board:#18/);
-        assert.match(plain, /5w\/1wait/);
+        if (width < 58) {
+          assert.match(plain, /5w\/1wait/);
+        } else {
+          assert.match(plain, /5 working · 1 waiting/);
+          assert.ok(!plain.includes("(5w/1wait)"), "Must not duplicate compact ratio next to human counts");
+        }
         assert.match(plain, /\+1 more working/);
         assert.match(plain, /#5/);
       }
 
       const statusLine = formatStatusLine(snap, false) ?? "";
-      assert.match(statusLine, /swarm:Live 5w\/1wait #18/);
+      assert.match(statusLine, /swarm:Live #18 · 5 working · 1 waiting/);
+      assert.ok(!statusLine.includes("5w/1wait"), "Status line must not duplicate compact count");
 
       widget.dispose();
     }
@@ -1216,7 +1225,7 @@ describe("dashboard-widget", () => {
     );
   });
 
-  it("bindSwarmShortcuts handles Ctrl+Shift+T & Esc and strictly respects isModalOpen()", () => {
+  it("bindSwarmShortcuts does not hook raw onTerminalInput so Pi native dialogs are never hijacked", () => {
     let listener: ((data: string) => { consume?: boolean } | undefined) | undefined;
     const ctx = {
       mode: "tui",
@@ -1231,48 +1240,25 @@ describe("dashboard-widget", () => {
     } as unknown as ExtensionContext;
 
     const state = createSwarmWidgetState({ expanded: false, modalDepth: 0 });
-    let toggles = 0;
-    let collapses = 0;
 
     const unbind = bindSwarmShortcuts(ctx, {
       isModalOpen: () => isModalOpen(state),
       isExpanded: () => state.expanded,
       onToggleExpand: () => {
-        toggles++;
         state.expanded = !state.expanded;
       },
       onCollapse: () => {
-        collapses++;
         state.expanded = false;
       },
     });
 
-    assert.ok(listener);
-    // Kitty Ctrl+Shift+T (\x1b[84;6u) toggles expand
-    const r1 = listener!("\x1b[84;6u");
-    assert.equal(r1?.consume, true);
-    assert.equal(state.expanded, true);
-    assert.equal(toggles, 1);
-
-    // Modal open -> MUST NOT consume Esc or Ctrl+Shift+T
-    state.modalDepth = 1;
-    assert.equal(listener!("\x1b"), undefined);
-    assert.equal(listener!("\x1b[84;6u"), undefined);
-    assert.equal(state.expanded, true);
-    assert.equal(collapses, 0);
-
-    // Modal closed -> Esc collapses when expanded
-    state.modalDepth = 0;
-    const r2 = listener!("\x1b");
-    assert.equal(r2?.consume, true);
-    assert.equal(state.expanded, false);
-    assert.equal(collapses, 1);
-
-    // Already collapsed -> Esc not consumed
-    assert.equal(listener!("\x1b"), undefined);
-
+    assert.equal(
+      listener,
+      undefined,
+      "bindSwarmShortcuts must not attach global onTerminalInput (Pi registerShortcut handles Alt+S/M/W safely)",
+    );
+    assert.equal(typeof unbind, "function");
     unbind();
-    assert.equal(listener, undefined);
   });
 });
 
@@ -1591,8 +1577,8 @@ describe("swarm-overlay", () => {
               assert.equal(mockEngine.switched[0]!.model, "anthropic/claude-opus-4-6");
               assert.equal(mockEngine.switched[0]!.thinkingLevel, "high");
 
-              // [k] Kill helper-lex: Esc cancels, then k -> y confirms
-              comp.handleInput?.("k");
+              // [K] (Shift+K) Kill helper-lex: Esc cancels, then K -> y confirms
+              comp.handleInput?.("K");
               const killConfirmPlain = stripTerminalSequences(comp.render(100).join("\n"));
               assert.match(killConfirmPlain, /Kill @helper-lex permanently\?/);
               assert.match(killConfirmPlain, /force dirty: OFF/);
@@ -1605,7 +1591,7 @@ describe("swarm-overlay", () => {
               await flushAsync();
               assert.equal(mockEngine.killed.length, 0, "Esc must cancel kill confirmation");
 
-              comp.handleInput?.("k");
+              comp.handleInput?.("K");
               comp.handleInput?.("y");
               await flushAsync();
               assert.equal(mockEngine.killed.length, 1);
@@ -2479,8 +2465,8 @@ describe("v0.3.7 UI enhancements", () => {
               const diffScrolled = stripTerminalSequences(comp.render(100).join("\n"));
               assert.match(diffScrolled, /export const line2[0-5]/);
 
-              // 5. Members [k] -> [f] force dirty toggle -> [Enter] confirm
-              comp.handleInput?.("k");
+              // 5. Members [K] (Shift+K) -> [f] force dirty toggle -> [Enter] confirm
+              comp.handleInput?.("K");
               comp.handleInput?.("f");
               comp.handleInput?.("\r");
               await flushAsync();
@@ -2898,11 +2884,8 @@ describe("v0.4.0 Droid Mission Model Picker, Hub & Overlay Upgrades", () => {
       onApplyRoleModel: async () => ({ settings: DEFAULT_SWARM_SETTINGS }),
     });
 
-    // Global shortcuts Ctrl+Shift+M and Ctrl+Shift+S
+    // bindSwarmShortcuts is a safe no-op in v0.7.0 (Pi registerShortcut routes Alt+S/M/W without hijacking native dialogs)
     const listeners = new Set<(data: string) => unknown>();
-    let modal = false;
-    let modelOpened = 0;
-    let mcOpened = 0;
     const unbind = bindSwarmShortcuts(
       {
         mode: "tui",
@@ -2914,39 +2897,25 @@ describe("v0.4.0 Droid Mission Model Picker, Hub & Overlay Upgrades", () => {
         },
       } as unknown as ExtensionContext,
       {
-        isModalOpen: () => modal,
+        isModalOpen: () => false,
         isExpanded: () => false,
         onToggleExpand: () => {},
         onCollapse: () => {},
-        onOpenModelPicker: () => {
-          modelOpened += 1;
-        },
-        onOpenMissionControl: () => {
-          mcOpened += 1;
-        },
+        onOpenModelPicker: () => {},
+        onOpenMissionControl: () => {},
       },
     );
-    const dispatch = (seq: string) => {
-      for (const l of listeners) l(seq);
-    };
-    dispatch("\x1b[77;6u"); // Ctrl+Shift+M
-    dispatch("\x1b[83;6u"); // Ctrl+Shift+S
-    assert.equal(modelOpened, 1);
-    assert.equal(mcOpened, 1);
-    modal = true;
-    dispatch("\x1b[77;6u");
-    assert.equal(modelOpened, 1, "Shortcuts must be ignored when modal is open");
+    assert.equal(listeners.size, 0, "bindSwarmShortcuts must not attach global onTerminalInput");
     unbind();
   });
 });
 
 describe("v0.5.0 TUI Protocol, Responsive Bounds & Mission Hub Resume", () => {
-  it("ignores Kitty key-release events and host-streaming Esc in bindSwarmShortcuts", () => {
+  it("bindSwarmShortcuts never intercepts Esc or Alt keys via raw onTerminalInput", () => {
     const listeners: Array<(d: string) => unknown> = [];
     let toggles = 0;
     let collapses = 0;
     let modelOpened = 0;
-    let streaming = true;
 
     const fakeCtx = {
       mode: "tui",
@@ -2962,7 +2931,7 @@ describe("v0.5.0 TUI Protocol, Responsive Bounds & Mission Hub Resume", () => {
     const unbind = bindSwarmShortcuts(fakeCtx, {
       isModalOpen: () => false,
       isExpanded: () => true,
-      isHostStreaming: () => streaming,
+      isHostStreaming: () => false,
       onToggleExpand: () => {
         toggles += 1;
       },
@@ -2974,25 +2943,10 @@ describe("v0.5.0 TUI Protocol, Responsive Bounds & Mission Hub Resume", () => {
       },
     });
 
-    const dispatch = (seq: string) => {
-      for (const fn of listeners) fn(seq);
-    };
-
-    // Kitty release events (:3u) must be ignored cleanly
-    dispatch("\x1b[77;6:3u");
-    dispatch("\x1b[84;6:3u");
-    dispatch("\x1b[27;1:3u");
+    assert.equal(listeners.length, 0);
     assert.equal(modelOpened, 0);
     assert.equal(toggles, 0);
     assert.equal(collapses, 0);
-
-    // Esc while host is streaming must NOT collapse so Pi can abort cleanly
-    dispatch("\x1b");
-    assert.equal(collapses, 0);
-
-    streaming = false;
-    dispatch("\x1b");
-    assert.equal(collapses, 1);
     unbind();
   });
 
@@ -3813,30 +3767,32 @@ describe("v0.6.0 Mission Control Overlay, 1-Keystroke Q&A & Plan Confirmation UX
               void (async () => {
                 await flushAsync();
 
-                // 1. Mission Pipeline Strip visible when rows >= 20 (1 working, 3 ready, 1 merged)
+                // 1. Mission Pipeline Strip visible when rows >= 20 (1 working, 3 waiting, 1 stopped, 1 merged)
                 (mockTui.tui.terminal as unknown as { rows: number; columns: number }).rows = 20;
                 const at20Rows = stripTerminalSequences(comp.render(100).join("\n"));
-                assert.match(at20Rows, /Build and verify streaming parser pipeline/);
-                assert.match(at20Rows, /Working: 1 · Ready: 3 · Merged: 1/);
+                assert.match(at20Rows, /Objective: Build and verify streaming parser/);
+                assert.match(at20Rows, /Working: 1 · Waiting: 3 · Stopped: 1 · Merged: 1/);
 
                 // 2. Switch to [2] Members tab -> selected worker-live (working)
                 comp.handleInput?.("2");
                 const workingView = stripTerminalSequences(comp.render(80).join("\n"));
                 assert.match(
                   workingView,
-                  /\[Enter\] Logs  \[w\] Steer Live  \[d\] Diff  \[m\] Queue Model  \[x\] Stop  \[k\] Kill/,
+                  /\[Enter\] Logs  \[w\] Steer Live  \[d\] Diff  \[m\] Queue Model  \[x\] Stop  \[K\] Kill/,
                 );
 
-                // [Enter] toggles full Brief & Logs inspector on and off
+                // [Enter] toggles full Brief & Logs inspector on and off (and toggles [Enter] Info)
                 comp.handleInput?.("\r");
                 const logsOpen = stripTerminalSequences(comp.render(90).join("\n"));
                 assert.match(logsOpen, /Brief & Logs/);
+                assert.match(logsOpen, /\[Enter\] Info/);
                 assert.match(logsOpen, /Log Tail \(2 line\(s\)\)/);
                 assert.match(logsOpen, /Implement streaming lexer and verify edge cases/);
 
                 comp.handleInput?.("\r");
                 const logsClosed = stripTerminalSequences(comp.render(90).join("\n"));
                 assert.match(logsClosed, /Details & Logs/);
+                assert.match(logsClosed, /\[Enter\] Logs/);
                 assert.ok(!logsClosed.includes("Log Tail (2 line(s))"));
 
                 // When inline [w] prompt is active, [Enter] submits prompt rather than toggling logs
@@ -3855,15 +3811,15 @@ describe("v0.6.0 Mission Control Overlay, 1-Keystroke Q&A & Plan Confirmation UX
                 const unmergedWaitingBar = stripTerminalSequences(comp.render(80).join("\n"));
                 assert.match(
                   unmergedWaitingBar,
-                  /\[Enter\] Logs  \[g\] Merge Branch  \[d\] Diff  \[w\] Wake  \[m\] Model  \[k\] Kill/,
+                  /\[Enter\] Logs  \[g\] Merge Branch  \[d\] Diff  \[w\] Wake  \[m\] Model  \[K\] Kill/,
                 );
 
-                // 4. Down -> worker-stopped-branch (stopped + unmerged branch): highlights [g] Merge Branch
+                // 4. Down -> worker-stopped-branch (stopped + unmerged branch): highlights [r] Retry and [g] Merge Branch
                 comp.handleInput?.("\x1b[B");
-                const unmergedStoppedBar = stripTerminalSequences(comp.render(80).join("\n"));
+                const unmergedStoppedBar = stripTerminalSequences(comp.render(88).join("\n"));
                 assert.match(
                   unmergedStoppedBar,
-                  /\[Enter\] Logs  \[g\] Merge Branch  \[d\] Diff  \[w\] Wake  \[m\] Model  \[k\] Kill/,
+                  /\[Enter\] Logs  \[r\] Retry  \[g\] Merge Branch  \[d\] Diff  \[w\] Wake  \[m\] Model  \[K\] Kill/,
                 );
 
                 // 5. Down -> worker-merged (already merged share): omits [g] Merge Branch
@@ -3871,7 +3827,7 @@ describe("v0.6.0 Mission Control Overlay, 1-Keystroke Q&A & Plan Confirmation UX
                 const mergedBar = stripTerminalSequences(comp.render(80).join("\n"));
                 assert.match(
                   mergedBar,
-                  /\[Enter\] Logs  \[w\] Wake  \[m\] Model  \[k\] Kill/,
+                  /\[Enter\] Logs  \[w\] Wake  \[m\] Model  \[K\] Kill/,
                 );
                 assert.ok(!mergedBar.includes("[g] Merge Branch"));
 
@@ -3880,7 +3836,7 @@ describe("v0.6.0 Mission Control Overlay, 1-Keystroke Q&A & Plan Confirmation UX
                 const inheritBar = stripTerminalSequences(comp.render(80).join("\n"));
                 assert.match(
                   inheritBar,
-                  /\[Enter\] Logs  \[w\] Wake  \[m\] Model  \[k\] Kill/,
+                  /\[Enter\] Logs  \[w\] Wake  \[m\] Model  \[K\] Kill/,
                 );
                 assert.ok(!inheritBar.includes("[g] Merge Branch"));
 
@@ -3900,7 +3856,7 @@ describe("v0.6.0 Mission Control Overlay, 1-Keystroke Q&A & Plan Confirmation UX
                 }
                 const at16Plain = stripTerminalSequences(comp.render(100).join("\n"));
                 assert.ok(
-                  !at16Plain.includes("Working: 1 · Ready: 3 · Merged: 1"),
+                  !at16Plain.includes("Working: 1 · Waiting: 3"),
                   "Mission Pipeline Strip must be hidden when terminal height < 20",
                 );
 
@@ -4175,5 +4131,536 @@ describe("v0.6.0 Mission Control Overlay, 1-Keystroke Q&A & Plan Confirmation UX
 
     assert.equal(outcome.action, "confirm");
     assert.equal(outcome.feedback, "Ship cleanly");
+  });
+});
+
+describe("v0.7.0 UI Live Dashboard & Mission Control Overhaul", () => {
+  const fixedNow = () => Date.parse("2026-11-20T17:45:00.000Z");
+
+  it("exports SwarmDashboardComponent & SwarmOverlayComponent, excludes waking members from waiting (no 2w/1wait), shows N stopped, and suppresses · draft on active runs", () => {
+    assert.equal(typeof SwarmDashboardComponent, "function");
+    assert.equal(typeof SwarmOverlayComponent, "function");
+
+    const theme = createMockTheme();
+    const mockTui = createMockTUI(30, 100);
+
+    // 2 members total: slugger is waking (in workingMemberNames while m.state is still "waiting") + checker is working
+    const slugger = makeSampleMember({
+      name: "slugger",
+      role: "worker",
+      state: "waiting",
+      createdAt: "2026-11-20T17:30:00.000Z",
+      turnStartedAt: "2026-11-20T17:44:48.000Z", // 12s ago (not 15m spawn lifetime!)
+      currentActivity: "Running tests",
+    });
+    const checker = makeSampleMember({
+      name: "checker",
+      role: "validator",
+      state: "working",
+      createdAt: "2026-11-20T17:31:00.000Z",
+      turnStartedAt: "2026-11-20T17:44:55.000Z", // 5s ago
+      currentActivity: "Auditing diff",
+    });
+    const wakingSnap = makeSampleSnapshot({
+      members: [slugger, checker],
+      boardHead: 5,
+    });
+    wakingSnap.workingMemberNames = ["slugger", "checker"];
+    wakingSnap.waitingMemberNames = ["slugger"]; // stale waiting entry during wakeup transition
+
+    // Status line must report 2 working · 0 waiting (never 2w/1wait) and suppress · draft when active
+    const activeStatusWithDraft = formatStatusLine(wakingSnap, true) ?? "";
+    assert.match(activeStatusWithDraft, /2 working · 0 waiting/);
+    assert.ok(!activeStatusWithDraft.includes("2w/1wait"));
+    assert.ok(!activeStatusWithDraft.includes("1 waiting"));
+    assert.ok(!activeStatusWithDraft.includes("· draft"), `Active run must suppress · draft: ${activeStatusWithDraft}`);
+
+    // Compact widget must also report 2 working · 0 waiting and use turnStartedAt (12s, 5s) instead of createdAt (15m, 14m)
+    const widget = createSwarmWidget(() => wakingSnap, createSwarmWidgetState(), {
+      now: fixedNow,
+    })(mockTui.tui, theme);
+    try {
+      const plain100 = stripTerminalSequences(widget.render(100).join("\n"));
+      assert.match(plain100, /2 working · 0 waiting/);
+      assert.ok(!plain100.includes("(2w/"));
+      assert.match(plain100, /slugger Running tests\s+12s/);
+      assert.match(plain100, /checker Auditing diff\s+5s/);
+      assert.ok(!plain100.includes("15m"), "Must use turnStartedAt rather than spawn createdAt");
+
+      const plain40 = stripTerminalSequences(widget.render(40).join("\n"));
+      assert.match(plain40, /2w\/0wait/);
+      assert.ok(!plain40.includes("2w/1wait"));
+    } finally {
+      widget.dispose();
+    }
+
+    // Stopped members: show N stopped across compact widget, expanded widget, and status line; paused run still allows · draft
+    const stoppedSnap = makeSampleSnapshot({
+      members: [
+        makeSampleMember({ name: "s1", state: "stopped", error: "SIGTERM" }),
+        makeSampleMember({ name: "s2", state: "stopped" }),
+      ],
+      boardHead: 3,
+    });
+    stoppedSnap.run!.status = "paused";
+    const stoppedStatus = formatStatusLine(stoppedSnap, true) ?? "";
+    assert.match(stoppedStatus, /0 working · 0 waiting · 2 stopped/);
+    assert.match(stoppedStatus, /· draft$/);
+
+    const stoppedWidget = createSwarmWidget(
+      () => stoppedSnap,
+      createSwarmWidgetState({ expanded: false }),
+      { now: fixedNow },
+    )(mockTui.tui, theme);
+    try {
+      const compactPlain = stripTerminalSequences(stoppedWidget.render(100).join("\n"));
+      assert.match(compactPlain, /0 working · 0 waiting · 2 stopped/);
+      const narrowPlain = stripTerminalSequences(stoppedWidget.render(48).join("\n"));
+      assert.match(narrowPlain, /0w\/0wait\/2stop/);
+    } finally {
+      stoppedWidget.dispose();
+    }
+  });
+
+  it("caps renderExpanded at Math.max(8, termRows - 7) for 72x20 without clipping bottom border or newest board post, avoids +1 more row, balances columns at 100x30, formats local clocks, shows Phase/Milestones, and collapses completed runs to 1 line", () => {
+    const theme = createMockTheme();
+
+    // 1. 72x20 with 2 members & 6 board messages: height <= 13, bottom border intact, newest post #6 visible, NO "+1 more row"
+    {
+      const { tui } = createMockTUI(20, 72);
+      const snap = makeSampleSnapshot({
+        members: [
+          makeSampleMember({
+            name: "impl-auth",
+            role: "worker",
+            state: "working",
+            model: "anthropic/claude-sonnet-4-5",
+            thinkingLevel: "high",
+            workspace: "share",
+            branch: "swarm/run-demo/impl-auth",
+            currentActivity: "Implementing PKCE S256 flow",
+          }),
+          makeSampleMember({
+            name: "verifier",
+            role: "validator",
+            state: "waiting",
+            model: "openai/gpt-6.2-astra",
+            thinkingLevel: "high",
+            workspace: "inherit",
+            branch: undefined,
+            parkedOn: "Ready for audit",
+          }),
+        ],
+        boardHead: 6,
+      });
+      snap.recentBoard.push({
+        seq: 6,
+        runId: snap.run!.id,
+        channel: "main",
+        from: "verifier",
+        fromRole: "validator",
+        text: "Newest board message #6 must never be clipped at 72x20",
+        mentions: ["orchestrator"],
+        channelMentions: [],
+        kind: "done",
+        timestamp: "2026-11-20T17:44:30.000Z",
+      });
+
+      const widget = createSwarmWidget(
+        () => snap,
+        createSwarmWidgetState({ expanded: true }),
+        { now: fixedNow },
+      )(tui, theme);
+      try {
+        const lines = widget.render(72);
+        assert.ok(
+          lines.length <= 13,
+          `72x20 renderExpanded must be <= termRows - 7 (13), got ${lines.length}`,
+        );
+        assertAllLinesFit(lines, 72, "v070-expanded@72x20");
+        const plainLines = lines.map((l) => stripTerminalSequences(l));
+        assert.ok(plainLines[0]!.startsWith("╭─"), "Top border intact");
+        assert.ok(plainLines[plainLines.length - 1]!.startsWith("╰─"), "Bottom border intact");
+        const joined = plainLines.join("\n");
+        assert.match(joined, /impl-auth/);
+        assert.match(joined, /verifier/);
+        assert.ok(!joined.includes("+1 more row"), "Must not show '+1 more row' when 2 members fit directly");
+        assert.match(joined, /#6/);
+      } finally {
+        widget.dispose();
+      }
+    }
+
+    // 2. 100x30 column balance (Workspace capped at 18 so Model:thinking & Activity fit cleanly) + Phase & Milestones
+    {
+      const { tui } = createMockTUI(30, 100);
+      const snap = makeSampleSnapshot({
+        members: [
+          makeSampleMember({
+            name: "impl-auth",
+            role: "worker",
+            state: "working",
+            model: "anthropic/claude-sonnet-4-5",
+            thinkingLevel: "high",
+            workspace: "share",
+            branch: "swarm/run-20261123-very-long/impl-auth",
+            currentActivity: "Running PKCE verification tests",
+          }),
+        ],
+      });
+      snap.run!.phase = "Validation";
+      snap.run!.milestones = [
+        { label: "Design", status: "done" },
+        { label: "Implement", status: "done" },
+        { label: "Tests", status: "done" },
+        { label: "Audit", status: "in_progress" },
+      ];
+
+      const compactWidget = createSwarmWidget(
+        () => snap,
+        createSwarmWidgetState({ expanded: false }),
+        { now: fixedNow },
+      )(tui, theme);
+      try {
+        const compactPlain = stripTerminalSequences(compactWidget.render(100).join("\n"));
+        assert.match(compactPlain, /Phase: Validation \[3\/4\]/);
+      } finally {
+        compactWidget.dispose();
+      }
+
+      const expandedWidget = createSwarmWidget(
+        () => snap,
+        createSwarmWidgetState({ expanded: true }),
+        { now: fixedNow },
+      )(tui, theme);
+      try {
+        const lines100 = expandedWidget.render(100);
+        assertAllLinesFit(lines100, 100, "v070-expanded@100x30");
+        const plain100 = stripTerminalSequences(lines100.join("\n"));
+        assert.match(plain100, /Phase: Validation \[3\/4\]/);
+        assert.match(plain100, /claude-sonnet-4-5:high/, "Model + thinking level must not be starved at 100x30");
+        assert.match(plain100, /Running PKCE verif/, "Activity must have >= 18 chars breathing room at 100x30");
+      } finally {
+        expandedWidget.dispose();
+      }
+
+      // Local HH:MM:SS clock consistency between zero-turn board/status and formatClock
+      const ts = snap.recentBoard[0]!.timestamp;
+      const expectedLocalClock = formatClock(ts);
+      const boardMd = formatZeroTurnBoardView(snap.recentBoard, snap.boardHead);
+      const statusMd = formatZeroTurnStatusDashboard(snap, { now: fixedNow });
+      assert.ok(boardMd.includes(`\`${expectedLocalClock}\``), "Board clock must use local HH:MM:SS");
+      assert.ok(statusMd.includes(`\`${expectedLocalClock}\``), "Status clock must use local HH:MM:SS");
+      assert.match(statusMd, /Phase:\*\* Validation \[3\/4\]/);
+    }
+
+    // 3. Completed / cancelled / failed collapse to sleek 1-line summary unless manually expanded
+    {
+      const { tui } = createMockTUI(30, 100);
+      for (const terminalStatus of ["completed", "abandoned", "cancelled", "failed"] as const) {
+        const snap = makeSampleSnapshot();
+        snap.run!.status = terminalStatus as SwarmRunState["status"];
+        const state = createSwarmWidgetState({ expanded: false });
+        const widget = createSwarmWidget(() => snap, state, { now: fixedNow })(tui, theme);
+        try {
+          for (const w of [40, 60, 72, 80, 100, 120] as const) {
+            const collapsed = widget.render(w);
+            assert.equal(
+              collapsed.length,
+              1,
+              `Terminal run (${terminalStatus}) must collapse to 1 line at width ${w}, got ${collapsed.length}`,
+            );
+            assertAllLinesFit(collapsed, w, `v070-terminal-${terminalStatus}@${w}`);
+          }
+          // Manually expanded still renders full box
+          state.expanded = true;
+          const expanded = widget.render(100);
+          assert.ok(expanded.length > 5, "Manually expanded terminal run must render full dashboard");
+          assertAllLinesFit(expanded, 100, `v070-terminal-expanded-${terminalStatus}@100`);
+        } finally {
+          widget.dispose();
+        }
+      }
+    }
+  });
+
+  it("SwarmOverlayComponent clamps height at termRows=12, runs live 120ms spinner, surfaces inline activity & ✗ error icon, supports j/k vs Shift+K kill, [r] Retry (direct + conflict prefill), Phase/Milestones, narrow 72x20 polish, and updated ? Help", async () => {
+    const theme = createMockTheme();
+    const mockTui = createMockTUI(24, 100);
+
+    const workingMember = makeSampleMember({
+      name: "worker-live",
+      role: "worker",
+      state: "working",
+      workspace: "share",
+      branch: "swarm/dyn/worker-live",
+      createdAt: "2026-11-20T17:30:00.000Z",
+      turnStartedAt: "2026-11-20T17:44:45.000Z", // 15s
+      currentActivity: "Running vitest suite",
+      brief:
+        "Line 1 of a very detailed brief\nLine 2 explaining architecture\nLine 3 explaining invariants\nLine 4 explaining edge cases\nLine 5 explaining verification\nLine 6 explaining cleanup",
+      logTail: [
+        "This is a long log entry that definitely wraps across multiple terminal columns at 72 width so we can verify every wrapped continuation line keeps the vertical bar gutter intact",
+        "Second log line",
+      ],
+    });
+    const erroredMember = makeSampleMember({
+      name: "worker-err",
+      role: "worker",
+      state: "stopped",
+      workspace: "share",
+      branch: "swarm/dyn/worker-err",
+      error: "Process exited unexpectedly with code 1",
+    });
+    const conflictMember = makeSampleMember({
+      name: "worker-conflict",
+      role: "worker",
+      state: "stopped",
+      workspace: "share",
+      branch: "swarm/dyn/worker-conflict",
+      error: "REBASE_CONFLICT in src/index.ts",
+    });
+
+    const snap = makeSampleSnapshot({
+      members: [workingMember, erroredMember, conflictMember],
+      boardHead: 5,
+    });
+    snap.run!.phase = "Integration";
+    snap.run!.milestones = [
+      { label: "Core", status: "done" },
+      { label: "UI", status: "done" },
+      { label: "Verify", status: "in_progress" },
+    ];
+
+    const steered: Array<{ name: string; message: string }> = [];
+    const killed: string[] = [];
+    const engine: ISwarmEngine = {
+      startRun: async () => snap.run!,
+      attachRun: async () => snap,
+      setTitle: async () => snap.run!,
+      updateDirection: async () => snap.run!,
+      addMembers: async () => [],
+      postMessage: async () => snap.recentBoard[0]!,
+      readBoard: async () => ({ messages: snap.recentBoard, head: snap.boardHead }),
+      waitForBoard: async () => ({ wokeBy: "timeout", messages: [], head: 0, summary: "" }),
+      parkOrchestratorWait: async () => ({
+        parked: false,
+        messages: [],
+        head: 0,
+        activeMembers: [],
+        summary: "",
+      }),
+      clearOrchestratorWait: () => {},
+      steerMember: async (name, message) => {
+        steered.push({ name, message });
+        return { delivery: "woken" };
+      },
+      switchModel: async (o) => ({ targetName: o.targetName ?? "", model: o.model ?? "" }),
+      stopMember: async () => {},
+      killMember: async (name) => {
+        killed.push(name);
+      },
+      mergeMember: async () => null,
+      manageChannel: async () => ({
+        action: "create",
+        name: "main",
+        topic: "",
+        createdBy: ORCHESTRATOR_NAME,
+        createdAt: "",
+        subscribers: [],
+        archived: false,
+        summary: "ok",
+      }),
+      completeRun: async () => snap.run!,
+      pause: async () => snap.run!,
+      resume: async () => snap.run!,
+      teardown: async () => ({ removed: [], skipped: [], errors: [] }),
+      listModels: async () => [],
+      getSnapshot: () => snap,
+      subscribe: () => () => {},
+      dispose: async () => {},
+    };
+
+    let overlayRef: (Component & { dispose?(): void }) | undefined;
+
+    await openSwarmOverlay(
+      {
+        mode: "tui",
+        hasUI: true,
+        ui: {
+          theme,
+          notify() {},
+          async custom<T>(
+            factory: (
+              t: TUI,
+              th: Theme,
+              kb: unknown,
+              done: (r: T) => void,
+            ) => Component & { dispose?(): void },
+          ): Promise<T> {
+            return new Promise<T>((resolve) => {
+              const comp = factory(mockTui.tui, theme, {}, resolve);
+              overlayRef = comp;
+              if (isFocusable(comp)) comp.focused = true;
+
+              void (async () => {
+                await flushAsync();
+
+                // 1. Live spinner ticks while member is working
+                const rendersBefore = mockTui.renderCount();
+                await new Promise((r) => setTimeout(r, 120));
+                assert.ok(
+                  mockTui.renderCount() > rendersBefore,
+                  "Overlay must tick spinner timer while members are working",
+                );
+
+                // 2. Row 2 omits duplicate run title so full 3-role models fit at 100x30; Pipeline Strip shows Phase [2/3] & Stopped: 2
+                (mockTui.tui.terminal as unknown as { rows: number; columns: number }).rows = 30;
+                const board100 = stripTerminalSequences(comp.render(100).join("\n"));
+                assert.match(board100, /\[Live\] base:main/);
+                assert.match(board100, /O:claude-opus-4-6\(high\)/);
+                assert.match(board100, /W:gpt-5\.4-codex\(medium\)/);
+                assert.match(board100, /V:gemini-2\.5-pro\(high\)/);
+                assert.match(board100, /Phase: Integration \[2\/3\]/);
+                assert.match(board100, /Working: 1 · Waiting: 0 · Stopped: 2 · Merged: 0/);
+                assert.match(board100, /\[\?\] help · \[Esc\/q\] close/);
+
+                // 3. Narrow 72x20 Board header keeps Channel: #main untruncated, and footer keeps [?] help · [Esc/q] close
+                (mockTui.tui.terminal as unknown as { rows: number; columns: number }).rows = 20;
+                comp.handleInput?.("c"); // * -> #main
+                const board72 = stripTerminalSequences(comp.render(72).join("\n"));
+                assert.match(board72, /Channel: #main \(\d+\)/);
+                assert.match(board72, /\[\?\] help · \[Esc\/q\] close/);
+
+                // 4. ? Help omits stale ^Shift+M/^Shift+S and lists Alt+S/M/W, j/k, K kill, r retry, Board/Search keys
+                comp.handleInput?.("?");
+                const help100 = stripTerminalSequences(comp.render(100).join("\n"));
+                assert.ok(!help100.includes("^Shift+M"));
+                assert.ok(!help100.includes("^Shift+S"));
+                assert.match(help100, /Alt\+S \/ Alt\+M \/ Alt\+W/);
+                assert.match(help100, /j \/ k/);
+                assert.match(help100, /w \/ r \/ m \/ g \/ x \/ K/);
+                assert.match(help100, /Board \[1\] & Search \[4\]/);
+                comp.handleInput?.("?");
+
+                // 5. Tab 2 (Members): inline activity, ✗ error icon, per-turn elapsed (15s), j/k nav, K kill (not k!)
+                comp.handleInput?.("2");
+                (mockTui.tui.terminal as unknown as { rows: number; columns: number }).rows = 24;
+                const members100 = stripTerminalSequences(comp.render(100).join("\n"));
+                assert.match(members100, /Running vitest suite/);
+                assert.match(members100, /15s t:/);
+                assert.match(members100, /✗ worker-err/);
+                assert.match(members100, /✗ worker-conflict/);
+
+                // Narrow 72x20 Members action bar fits compact labels including [x] Stop and [K] Kill
+                (mockTui.tui.terminal as unknown as { rows: number; columns: number }).rows = 20;
+                const members72 = stripTerminalSequences(comp.render(72).join("\n"));
+                assert.match(members72, /\[Enter\] Logs \[w\] Steer \[d\] Diff \[m\] Model \[x\] Stop \[K\] Kill/);
+
+                // Members Logs view at 72x20: Brief clips before logs -> shows ↓ scroll (]/PgDn) cue, and wrapped log lines preserve `  │ ` gutter!
+                comp.handleInput?.("\r"); // Enter -> Logs mode
+                const logsTop72 = stripTerminalSequences(comp.render(72).join("\n"));
+                assert.match(logsTop72, /\[Enter\] Info/);
+                assert.match(logsTop72, /↓ scroll \(\]\/PgDn\)/);
+                // Scroll down to logs and verify every wrapped log line preserves `  │ `
+                comp.handleInput?.("]");
+                comp.handleInput?.("]");
+                comp.handleInput?.("]");
+                const logsScrolled72 = stripTerminalSequences(comp.render(72).join("\n"));
+                const gutterLines = logsScrolled72
+                  .split("\n")
+                  .filter((l) => l.includes("log entry") || l.includes("gutter intact") || l.includes("wraps across"));
+                assert.ok(gutterLines.length >= 2, "Expected wrapped log lines to be rendered");
+                for (const gl of gutterLines) {
+                  assert.match(gl, /│\s+/, `Wrapped log line lost left gutter: ${gl}`);
+                }
+                comp.handleInput?.("\r"); // back to Info
+
+                // j moves Down (worker-live -> worker-err), k moves Up (NOT Kill!)
+                comp.handleInput?.("j");
+                assert.match(
+                  stripTerminalSequences(comp.render(100).join("\n")),
+                  /── worker-err — Details & Logs/,
+                );
+                comp.handleInput?.("k");
+                const afterLowercaseK = stripTerminalSequences(comp.render(100).join("\n"));
+                assert.match(afterLowercaseK, /── worker-live — Details & Logs/);
+                assert.ok(!afterLowercaseK.includes("Kill @"), "Lowercase k must navigate Up, never trigger Kill");
+
+                // Move down with j to worker-err (non-conflict stopped/errored) -> [r] directly revives via steerMember
+                comp.handleInput?.("j");
+                comp.handleInput?.("r");
+                await flushAsync();
+                assert.equal(steered.length, 1);
+                assert.equal(steered[0]!.name, "worker-err");
+                assert.match(steered[0]!.message, /Retry and continue/);
+
+                // Move down with j to worker-conflict -> [r] opens conflict-aware prefilled steer input
+                comp.handleInput?.("j");
+                comp.handleInput?.("r");
+                const conflictPrompt = stripTerminalSequences(comp.render(100).join("\n"));
+                assert.match(conflictPrompt, /Conflict retry for @worker-conflict/);
+                assert.match(conflictPrompt, /Rebase onto main and resolve conflicts/);
+                comp.handleInput?.("\r"); // submit prefilled conflict steer
+                await flushAsync();
+                assert.equal(steered.length, 2);
+                assert.equal(steered[1]!.name, "worker-conflict");
+                assert.match(steered[1]!.message, /Rebase onto main and resolve conflicts/);
+
+                // Shift+K triggers Kill confirmation on worker-conflict
+                comp.handleInput?.("K");
+                assert.match(
+                  stripTerminalSequences(comp.render(100).join("\n")),
+                  /Kill @worker-conflict permanently\?/,
+                );
+                comp.handleInput?.("y");
+                await flushAsync();
+                assert.deepEqual(killed, ["worker-conflict"]);
+
+                // 6. Height clamp at termRows=12 (<= Math.floor(12 * 0.86) = 10) across all 4 tabs and widths 40/60/72/80/100/120
+                (mockTui.tui.terminal as unknown as { rows: number; columns: number }).rows = 12;
+                for (const tabKey of ["1", "2", "3", "4"] as const) {
+                  comp.handleInput?.(tabKey);
+                  if (tabKey === "4") comp.handleInput?.("\x1b");
+                  for (const w of [40, 60, 72, 80, 100, 120] as const) {
+                    const rendered = comp.render(w);
+                    assert.ok(
+                      rendered.length <= 10,
+                      `Overlay tab ${tabKey} at 12x${w} must clamp to <= 10 rows (got ${rendered.length})`,
+                    );
+                    assertAllLinesFit(rendered, w, `v070-overlay-tab${tabKey}@12x${w}`);
+                    const lastPlain = stripTerminalSequences(rendered[rendered.length - 1]!);
+                    assert.ok(
+                      lastPlain.startsWith("╰─"),
+                      `Bottom border must remain intact at 12x${w}`,
+                    );
+                  }
+                }
+
+                // 7. Search tab narrow 72x20 header & footer fit cleanly
+                (mockTui.tui.terminal as unknown as { rows: number; columns: number }).rows = 20;
+                const search72 = stripTerminalSequences(comp.render(72).join("\n"));
+                assert.match(search72, /\[\?\] help · \[Esc\/q\] close/);
+
+                comp.handleInput?.("q");
+              })();
+            });
+          },
+        },
+      } as unknown as ExtensionContext,
+      engine,
+      null,
+      { now: fixedNow, spinnerIntervalMs: 40 },
+    );
+
+    // Confirm spinner timer stopped cleanly after overlay closed/disposed
+    assert.ok(overlayRef);
+    const rendersAfterClose = mockTui.renderCount();
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(
+      mockTui.renderCount(),
+      rendersAfterClose,
+      "Overlay spinner timer must be cleaned up on dispose()",
+    );
   });
 });
