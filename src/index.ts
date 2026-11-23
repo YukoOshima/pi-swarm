@@ -1,4 +1,7 @@
+import { execFile } from "node:child_process";
+import { access } from "node:fs/promises";
 import path from "node:path";
+import { promisify } from "node:util";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import {
   type CustomMessageEntryDraft,
@@ -12,9 +15,18 @@ import {
   type ThemeColor,
   ModelRuntime,
   getAgentDir,
+  getMarkdownTheme,
   resolveCliModel,
 } from "@earendil-works/pi-coding-agent";
-import { Text, type AutocompleteItem, type Component, type TUI } from "@earendil-works/pi-tui";
+import {
+  Box,
+  Markdown,
+  Text,
+  type AutocompleteItem,
+  type Component,
+  type MarkdownTheme,
+  type TUI,
+} from "@earendil-works/pi-tui";
 import {
   DEFAULT_CHANNEL,
   DEFAULT_SWARM_SETTINGS,
@@ -511,18 +523,49 @@ function formatHostModelId(
 
 export interface ApplyOrchestratorModelResult {
   applied: boolean;
+  changed?: boolean;
   model?: string;
   thinkingLevel?: ThinkingLevel;
   warning?: string;
 }
 
+interface PreSwarmHostModelSnapshot {
+  provider: string;
+  modelId: string;
+  thinkingLevel?: ThinkingLevel;
+}
+
+function doesHostModelMatchTarget(
+  hostModel: { provider?: string; id?: string } | undefined,
+  targetModelSpec: string,
+): boolean {
+  if (!hostModel?.id) {
+    return false;
+  }
+  const target = targetModelSpec.trim().toLowerCase();
+  if (!target) {
+    return false;
+  }
+  const hostId = hostModel.id.trim().toLowerCase();
+  const hostFull = formatHostModelId(hostModel)?.trim().toLowerCase();
+  if (hostFull && target === hostFull) {
+    return true;
+  }
+  if (!target.includes("/") && target === hostId) {
+    return true;
+  }
+  return false;
+}
+
 /**
  * Resolves and applies `settings.orchestratorModel` (+ optional thinking level)
  * onto the host Pi session via `resolveCliModel` + `pi.setModel` / `pi.setThinkingLevel`.
+ * Idempotently short-circuits when `ctx.model` and active thinking level already match target.
  * Never throws when credentials or model catalog entries are unavailable — emits a clean warning.
  */
 async function applyOrchestratorModel(
-  pi: Pick<ExtensionAPI, "setModel" | "setThinkingLevel">,
+  pi: Pick<ExtensionAPI, "setModel" | "setThinkingLevel"> &
+    Partial<Pick<ExtensionAPI, "getThinkingLevel">>,
   ctx: ExtensionContext | undefined,
   settings: SwarmSettings,
   getFallbackRuntime: () => Promise<ModelRuntime>,
@@ -537,27 +580,88 @@ async function applyOrchestratorModel(
     )?.settingsManager?.getDefaultThinkingLevel?.();
     return raw && VALID_THINKING_LEVELS.has(raw) ? raw : "medium";
   };
+  const getActiveThinkingLevel = (): ThinkingLevel | undefined => {
+    try {
+      const fromPi =
+        typeof pi.getThinkingLevel === "function" ? pi.getThinkingLevel() : undefined;
+      if (fromPi && VALID_THINKING_LEVELS.has(fromPi)) {
+        return fromPi;
+      }
+    } catch {
+      // ignore if host harness does not expose active thinking level
+    }
+    const fromCtx = ctx?.thinkingLevel;
+    return fromCtx && VALID_THINKING_LEVELS.has(fromCtx) ? fromCtx : undefined;
+  };
 
   if (!configuredModel) {
+    let changed = false;
+    const currentThinking = getActiveThinkingLevel();
+    let appliedThinking: ThinkingLevel | undefined;
     if (typeof pi.setThinkingLevel === "function") {
       try {
         if (settings.orchestratorThinkingLevel) {
-          pi.setThinkingLevel(settings.orchestratorThinkingLevel);
+          appliedThinking = settings.orchestratorThinkingLevel;
+          if (currentThinking !== settings.orchestratorThinkingLevel) {
+            pi.setThinkingLevel(settings.orchestratorThinkingLevel);
+            changed = true;
+          }
         } else if (options.clearThinking) {
-          pi.setThinkingLevel(resolveHostDefaultThinking());
+          const defaultThinking = resolveHostDefaultThinking();
+          appliedThinking = defaultThinking;
+          if (currentThinking !== defaultThinking) {
+            pi.setThinkingLevel(defaultThinking);
+            changed = true;
+          }
         }
       } catch {
         // ignore thinking-level error when no model change requested
       }
     }
-    return { applied: false };
+    return {
+      applied: false,
+      changed,
+      ...(appliedThinking !== undefined ? { thinkingLevel: appliedThinking } : {}),
+    };
+  }
+
+  const parsedConfigured = parseModelSpec(configuredModel);
+  const targetModelSpec = parsedConfigured.model || configuredModel;
+  const targetThinking =
+    settings.orchestratorThinkingLevel ?? parsedConfigured.thinkingLevel;
+  const desiredThinking =
+    targetThinking ?? (options.clearThinking ? resolveHostDefaultThinking() : undefined);
+  const activeThinkingBefore = getActiveThinkingLevel();
+
+  // Fast-path idempotency: if host ctx.model already matches targetModelSpec,
+  // avoid redundant resolveCliModel custom-model warnings, pi.setModel calls, and thinking flaps.
+  if (doesHostModelMatchTarget(ctx?.model, targetModelSpec)) {
+    let thinkingChanged = false;
+    if (
+      desiredThinking !== undefined &&
+      activeThinkingBefore !== desiredThinking &&
+      typeof pi.setThinkingLevel === "function"
+    ) {
+      try {
+        pi.setThinkingLevel(desiredThinking);
+        thinkingChanged = true;
+      } catch {
+        // ignore thinking-level update error when model already matches
+      }
+    }
+    return {
+      applied: true,
+      changed: thinkingChanged,
+      model: formatHostModelId(ctx?.model) ?? targetModelSpec,
+      thinkingLevel: desiredThinking ?? activeThinkingBefore,
+    };
   }
 
   const warn = (message: string): ApplyOrchestratorModelResult => {
     if (ctx?.hasUI) {
       ctx.ui.notify(message, "warning");
     }
-    return { applied: false, warning: message };
+    return { applied: false, changed: false, warning: message };
   };
 
   try {
@@ -578,6 +682,33 @@ async function applyOrchestratorModel(
       );
     }
 
+    const effectiveThinking =
+      settings.orchestratorThinkingLevel ?? resolved.thinkingLevel;
+    const resolvedDesiredThinking =
+      effectiveThinking ?? (options.clearThinking ? resolveHostDefaultThinking() : undefined);
+    const alreadyOnResolvedModel =
+      Boolean(ctx?.model?.id) &&
+      ctx?.model?.id === resolved.model.id &&
+      ctx?.model?.provider === resolved.model.provider;
+
+    if (alreadyOnResolvedModel) {
+      let thinkingChanged = false;
+      if (
+        resolvedDesiredThinking !== undefined &&
+        activeThinkingBefore !== resolvedDesiredThinking &&
+        typeof pi.setThinkingLevel === "function"
+      ) {
+        pi.setThinkingLevel(resolvedDesiredThinking);
+        thinkingChanged = true;
+      }
+      return {
+        applied: true,
+        changed: thinkingChanged,
+        model: formatHostModelId(resolved.model) ?? configuredModel,
+        thinkingLevel: resolvedDesiredThinking ?? activeThinkingBefore,
+      };
+    }
+
     if (resolved.warning && ctx?.hasUI) {
       ctx.ui.notify(resolved.warning, "warning");
     }
@@ -595,18 +726,16 @@ async function applyOrchestratorModel(
       );
     }
 
-    const effectiveThinking =
-      settings.orchestratorThinkingLevel ?? resolved.thinkingLevel;
-    if (typeof pi.setThinkingLevel === "function") {
-      if (effectiveThinking) {
-        pi.setThinkingLevel(effectiveThinking);
-      } else if (options.clearThinking) {
-        pi.setThinkingLevel(resolveHostDefaultThinking());
+    if (typeof pi.setThinkingLevel === "function" && resolvedDesiredThinking !== undefined) {
+      const thinkingAfterModelSet = getActiveThinkingLevel();
+      if (thinkingAfterModelSet !== resolvedDesiredThinking) {
+        pi.setThinkingLevel(resolvedDesiredThinking);
       }
     }
 
     return {
       applied: true,
+      changed: true,
       model: formatHostModelId(resolved.model) ?? configuredModel,
       thinkingLevel: effectiveThinking,
     };
@@ -839,7 +968,7 @@ function buildMissionResumePrompt(
     "",
     "Resume Mission coordination from the persisted board & git state:",
     `1. Inspect recent board context via \`read_board{since: ${Math.max(0, run.boardHead - 20)}}\` (or inspect \`#tasks\` / \`git status\`) to see what is completed, parked, or unmerged.`,
-    '2. Wake parked/stopped members with `post_message` (`wake: true`), spawn any remaining work via `swarm{action:"add"}`, merge verified `share`/`branch` worktrees, and call `swarm{action:"done", summary}` once verified.',
+    '2. Wake parked/stopped members with `post_message` (mention `@<name>` in `text`), spawn any remaining work via `swarm{action:"add"}`, merge verified `share`/`branch` worktrees, and call `swarm{action:"done", summary}` once verified.',
     "</swarm_mission_resumed>",
   );
   return lines.join("\n");
@@ -941,6 +1070,93 @@ function clampPreviewText(
   };
 }
 
+const execFileAsync = promisify(execFile);
+
+function resolveSwarmMarkdownTheme(
+  theme: Partial<Theme> | undefined,
+): MarkdownTheme | undefined {
+  try {
+    if (typeof getMarkdownTheme === "function") {
+      const nativeTheme = getMarkdownTheme();
+      if (nativeTheme && typeof nativeTheme.heading === "function") {
+        // Probe lazily-bound global Pi theme so headless mocks without initTheme() fall back cleanly.
+        nativeTheme.heading("x");
+        return nativeTheme;
+      }
+    }
+  } catch {
+    // Fall through to theme adapter below.
+  }
+
+  if (!theme) {
+    return undefined;
+  }
+
+  const fg = (color: ThemeColor, value: string): string =>
+    typeof theme.fg === "function" ? theme.fg(color, value) : value;
+  const bold = (value: string): string =>
+    typeof theme.bold === "function" ? theme.bold(value) : value;
+  const italic = (value: string): string =>
+    typeof theme.italic === "function" ? theme.italic(value) : value;
+  const underline = (value: string): string =>
+    typeof theme.underline === "function" ? theme.underline(value) : value;
+  const strikethrough = (value: string): string =>
+    typeof theme.strikethrough === "function" ? theme.strikethrough(value) : value;
+
+  return {
+    heading: (t) => fg("mdHeading", bold(t)),
+    link: (t) => fg("mdLink", t),
+    linkUrl: (t) => fg("mdLinkUrl", t),
+    code: (t) => fg("mdCode", t),
+    codeBlock: (t) => fg("mdCodeBlock", t),
+    codeBlockBorder: (t) => fg("mdCodeBlockBorder", t),
+    quote: (t) => fg("mdQuote", t),
+    quoteBorder: (t) => fg("mdQuoteBorder", t),
+    hr: (t) => fg("mdHr", t),
+    listBullet: (t) => fg("mdListBullet", t),
+    bold,
+    italic,
+    underline,
+    strikethrough,
+  };
+}
+
+function createSwarmMarkdownComponent(
+  markdownText: string,
+  padX: number,
+  theme: Partial<Theme> | undefined,
+  bgFn: ((line: string) => string) | undefined,
+  headerLine?: string,
+): Component | undefined {
+  if (typeof Markdown !== "function") {
+    return undefined;
+  }
+  const mdTheme = resolveSwarmMarkdownTheme(theme);
+  if (!mdTheme) {
+    return undefined;
+  }
+  try {
+    const defaultTextStyle =
+      typeof theme?.fg === "function"
+        ? { color: (t: string) => theme.fg!("customMessageText", t) }
+        : undefined;
+    if (typeof Box === "function") {
+      const box = new Box(padX, 0, bgFn);
+      if (headerLine) {
+        box.addChild(new Text(headerLine, 0, 0));
+      }
+      if (markdownText.trim().length > 0) {
+        box.addChild(new Markdown(markdownText, 0, 0, mdTheme, defaultTextStyle));
+      }
+      return box;
+    }
+    const combined = headerLine ? `${headerLine}\n${markdownText}` : markdownText;
+    return new Markdown(combined, padX, 0, mdTheme, defaultTextStyle);
+  } catch {
+    return undefined;
+  }
+}
+
 function renderSwarmWakeupMessage(
   message: { content: unknown; details?: unknown },
   options: Partial<MessageRenderOptions> | undefined,
@@ -990,11 +1206,22 @@ function renderSwarmWakeupMessage(
     .trim();
 
   if (options?.expanded) {
-    const expandedLines: string[] = [
-      `${badge} ${styleInlineMarkdownLine(cleanTitleSource, fg, bold)}`,
-    ];
+    const headerLine = `${badge} ${styleInlineMarkdownLine(cleanTitleSource, fg, bold)}`;
     const firstIdx = rawLines.findIndex((l) => l.trim().length > 0);
     const bodyRawLines = firstIdx >= 0 ? rawLines.slice(firstIdx + 1) : [];
+    const bodyMarkdown = bodyRawLines.join("\n").trim();
+    const mdComp = createSwarmMarkdownComponent(
+      bodyMarkdown,
+      padX,
+      theme,
+      bgFn,
+      headerLine,
+    );
+    if (mdComp) {
+      return mdComp;
+    }
+
+    const expandedLines: string[] = [headerLine];
     for (const line of bodyRawLines) {
       if (!line.trim()) {
         expandedLines.push("");
@@ -1063,7 +1290,14 @@ function renderSwarmWakeupMessage(
     while (cardLines.length > 3) {
       cardLines.pop();
     }
-    cardLines.push(`  ${fg("dim", "(Ctrl+O to expand full board wakeup)")}`);
+    const rawKeyHint =
+      typeof options?.keyHint === "function"
+        ? options.keyHint("app.tools.expand", "to expand")
+        : undefined;
+    const expandHint = rawKeyHint?.trim()
+      ? rawKeyHint
+      : fg("dim", "(Ctrl+O to expand)");
+    cardLines.push(`  ${expandHint}`);
   }
 
   return new Text(cardLines.join("\n"), padX, 0, bgFn);
@@ -1093,6 +1327,11 @@ function renderSwarmStatusMessage(
     return new Text(styled, padX, 0, bgFn);
   }
 
+  const mdComp = createSwarmMarkdownComponent(raw, padX, theme, bgFn);
+  if (mdComp) {
+    return mdComp;
+  }
+
   const styledLines = lines.map((line) => {
     if (/^#{1,4}\s+/.test(line)) {
       const heading = line.replace(/^#{1,4}\s+/, "");
@@ -1101,6 +1340,309 @@ function renderSwarmStatusMessage(
     return fg("customMessageText", styleInlineMarkdownLine(line, fg, bold));
   });
   return new Text(styledLines.join("\n"), padX, 0, bgFn);
+}
+
+interface RemainingWorktreeInfo {
+  memberName: string;
+  branch: string;
+  worktreePath: string;
+  merged: boolean;
+  dirty: boolean;
+}
+
+function formatMissionDuration(startIso: string, endMs: number): string {
+  const startMs = Date.parse(startIso);
+  if (!Number.isFinite(startMs) || endMs <= startMs) {
+    return "<1s";
+  }
+  const totalSec = Math.max(0, Math.round((endMs - startMs) / 1000));
+  if (totalSec < 60) {
+    return `${totalSec}s`;
+  }
+  const mins = Math.floor(totalSec / 60);
+  const secs = totalSec % 60;
+  if (mins < 60) {
+    return secs > 0 ? `${mins}m ${secs}s` : `${mins}m`;
+  }
+  const hours = Math.floor(mins / 60);
+  const remMins = mins % 60;
+  return remMins > 0 ? `${hours}h ${remMins}m` : `${hours}h`;
+}
+
+function formatMissionTokens(tokens: number): string {
+  if (!Number.isFinite(tokens) || tokens <= 0) {
+    return "0";
+  }
+  if (tokens >= 1_000_000) {
+    return `${(tokens / 1_000_000).toFixed(2)}M`;
+  }
+  if (tokens >= 1_000) {
+    return `${(tokens / 1_000).toFixed(1)}k`;
+  }
+  return String(Math.round(tokens));
+}
+
+function formatMissionCost(cost: number): string {
+  if (!Number.isFinite(cost) || cost <= 0) {
+    return "$0.00";
+  }
+  if (cost >= 0.01) {
+    return `$${cost.toFixed(2)}`;
+  }
+  return `$${cost.toFixed(4)}`;
+}
+
+async function inspectRemainingWorktrees(
+  run: SwarmRunState,
+  store: ISwarmStore | undefined,
+  worktree: IWorktreeManager | undefined,
+): Promise<{
+  remaining: RemainingWorktreeInfo[];
+  cleanMerged: RemainingWorktreeInfo[];
+}> {
+  const remaining: RemainingWorktreeInfo[] = [];
+  const cleanMerged: RemainingWorktreeInfo[] = [];
+  for (const member of getOrderedMembers(run)) {
+    if (member.workspace === "inherit" || !member.branch) {
+      continue;
+    }
+    const wtPath =
+      member.cwd || (store ? store.getWorktreePath(run.id, member.name) : "");
+    if (!wtPath) {
+      continue;
+    }
+    let exists = false;
+    try {
+      await access(wtPath);
+      exists = true;
+    } catch {
+      exists = false;
+    }
+    if (!exists) {
+      continue;
+    }
+    const merged = Boolean(member.mergedCommitSha);
+    let dirty = false;
+    if (worktree) {
+      dirty = await worktree.isWorktreeDirty(wtPath).catch(() => true);
+    }
+    const info: RemainingWorktreeInfo = {
+      memberName: member.name,
+      branch: member.branch,
+      worktreePath: wtPath,
+      merged,
+      dirty,
+    };
+    remaining.push(info);
+    if (merged && !dirty) {
+      cleanMerged.push(info);
+    }
+  }
+  return { remaining, cleanMerged };
+}
+
+async function computeMergedGitDiffStat(
+  cwd: string | undefined,
+  run: SwarmRunState,
+): Promise<string | undefined> {
+  if (!cwd) {
+    return undefined;
+  }
+  const mergedMembers = getOrderedMembers(run).filter(
+    (m) => Boolean(m.mergedCommitSha),
+  );
+  if (mergedMembers.length === 0) {
+    return undefined;
+  }
+
+  const runGit = async (args: string[]): Promise<string | undefined> => {
+    try {
+      const { stdout } = await execFileAsync("git", args, {
+        cwd,
+        encoding: "utf8",
+        timeout: 4_000,
+        env: {
+          ...process.env,
+          GIT_TERMINAL_PROMPT: "0",
+          LC_ALL: "C",
+        },
+      });
+      const trimmed = stdout.trim();
+      return trimmed || undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const shas = Array.from(
+    new Set(
+      mergedMembers
+        .map((m) => m.mergedCommitSha?.trim())
+        .filter((s): s is string => Boolean(s)),
+    ),
+  );
+  if (shas.length === 0) {
+    return undefined;
+  }
+
+  let stat: string | undefined;
+  if (shas.length === 1) {
+    stat = await runGit(["diff", "--stat", `${shas[0]!}~1`, shas[0]!]);
+  } else {
+    stat = await runGit([
+      "diff",
+      "--stat",
+      `${shas[0]!}~1`,
+      shas[shas.length - 1]!,
+    ]);
+    if (!stat) {
+      const chunks: string[] = [];
+      for (const sha of shas.slice(0, 6)) {
+        const part = await runGit(["diff", "--stat", `${sha}~1`, sha]);
+        if (part) {
+          chunks.push(part);
+        }
+      }
+      stat = chunks.join("\n");
+    }
+  }
+  if (!stat) {
+    return undefined;
+  }
+  const lines = stat.split(/\r?\n/);
+  if (lines.length <= 12) {
+    return stat;
+  }
+  const summaryLine = lines[lines.length - 1]!;
+  const headLines = lines.slice(0, 10);
+  const omitted = lines.length - 11;
+  return [...headLines, `… (+${omitted} more file line(s))`, summaryLine].join("\n");
+}
+
+function extractValidatorVerdict(
+  run: SwarmRunState,
+  boardMessages: readonly BoardMessage[],
+): string {
+  const validators = getOrderedMembers(run).filter((m) => m.role === "validator");
+  if (validators.length === 0) {
+    return run.validatorEnabled
+      ? "Enabled (no validator spawned)"
+      : "Disabled";
+  }
+
+  const validatorNames = new Set(validators.map((v) => v.name.toLowerCase()));
+  const validatorPosts = boardMessages.filter(
+    (msg) =>
+      msg.fromRole === "validator" ||
+      validatorNames.has(msg.from.toLowerCase()),
+  );
+  const donePosts = validatorPosts.filter((m) => m.kind === "done");
+  const latestPost =
+    donePosts[donePosts.length - 1] ?? validatorPosts[validatorPosts.length - 1];
+
+  if (!latestPost) {
+    const states = validators.map((v) => `\`@${v.name}\` (${v.state})`).join(", ");
+    return `No verdict posted (${states})`;
+  }
+
+  const preview = sanitizePlainText(latestPost.text)
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 160);
+  const isPass = /\b(pass|passed|approved|lgtm|verified)\b/i.test(preview);
+  const isFail = /\b(fail|failed|rejected|blocked|changes requested)\b/i.test(preview);
+  const icon = isFail && !isPass ? "❌ FAIL" : isPass ? "✅ PASS" : "ℹ️ Reported";
+  return `${icon} — \`@${latestPost.from}\` (#${latestPost.seq}): ${preview}`;
+}
+
+function buildMissionCompletionCard(
+  run: SwarmRunState,
+  options: {
+    summary: string;
+    nowMs: number;
+    boardMessages: readonly BoardMessage[];
+    diffStat?: string;
+    remainingWorktrees: readonly RemainingWorktreeInfo[];
+    teardownResult?: SafeTeardownResult;
+    initiatedBy: "tool" | "command" | "event";
+  },
+): string {
+  const title = sanitizePlainText(run.title || run.objective || run.id);
+  const objective = sanitizePlainText(run.objective || title);
+  const summary = sanitizePlainText(
+    options.summary || run.completionSummary || "Mission completed",
+  );
+  const parsedEnd = Date.parse(run.updatedAt);
+  const endMs =
+    Number.isFinite(parsedEnd) && parsedEnd >= Date.parse(run.createdAt)
+      ? Math.max(parsedEnd, options.nowMs)
+      : options.nowMs;
+  const duration = formatMissionDuration(run.createdAt, endMs);
+
+  const members = getOrderedMembers(run);
+  const totalTokens = members.reduce((sum, m) => sum + (m.tokens || 0), 0);
+  const totalCost = members.reduce((sum, m) => sum + (m.cost || 0), 0);
+
+  const mergedMembers = members.filter((m) => Boolean(m.mergedCommitSha));
+  const unmergedIsolated = members.filter(
+    (m) => m.workspace !== "inherit" && Boolean(m.branch) && !m.mergedCommitSha,
+  );
+  const validatorVerdict = extractValidatorVerdict(run, options.boardMessages);
+
+  const lines: string[] = [
+    `### 🐝 Mission Complete — ${title} (\`${run.id}\`)`,
+    "",
+    `- **Objective:** ${objective}`,
+    `- **Summary:** ${summary}`,
+    `- **Duration:** ${duration} · **Members:** ${members.length} · **Usage:** ${formatMissionTokens(totalTokens)} tok (${formatMissionCost(totalCost)})`,
+    `- **Validator:** ${validatorVerdict}`,
+  ];
+
+  if (mergedMembers.length > 0) {
+    const mergedList = mergedMembers
+      .map((m) => {
+        const shortSha = (m.mergedCommitSha ?? "").slice(0, 8);
+        const branchPart = m.branch ? `\`${m.branch}\` → ` : "";
+        return `\`@${m.name}\` (${branchPart}\`${shortSha}\`)`;
+      })
+      .join(", ");
+    lines.push(`- **Merged into \`${run.baseBranch}\`:** ${mergedList}`);
+  } else {
+    lines.push(`- **Merged into \`${run.baseBranch}\`:** none`);
+  }
+
+  if (unmergedIsolated.length > 0) {
+    const unmergedList = unmergedIsolated
+      .map((m) => `\`@${m.name}\` (\`${m.branch}\`)`)
+      .join(", ");
+    lines.push(`- **⚠️ Unmerged branches:** ${unmergedList}`);
+  }
+
+  if (options.teardownResult && options.teardownResult.removed.length > 0) {
+    const remCount = options.remainingWorktrees.length;
+    lines.push(
+      `- **Worktrees:** ${remCount} remaining (removed ${options.teardownResult.removed.length} merged worktree(s)).`,
+    );
+  } else if (options.remainingWorktrees.length > 0) {
+    const wtList = options.remainingWorktrees
+      .map((w) => `\`@${w.memberName}\`${w.dirty ? " (dirty)" : ""}`)
+      .join(", ");
+    const teardownCmd =
+      options.initiatedBy === "tool"
+        ? "Run `/swarm teardown` to clean up."
+        : "Run `/swarm teardown` (or `/swarm teardown --delete-branches`) to clean up.";
+    lines.push(
+      `- **Worktrees:** ${options.remainingWorktrees.length} remaining (${wtList}) — ${teardownCmd}`,
+    );
+  } else {
+    lines.push("- **Worktrees:** 0 remaining");
+  }
+
+  if (options.diffStat) {
+    lines.push("", "**Diff Summary (`git diff --stat`):**", "```text", options.diffStat, "```");
+  }
+
+  return lines.join("\n");
 }
 
 function formatTeardownReport(
@@ -1208,6 +1750,12 @@ export function createPiSwarmExtension(
     let lastLayeredSettings: LayeredSettingsResult | undefined;
     let cachedAvailableModels: AvailableModelInfo[] = [];
     let lastStatusText: string | undefined | null = null;
+    let lastWorkingMessage: string | undefined;
+    let lastTerminalTitle: string | undefined;
+    let unfinishedFooterCue: string | undefined;
+    let preSwarmHostModel: PreSwarmHostModelSnapshot | undefined;
+    const completedCardEmittedRunIds = new Set<string>();
+    const activeDoneFlowRunIds = new Set<string>();
     let runsCache:
       | { cwd: string; runs: RunSummary[]; fetchedAt: number }
       | undefined;
@@ -1561,6 +2109,210 @@ export function createPiSwarmExtension(
       }
     }
 
+    function computeSwarmWorkingMessage(
+      snapshot: SwarmSnapshot,
+      draftActive: boolean,
+    ): string | undefined {
+      const run = snapshot.run;
+      if (run && isRunningProfileRun(run)) {
+        const workingSet = new Set(snapshot.workingMemberNames);
+        const workingCount = workingSet.size;
+        const waitingCount = snapshot.waitingMemberNames.filter(
+          (name) => !workingSet.has(name),
+        ).length;
+        if (run.status === "paused") {
+          const shortTitle = sanitizePlainText(run.title || run.objective || run.id).slice(0, 36);
+          return `🐝 Swarm (paused) · ${shortTitle}`;
+        }
+        const boardTag = snapshot.boardHead > 0 ? ` · #${snapshot.boardHead}` : "";
+        return `🐝 Swarm · ${workingCount}w/${waitingCount}wait${boardTag}`;
+      }
+      if (draftActive) {
+        return "🐝 Drafting Swarm Plan…";
+      }
+      return undefined;
+    }
+
+    function computeSwarmTerminalTitle(
+      snapshot: SwarmSnapshot,
+      draftActive: boolean,
+    ): string | undefined {
+      const run = snapshot.run;
+      if (run && isRunningProfileRun(run)) {
+        const workingSet = new Set(snapshot.workingMemberNames);
+        const workingCount = workingSet.size;
+        const waitingCount = snapshot.waitingMemberNames.filter(
+          (name) => !workingSet.has(name),
+        ).length;
+        const shortTitle = sanitizePlainText(run.title || run.objective || run.id).slice(0, 48);
+        const stateTag =
+          run.status === "paused" ? "Paused" : `${workingCount}w/${waitingCount}wait`;
+        return `🐝 Swarm · ${shortTitle} (${stateTag})`;
+      }
+      if (draftActive) {
+        return "🐝 Swarm · Drafting Plan";
+      }
+      return undefined;
+    }
+
+    function clearWorkingMessageAndTitle(ctxOverride?: ExtensionContext): void {
+      const targetCtx = ctxOverride ?? lastCtx;
+      if (targetCtx?.hasUI) {
+        if (typeof targetCtx.ui.setWorkingMessage === "function") {
+          try {
+            targetCtx.ui.setWorkingMessage(undefined);
+          } catch {
+            // ignore UI cleanup errors
+          }
+        }
+        if (
+          typeof targetCtx.ui.setTitle === "function" &&
+          lastTerminalTitle !== undefined
+        ) {
+          try {
+            targetCtx.ui.setTitle("");
+          } catch {
+            // ignore UI cleanup errors
+          }
+        }
+      }
+      lastWorkingMessage = undefined;
+      lastTerminalTitle = undefined;
+    }
+
+    function snapshotCurrentHostModel(
+      ctx?: ExtensionContext,
+    ): PreSwarmHostModelSnapshot | undefined {
+      const targetCtx = ctx ?? lastCtx;
+      const model = targetCtx?.model;
+      if (!model?.id) {
+        return undefined;
+      }
+      let thinkingLevel: ThinkingLevel | undefined;
+      try {
+        const fromPi =
+          typeof pi.getThinkingLevel === "function"
+            ? pi.getThinkingLevel()
+            : undefined;
+        if (fromPi && VALID_THINKING_LEVELS.has(fromPi)) {
+          thinkingLevel = fromPi;
+        }
+      } catch {
+        // ignore if unavailable
+      }
+      if (!thinkingLevel && targetCtx?.thinkingLevel && VALID_THINKING_LEVELS.has(targetCtx.thinkingLevel)) {
+        thinkingLevel = targetCtx.thinkingLevel;
+      }
+      return {
+        provider: model.provider ?? "",
+        modelId: model.id,
+        ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
+      };
+    }
+
+    async function applyOrchestratorModelWithSnapshot(
+      ctx: ExtensionContext | undefined,
+      settings: SwarmSettings,
+      options: { clearThinking?: boolean } = {},
+    ): Promise<ApplyOrchestratorModelResult> {
+      const beforeSnap = !preSwarmHostModel
+        ? snapshotCurrentHostModel(ctx)
+        : undefined;
+      const res = await applyOrchestratorModel(
+        pi,
+        ctx,
+        settings,
+        getLazyFallbackModelRuntime,
+        options,
+      );
+      if (!preSwarmHostModel && beforeSnap && res.changed) {
+        preSwarmHostModel = beforeSnap;
+      }
+      return res;
+    }
+
+    async function restorePreSwarmHostModel(
+      ctxOverride?: ExtensionContext,
+    ): Promise<void> {
+      const snap = preSwarmHostModel;
+      if (!snap) {
+        return;
+      }
+      preSwarmHostModel = undefined;
+      const targetCtx = ctxOverride ?? lastCtx;
+      const fullId = snap.provider ? `${snap.provider}/${snap.modelId}` : snap.modelId;
+      await applyOrchestratorModel(
+        pi,
+        targetCtx,
+        {
+          ...currentSettings,
+          orchestratorModel: fullId,
+          orchestratorThinkingLevel: snap.thinkingLevel,
+        },
+        getLazyFallbackModelRuntime,
+        { clearThinking: snap.thinkingLevel === undefined },
+      );
+    }
+
+    async function emitMissionCompleteCardForRun(
+      run: SwarmRunState,
+      options: {
+        summary: string;
+        initiatedBy: "tool" | "command" | "event";
+        ctx?: ExtensionContext;
+        remainingWorktrees?: readonly RemainingWorktreeInfo[];
+        teardownResult?: SafeTeardownResult;
+      },
+    ): Promise<void> {
+      if (completedCardEmittedRunIds.has(run.id)) {
+        return;
+      }
+      completedCardEmittedRunIds.add(run.id);
+
+      const targetCtx = options.ctx ?? lastCtx;
+      const boardMessages = activeStore
+        ? (
+            await activeStore
+              .readBoard(run.id, { channel: "*", limit: 200 })
+              .catch(() => ({ messages: [] as BoardMessage[] }))
+          ).messages
+        : (activeEngine?.getSnapshot().recentBoard ?? []);
+
+      const remainingWorktrees =
+        options.remainingWorktrees ??
+        (await inspectRemainingWorktrees(run, activeStore, activeWorktree)).remaining;
+      const diffStat = await computeMergedGitDiffStat(
+        boundCwd ?? targetCtx?.cwd,
+        run,
+      );
+      const card = buildMissionCompletionCard(run, {
+        summary: options.summary,
+        nowMs: (overrides.now ?? Date.now)(),
+        boardMessages,
+        diffStat,
+        remainingWorktrees,
+        teardownResult: options.teardownResult,
+        initiatedBy: options.initiatedBy,
+      });
+
+      pi.sendMessage(
+        {
+          customType: SWARM_STATUS_CUSTOM_TYPE,
+          content: card,
+          display: true,
+          details: {
+            runId: run.id,
+            status: run.status,
+            summary: options.summary,
+            missionCompleteCard: true,
+            remainingWorktrees: remainingWorktrees.length,
+          },
+        },
+        { triggerTurn: false },
+      );
+      refreshUI(targetCtx);
+    }
+
     function refreshUI(
       ctxOverride?: ExtensionContext,
       snapshotOverride?: SwarmSnapshot,
@@ -1569,10 +2321,39 @@ export function createPiSwarmExtension(
       activeWidgetTui?.requestRender();
       if (ctx?.hasUI) {
         const snapshot = snapshotOverride ?? getSnapshotSafe();
-        const line = formatStatusLine(snapshot, draftController.isActive());
+        const draftActive = draftController.isActive();
+        if (snapshot.run || draftActive) {
+          unfinishedFooterCue = undefined;
+        }
+        const line =
+          formatStatusLine(snapshot, draftActive) ?? unfinishedFooterCue;
         if (line !== lastStatusText) {
           lastStatusText = line;
           ctx.ui.setStatus(SWARM_STATUS_KEY, line);
+        }
+
+        if (typeof ctx.ui.setWorkingMessage === "function") {
+          const nextWorkingMsg = computeSwarmWorkingMessage(snapshot, draftActive);
+          if (nextWorkingMsg !== lastWorkingMessage) {
+            lastWorkingMessage = nextWorkingMsg;
+            try {
+              ctx.ui.setWorkingMessage(nextWorkingMsg);
+            } catch {
+              // ignore UI sync errors
+            }
+          }
+        }
+
+        if (typeof ctx.ui.setTitle === "function") {
+          const nextTitle = computeSwarmTerminalTitle(snapshot, draftActive);
+          if (nextTitle !== lastTerminalTitle) {
+            lastTerminalTitle = nextTitle;
+            try {
+              ctx.ui.setTitle(nextTitle ?? "");
+            } catch {
+              // ignore UI sync errors
+            }
+          }
         }
       }
     }
@@ -2170,7 +2951,19 @@ export function createPiSwarmExtension(
         purgePendingWakeupsForRun(ev.runId);
         applySwarmToolProfile(pi, computeDesiredToolProfile());
         syncActiveRunSections();
+        clearWorkingMessageAndTitle(lastCtx);
         refreshUI(undefined, ev.snapshot);
+        if (
+          ev.snapshot.run &&
+          !activeDoneFlowRunIds.has(ev.snapshot.run.id) &&
+          !completedCardEmittedRunIds.has(ev.snapshot.run.id)
+        ) {
+          void emitMissionCompleteCardForRun(ev.snapshot.run, {
+            summary: ev.snapshot.run.completionSummary ?? ev.summary,
+            initiatedBy: "event",
+            ctx: lastCtx,
+          });
+        }
         return;
       }
 
@@ -2385,10 +3178,17 @@ export function createPiSwarmExtension(
       } else if (focusedRunId !== prevFocused) {
         purgePendingWakeupsForRun(null);
       }
-      const allowSamePidFork = sessionStartReason === "fork";
+      const startReason = sessionStartReason;
+      const allowSamePidFork = startReason === "fork";
+      let priorLiveMemberNames = new Set<string>();
       if (focusedRunId) {
         try {
           const loadedRun = await store.loadRun(focusedRunId);
+          priorLiveMemberNames = new Set(
+            Object.values(loadedRun.members)
+              .filter((m) => m.state === "working" || m.state === "waiting")
+              .map((m) => m.name),
+          );
           const canOwn =
             isCurrentSessionOwner(loadedRun, ctx) ||
             (allowSamePidFork && loadedRun.ownerPid === process.pid);
@@ -2417,6 +3217,57 @@ export function createPiSwarmExtension(
 
       const hasFocusedRun =
         isRunningProfileRun(snapshot.run) && isCurrentSessionOwner(snapshot.run, ctx);
+
+      if (hasFocusedRun && snapshot.run) {
+        const runOrch = snapshot.run.roleModels?.orchestrator;
+        const hasRunOrchModel = Boolean(runOrch?.model?.trim());
+        const effectiveOrchModel =
+          runOrch?.model?.trim() || currentSettings.orchestratorModel;
+        const effectiveOrchThinking = hasRunOrchModel
+          ? runOrch?.thinkingLevel
+          : (runOrch?.thinkingLevel ?? currentSettings.orchestratorThinkingLevel);
+        if (effectiveOrchModel || effectiveOrchThinking) {
+          await applyOrchestratorModelWithSnapshot(
+            ctx,
+            {
+              ...currentSettings,
+              orchestratorModel: effectiveOrchModel,
+              orchestratorThinkingLevel: effectiveOrchThinking,
+            },
+            { clearThinking: effectiveOrchThinking === undefined },
+          );
+        }
+
+        const normalizedStopped = Object.values(snapshot.run.members).filter((m) => {
+          if (m.state !== "stopped") {
+            return false;
+          }
+          if (priorLiveMemberNames.has(m.name)) {
+            return true;
+          }
+          return (
+            Boolean(startReason) &&
+            prevFocused !== snapshot.run!.id &&
+            !m.humanStopped &&
+            /reloaded|disposed|detached|switched/i.test(m.parkedOn ?? "")
+          );
+        });
+        if (normalizedStopped.length > 0 && ctx.hasUI) {
+          const preview = normalizedStopped
+            .slice(0, 6)
+            .map((m) => `@${m.name}`)
+            .join(", ");
+          const extra =
+            normalizedStopped.length > 6
+              ? ` +${normalizedStopped.length - 6} more`
+              : "";
+          ctx.ui.notify(
+            `Rehydrated Swarm Mission "${snapshot.run.title}" (${snapshot.run.id}): ${normalizedStopped.length} worker(s) normalized to stopped (${preview}${extra}) — @mention on board or run /swarm resume to continue.`,
+            "info",
+          );
+        }
+      }
+
       const draft = draftController.rehydrate(ctx, {
         syncToolProfile: true,
         hasActiveRun: hasFocusedRun,
@@ -2449,6 +3300,7 @@ export function createPiSwarmExtension(
       }
 
       const targetCtx = ctx ?? lastCtx;
+      clearWorkingMessageAndTitle(targetCtx);
       if (targetCtx?.hasUI) {
         try {
           targetCtx.ui.setWidget(SWARM_WIDGET_KEY, undefined);
@@ -2460,6 +3312,10 @@ export function createPiSwarmExtension(
 
       activeWidgetTui = undefined;
       lastStatusText = null;
+      unfinishedFooterCue = undefined;
+      preSwarmHostModel = undefined;
+      completedCardEmittedRunIds.clear();
+      activeDoneFlowRunIds.clear();
       cachedAvailableModels = [];
       runsCache = undefined;
       widgetState.expanded = false;
@@ -2540,14 +3396,32 @@ export function createPiSwarmExtension(
               disarmOrchestratorWait("Tool completeRun invoked after swarm_wait turn");
             }
             await assertToolEngineOwner(target);
-            const completed = await target.completeRun({
-              ...options,
-              sessionId: options.sessionId ?? getCurrentSessionId(lastCtx),
-            });
+            const activeRunId = target.getSnapshot().activeRunId;
+            if (activeRunId) {
+              activeDoneFlowRunIds.add(activeRunId);
+            }
+            let completed: SwarmRunState;
+            try {
+              completed = await target.completeRun({
+                ...options,
+                sessionId: options.sessionId ?? getCurrentSessionId(lastCtx),
+              });
+            } finally {
+              if (activeRunId) {
+                activeDoneFlowRunIds.delete(activeRunId);
+              }
+            }
             waitArmedTurnIndex = null;
             purgePendingWakeupsForRun(completed.id);
             applySwarmToolProfile(pi, computeDesiredToolProfile());
             syncActiveRunSections();
+            clearWorkingMessageAndTitle(lastCtx);
+            await restorePreSwarmHostModel(lastCtx);
+            await emitMissionCompleteCardForRun(completed, {
+              summary: options.summary,
+              initiatedBy: "tool",
+              ctx: lastCtx,
+            });
             refreshUI();
             return completed;
           };
@@ -2748,11 +3622,9 @@ export function createPiSwarmExtension(
       await reloadSettings(toolCtx.cwd);
 
       // 1. Apply configured Orchestrator model cleanly before launching/revising the run
-      await applyOrchestratorModel(
-        pi,
+      await applyOrchestratorModelWithSnapshot(
         toolCtx,
         currentSettings,
-        getLazyFallbackModelRuntime,
       );
 
       const ownerSessionId = getSessionIdSafe(toolCtx);
@@ -3084,11 +3956,9 @@ export function createPiSwarmExtension(
       const { worktree } = await ensureBound(ctx);
       await reloadSettings(ctx.cwd);
       void refreshAvailableModels(ctx);
-      await applyOrchestratorModel(
-        pi,
+      await applyOrchestratorModelWithSnapshot(
         ctx,
         currentSettings,
-        getLazyFallbackModelRuntime,
       );
 
       const baseBranch = await resolveBaseBranchSafe(worktree, ctx.cwd);
@@ -3152,11 +4022,9 @@ export function createPiSwarmExtension(
         return;
       }
 
-      await applyOrchestratorModel(
-        pi,
+      await applyOrchestratorModelWithSnapshot(
         ctx,
         currentSettings,
-        getLazyFallbackModelRuntime,
       );
 
       const baseBranch = await resolveBaseBranchSafe(worktree, ctx.cwd);
@@ -3231,11 +4099,9 @@ export function createPiSwarmExtension(
       }
 
       const run = snapshot.run;
-      await applyOrchestratorModel(
-        pi,
+      await applyOrchestratorModelWithSnapshot(
         ctx,
         currentSettings,
-        getLazyFallbackModelRuntime,
       );
 
       const seed = rawSeed.trim() || run.objective;
@@ -3371,8 +4237,10 @@ export function createPiSwarmExtension(
         .readBoard({ channel: "*", limit: 200 })
         .catch(() => ({ messages: snapshot.recentBoard, head: snapshot.boardHead }));
 
+      const width = Math.max(40, Math.min(88, (process.stdout.columns ?? 88) - 4));
       const markdown = formatZeroTurnGraphView(snapshot, {
         board: boardRes.messages,
+        width,
       });
       emitZeroTurnMessage(ctx, markdown, {
         runId: snapshot.activeRunId,
@@ -4159,25 +5027,80 @@ export function createPiSwarmExtension(
 
       try {
         const sessionId = getSessionIdSafe(ctx);
-        const completed = await engine.completeRun({
-          summary,
-          teardown: currentSettings.autoTeardownOnComplete,
-          callerRole: "human",
-          actor: "human",
-          sessionId,
-        });
+        const runId = snapshot.run.id;
+        activeDoneFlowRunIds.add(runId);
+        let completed: SwarmRunState;
+        try {
+          completed = await engine.completeRun({
+            summary,
+            teardown: currentSettings.autoTeardownOnComplete,
+            callerRole: "human",
+            actor: "human",
+            sessionId,
+          });
+        } finally {
+          activeDoneFlowRunIds.delete(runId);
+        }
         purgePendingWakeupsForRun(completed.id);
         applySwarmToolProfile(pi, computeDesiredToolProfile(ctx));
         syncActiveRunSections({ ctx });
+        clearWorkingMessageAndTitle(ctx);
+        await restorePreSwarmHostModel(ctx);
+
+        let inspected = await inspectRemainingWorktrees(
+          completed,
+          activeStore,
+          activeWorktree,
+        );
+        let teardownResult: SafeTeardownResult | undefined;
+        if (
+          !currentSettings.autoTeardownOnComplete &&
+          inspected.cleanMerged.length > 0 &&
+          ctx.hasUI &&
+          ctx.mode === "tui" &&
+          typeof ctx.ui.confirm === "function"
+        ) {
+          const cleanCount = inspected.cleanMerged.length;
+          const names = inspected.cleanMerged
+            .map((w) => `@${w.memberName}`)
+            .join(", ");
+          const confirmed = await withModalGuard(() =>
+            ctx.ui.confirm(
+              `Remove ${cleanCount} merged worktree(s) now?`,
+              `Clean up ${cleanCount} clean merged worktree(s) (${names}) for "${completed.title}". Audit logs and board history in ${SWARM_DIR}/runs/${completed.id}/ are preserved.`,
+            ),
+          );
+          if (confirmed) {
+            teardownResult = await engine
+              .teardown({
+                runId: completed.id,
+                deleteBranches: false,
+                sessionId,
+              })
+              .catch(() => undefined);
+            if (teardownResult) {
+              const refreshedRun =
+                (await activeStore?.loadRun(completed.id).catch(() => completed)) ??
+                completed;
+              inspected = await inspectRemainingWorktrees(
+                refreshedRun,
+                activeStore,
+                activeWorktree,
+              );
+            }
+          }
+        }
+
         refreshUI(ctx);
-        const msg = `Completed Swarm run "${completed.title}" (\`${completed.id}\`): ${summary} — restored \`idle\` tool profile.`;
         if (ctx.hasUI) {
           ctx.ui.notify(`Completed Swarm run ${completed.id}.`, "info");
         }
-        emitZeroTurnMessage(ctx, `✓ ${msg}`, {
-          runId: completed.id,
-          status: completed.status,
+        await emitMissionCompleteCardForRun(completed, {
           summary,
+          initiatedBy: "command",
+          ctx,
+          remainingWorktrees: inspected.remaining,
+          teardownResult,
         });
       } catch (err) {
         const msg = `Failed to complete Swarm run: ${formatError(err)}`;
@@ -4315,7 +5238,7 @@ export function createPiSwarmExtension(
         if (matched) {
           requestedRunId = matched.id;
           guidance = positional.slice(1).join(" ").trim();
-        } else if (/^run-/i.test(firstTok)) {
+        } else if (/^run[_-]/i.test(firstTok)) {
           const msg = `Swarm run \`${firstTok}\` not found.`;
           if (ctx.hasUI) ctx.ui.notify(msg, "error");
           else emitZeroTurnMessage(ctx, msg);
@@ -4421,15 +5344,13 @@ export function createPiSwarmExtension(
           (!wasAlreadyFocusedAndOwned || !wasActivatedInProcess) &&
           (effectiveOrchModel || effectiveOrchThinking || runOrch)
         ) {
-          await applyOrchestratorModel(
-            pi,
+          await applyOrchestratorModelWithSnapshot(
             ctx,
             {
               ...currentSettings,
               orchestratorModel: effectiveOrchModel,
               orchestratorThinkingLevel: effectiveOrchThinking,
             },
-            getLazyFallbackModelRuntime,
             { clearThinking: effectiveOrchThinking === undefined },
           );
         }
@@ -4495,6 +5416,10 @@ export function createPiSwarmExtension(
         draftController.clear(nextProfile);
         syncDraftWidgetState(null);
         syncActiveRunSections({ ctx });
+        if (nextProfile === "idle") {
+          clearWorkingMessageAndTitle(ctx);
+          await restorePreSwarmHostModel(ctx);
+        }
         refreshUI(ctx);
         const msg = `Cancelled active Swarm draft and restored \`${nextProfile}\` tools.`;
         if (ctx.hasUI) ctx.ui.notify("Cancelled active Swarm draft.", "info");
@@ -4601,6 +5526,8 @@ export function createPiSwarmExtension(
       await engine.attachRun(run.id, ctx);
       applySwarmToolProfile(pi, computeDesiredToolProfile(ctx));
       syncActiveRunSections({ ctx });
+      clearWorkingMessageAndTitle(ctx);
+      await restorePreSwarmHostModel(ctx);
       refreshUI(ctx);
 
       const msg = `Stopped active members and marked Swarm run \`${run.id}\` as abandoned (audit trail, board & worktrees preserved).`;
@@ -4752,10 +5679,11 @@ export function createPiSwarmExtension(
       const sessionId = getSessionIdSafe(ctx);
 
       if (target === "none" || target === "--clear" || target === "off") {
+        unfinishedFooterCue = undefined;
         await detachFocusedRun(store, engine, ctx, sessionId);
         const msg = "Detached session focus from Swarm run.";
         if (ctx.hasUI) ctx.ui.notify(msg, "info");
-        emitZeroTurnMessage(ctx, msg, { runId: null });
+        else emitZeroTurnMessage(ctx, msg, { runId: null });
         return;
       }
 
@@ -4834,9 +5762,16 @@ export function createPiSwarmExtension(
         const readOnlyNote = canOwn
           ? ""
           : ` (read-only observer; owned by ${targetRun.ownerSessionId || "another session"} PID ${targetRun.ownerPid})`;
-        const msg = `Focused Swarm run \`${chosenRunId}\` (${snapshot.run?.status ?? "unknown"})${readOnlyNote}.`;
-        if (ctx.hasUI) ctx.ui.notify(`Focused Swarm run ${chosenRunId}${readOnlyNote}.`, "info");
-        emitZeroTurnMessage(ctx, msg, { runId: chosenRunId });
+        const statusLabel = snapshot.run?.status ?? "unknown";
+        const msg = `Focused Swarm run \`${chosenRunId}\` (${statusLabel})${readOnlyNote}.`;
+        if (ctx.hasUI) {
+          ctx.ui.notify(
+            `Focused Swarm run ${chosenRunId} (${statusLabel})${readOnlyNote}.`,
+            "info",
+          );
+        } else {
+          emitZeroTurnMessage(ctx, msg, { runId: chosenRunId });
+        }
       } catch (err) {
         const msg = `Unable to focus run "${chosenRunId}": ${formatError(err)}`;
         if (ctx.hasUI) ctx.ui.notify(msg, "error");
@@ -5436,6 +6371,26 @@ export function createPiSwarmExtension(
     }
 
     async function getSwarmCompletions(
+      prefix: string,
+    ): Promise<AutocompleteItem[] | null> {
+      const items = await computeSwarmCompletions(prefix);
+      if (!items || items.length === 0) {
+        return null;
+      }
+      const trimmedPrefix = prefix.trimStart();
+      const normalizedPrefix = /\s$/.test(prefix)
+        ? trimmedPrefix.toLowerCase()
+        : trimmedPrefix.trimEnd().replace(/\s+/g, " ").toLowerCase();
+      if (
+        items.length === 1 &&
+        items[0]!.value.toLowerCase() === normalizedPrefix
+      ) {
+        return null;
+      }
+      return items;
+    }
+
+    async function computeSwarmCompletions(
       prefix: string,
     ): Promise<AutocompleteItem[] | null> {
       const trimmedStart = prefix.trimStart();
@@ -6074,11 +7029,17 @@ export function createPiSwarmExtension(
               `Unfinished Swarm Mission "${r.title}" (${r.id}, ${r.status}) — run /swarm or /swarm resume to continue.`,
               "info",
             );
+            unfinishedFooterCue = "🐝 1 unfinished mission · /swarm resume";
+            lastStatusText = unfinishedFooterCue;
+            ctx.ui.setStatus(SWARM_STATUS_KEY, unfinishedFooterCue);
           } else if (unfinished.length > 1) {
             ctx.ui.notify(
               `${unfinished.length} unfinished Swarm Missions found — run /swarm or /swarm resume to continue.`,
               "info",
             );
+            unfinishedFooterCue = `🐝 ${unfinished.length} unfinished missions · /swarm resume`;
+            lastStatusText = unfinishedFooterCue;
+            ctx.ui.setStatus(SWARM_STATUS_KEY, unfinishedFooterCue);
           }
         } catch {
           // best-effort startup hint
