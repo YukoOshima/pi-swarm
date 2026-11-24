@@ -5335,3 +5335,626 @@ describe("v0.8.0 UI Goal Progress, Contract Inspector & Proposal Card", () => {
     }
   });
 });
+
+// ============================================================================
+// v0.9.0 UI Services, Audited Overrides & Library Inspector
+// ============================================================================
+
+describe("v0.9.0 UI Services, Audited Overrides & Library Inspector", () => {
+  const fixedNow = () => Date.parse("2026-11-24T16:00:00.000Z");
+  const WIDTH_MATRIX = [40, 60, 72, 80, 100, 120] as const;
+  const AMBIGUOUS_EMOJI_RE = /[\u23f0-\u23ff\u26a0\u{1f300}-\u{1f9ff}]\ufe0f?/u;
+
+  function assertIntactBoxBorders(
+    lines: readonly string[],
+    width: number,
+    label: string,
+  ): void {
+    assert.ok(lines.length >= 2, `${label}: expected >= 2 lines, got ${lines.length}`);
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]!;
+      const w = visibleWidth(line);
+      const plain = stripTerminalSequences(line);
+      assert.equal(
+        w,
+        width,
+        `${label}: line ${i} visibleWidth expected ${width}, got ${w}: ${JSON.stringify(plain)}`,
+      );
+      if (i === 0) {
+        assert.ok(
+          plain.startsWith("╭") && plain.endsWith("╮"),
+          `${label}: top border broken on row 0: ${plain}`,
+        );
+      } else if (i === lines.length - 1) {
+        assert.ok(
+          plain.startsWith("╰") && plain.endsWith("╯"),
+          `${label}: bottom border broken on row ${i}: ${plain}`,
+        );
+      } else {
+        assert.ok(
+          plain.startsWith("│") && plain.endsWith("│"),
+          `${label}: side borders broken on row ${i}: ${plain}`,
+        );
+        assert.doesNotMatch(
+          plain,
+          AMBIGUOUS_EMOJI_RE,
+          `${label}: inner row ${i} must not contain ambiguous-width emoji: ${plain}`,
+        );
+      }
+    }
+  }
+
+  function makeV090MissionSnapshot(): SwarmSnapshot {
+    const snap = makeSampleSnapshot();
+    const run = snap.run!;
+    run.id = "run-v090-audit";
+    run.phase = "Validation";
+    run.milestones = [
+      { label: "m1-foundation", status: "done", owner: "worker-1", sealed: true },
+      { label: "m2-services", status: "in_progress", owner: "worker-2" },
+    ];
+    run.services = [
+      {
+        name: "worker-redis",
+        port: 6379,
+        start: "redis-server --port 6379",
+        stop: "redis-cli -p 6379 shutdown",
+        healthcheck: "redis-cli -p 6379 ping",
+      },
+      {
+        name: "api-server",
+        port: 3000,
+        start: "npm run start:api",
+        healthcheck: "curl -sf http://127.0.0.1:3000/healthz",
+        dependsOn: ["worker-redis"],
+      },
+    ];
+    run.commands = [
+      { name: "typecheck", command: "npm run typecheck" },
+      { name: "test", command: "npm run test:file tests/ui.test.ts" },
+    ];
+    run.boundaries = [
+      "Bind test services exclusively to 127.0.0.1 ports 3000-3999 and 6379",
+    ];
+    run.features = [
+      {
+        id: "feat-library",
+        title: "Bootstrap shared mission library",
+        description: "Persist architecture, environment, and testing markdown notes",
+        milestone: "m1-foundation",
+        fulfills: ["VAL-LIB-01"],
+        status: "completed",
+        assignedMember: "worker-1",
+        mergedCommitSha: "c73158e41e29",
+        updatedAt: "2026-11-24T15:40:00.000Z",
+      },
+      {
+        id: "feat-webhook",
+        title: "External billing webhook handler",
+        description: "Verify webhook signature and idempotency",
+        milestone: "m2-services",
+        dependsOn: ["feat-library"],
+        fulfills: ["VAL-EXT-02", "VAL-SVC-03"],
+        status: "in_progress",
+        assignedMember: "worker-2",
+        updatedAt: "2026-11-24T15:55:00.000Z",
+      },
+    ];
+    run.assertions = [
+      {
+        id: "VAL-LIB-01",
+        title: "Shared library topics persist safely",
+        description: "architecture.md, environment.md, testing.md initialized",
+        status: "passed",
+        evidence: "Verified 3 default markdown files under library/",
+        verifiedBy: "validator",
+        verifiedByRole: "validator",
+        updatedAt: "2026-11-24T15:42:00.000Z",
+      },
+      {
+        id: "VAL-EXT-02",
+        title: "Live Stripe staging webhook roundtrip",
+        description: "End-to-end delivery from external staging endpoint",
+        status: "passed",
+        evidence: "Signed replay fixture verified locally",
+        verifiedBy: "orchestrator",
+        verifiedByRole: "orchestrator",
+        overridden: true,
+        overrideJustification:
+          "External Stripe staging sandbox offline; verified via signed webhook replay fixture",
+        updatedAt: "2026-11-24T15:50:00.000Z",
+      },
+      {
+        id: "VAL-SVC-03",
+        title: "API healthcheck passes on port 3000",
+        description: "api-server responds 200 OK after worker-redis starts",
+        evidenceRequired: "curl -sf http://127.0.0.1:3000/healthz returns 200",
+        status: "pending",
+        updatedAt: "2026-11-24T15:55:00.000Z",
+      },
+    ];
+    return snap;
+  }
+
+  it("(a) formatZeroTurnStatusView & SwarmDashboardComponent surface [OVERRIDE] + overrideJustification, compact ovr indicator, Mission Services & Ports, and library/ hint with intact borders across 40..120", () => {
+    const theme = createMockTheme();
+    const snap = makeV090MissionSnapshot();
+
+    // 1. Single-line status bar includes compact `(1 ovr)` indicator alongside VAL ratio
+    const statusLine = formatStatusLine(snap, false) ?? "";
+    assert.match(statusLine, /VAL 2\/3 \(1 ovr\)/);
+
+    // 2. Zero-turn `/swarm status` Markdown surfaces [OVERRIDE], overrideJustification, Services & Ports, and library/ hint
+    const md = formatZeroTurnStatusView(snap, {
+      hostModel: "anthropic/claude-sonnet-4-5",
+      now: fixedNow,
+    });
+    assert.match(
+      md,
+      /- \*\*Shared Library:\*\* `\.pi\/swarm\/runs\/run-v090-audit\/library\/`/,
+    );
+    assert.match(
+      md,
+      /Validation Contract 2\/3 `VAL-\*` passed \(1 ovr `\[OVERRIDE\]`\)/,
+    );
+    assert.match(md, /#### Validation Contract \(2\/3 passed · 1 \[OVERRIDE\]\)/);
+    assert.match(
+      md,
+      /\| `VAL-EXT-02` \| \[✓\] `passed` `\[OVERRIDE\]` \| `@orchestrator` \(orchestrator\) \| Live Stripe staging webhook roundtrip — _Signed replay fixture verified locally_ — \*\*Override:\*\* External Stripe staging sandbox offline; verified via signed webhook replay fixture \|/,
+    );
+    assert.match(md, /#### Mission Services & Ports \(2\)/);
+    assert.match(md, /\| Service \| Port \| Start \| Healthcheck \| Depends On \|/);
+    assert.match(
+      md,
+      /\| `worker-redis` \| `:6379` \| `redis-server --port 6379` _\(stop: `redis-cli -p 6379 shutdown`\)_ \| `redis-cli -p 6379 ping` \| — \|/,
+    );
+    assert.match(
+      md,
+      /\| `api-server` \| `:3000` \| `npm run start:api` \| `curl -sf http:\/\/127\.0\.0\.1:3000\/healthz` \| `worker-redis` \|/,
+    );
+
+    // 3. Compact + Expanded dashboard widget across 40, 60, 72, 80, 100, 120 (including 72x20 & 100x30)
+    {
+      const { tui } = createMockTUI(30, 100);
+      const compact = createSwarmWidget(
+        () => snap,
+        createSwarmWidgetState({ expanded: false }),
+        { now: fixedNow },
+      )(tui, theme);
+      try {
+        for (const w of WIDTH_MATRIX) {
+          assertAllLinesFit(compact.render(w), w, `v090-compact@${w}`);
+        }
+        assert.match(
+          stripTerminalSequences(compact.render(100).join("\n")),
+          /VAL 2\/3 \(1 ovr\)/,
+        );
+      } finally {
+        compact.dispose();
+      }
+
+      const expanded30 = createSwarmWidget(
+        () => snap,
+        createSwarmWidgetState({ expanded: true }),
+        { now: fixedNow },
+      )(tui, theme);
+      try {
+        for (const w of WIDTH_MATRIX) {
+          const lines = expanded30.render(w);
+          assertIntactBoxBorders(lines, w, `v090-expanded@30x${w}`);
+        }
+        assert.match(
+          stripTerminalSequences(expanded30.render(100).join("\n")),
+          /VAL 2\/3 \(1 ovr\)/,
+        );
+      } finally {
+        expanded30.dispose();
+      }
+    }
+
+    // Assertion-only expanded preview also shows [OVERRIDE] + justification with intact borders at 72x20 and 100x30
+    {
+      const valOnlySnap = makeV090MissionSnapshot();
+      valOnlySnap.run!.features = [];
+      for (const rows of [20, 30] as const) {
+        const { tui } = createMockTUI(rows, 100);
+        const expandedVal = createSwarmWidget(
+          () => valOnlySnap,
+          createSwarmWidgetState({ expanded: true }),
+          { now: fixedNow },
+        )(tui, theme);
+        try {
+          for (const w of WIDTH_MATRIX) {
+            assertIntactBoxBorders(
+              expandedVal.render(w),
+              w,
+              `v090-expanded-val@${rows}x${w}`,
+            );
+          }
+          const plain = stripTerminalSequences(expandedVal.render(100).join("\n"));
+          assert.match(plain, /\[OVERRIDE\]/);
+        } finally {
+          expandedVal.dispose();
+        }
+      }
+    }
+  });
+
+  it("(b) SwarmOverlayComponent [v] Contract Inspector displays [OVERRIDE] + overrideJustification, Services & Ports, and .pi/swarm/runs/<runId>/library/ with 0 broken borders across 40..120", async () => {
+    const theme = createMockTheme();
+    const mockTui = createMockTUI(36, 100);
+    const snap = makeV090MissionSnapshot();
+
+    const engine: ISwarmEngine = {
+      startRun: async () => snap.run!,
+      attachRun: async () => snap,
+      setTitle: async () => snap.run!,
+      updateDirection: async () => snap.run!,
+      addMembers: async () => [],
+      postMessage: async () => snap.recentBoard[0]!,
+      readBoard: async () => ({ messages: snap.recentBoard, head: snap.boardHead }),
+      waitForBoard: async () => ({ wokeBy: "timeout", messages: [], head: 0, summary: "" }),
+      parkOrchestratorWait: async () => ({
+        parked: false,
+        messages: [],
+        head: 0,
+        activeMembers: [],
+        summary: "",
+      }),
+      clearOrchestratorWait: () => {},
+      steerMember: async () => ({ delivery: "woken" }),
+      switchModel: async (o) => ({ targetName: o.targetName ?? "", model: o.model ?? "" }),
+      stopMember: async () => {},
+      killMember: async () => {},
+      mergeMember: async () => null,
+      manageChannel: async () => ({
+        action: "create",
+        name: "main",
+        topic: "",
+        createdBy: ORCHESTRATOR_NAME,
+        createdAt: "",
+        subscribers: [],
+        archived: false,
+        summary: "ok",
+      }),
+      completeRun: async () => snap.run!,
+      pause: async () => snap.run!,
+      resume: async () => snap.run!,
+      teardown: async () => ({ removed: [], skipped: [], errors: [] }),
+      listModels: async () => [],
+      getSnapshot: () => snap,
+      subscribe: () => () => {},
+      dispose: async () => {},
+    };
+
+    await openSwarmOverlay(
+      {
+        mode: "tui",
+        hasUI: true,
+        ui: {
+          theme,
+          notify() {},
+          async custom<T>(
+            factory: (
+              t: TUI,
+              th: Theme,
+              kb: unknown,
+              done: (r: T) => void,
+            ) => Component & { dispose?(): void },
+          ): Promise<T> {
+            return new Promise<T>((resolve) => {
+              const comp = factory(mockTui.tui, theme, {}, resolve);
+              if (isFocusable(comp)) comp.focused = true;
+
+              void (async () => {
+                await flushAsync();
+
+                // Pipeline strip on Board [1] surfaces `VAL 2/3 (1 ovr)`
+                const boardPlain = stripTerminalSequences(comp.render(100).join("\n"));
+                assert.match(boardPlain, /VAL 2\/3 \(1 ovr\)/);
+
+                // Switch to Graph [3] -> top banner surfaces `VAL 2/3 (1 ovr)`
+                comp.handleInput?.("3");
+                const graphPlain = stripTerminalSequences(comp.render(100).join("\n"));
+                assert.match(graphPlain, /VAL 2\/3 \(1 ovr\)/);
+
+                // Toggle [v] into Mission Contract & Features Inspector
+                comp.handleInput?.("v");
+                for (const rows of [20, 30, 40] as const) {
+                  (mockTui.tui.terminal as unknown as { rows: number; columns: number }).rows = rows;
+                  for (const w of WIDTH_MATRIX) {
+                    const lines = comp.render(w);
+                    assertIntactBoxBorders(
+                      lines,
+                      w,
+                      `v090-overlay-contract@${rows}x${w}`,
+                    );
+                  }
+                }
+
+                // Inspect full Contract Inspector content across top + scrolled bottom
+                (mockTui.tui.terminal as unknown as { rows: number; columns: number }).rows = 40;
+                comp.handleInput?.("g");
+                const topPlain = stripTerminalSequences(comp.render(100).join("\n"));
+                comp.handleInput?.("G");
+                const bottomPlain = stripTerminalSequences(comp.render(100).join("\n"));
+                const fullContract = `${topPlain}\n${bottomPlain}`;
+
+                assert.match(
+                  fullContract,
+                  /Validation Assertions \(2\/3 passed · 1 \[OVERRIDE\]\)/,
+                );
+                assert.match(
+                  fullContract,
+                  /\[✓\] VAL-EXT-02 \[passed\] \[OVERRIDE\] \(@orchestrator\): Live Stripe staging webhook roundtrip/,
+                );
+                assert.match(
+                  fullContract,
+                  /override: External Stripe staging sandbox offline; verified via signed webhook[\s\S]*replay fixture/,
+                );
+                assert.match(fullContract, /Services & Ports \(2\)/);
+                assert.match(
+                  fullContract,
+                  /▸ worker-redis :6379 — start: redis-server --port 6379/,
+                );
+                assert.match(
+                  fullContract,
+                  /healthcheck: redis-cli -p 6379 ping/,
+                );
+                assert.match(
+                  fullContract,
+                  /▸ api-server :3000 — start: npm run start:api/,
+                );
+                assert.match(
+                  fullContract,
+                  /healthcheck: curl -sf http:\/\/127\.0\.0\.1:3000\/healthz/,
+                );
+                assert.match(fullContract, /dependsOn: worker-redis/);
+                assert.match(fullContract, /Shared Library/);
+                assert.match(
+                  fullContract,
+                  /\.pi\/swarm\/runs\/run-v090-audit\/library\//,
+                );
+
+                // Even at narrow width 40, [OVERRIDE] badge remains visible before title truncation
+                comp.handleInput?.("g");
+                const chunks40: string[] = [];
+                for (let step = 0; step < 6; step++) {
+                  const lines40 = comp.render(40);
+                  assertIntactBoxBorders(lines40, 40, `v090-contract-scroll-${step}@40`);
+                  chunks40.push(stripTerminalSequences(lines40.join("\n")));
+                  comp.handleInput?.("\x1b[6~");
+                }
+                assert.match(chunks40.join("\n"), /\[OVERRIDE\]/);
+
+                comp.handleInput?.("q");
+              })();
+            });
+          },
+        },
+      } as unknown as ExtensionContext,
+      engine,
+      null,
+      { now: fixedNow },
+    );
+  });
+
+  it("(c) ConfirmProposalComponent & RPC fallback render proposed Services & Ports cleanly alongside Commands & Boundaries across 40..120, 72x20, and 100x30", async () => {
+    const theme = createMockTheme();
+    const proposal: ProposedSwarmPlan = {
+      title: "v0.9.0 Full-Stack Services Mission",
+      objective: "Ship API and Redis worker pipeline with contract verification",
+      strategy: "Boot shared services first, then parallelize API and worker slices",
+      acceptanceCriteria: "All VAL-* assertions verified and healthchecks green",
+      baseBranch: "main",
+      maxConcurrency: 6,
+      validatorEnabled: true,
+      commands: [
+        { name: "typecheck", command: "npm run typecheck" },
+        { name: "test", command: "npm test" },
+      ],
+      services: [
+        {
+          name: "worker-redis",
+          port: 6379,
+          start: "redis-server --port 6379",
+          stop: "redis-cli -p 6379 shutdown",
+          healthcheck: "redis-cli -p 6379 ping",
+        },
+        {
+          name: "api-server",
+          port: 3000,
+          start: "npm run start:api",
+          healthcheck: "curl -sf http://127.0.0.1:3000/healthz",
+          dependsOn: ["worker-redis"],
+        },
+      ],
+      boundaries: [
+        "Never read or print auth.json",
+        "Use ports 3000 and 6379 on 127.0.0.1 only",
+      ],
+      assertions: [
+        {
+          id: "VAL-SVC-01",
+          title: "API health endpoint responds 200",
+          description: "GET /healthz returns status ok",
+          status: "pending",
+          updatedAt: "2026-11-24T16:00:00.000Z",
+        },
+        {
+          id: "VAL-EXT-02",
+          title: "External webhook replay verified",
+          description: "Verified via recorded fixture",
+          status: "passed",
+          overridden: true,
+          overrideJustification: "Staging sandbox offline during tweak",
+          updatedAt: "2026-11-24T16:00:00.000Z",
+        },
+      ],
+      features: [
+        {
+          id: "feat-api",
+          title: "Implement healthcheck and webhook routes",
+          description: "HTTP server on :3000",
+          milestone: "m1-api",
+          fulfills: ["VAL-SVC-01", "VAL-EXT-02"],
+          status: "pending",
+          updatedAt: "2026-11-24T16:00:00.000Z",
+        },
+      ],
+    };
+
+    // 1. 100x30 viewport: Commands & Boundaries + Services & Ports visible together, exact box borders across 40..120
+    {
+      const { tui } = createMockTUI(30, 100);
+      let outcome: unknown;
+      const comp = new ConfirmProposalComponent(
+        tui,
+        theme,
+        proposal,
+        { mode: "tweak" },
+        (res) => {
+          outcome = res;
+        },
+      );
+      try {
+        for (const w of WIDTH_MATRIX) {
+          const lines = comp.render(w);
+          assert.ok(lines.length <= 26, `100x30 proposal@${w} exceeded 26 lines: ${lines.length}`);
+          assertIntactBoxBorders(lines, w, `v090-proposal@30x${w}`);
+        }
+
+        const topPlain = stripTerminalSequences(comp.render(100).join("\n"));
+        assert.match(topPlain, /Commands & Boundaries/);
+        assert.match(topPlain, /Services & Ports \(2\)/);
+        assert.match(
+          topPlain,
+          /▸ worker-redis :6379 — start: redis-server --port 6379/,
+        );
+        assert.match(topPlain, /healthcheck: redis-cli -p 6379 ping/);
+        assert.match(
+          topPlain,
+          /▸ api-server :3000 — start: npm run start:api/,
+        );
+        assert.match(
+          topPlain,
+          /healthcheck: curl -sf http:\/\/127\.0\.0\.1:3000\/healthz/,
+        );
+        assert.match(topPlain, /dependsOn: worker-redis/);
+
+        // Scroll down to verify overridden assertion badge + justification in tweak preview
+        comp.handleInput("]");
+        comp.handleInput("]");
+        const scrolledLines = comp.render(100);
+        assertIntactBoxBorders(scrolledLines, 100, "v090-proposal-scrolled@30x100");
+        const combined = `${topPlain}\n${stripTerminalSequences(scrolledLines.join("\n"))}`;
+        assert.match(
+          combined,
+          /\[✓\] VAL-EXT-02 \[OVERRIDE\]: External webhook replay verified/,
+        );
+        assert.match(
+          combined,
+          /override: Staging sandbox offline during tweak/,
+        );
+
+        comp.handleInput("\r");
+        assert.deepEqual(outcome, {
+          action: "confirm",
+          validatorEnabled: true,
+          maxConcurrency: 6,
+        });
+      } finally {
+        comp.dispose();
+      }
+    }
+
+    // 2. Narrow 72x20 viewport (plus services-only proposal): intact borders across 40..120 and scrollable Services & Ports
+    {
+      const { tui } = createMockTUI(20, 72);
+      const comp72 = new ConfirmProposalComponent(
+        tui,
+        theme,
+        proposal,
+        undefined,
+        () => {},
+      );
+      try {
+        for (const w of WIDTH_MATRIX) {
+          const lines = comp72.render(w);
+          assert.ok(lines.length <= 16, `72x20 proposal@${w} exceeded 16 lines: ${lines.length}`);
+          assertIntactBoxBorders(lines, w, `v090-proposal@20x${w}`);
+        }
+        comp72.handleInput("]"); // scroll into Services & Ports
+        const scrolled72 = comp72.render(72);
+        assertIntactBoxBorders(scrolled72, 72, "v090-proposal-scrolled@72x20");
+        assert.match(
+          stripTerminalSequences(scrolled72.join("\n")),
+          /Services & Ports \(2\)/,
+        );
+      } finally {
+        comp72.dispose();
+      }
+
+      // Services-only proposal (no commands/assertions/features) also activates mission preview cleanly
+      const servicesOnlyPlan: ProposedSwarmPlan = {
+        title: "Services-Only Proposal",
+        objective: "Verify dev server port",
+        strategy: "Single worker",
+        acceptanceCriteria: "Port 4000 responds",
+        baseBranch: "main",
+        maxConcurrency: 4,
+        validatorEnabled: true,
+        services: [{ name: "web", port: 4000, start: "npm run dev" }],
+      };
+      const compSvcOnly = new ConfirmProposalComponent(
+        tui,
+        theme,
+        servicesOnlyPlan,
+        undefined,
+        () => {},
+      );
+      try {
+        for (const w of WIDTH_MATRIX) {
+          assertIntactBoxBorders(
+            compSvcOnly.render(w),
+            w,
+            `v090-proposal-svconly@20x${w}`,
+          );
+        }
+        assert.match(
+          stripTerminalSequences(compSvcOnly.render(72).join("\n")),
+          /Services & Ports \(1\)/,
+        );
+        assert.match(
+          stripTerminalSequences(compSvcOnly.render(72).join("\n")),
+          /▸ web :4000 — start: npm run dev/,
+        );
+      } finally {
+        compSvcOnly.dispose();
+      }
+    }
+
+    // 3. RPC / non-TUI fallback surfaces proposed Services & Ports in select header
+    const qUi = createQuestionnaireUI();
+    let rpcHeader = "";
+    const rpcCtx = {
+      mode: "rpc",
+      hasUI: true,
+      ui: {
+        async select(header: string) {
+          rpcHeader = header;
+          return "Confirm — launch dynamic Swarm (recommended)";
+        },
+        async input() {
+          return undefined;
+        },
+      },
+    } as unknown as ExtensionContext;
+    const rpcOutcome = await qUi.confirmProposal(rpcCtx, proposal);
+    assert.equal(rpcOutcome.action, "confirm");
+    assert.match(
+      rpcHeader,
+      /Services: 2 \(worker-redis:6379, api-server:3000\)/,
+    );
+  });
+});

@@ -203,6 +203,7 @@ interface OverlayGoalSummary {
   valPassed: number;
   valTotal: number;
   valFailed: number;
+  valOverridden: number;
   openHandoffs: MissionHandoffItem[];
   openDebtItems: MissionHandoffItem[];
   sealedMilestones: string[];
@@ -226,6 +227,7 @@ function summarizeOverlayGoal(run: SwarmRunState): OverlayGoalSummary {
   const valTotal = assertions.length;
   const valPassed = assertions.filter((a) => a.status === "passed").length;
   const valFailed = assertions.filter((a) => a.status === "failed").length;
+  const valOverridden = assertions.filter((a) => Boolean(a.overridden)).length;
 
   const openHandoffs = (run.handoffItems ?? []).filter(
     (h) => h.resolution === "open",
@@ -247,7 +249,12 @@ function summarizeOverlayGoal(run: SwarmRunState): OverlayGoalSummary {
   const hasMissionInspector =
     hasPipelineGoal ||
     openHandoffs.length > 0 ||
-    Boolean(run.commands?.length || run.boundaries?.length || run.lastAudit);
+    Boolean(
+      run.commands?.length ||
+        run.services?.length ||
+        run.boundaries?.length ||
+        run.lastAudit,
+    );
 
   return {
     features,
@@ -258,6 +265,7 @@ function summarizeOverlayGoal(run: SwarmRunState): OverlayGoalSummary {
     valPassed,
     valTotal,
     valFailed,
+    valOverridden,
     openHandoffs,
     openDebtItems,
     sealedMilestones,
@@ -344,10 +352,11 @@ function buildMissionContractLines(
   }
   if (goal.assertions.length > 0) {
     const ratio = `${goal.valPassed}/${goal.valTotal}`;
+    const ovrRaw = goal.valOverridden > 0 ? ` (${goal.valOverridden} ovr)` : "";
     overviewParts.push(
       theme
-        ? `${theme.fg("muted", "VAL")} ${theme.fg(goal.valFailed > 0 ? "error" : goal.valPassed === goal.valTotal && goal.valTotal > 0 ? "success" : "accent", ratio)}`
-        : `VAL ${ratio}`,
+        ? `${theme.fg("muted", "VAL")} ${theme.fg(goal.valFailed > 0 ? "error" : goal.valPassed === goal.valTotal && goal.valTotal > 0 ? "success" : "accent", ratio)}${ovrRaw ? theme.fg("warning", ovrRaw) : ""}`
+        : `VAL ${ratio}${ovrRaw}`,
     );
   }
   if (goal.sealedMilestones.length > 0) {
@@ -505,14 +514,14 @@ function buildMissionContractLines(
     }
   }
 
-  // 3. Validation Contract Assertions (VAL-* + verifiedBy + evidence)
-  lines.push(
-    renderHorizontalRule(
-      targetWidth,
-      `Validation Assertions (${goal.valPassed}/${goal.valTotal} passed)`,
-      theme,
-    ),
-  );
+  // 3. Validation Contract Assertions (VAL-* + verifiedBy + evidence + audited [OVERRIDE])
+  const valHeaderTitle =
+    goal.valOverridden > 0
+      ? targetWidth >= 56
+        ? `Validation Assertions (${goal.valPassed}/${goal.valTotal} passed · ${goal.valOverridden} [OVERRIDE])`
+        : `Assertions (${goal.valPassed}/${goal.valTotal} · ${goal.valOverridden} ovr)`
+      : `Validation Assertions (${goal.valPassed}/${goal.valTotal} passed)`;
+  lines.push(renderHorizontalRule(targetWidth, valHeaderTitle, theme));
   if (goal.assertions.length === 0) {
     const emptyVal = "  (no validation assertions defined)";
     lines.push(fitLine(theme ? theme.fg("muted", emptyVal) : emptyVal, targetWidth));
@@ -533,6 +542,12 @@ function buildMissionContractLines(
             `[${a.status}]`,
           )
         : `[${a.status}]`;
+      const isOverridden = Boolean(a.overridden);
+      const overrideBadge = isOverridden
+        ? theme
+          ? ` ${theme.fg("warning", theme.bold("[OVERRIDE]"))}`
+          : " [OVERRIDE]"
+        : "";
       const verifiedRaw = a.verifiedBy
         ? `@${sanitizePlainText(a.verifiedBy)}`
         : "unverified";
@@ -542,9 +557,13 @@ function buildMissionContractLines(
           : theme.fg("dim", verifiedRaw)
         : verifiedRaw;
       const cleanTitle = sanitizePlainText(a.title);
+      const statusAndOverride =
+        isOverridden && targetWidth < 48
+          ? `${overrideBadge.trimStart()} ${statusStyled}`
+          : `${statusStyled}${overrideBadge}`;
       lines.push(
         fitLine(
-          `  ${glyph} ${idStyled} ${statusStyled} (${verifiedStyled}): ${cleanTitle}`,
+          `  ${glyph} ${idStyled} ${statusAndOverride} (${verifiedStyled}): ${cleanTitle}`,
           targetWidth,
         ),
       );
@@ -561,6 +580,30 @@ function buildMissionContractLines(
             targetWidth,
           ),
         );
+      }
+
+      const justClean = a.overrideJustification
+        ? sanitizePlainText(a.overrideJustification)
+        : isOverridden
+          ? "(no justification recorded)"
+          : "";
+      if (justClean) {
+        const justLabel = theme
+          ? theme.fg("warning", "override:")
+          : "override:";
+        const justText = theme ? theme.fg("muted", justClean) : justClean;
+        if (targetWidth > 12) {
+          const wrappedJust = wrapLines(
+            `${justLabel} ${justText}`,
+            targetWidth - 6,
+            2,
+          );
+          for (const wl of wrappedJust) {
+            lines.push(fitLine(`      ${wl}`, targetWidth));
+          }
+        } else {
+          lines.push(fitLine(`      ${justLabel} ${justText}`, targetWidth));
+        }
       }
     }
   }
@@ -597,7 +640,73 @@ function buildMissionContractLines(
     }
   }
 
-  // 5. Commands & Boundaries
+  // 5. Services & Ports
+  if (run.services && run.services.length > 0) {
+    const svcRuleTitle =
+      targetWidth >= 36
+        ? `Services & Ports (${run.services.length})`
+        : `Services (${run.services.length})`;
+    lines.push(renderHorizontalRule(targetWidth, svcRuleTitle, theme));
+    for (const svc of run.services) {
+      const nameClean = sanitizePlainText(svc.name);
+      const nameStyled = theme ? theme.bold(nameClean) : nameClean;
+      const portNum =
+        typeof svc.port === "number" && Number.isFinite(svc.port)
+          ? Math.floor(svc.port)
+          : undefined;
+      const portRaw = portNum !== undefined ? `:${portNum}` : "";
+      const portStyled = portRaw
+        ? ` ${theme ? theme.fg("accent", portRaw) : portRaw}`
+        : "";
+      const startClean = sanitizePlainText(svc.start);
+      const startStyled = theme
+        ? `${theme.fg("muted", "start:")} ${theme.fg("dim", startClean)}`
+        : `start: ${startClean}`;
+      const leadGlyph = theme ? theme.fg("accent", "▸") : "▸";
+      const headLine = `  ${leadGlyph} ${nameStyled}${portStyled} — ${startStyled}`;
+
+      const detailParts: string[] = [];
+      if (svc.healthcheck) {
+        const hcClean = sanitizePlainText(svc.healthcheck);
+        detailParts.push(
+          theme
+            ? `${theme.fg("muted", "healthcheck:")} ${theme.fg("dim", hcClean)}`
+            : `healthcheck: ${hcClean}`,
+        );
+      }
+      if (svc.dependsOn && svc.dependsOn.length > 0) {
+        const depsClean = svc.dependsOn.map(sanitizePlainText).join(", ");
+        detailParts.push(
+          theme
+            ? `${theme.fg("muted", "dependsOn:")} ${theme.fg("dim", depsClean)}`
+            : `dependsOn: ${depsClean}`,
+        );
+      }
+      if (svc.stop) {
+        const stopClean = sanitizePlainText(svc.stop);
+        detailParts.push(
+          theme
+            ? `${theme.fg("muted", "stop:")} ${theme.fg("dim", stopClean)}`
+            : `stop: ${stopClean}`,
+        );
+      }
+
+      if (detailParts.length === 0) {
+        lines.push(fitLine(headLine, targetWidth));
+      } else {
+        const detailTail = detailParts.join(sep);
+        const singleCandidate = `${headLine}${sep}${detailTail}`;
+        if (visibleWidth(singleCandidate) <= targetWidth) {
+          lines.push(fitLine(singleCandidate, targetWidth));
+        } else {
+          lines.push(fitLine(headLine, targetWidth));
+          lines.push(fitLine(`      ${detailTail}`, targetWidth));
+        }
+      }
+    }
+  }
+
+  // 6. Commands & Boundaries
   const hasCommands = Boolean(run.commands && run.commands.length > 0);
   const hasBoundaries = Boolean(run.boundaries && run.boundaries.length > 0);
   if (hasCommands || hasBoundaries) {
@@ -628,6 +737,18 @@ function buildMissionContractLines(
       );
     }
   }
+
+  // 7. Shared Mission Library Reference
+  const libraryPath = `.pi/swarm/runs/${sanitizePlainText(run.id)}/library/`;
+  lines.push(renderHorizontalRule(targetWidth, "Shared Library", theme));
+  lines.push(
+    fitLine(
+      theme
+        ? `  ${theme.fg("accent", "◆")} ${theme.bold(libraryPath)}${theme.fg("dim", " (architecture · environment · testing)")}`
+        : `  ◆ ${libraryPath} (architecture · environment · testing)`,
+      targetWidth,
+    ),
+  );
 
   return lines.map((l) => fitLine(l, targetWidth));
 }
@@ -2878,8 +2999,12 @@ export class SwarmOverlayComponent implements Component, Focusable {
           );
         }
         if (goal.assertions.length > 0) {
+          const ovrSuffix =
+            goal.valOverridden > 0
+              ? ` ${this.theme.fg("warning", `(${goal.valOverridden} ovr)`)}`
+              : "";
           summaryParts.push(
-            `${this.theme.fg("muted", "VAL")} ${this.theme.fg(goal.valFailed > 0 ? "error" : goal.valPassed === goal.valTotal && goal.valTotal > 0 ? "success" : "accent", `${goal.valPassed}/${goal.valTotal}`)}`,
+            `${this.theme.fg("muted", "VAL")} ${this.theme.fg(goal.valFailed > 0 ? "error" : goal.valPassed === goal.valTotal && goal.valTotal > 0 ? "success" : "accent", `${goal.valPassed}/${goal.valTotal}`)}${ovrSuffix}`,
           );
         }
         if (goal.sealedMilestones.length > 0) {
@@ -3092,7 +3217,7 @@ export class SwarmOverlayComponent implements Component, Focusable {
           : "";
       const valSeg =
         goal.assertions.length > 0
-          ? `${this.theme.fg("muted", "VAL")} ${this.theme.fg(goal.valFailed > 0 ? "error" : goal.valPassed === goal.valTotal && goal.valTotal > 0 ? "success" : "accent", `${goal.valPassed}/${goal.valTotal}`)}`
+          ? `${this.theme.fg("muted", "VAL")} ${this.theme.fg(goal.valFailed > 0 ? "error" : goal.valPassed === goal.valTotal && goal.valTotal > 0 ? "success" : "accent", `${goal.valPassed}/${goal.valTotal}`)}${goal.valOverridden > 0 ? ` ${this.theme.fg("warning", `(${goal.valOverridden} ovr)`)}` : ""}`
           : "";
       const sealedSeg =
         goal.sealedMilestones.length > 0

@@ -301,6 +301,7 @@ interface GoalProgressSummary {
   valTotal: number;
   valFailed: number;
   valBlocked: number;
+  valOverridden: number;
   openDebtItems: MissionHandoffItem[];
   openHandoffs: MissionHandoffItem[];
   sealedMilestoneLabels: string[];
@@ -326,6 +327,7 @@ function summarizeGoalProgress(run: SwarmRunState): GoalProgressSummary {
   const valPassed = assertions.filter((a) => a.status === "passed").length;
   const valFailed = assertions.filter((a) => a.status === "failed").length;
   const valBlocked = assertions.filter((a) => a.status === "blocked").length;
+  const valOverridden = assertions.filter((a) => Boolean(a.overridden)).length;
 
   const handoffItems = run.handoffItems ?? [];
   const openHandoffs = handoffItems.filter((h) => h.resolution === "open");
@@ -354,6 +356,7 @@ function summarizeGoalProgress(run: SwarmRunState): GoalProgressSummary {
     valTotal,
     valFailed,
     valBlocked,
+    valOverridden,
     openDebtItems,
     openHandoffs,
     sealedMilestoneLabels,
@@ -437,6 +440,7 @@ function formatCompactGoalBadges(
         ? `${formatAsciiProgressBar(goal.valPassed, goal.valTotal, 4)} `
         : "";
     const ratioRaw = `${bar}${goal.valPassed}/${goal.valTotal}`;
+    const ovrRaw = goal.valOverridden > 0 ? `(${goal.valOverridden} ovr)` : "";
     if (theme) {
       const valColor =
         goal.valFailed > 0
@@ -444,9 +448,12 @@ function formatCompactGoalBadges(
           : goal.valPassed === goal.valTotal && goal.valTotal > 0
             ? "success"
             : "accent";
-      parts.push(`${theme.fg("muted", "VAL")} ${theme.fg(valColor, ratioRaw)}`);
+      const ovrStyled = ovrRaw ? ` ${theme.fg("warning", ovrRaw)}` : "";
+      parts.push(
+        `${theme.fg("muted", "VAL")} ${theme.fg(valColor, ratioRaw)}${ovrStyled}`,
+      );
     } else {
-      parts.push(`VAL ${ratioRaw}`);
+      parts.push(`VAL ${ratioRaw}${ovrRaw ? ` ${ovrRaw}` : ""}`);
     }
   }
 
@@ -1078,10 +1085,12 @@ export class SwarmDashboardComponent implements Component {
             fitLine(`  ${pillFeats.join(this.theme.fg("dim", " · "))}`, innerWidth),
           );
         } else if (goal.assertions.length > 0) {
-          const pillVals = goal.assertions.slice(0, 4).map(
-            (a) =>
-              `${formatAssertionStatusGlyph(a.status, this.theme)} ${sanitizePlainText(a.id)}`,
-          );
+          const pillVals = goal.assertions.slice(0, 4).map((a) => {
+            const ovrTag = a.overridden
+              ? ` ${this.theme.fg("warning", "[OVERRIDE]")}`
+              : "";
+            return `${formatAssertionStatusGlyph(a.status, this.theme)} ${sanitizePlainText(a.id)}${ovrTag}`;
+          });
           body.push(
             fitLine(`  ${pillVals.join(this.theme.fg("dim", " · "))}`, innerWidth),
           );
@@ -1151,9 +1160,16 @@ export class SwarmDashboardComponent implements Component {
         } else if (itemSlotBudget > 0 && goal.assertions.length > 0) {
           for (const a of goal.assertions.slice(0, itemSlotBudget)) {
             const glyph = formatAssertionStatusGlyph(a.status, this.theme);
+            const ovrBadge = a.overridden
+              ? ` ${this.theme.fg("warning", "[OVERRIDE]")}`
+              : "";
+            const ovrJust =
+              a.overridden && a.overrideJustification
+                ? ` ${this.theme.fg("dim", `— ${sanitizePlainText(a.overrideJustification)}`)}`
+                : "";
             body.push(
               fitLine(
-                `  ${glyph} ${this.theme.bold(sanitizePlainText(a.id))}: ${sanitizePlainText(a.title)}`,
+                `  ${glyph} ${this.theme.bold(sanitizePlainText(a.id))}${ovrBadge}: ${sanitizePlainText(a.title)}${ovrJust}`,
                 innerWidth,
               ),
             );
@@ -1531,6 +1547,9 @@ export function formatZeroTurnStatusDashboard(
   out.push(
     `- **Validator Policy:** ${run.validatorEnabled ? "ON" : "OFF"} · **Keep Warm:** ${run.keepWorkersWarm ? "ON" : "OFF"} · **Usage:** ${formatTokens(snapshot.totalTokens)} tokens (${formatCost(snapshot.totalCost)})`,
   );
+  out.push(
+    `- **Shared Library:** \`.pi/swarm/runs/${sanitizePlainText(run.id)}/library/\` _(shared mission knowledge base)_`,
+  );
   if (run.status === "active" && workingCount === 0 && waitingCount > 0) {
     out.push(
       `- **Status:** ⏳ 0 working — awaiting @${ORCHESTRATOR_NAME} next step`,
@@ -1552,8 +1571,12 @@ export function formatZeroTurnStatusDashboard(
       goalSegments.push(`Features ${goal.featDone}/${goal.featTotal} completed`);
     }
     if (goal.assertions.length > 0) {
+      const ovrSuffix =
+        goal.valOverridden > 0
+          ? ` (${goal.valOverridden} ovr \`[OVERRIDE]\`)`
+          : "";
       goalSegments.push(
-        `Validation Contract ${goal.valPassed}/${goal.valTotal} \`VAL-*\` passed`,
+        `Validation Contract ${goal.valPassed}/${goal.valTotal} \`VAL-*\` passed${ovrSuffix}`,
       );
     }
     if (goal.sealedMilestoneLabels.length > 0) {
@@ -1615,22 +1638,30 @@ export function formatZeroTurnStatusDashboard(
   // Validation Contract (VAL-*) Table
   if (run.assertions && run.assertions.length > 0) {
     out.push("");
+    const ovrHeaderSuffix =
+      goal.valOverridden > 0 ? ` · ${goal.valOverridden} [OVERRIDE]` : "";
     out.push(
-      `#### Validation Contract (${goal.valPassed}/${goal.valTotal} passed)`,
+      `#### Validation Contract (${goal.valPassed}/${goal.valTotal} passed${ovrHeaderSuffix})`,
     );
     out.push("| ID | Status | Verified By | Title / Evidence |");
     out.push("| --- | --- | --- | --- |");
     for (const a of run.assertions) {
-      const statusCell = `${formatAssertionStatusGlyph(a.status)} \`${escapeMdCell(a.status)}\``;
+      const overrideBadge = a.overridden ? " `[OVERRIDE]`" : "";
+      const statusCell = `${formatAssertionStatusGlyph(a.status)} \`${escapeMdCell(a.status)}\`${overrideBadge}`;
       const verifiedCell = a.verifiedBy
         ? `\`@${escapeMdCell(a.verifiedBy)}\`${a.verifiedByRole ? ` (${escapeMdCell(a.verifiedByRole)})` : ""}`
         : "—";
       const evidenceSuffix = a.evidence
         ? ` — _${escapeMdCell(a.evidence)}_`
         : a.evidenceRequired
-          ? ` _(req: ${escapeMdCell(a.evidenceRequired)})_`
+           ? ` _(req: ${escapeMdCell(a.evidenceRequired)})_`
+           : "";
+      const overrideJustSuffix = a.overrideJustification
+        ? ` — **Override:** ${escapeMdCell(a.overrideJustification)}`
+        : a.overridden
+          ? " — **Override:** _(no justification recorded)_"
           : "";
-      const titleEvidenceCell = `${escapeMdCell(a.title)}${evidenceSuffix}`;
+      const titleEvidenceCell = `${escapeMdCell(a.title)}${evidenceSuffix}${overrideJustSuffix}`;
       out.push(
         `| \`${escapeMdCell(a.id)}\` | ${statusCell} | ${verifiedCell} | ${titleEvidenceCell} |`,
       );
@@ -1664,6 +1695,33 @@ export function formatZeroTurnStatusDashboard(
         : "";
       out.push(
         `| \`${escapeMdCell(h.id)}\` | \`${escapeMdCell(h.type)}\` | ${sourceCell} | ${resCell} | ${escapeMdCell(h.summary)}${justSuffix} |`,
+      );
+    }
+  }
+
+  // Mission Services & Ports
+  if (run.services && run.services.length > 0) {
+    out.push("");
+    out.push(`#### Mission Services & Ports (${run.services.length})`);
+    out.push("| Service | Port | Start | Healthcheck | Depends On |");
+    out.push("| --- | --- | --- | --- | --- |");
+    for (const svc of run.services) {
+      const portNum =
+        typeof svc.port === "number" && Number.isFinite(svc.port)
+          ? Math.floor(svc.port)
+          : undefined;
+      const portCell = portNum !== undefined ? `\`:${portNum}\`` : "—";
+      const stopNote = svc.stop ? ` _(stop: \`${escapeMdCell(svc.stop)}\`)_` : "";
+      const startCell = `\`${escapeMdCell(svc.start)}\`${stopNote}`;
+      const healthCell = svc.healthcheck
+        ? `\`${escapeMdCell(svc.healthcheck)}\``
+        : "—";
+      const depsCell =
+        svc.dependsOn && svc.dependsOn.length > 0
+          ? svc.dependsOn.map((d) => `\`${escapeMdCell(d)}\``).join(", ")
+          : "—";
+      out.push(
+        `| \`${escapeMdCell(svc.name)}\` | ${portCell} | ${startCell} | ${healthCell} | ${depsCell} |`,
       );
     }
   }

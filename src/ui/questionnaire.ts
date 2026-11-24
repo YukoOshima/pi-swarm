@@ -285,6 +285,18 @@ async function confirmProposalBasic(
     if (plan.assertions && plan.assertions.length > 0) {
       missionCounts.push(`VAL: ${plan.assertions.length}`);
     }
+    if (plan.services && plan.services.length > 0) {
+      const svcSummary = plan.services
+        .map((svc) => {
+          const portNum =
+            typeof svc.port === "number" && Number.isFinite(svc.port)
+              ? Math.floor(svc.port)
+              : undefined;
+          return `${sanitizePlainText(svc.name)}${portNum !== undefined ? `:${portNum}` : ""}`;
+        })
+        .join(", ");
+      missionCounts.push(`Services: ${plan.services.length} (${svcSummary})`);
+    }
     const header = [
       options?.mode === "tweak"
         ? "Swarm Plan Confirmation (Revision)"
@@ -1609,11 +1621,13 @@ export class ConfirmProposalComponent implements Component, Focusable {
     const body: string[] = [];
 
     const commands = this.plan.commands ?? [];
+    const services = this.plan.services ?? [];
     const boundaries = this.plan.boundaries ?? [];
     const assertions = this.plan.assertions ?? [];
     const features = this.plan.features ?? [];
     const hasMissionSections =
       commands.length > 0 ||
+      services.length > 0 ||
       boundaries.length > 0 ||
       assertions.length > 0 ||
       features.length > 0;
@@ -1725,6 +1739,62 @@ export class ConfirmProposalComponent implements Component, Focusable {
         }
       }
 
+      // 1b. Services & Ports (alongside Commands & Boundaries)
+      if (services.length > 0) {
+        const svcHeader =
+          innerWidth >= 36
+            ? `Services & Ports (${services.length})`
+            : `Services (${services.length})`;
+        allPreviewLines.push(
+          renderHorizontalRule(innerWidth, svcHeader, this.theme),
+        );
+        for (const svc of services) {
+          const nameClean = sanitizePlainText(svc.name);
+          const nameStyled = this.theme.bold(nameClean);
+          const portNum =
+            typeof svc.port === "number" && Number.isFinite(svc.port)
+              ? Math.floor(svc.port)
+              : undefined;
+          const portStyled =
+            portNum !== undefined
+              ? ` ${this.theme.fg("accent", `:${portNum}`)}`
+              : "";
+          const startStyled = `${this.theme.fg("muted", "start:")} ${this.theme.fg("dim", sanitizePlainText(svc.start))}`;
+          const lead = this.theme.fg("accent", "▸");
+          const primarySvc = `  ${lead} ${nameStyled}${portStyled} — ${startStyled}`;
+
+          const extraParts: string[] = [];
+          if (svc.healthcheck) {
+            extraParts.push(
+              `${this.theme.fg("muted", "healthcheck:")} ${this.theme.fg("dim", sanitizePlainText(svc.healthcheck))}`,
+            );
+          }
+          if (svc.dependsOn && svc.dependsOn.length > 0) {
+            extraParts.push(
+              `${this.theme.fg("muted", "dependsOn:")} ${this.theme.fg("dim", svc.dependsOn.map(sanitizePlainText).join(", "))}`,
+            );
+          }
+          if (svc.stop) {
+            extraParts.push(
+              `${this.theme.fg("muted", "stop:")} ${this.theme.fg("dim", sanitizePlainText(svc.stop))}`,
+            );
+          }
+
+          if (extraParts.length === 0) {
+            allPreviewLines.push(fitLine(primarySvc, innerWidth));
+          } else {
+            const extraJoined = extraParts.join(sep);
+            const singleSvc = `${primarySvc}${sep}${extraJoined}`;
+            if (visibleWidth(singleSvc) <= innerWidth) {
+              allPreviewLines.push(fitLine(singleSvc, innerWidth));
+            } else {
+              allPreviewLines.push(fitLine(primarySvc, innerWidth));
+              allPreviewLines.push(fitLine(`      ${extraJoined}`, innerWidth));
+            }
+          }
+        }
+      }
+
       // 2. Validation Contract (N VAL-* assertions)
       if (assertions.length > 0) {
         const contractHeader =
@@ -1744,15 +1814,36 @@ export class ConfirmProposalComponent implements Component, Focusable {
                   ? this.theme.fg("warning", "[!]")
                   : this.theme.fg("muted", "[ ]");
           const idStr = this.theme.bold(sanitizePlainText(a.id));
+          const overrideBadge = a.overridden
+            ? ` ${this.theme.fg("warning", this.theme.bold("[OVERRIDE]"))}`
+            : "";
           const titleStr = sanitizePlainText(a.title);
           const descStr = sanitizePlainText(a.description);
-          const descTail =
-            descStr && descStr !== titleStr
-              ? ` ${this.theme.fg("dim", `— ${descStr}`)}`
-              : "";
-          allPreviewLines.push(
-            fitLine(`  ${glyph} ${idStr}: ${titleStr}${descTail}`, innerWidth),
-          );
+          const justStr = a.overrideJustification
+            ? sanitizePlainText(a.overrideJustification)
+            : "";
+          if (justStr) {
+            const primaryVal = `  ${glyph} ${idStr}${overrideBadge}: ${titleStr}`;
+            const justMeta = `${this.theme.fg("warning", "override:")} ${this.theme.fg("muted", justStr)}`;
+            const singleVal = `${primaryVal}${sep}${justMeta}`;
+            if (visibleWidth(singleVal) <= innerWidth) {
+              allPreviewLines.push(fitLine(singleVal, innerWidth));
+            } else {
+              allPreviewLines.push(fitLine(primaryVal, innerWidth));
+              allPreviewLines.push(fitLine(`      ${justMeta}`, innerWidth));
+            }
+          } else {
+            const descTail =
+              descStr && descStr !== titleStr
+                ? ` ${this.theme.fg("dim", `— ${descStr}`)}`
+                : "";
+            allPreviewLines.push(
+              fitLine(
+                `  ${glyph} ${idStr}${overrideBadge}: ${titleStr}${descTail}`,
+                innerWidth,
+              ),
+            );
+          }
         }
       }
 
@@ -1875,6 +1966,7 @@ export class ConfirmProposalComponent implements Component, Focusable {
           const miniParts: string[] = [];
           if (features.length > 0) miniParts.push(`Feat:${features.length}`);
           if (assertions.length > 0) miniParts.push(`VAL:${assertions.length}`);
+          if (services.length > 0) miniParts.push(`Svc:${services.length}`);
           if (commands.length > 0) miniParts.push(`Cmd:${commands.length}`);
           if (boundaries.length > 0) miniParts.push(`Bnd:${boundaries.length}`);
           body.push(
