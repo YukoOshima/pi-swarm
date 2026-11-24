@@ -172,6 +172,12 @@ class MockSwarmStore implements ISwarmStore {
       validatorEnabled: input.validatorEnabled ?? true,
       keepWorkersWarm: input.keepWorkersWarm ?? true,
       roleModels: input.roleModels ?? {},
+      ...(input.milestones ? { milestones: cloneState(input.milestones) } : {}),
+      ...(input.assertions ? { assertions: cloneState(input.assertions) } : {}),
+      ...(input.features ? { features: cloneState(input.features) } : {}),
+      ...(input.handoffItems ? { handoffItems: cloneState(input.handoffItems) } : {}),
+      ...(input.commands ? { commands: cloneState(input.commands) } : {}),
+      ...(input.boundaries ? { boundaries: cloneState(input.boundaries) } : {}),
       revision: 1,
       members: {},
       memberOrder: [],
@@ -263,6 +269,48 @@ class MockSwarmStore implements ISwarmStore {
         delete run.milestones;
       } else {
         run.milestones = cloneState(patch.milestones);
+      }
+    }
+    if (patch.assertions !== undefined) {
+      if (patch.assertions === null) {
+        delete run.assertions;
+      } else {
+        run.assertions = cloneState(patch.assertions);
+      }
+    }
+    if (patch.features !== undefined) {
+      if (patch.features === null) {
+        delete run.features;
+      } else {
+        run.features = cloneState(patch.features);
+      }
+    }
+    if (patch.handoffItems !== undefined) {
+      if (patch.handoffItems === null) {
+        delete run.handoffItems;
+      } else {
+        run.handoffItems = cloneState(patch.handoffItems);
+      }
+    }
+    if (patch.commands !== undefined) {
+      if (patch.commands === null) {
+        delete run.commands;
+      } else {
+        run.commands = cloneState(patch.commands);
+      }
+    }
+    if (patch.boundaries !== undefined) {
+      if (patch.boundaries === null) {
+        delete run.boundaries;
+      } else {
+        run.boundaries = cloneState(patch.boundaries);
+      }
+    }
+    if (patch.lastAudit !== undefined) {
+      if (patch.lastAudit === null) {
+        delete run.lastAudit;
+      } else {
+        run.lastAudit = cloneState(patch.lastAudit);
       }
     }
     if (patch.completionSummary !== undefined) run.completionSummary = patch.completionSummary;
@@ -472,6 +520,16 @@ class MockSwarmStore implements ISwarmStore {
       mentions: [...(input.mentions ?? [])],
       channelMentions: [...(input.channelMentions ?? [])],
       kind: input.kind ?? "chat",
+      ...(input.featureId ? { featureId: input.featureId } : {}),
+      ...(input.discoveredIssues && input.discoveredIssues.length > 0
+        ? { discoveredIssues: [...input.discoveredIssues] }
+        : {}),
+      ...(input.leftUndone && input.leftUndone.length > 0
+        ? { leftUndone: [...input.leftUndone] }
+        : {}),
+      ...(input.verificationEvidence
+        ? { verificationEvidence: input.verificationEvidence }
+        : {}),
       timestamp: new Date().toISOString(),
     };
     list.push(msg);
@@ -588,6 +646,8 @@ class MockWorktreeManager implements IWorktreeManager {
   }> = [];
   readonly fetchedClones: Array<{ sourceWorktreePath: string; branch: string }> = [];
   readonly dirtyPaths = new Set<string>();
+  readonly commitsAheadByBranch = new Map<string, number>();
+  defaultCommitsAhead = 1;
   failCreateWorktreeFor?: string;
   baseBranchCheck: BaseBranchCleanCheck = { ok: true, currentBranch: "main", dirty: false };
   rebaseResult: AutoRebaseResult = { status: "up-to-date" };
@@ -643,8 +703,11 @@ class MockWorktreeManager implements IWorktreeManager {
     return this.nextMergeSha;
   }
 
-  async getCommitCountAhead(): Promise<number> {
-    return 1;
+  async getCommitCountAhead(_baseRef?: string, targetRef?: string): Promise<number> {
+    if (targetRef && this.commitsAheadByBranch.has(targetRef)) {
+      return this.commitsAheadByBranch.get(targetRef)!;
+    }
+    return this.defaultCommitsAhead;
   }
 
   async getChangedFiles(): Promise<string[]> {
@@ -7593,6 +7656,1235 @@ describe("SwarmEngine & Runtime — v0.7.0 Live Telemetry, Recovery & Safety Fix
         workerPrompt.includes("Batch independent read, inspection, or verification shell commands"),
         "worker prompt must instruct batching independent shell commands",
       );
+    } finally {
+      await engine.dispose();
+    }
+  });
+});
+
+// ============================================================================
+// 19. v0.8.0 Dynamic Mission Goal Engine, Structured Handoffs & Hard Gates
+// ============================================================================
+
+describe("SwarmEngine & Runtime — v0.8.0 Dynamic Mission Goal Engine", () => {
+  it("1. supports all 8 SWARM_MISSION_OPS, role permissions, auto-sealing, sealed milestone guard, and modified assertion re-verification reset", async () => {
+    const { engine, transport } = await createTestHarness({
+      stallWatchdogEnabled: false,
+    });
+    let workerBridge: SpawnMemberRequest["engineApi"] | undefined;
+    let validatorBridge: SpawnMemberRequest["engineApi"] | undefined;
+
+    transport.onMember("worker-a", async ({ request }) => {
+      workerBridge = request.engineApi;
+    });
+    transport.onMember("validator", async ({ request }) => {
+      validatorBridge = request.engineApi;
+    });
+
+    try {
+      await engine.addMembers({ name: "worker-a", brief: "Implement auth slice" });
+      await engine.addMembers({
+        name: "validator",
+        role: "validator",
+        brief: "Audit VAL-* contract",
+      });
+      await waitUntil(
+        () =>
+          engine.getSnapshot().run?.members["worker-a"]?.state === "waiting" &&
+          engine.getSnapshot().run?.members.validator?.state === "waiting",
+      );
+      assert.ok(workerBridge);
+      assert.ok(validatorBridge);
+
+      const tools = createSwarmTools({ engine });
+      const swarmTool = tools.find((t) => t.name === SWARM_TOOL)!;
+      const workerTools = createMemberScopedTools(workerBridge, {
+        name: "worker-a",
+        role: "worker",
+        runId: "run-dyn",
+      });
+      const workerSwarmTool = workerTools.find((t) => t.name === SWARM_TOOL)!;
+      const validatorTools = createMemberScopedTools(validatorBridge, {
+        name: "validator",
+        role: "validator",
+        runId: "run-dyn",
+      });
+      const validatorSwarmTool = validatorTools.find((t) => t.name === SWARM_TOOL)!;
+      const toolCtx = {} as unknown as ExtensionToolContext;
+
+      // (h) set_manifest: orchestrator sets commands + boundaries; worker/validator rejected
+      const manifestRes = await swarmTool.execute(
+        "tc-manifest",
+        {
+          action: "mission",
+          mission_op: "set_manifest",
+          commands: [
+            { name: "typecheck", command: "npm run typecheck" },
+            { name: "test", command: "npm test" },
+          ],
+          boundaries: ["Never touch auth.json", "No external network calls"],
+        } as any,
+        undefined,
+        undefined,
+        toolCtx,
+      );
+      assert.ok(!manifestRes.isError);
+      assert.equal(engine.getSnapshot().run?.commands?.length, 2);
+      assert.equal(engine.getSnapshot().run?.boundaries?.length, 2);
+
+      const badManifestWorker = await workerSwarmTool.execute(
+        "tc-manifest-worker",
+        {
+          action: "mission",
+          mission_op: "set_manifest",
+          boundaries: ["hacked"],
+        } as any,
+        undefined,
+        undefined,
+        toolCtx,
+      );
+      assert.equal(badManifestWorker.isError, true);
+      assert.equal((badManifestWorker.details as any)?.errorCode, "PERMISSION_DENIED");
+
+      // (b) upsert_assertions: orchestrator adds VAL-* assertions; worker rejected
+      const upsertAssertionsRes = await engine.manageMission({
+        op: "upsert_assertions",
+        assertions: [
+          {
+            id: "VAL-AUTH-001",
+            title: "JWT signature validation",
+            description: "Rejects unsigned or tampered JWTs with 401.",
+            evidenceRequired: "Unit test output for invalid signature",
+          },
+          {
+            id: "VAL-AUTH-002",
+            title: "Session expiry enforcement",
+            description: "Rejects expired tokens beyond 30s clock skew.",
+            evidenceRequired: "Unit test output for expired token",
+          },
+          {
+            id: "VAL-DROP-003",
+            title: "Dropped legacy BasicAuth",
+            description: "Temporary scope item to remove later.",
+            evidenceRequired: "BasicAuth test",
+          },
+        ],
+      });
+      assert.equal(upsertAssertionsRes.assertions!.length, 3);
+
+      await assert.rejects(
+        () =>
+          workerBridge!.manageMission!({
+            op: "upsert_assertions",
+            assertions: [{ id: "VAL-HACK-1", title: "x", description: "y" }],
+          }),
+        (err: unknown) =>
+          err instanceof SwarmProtocolError && err.code === "PERMISSION_DENIED",
+      );
+
+      // (e) upsert_features: DAG cycle validation, milestone auto-creation, coverage warnings
+      await assert.rejects(
+        () =>
+          engine.manageMission({
+            op: "upsert_features",
+            features: [
+              {
+                id: "feat-self",
+                title: "Self",
+                description: "Self dep",
+                milestone: "m1",
+                dependsOn: ["feat-self"],
+              },
+            ],
+          }),
+        (err: unknown) =>
+          err instanceof SwarmProtocolError && err.code === "INVALID_INPUT",
+      );
+      await assert.rejects(
+        () =>
+          engine.manageMission({
+            op: "upsert_features",
+            features: [
+              {
+                id: "feat-a",
+                title: "A",
+                description: "Feature A",
+                milestone: "m1",
+                dependsOn: ["feat-b"],
+              },
+              {
+                id: "feat-b",
+                title: "B",
+                description: "Feature B",
+                milestone: "m1",
+                dependsOn: ["feat-a"],
+              },
+            ],
+          }),
+        (err: unknown) =>
+          err instanceof SwarmProtocolError && err.code === "INVALID_INPUT",
+      );
+
+      const upsertFeaturesRes = await engine.manageMission({
+        op: "upsert_features",
+        features: [
+          {
+            id: "feat-jwt",
+            title: "JWT signature verifier",
+            description: "Verify JWT RS256/HS256 signatures",
+            milestone: "m1-auth",
+            fulfills: ["VAL-AUTH-001", "VAL-DROP-003"],
+          },
+          {
+            id: "feat-expiry",
+            title: "Token expiry check",
+            description: "Check exp claim with 30s skew",
+            milestone: "m1-auth",
+            dependsOn: ["feat-jwt"],
+            fulfills: ["VAL-AUTH-001"], // intentionally leaves VAL-AUTH-002 unclaimed + duplicates VAL-AUTH-001
+          },
+        ],
+      });
+      assert.ok(
+        upsertFeaturesRes.summary.includes("VAL-AUTH-002") &&
+          upsertFeaturesRes.summary.includes("Duplicate fulfills"),
+        "summary must report unclaimedAssertions and duplicate fulfills",
+      );
+      assert.ok(
+        upsertFeaturesRes.milestones!.some((m) => m.label === "m1-auth"),
+        "upsert_features must auto-ensure milestone exists in run.milestones",
+      );
+
+      // Fix feat-expiry fulfills -> VAL-AUTH-002
+      await engine.manageMission({
+        op: "upsert_features",
+        features: [
+          {
+            id: "feat-expiry",
+            title: "Token expiry check",
+            description: "Check exp claim with 30s skew",
+            milestone: "m1-auth",
+            dependsOn: ["feat-jwt"],
+            fulfills: ["VAL-AUTH-002"],
+          },
+        ],
+      });
+
+      // (c) remove_assertion: drops VAL-DROP-003 and strips orphaned reference from feat-jwt.fulfills
+      const removeRes = await engine.manageMission({
+        op: "remove_assertion",
+        assertionId: "VAL-DROP-003",
+      });
+      assert.equal(removeRes.assertions!.length, 2);
+      const jwtFeatAfterRemove = removeRes.features!.find((f) => f.id === "feat-jwt")!;
+      assert.deepEqual(jwtFeatAfterRemove.fulfills, ["VAL-AUTH-001"]);
+
+      // (f) update_feature: worker claims unassigned feature -> in_progress; validator rejected; hijacking other worker's feature rejected
+      await workerSwarmTool.execute(
+        "tc-claim",
+        {
+          action: "mission",
+          mission_op: "update_feature",
+          feature_id: "feat-jwt",
+          feature_status: "in_progress",
+        } as any,
+        undefined,
+        undefined,
+        toolCtx,
+      );
+      assert.equal(
+        engine.getSnapshot().run?.features?.find((f) => f.id === "feat-jwt")?.assignedMember,
+        "worker-a",
+      );
+
+      await engine.manageMission({
+        op: "update_feature",
+        featureId: "feat-expiry",
+        assignedMember: "other-worker",
+      });
+      await assert.rejects(
+        () =>
+          workerBridge!.manageMission!({
+            op: "update_feature",
+            featureId: "feat-expiry",
+            featureStatus: "completed",
+          }),
+        (err: unknown) =>
+          err instanceof SwarmProtocolError && err.code === "PERMISSION_DENIED",
+      );
+      await assert.rejects(
+        () =>
+          validatorBridge!.manageMission!({
+            op: "update_feature",
+            featureId: "feat-jwt",
+            featureStatus: "completed",
+          }),
+        (err: unknown) =>
+          err instanceof SwarmProtocolError && err.code === "PERMISSION_DENIED",
+      );
+
+      // Queue ordering: failed moves to top; completed/cancelled sink to bottom; prepend:true inserts at top of pending
+      await engine.manageMission({
+        op: "update_feature",
+        featureId: "feat-jwt",
+        featureStatus: "completed",
+      });
+      await engine.manageMission({
+        op: "update_feature",
+        featureId: "feat-expiry",
+        featureStatus: "failed",
+      });
+      const prependRes = await engine.manageMission({
+        op: "upsert_features",
+        prepend: true,
+        features: [
+          {
+            id: "feat-urgent",
+            title: "Urgent clock skew helper",
+            description: "Add clock skew helper before expiry",
+            milestone: "m1-auth",
+            fulfills: ["VAL-AUTH-002"],
+          },
+        ],
+      });
+      assert.deepEqual(
+        prependRes.features!.map((f) => f.id),
+        ["feat-urgent", "feat-expiry", "feat-jwt"],
+        "prepend:true must insert at top of active queue while completed feat-jwt stays at bottom",
+      );
+
+      // Cancel feat-urgent and complete feat-expiry so all non-cancelled m1-auth features are completed
+      await engine.manageMission({
+        op: "update_feature",
+        featureId: "feat-urgent",
+        featureStatus: "cancelled",
+      });
+      await engine.manageMission({
+        op: "update_feature",
+        featureId: "feat-expiry",
+        featureStatus: "completed",
+      });
+
+      // (d) verify_assertion:
+      // 1) Worker MUST be rejected with PERMISSION_DENIED (never self-grade!)
+      const badWorkerVerify = await workerSwarmTool.execute(
+        "tc-worker-verify",
+        {
+          action: "mission",
+          mission_op: "verify_assertion",
+          assertion_id: "VAL-AUTH-001",
+          assertion_status: "passed",
+          evidence: "trust me bro",
+        } as any,
+        undefined,
+        undefined,
+        toolCtx,
+      );
+      assert.equal(badWorkerVerify.isError, true);
+      assert.equal((badWorkerVerify.details as any)?.errorCode, "PERMISSION_DENIED");
+
+      // 2) Orchestrator marking "passed" when validatorEnabled=true without force=true MUST be rejected!
+      await assert.rejects(
+        () =>
+          engine.manageMission({
+            op: "verify_assertion",
+            assertionId: "VAL-AUTH-001",
+            assertionStatus: "passed",
+            evidence: "Orchestrator self-check",
+          }),
+        (err: unknown) =>
+          err instanceof SwarmProtocolError && err.code === "PERMISSION_DENIED",
+      );
+
+      // 3) Empty evidence when setting "passed" or "failed" MUST be rejected!
+      await assert.rejects(
+        () =>
+          validatorBridge!.manageMission!({
+            op: "verify_assertion",
+            assertionId: "VAL-AUTH-001",
+            assertionStatus: "passed",
+            evidence: "   ",
+          }),
+        (err: unknown) =>
+          err instanceof SwarmProtocolError && err.code === "INVALID_INPUT",
+      );
+
+      // 4) Independent validator verifies VAL-AUTH-001 & VAL-AUTH-002 -> milestone m1-auth AUTO-SEALS!
+      await validatorSwarmTool.execute(
+        "tc-val-1",
+        {
+          action: "mission",
+          mission_op: "verify_assertion",
+          assertion_id: "VAL-AUTH-001",
+          assertion_status: "passed",
+          evidence: "npm test -- jwt.test.ts: 6/6 passed",
+        } as any,
+        undefined,
+        undefined,
+        toolCtx,
+      );
+      const sealRes = await validatorSwarmTool.execute(
+        "tc-val-2",
+        {
+          action: "mission",
+          mission_op: "verify_assertion",
+          assertion_id: "VAL-AUTH-002",
+          assertion_status: "passed",
+          evidence: "npm test -- expiry.test.ts: 4/4 passed",
+        } as any,
+        undefined,
+        undefined,
+        toolCtx,
+      );
+      assert.ok(!sealRes.isError);
+      const sealedMilestone = engine
+        .getSnapshot()
+        .run?.milestones?.find((m) => m.label === "m1-auth");
+      assert.equal(sealedMilestone?.status, "done");
+      assert.equal(sealedMilestone?.sealed, true);
+      assert.ok(sealedMilestone?.sealedAt);
+
+      // (e) Sealed Milestone Guard: reject adding new feature or re-opening completed feature in sealed m1-auth!
+      await assert.rejects(
+        () =>
+          engine.manageMission({
+            op: "upsert_features",
+            features: [
+              {
+                id: "feat-sneaky",
+                title: "Sneaky unvalidated edit",
+                description: "Bypass validation",
+                milestone: "m1-auth",
+              },
+            ],
+          }),
+        (err: unknown) =>
+          err instanceof SwarmProtocolError &&
+          err.code === "INVALID_INPUT" &&
+          err.message.includes("sealed") &&
+          err.message.includes("followup"),
+      );
+      await assert.rejects(
+        () =>
+          engine.manageMission({
+            op: "update_feature",
+            featureId: "feat-jwt",
+            featureStatus: "in_progress",
+          }),
+        (err: unknown) =>
+          err instanceof SwarmProtocolError && err.code === "INVALID_INPUT",
+      );
+
+      // Adding follow-up work in a new milestone "m1-auth-followup" succeeds cleanly!
+      const followupRes = await engine.manageMission({
+        op: "upsert_features",
+        features: [
+          {
+            id: "feat-refresh-token",
+            title: "Refresh token rotation",
+            description: "Rotate refresh tokens on use",
+            milestone: "m1-auth-followup",
+            fulfills: ["VAL-AUTH-002"],
+          },
+        ],
+      });
+      assert.ok(followupRes.milestones!.some((m) => m.label === "m1-auth-followup"));
+
+      // (b) Droid modified-assertion rule: changing description of a "passed" assertion resets status->"pending", clears evidence/verifiedBy, and unseals m1-auth!
+      const modifiedAssertionRes = await engine.manageMission({
+        op: "upsert_assertions",
+        assertions: [
+          {
+            id: "VAL-AUTH-001",
+            title: "JWT signature + key-id validation",
+            description: "Rejects unsigned JWTs AND unknown kid headers with 401.",
+            evidenceRequired: "Unit tests for signature + kid header",
+          },
+        ],
+      });
+      const resetVal1 = modifiedAssertionRes.assertions!.find(
+        (a) => a.id === "VAL-AUTH-001",
+      )!;
+      assert.equal(resetVal1.status, "pending");
+      assert.equal(resetVal1.evidence, undefined);
+      assert.equal(resetVal1.verifiedBy, undefined);
+      const unsealedM1 = modifiedAssertionRes.milestones!.find(
+        (m) => m.label === "m1-auth",
+      )!;
+      assert.equal(unsealedM1.sealed, false);
+      assert.equal(unsealedM1.status, "in_progress");
+
+      // Also verify marking an assertion "failed" keeps milestone unsealed and includes actionable failure info
+      const failedVerifyRes = await validatorBridge!.manageMission!({
+        op: "verify_assertion",
+        assertionId: "VAL-AUTH-001",
+        assertionStatus: "failed",
+        evidence: "src/auth/jwt.ts:44 accepts missing kid header",
+      });
+      assert.ok(failedVerifyRes.summary.includes("Action needed"));
+
+      // (a) status: readable by worker, validator, orchestrator, and human
+      for (const caller of [
+        () => workerBridge!.manageMission!({ op: "status" }),
+        () => validatorBridge!.manageMission!({ op: "status" }),
+        () => engine.manageMission({ op: "status" }),
+        () => engine.manageMission({ op: "status", callerRole: "human" }),
+      ]) {
+        const st = await caller();
+        assert.equal(st.op, "status");
+        assert.ok(st.summary.includes("Milestones"));
+        assert.ok(st.summary.includes("Feature Queue"));
+        assert.ok(st.summary.includes("Validation Contract"));
+        assert.ok(st.summary.includes("npm run typecheck"));
+        assert.ok(st.summary.includes("Never touch auth.json"));
+      }
+    } finally {
+      await engine.dispose();
+    }
+  });
+
+  it("2. enforces resolve_handoff tracking & anti-laziness justification rules (>=20 chars, no lazy excuses)", async () => {
+    const { engine, transport } = await createTestHarness({
+      stallWatchdogEnabled: false,
+    });
+    let workerBridge: SpawnMemberRequest["engineApi"] | undefined;
+    transport.onMember("author", async ({ request }) => {
+      workerBridge = request.engineApi;
+    });
+
+    try {
+      await engine.manageMission({
+        op: "upsert_features",
+        features: [
+          {
+            id: "feat-1",
+            title: "Base feature",
+            description: "Implement base feature",
+            milestone: "m1",
+          },
+        ],
+      });
+      await engine.addMembers({ name: "author", brief: "Build feat-1" });
+      await waitUntil(() => engine.getSnapshot().run?.members.author?.state === "waiting");
+      assert.ok(workerBridge);
+
+      await workerBridge.postMessage({
+        text: "@orchestrator [done] Implemented feat-1",
+        featureId: "feat-1",
+        discoveredIssues: [
+          "Race condition when refresh endpoint receives concurrent requests",
+          "Duplicate CSS utility in legacy header",
+        ],
+      });
+
+      const handoffs = engine.getSnapshot().run?.handoffItems ?? [];
+      assert.equal(handoffs.length, 2);
+      const [ho1, ho2] = handoffs;
+      assert.equal(ho1!.resolution, "open");
+      assert.equal(ho2!.resolution, "open");
+
+      // "tracked" requires an existing trackedFeatureId
+      await assert.rejects(
+        () =>
+          engine.manageMission({
+            op: "resolve_handoff",
+            handoffId: ho1!.id,
+            resolution: "tracked",
+            trackedFeatureId: "feat-nonexistent",
+          }),
+        (err: unknown) =>
+          err instanceof SwarmProtocolError && err.code === "INVALID_INPUT",
+      );
+
+      await engine.manageMission({
+        op: "upsert_features",
+        prepend: true,
+        features: [
+          {
+            id: "feat-refresh-lock",
+            title: "Serialize concurrent token refresh requests",
+            description: "Prevent concurrent token refresh race",
+            milestone: "m1",
+          },
+        ],
+      });
+      const trackedRes = await engine.manageMission({
+        op: "resolve_handoff",
+        handoffId: ho1!.id,
+        resolution: "tracked",
+        trackedFeatureId: "feat-refresh-lock",
+      });
+      const updatedHo1 = trackedRes.handoffItems!.find((h) => h.id === ho1!.id)!;
+      assert.equal(updatedHo1.resolution, "tracked");
+      assert.equal(updatedHo1.trackedFeatureId, "feat-refresh-lock");
+
+      // "dismissed" rejects < 20 chars AND all lazy justifications
+      const lazyExcuses = [
+        "Too short",
+        "This is low priority for the current release cycle.",
+        "Confirmed non-blocking for the main happy path.",
+        "We will handle later in a follow-up ticket.",
+        "Team agreed to fix later after shipping v1.",
+        "Tracked via inline TODO comment in header.css.",
+        "Only a minor issue affecting legacy styles.",
+      ];
+      for (const badJustification of lazyExcuses) {
+        await assert.rejects(
+          () =>
+            engine.manageMission({
+              op: "resolve_handoff",
+              handoffId: ho2!.id,
+              resolution: "dismissed",
+              justification: badJustification,
+            }),
+          (err: unknown) =>
+            err instanceof SwarmProtocolError && err.code === "INVALID_INPUT",
+          `Expected lazy justification to be rejected: "${badJustification}"`,
+        );
+      }
+
+      // Concrete >= 20 char technical justification succeeds
+      const dismissedRes = await engine.manageMission({
+        op: "resolve_handoff",
+        handoffId: ho2!.id,
+        resolution: "dismissed",
+        justification:
+          "Verified in src/ui/header.css:18 that legacy-header selector was removed by commit 5065d6e and is dead CSS.",
+      });
+      const updatedHo2 = dismissedRes.handoffItems!.find((h) => h.id === ho2!.id)!;
+      assert.equal(updatedHo2.resolution, "dismissed");
+      assert.ok(updatedHo2.resolvedAt);
+    } finally {
+      await engine.dispose();
+    }
+  });
+
+  it("3. persists structured post_message handoffs, auto-completes on mergeMember, and auto-wakes idle @validator with [milestone-review]", async () => {
+    const { engine, transport } = await createTestHarness({
+      stallWatchdogEnabled: false,
+    });
+
+    let shareWorkerBridge: SpawnMemberRequest["engineApi"] | undefined;
+    const validatorWakePrompts: string[] = [];
+
+    transport.onMember("share-dev", async ({ request }) => {
+      shareWorkerBridge = request.engineApi;
+    });
+    transport.onMember("validator", async ({ request, prompt, turnIndex }) => {
+      if (turnIndex > 1) {
+        validatorWakePrompts.push(prompt);
+        // Validator verifies VAL-CORE-001 right inside its auto-triggered [milestone-review] turn!
+        await request.engineApi!.manageMission!({
+          op: "verify_assertion",
+          assertionId: "VAL-CORE-001",
+          assertionStatus: "passed",
+          evidence: "Ran npm test && npm run typecheck on main: all 24 assertions green.",
+        });
+      }
+    });
+
+    try {
+      await engine.manageMission({
+        op: "set_manifest",
+        commands: [{ name: "test", command: "npm test" }],
+      });
+      await engine.manageMission({
+        op: "upsert_assertions",
+        assertions: [
+          {
+            id: "VAL-CORE-001",
+            title: "Core pipeline passes end-to-end",
+            description: "All pipeline stages execute cleanly.",
+          },
+        ],
+      });
+      await engine.manageMission({
+        op: "upsert_features",
+        features: [
+          {
+            id: "feat-core",
+            title: "Core pipeline implementation",
+            description: "Implement end-to-end core pipeline",
+            milestone: "m-core",
+            fulfills: ["VAL-CORE-001"],
+          },
+        ],
+      });
+
+      await engine.addMembers({
+        name: "share-dev",
+        workspace: "share",
+        brief: "Implement feat-core in isolated worktree",
+      });
+      await waitUntil(
+        () => engine.getSnapshot().run?.members["share-dev"]?.state === "waiting",
+      );
+      assert.ok(shareWorkerBridge);
+
+      // Worker posts [done] via member post_message tool with structured handoff fields
+      const memberTools = createMemberScopedTools(shareWorkerBridge, {
+        name: "share-dev",
+        role: "worker",
+        runId: "run-dyn",
+      });
+      const memberPostTool = memberTools.find((t) => t.name === POST_MESSAGE_TOOL)!;
+      const postRes = await memberPostTool.execute(
+        "tc-worker-done",
+        {
+          text: "@orchestrator [done] commit=abcdef1 Implemented feat-core",
+          feature_id: "feat-core",
+          discovered_issues: ["Unrelated CLI help typo in --verbose description"],
+          left_undone: [],
+          verification_evidence: "npm test -> 12/12 passed",
+        } as any,
+        undefined,
+        undefined,
+        {} as unknown as ExtensionToolContext,
+      );
+      assert.ok(!postRes.isError);
+      const postedMsg = postRes.details as BoardMessage;
+      assert.equal(postedMsg.featureId, "feat-core");
+      assert.deepEqual(postedMsg.discoveredIssues, [
+        "Unrelated CLI help typo in --verbose description",
+      ]);
+      assert.equal(postedMsg.verificationEvidence, "npm test -> 12/12 passed");
+
+      // Because share-dev is on an unmerged "share" worktree, feat-core is auto-linked & "in_progress" (not prematurely "completed" before merge!)
+      const featBeforeMerge = engine
+        .getSnapshot()
+        .run?.features?.find((f) => f.id === "feat-core")!;
+      assert.equal(featBeforeMerge.assignedMember, "share-dev");
+      assert.equal(featBeforeMerge.status, "in_progress");
+      assert.equal(engine.getSnapshot().run?.handoffItems?.length, 1);
+
+      // Spawn an idle read-only validator on inherit workspace BEFORE merging
+      await engine.addMembers({
+        name: "validator",
+        role: "validator",
+        workspace: "inherit",
+        brief: "Stand by to validate milestones",
+      });
+      await waitUntil(
+        () => engine.getSnapshot().run?.members.validator?.state === "waiting",
+      );
+
+      // Merge share-dev -> auto-completes feat-core + stamps mergedCommitSha + posts [milestone-review] @validator -> wakes validator -> validator seals m-core!
+      const mergeRes = await engine.mergeMember("share-dev");
+      assert.ok(mergeRes);
+      assert.deepEqual((mergeRes as any).completedFeatureIds, ["feat-core"]);
+      assert.equal(
+        (mergeRes as any).milestoneValidationCues?.[0]?.validatorWoken,
+        "validator",
+      );
+
+      await waitUntil(
+        () =>
+          validatorWakePrompts.length === 1 &&
+          engine.getSnapshot().run?.members.validator?.state === "waiting",
+      );
+      assert.ok(
+        validatorWakePrompts[0]!.includes("[milestone-review]") &&
+          validatorWakePrompts[0]!.includes("VAL-CORE-001") &&
+          validatorWakePrompts[0]!.includes("npm test"),
+        "auto-injected [milestone-review] must list operational commands and milestone VAL-* IDs",
+      );
+
+      const finalRun = engine.getSnapshot().run!;
+      const mergedFeat = finalRun.features?.find((f) => f.id === "feat-core")!;
+      assert.equal(mergedFeat.status, "completed");
+      assert.equal(mergedFeat.mergedCommitSha, mergeRes.mergedCommitSha);
+      const sealedMCore = finalRun.milestones?.find((m) => m.label === "m-core")!;
+      assert.equal(sealedMCore.sealed, true);
+
+      // Also verify: open left_undone prevents premature auto-completion on mergeMember, and missing validator emits needsValidatorSpawn cue!
+      await engine.killMember("validator", { reason: "retire first validator" });
+      await engine.manageMission({
+        op: "upsert_assertions",
+        assertions: [
+          {
+            id: "VAL-CORE-002",
+            title: "Follow-up edge cases pass",
+            description: "All edge cases pass.",
+          },
+        ],
+      });
+      await engine.manageMission({
+        op: "upsert_features",
+        features: [
+          {
+            id: "feat-partial",
+            title: "Partial edge-case work",
+            description: "Partial work with left_undone",
+            milestone: "m-partial",
+            assignedMember: "partial-dev",
+            status: "in_progress",
+            fulfills: ["VAL-CORE-002"],
+          },
+          {
+            id: "feat-m2",
+            title: "Complete m2 feature without validator spawned yet",
+            description: "Complete m2 feature",
+            milestone: "m2-noval",
+            assignedMember: "m2-dev",
+            status: "in_progress",
+            fulfills: ["VAL-CORE-002"],
+          },
+        ],
+      });
+      await engine.addMembers({
+        name: "partial-dev",
+        workspace: "share",
+        brief: "Work on feat-partial",
+      });
+      await engine.addMembers({
+        name: "m2-dev",
+        workspace: "share",
+        brief: "Work on feat-m2",
+      });
+      await waitUntil(
+        () =>
+          engine.getSnapshot().run?.members["partial-dev"]?.state === "waiting" &&
+          engine.getSnapshot().run?.members["m2-dev"]?.state === "waiting",
+      );
+      await engine.postMessage({
+        from: "partial-dev",
+        fromRole: "worker",
+        text: "@orchestrator [done] Partial progress",
+        featureId: "feat-partial",
+        leftUndone: ["Retry jitter backoff not wired yet"],
+      });
+      await engine.mergeMember("partial-dev");
+      const partialAfterMerge = engine
+        .getSnapshot()
+        .run!.features!.find((f) => f.id === "feat-partial")!;
+      assert.equal(
+        partialAfterMerge.status,
+        "in_progress",
+        "open incomplete_work handoff must prevent premature auto-completion on mergeMember",
+      );
+      assert.ok(partialAfterMerge.mergedCommitSha);
+
+      const tools = createSwarmTools({ engine });
+      const swarmTool = tools.find((t) => t.name === SWARM_TOOL)!;
+      const m2MergeToolRes = await swarmTool.execute(
+        "tc-merge-m2",
+        { action: "merge", name: "m2-dev" } as any,
+        undefined,
+        undefined,
+        {} as unknown as ExtensionToolContext,
+      );
+      assert.ok(!m2MergeToolRes.isError);
+      const m2MergeText = (m2MergeToolRes.content[0] as any)?.text ?? "";
+      assert.ok(
+        m2MergeText.includes("m2-noval") && m2MergeText.includes("validator"),
+        "merge output must prompt Orchestrator to spawn @validator when no idle validator exists yet",
+      );
+    } finally {
+      await engine.dispose();
+    }
+  });
+
+  it("4. enforces all 5 End-of-Mission Hard Gates (A..E) on swarm{action:'done'} and honors force:true", async () => {
+    const { engine, worktree, transport } = await createTestHarness({
+      stallWatchdogEnabled: false,
+    });
+    let releaseSlowWorker: (() => void) | undefined;
+    transport.onMember("slow-worker", async () => {
+      await new Promise<void>((resolve) => {
+        releaseSlowWorker = resolve;
+      });
+    });
+
+    try {
+      const tools = createSwarmTools({ engine });
+      const swarmTool = tools.find((t) => t.name === SWARM_TOOL)!;
+      const toolCtx = {} as unknown as ExtensionToolContext;
+
+      await engine.manageMission({
+        op: "upsert_assertions",
+        assertions: [
+          { id: "VAL-GATE-001", title: "Gate assertion 1", description: "Must pass" },
+          { id: "VAL-GATE-002", title: "Gate assertion 2", description: "Must be claimed & pass" },
+        ],
+      });
+      await engine.manageMission({
+        op: "upsert_features",
+        features: [
+          {
+            id: "feat-gate-1",
+            title: "Gate feature 1",
+            description: "Implement gate feature 1",
+            milestone: "m-gate",
+            fulfills: ["VAL-GATE-001"],
+          },
+        ],
+      });
+
+      const expectDoneBlocked = async (
+        callId: string,
+        summary: string,
+        expectedSubstring: string,
+      ): Promise<void> => {
+        const res = await swarmTool.execute(
+          callId,
+          { action: "done", summary } as any,
+          undefined,
+          undefined,
+          toolCtx,
+        );
+        assert.equal(res.isError, true, `Expected done (${callId}) to be blocked`);
+        assert.equal((res.details as any)?.errorCode, "INVALID_INPUT");
+        const errText = (res.content[0] as any)?.text ?? "";
+        assert.ok(
+          errText.includes(expectedSubstring),
+          `Expected done error (${callId}) to mention "${expectedSubstring}", got: ${errText}`,
+        );
+      };
+
+      // Gate A: Working member blocks done
+      const addPromise = engine.addMembers({
+        name: "slow-worker",
+        workspace: "share",
+        brief: "Work slowly",
+      });
+      await waitUntil(() => Boolean(releaseSlowWorker));
+      await expectDoneBlocked("tc-done-a", "Premature done", "slow-worker");
+      releaseSlowWorker!();
+      await addPromise;
+      await waitUntil(
+        () => engine.getSnapshot().run?.members["slow-worker"]?.state === "waiting",
+      );
+
+      const workerBranch = engine.getSnapshot().run!.members["slow-worker"]!.branch!;
+
+      // Gate B: Unmerged share branch with commitsAhead > 0 blocks done
+      worktree.commitsAheadByBranch.set(workerBranch, 2);
+      await expectDoneBlocked("tc-done-b", "Unmerged commits ahead", "commits ahead");
+
+      // When commitsAhead === 0, Gate B does NOT block -> reaches Gate C (incomplete feature feat-gate-1)
+      worktree.commitsAheadByBranch.set(workerBranch, 0);
+      await expectDoneBlocked("tc-done-c", "Incomplete feature", "feat-gate-1");
+
+      // Complete feat-gate-1 and inject an open discovered_issue -> Gate D blocks done!
+      await engine.manageMission({
+        op: "update_feature",
+        featureId: "feat-gate-1",
+        featureStatus: "completed",
+      });
+      await engine.postMessage({
+        from: "slow-worker",
+        fromRole: "worker",
+        text: "@orchestrator [done] Finished work",
+        discoveredIssues: ["Unhandled edge case on empty payload"],
+      });
+      const openHandoffId = engine.getSnapshot().run!.handoffItems![0]!.id;
+
+      await expectDoneBlocked("tc-done-d", "Open handoff debt", openHandoffId);
+
+      // Resolve handoff by tracking it in feat-gate-2 (fulfilling VAL-GATE-002) and completing feat-gate-2
+      await engine.manageMission({
+        op: "upsert_features",
+        features: [
+          {
+            id: "feat-gate-2",
+            title: "Handle empty payload & fulfill VAL-GATE-002",
+            description: "Handle empty payload cleanly",
+            milestone: "m-gate",
+            fulfills: [], // intentionally leave VAL-GATE-002 unclaimed first!
+          },
+        ],
+      });
+      await engine.manageMission({
+        op: "resolve_handoff",
+        handoffId: openHandoffId,
+        resolution: "tracked",
+        trackedFeatureId: "feat-gate-2",
+      });
+      await engine.manageMission({
+        op: "update_feature",
+        featureId: "feat-gate-2",
+        featureStatus: "completed",
+      });
+
+      // Gate E (part 1): unpassed VAL-* assertions block done!
+      await expectDoneBlocked("tc-done-e1", "Unverified assertions", "VAL-GATE-001");
+
+      // Verify both assertions as human/validator, while VAL-GATE-002 is still NOT claimed by any completed feature -> Gate E (part 2) blocks!
+      await engine.manageMission({
+        op: "verify_assertion",
+        callerRole: "human",
+        assertionId: "VAL-GATE-001",
+        assertionStatus: "passed",
+        evidence: "Verified gate 1",
+      });
+      await engine.manageMission({
+        op: "verify_assertion",
+        callerRole: "human",
+        assertionId: "VAL-GATE-002",
+        assertionStatus: "passed",
+        evidence: "Verified gate 2",
+      });
+      await expectDoneBlocked("tc-done-e2", "Unclaimed assertion", "VAL-GATE-002");
+
+      // Claim VAL-GATE-002 on completed feat-gate-2 -> all 5 gates pass and done succeeds!
+      await engine.manageMission({
+        op: "upsert_features",
+        force: true,
+        features: [
+          {
+            id: "feat-gate-2",
+            title: "Handle empty payload & fulfill VAL-GATE-002",
+            description: "Handle empty payload cleanly",
+            milestone: "m-gate",
+            status: "completed",
+            fulfills: ["VAL-GATE-002"],
+          },
+        ],
+      });
+      const doneRes = await swarmTool.execute(
+        "tc-done-ok",
+        { action: "done", summary: "All 5 mission gates satisfied!" } as any,
+        undefined,
+        undefined,
+        toolCtx,
+      );
+      assert.ok(!doneRes.isError);
+      assert.equal(engine.getSnapshot().run?.status, "completed");
+
+      // Also verify force:true bypasses incomplete feature/assertion gates on an emergency close
+      const { engine: forceEngine } = await createTestHarness({
+        stallWatchdogEnabled: false,
+      });
+      try {
+        await forceEngine.manageMission({
+          op: "upsert_assertions",
+          assertions: [{ id: "VAL-FORCE-001", title: "Pending", description: "Pending" }],
+        });
+        await forceEngine.manageMission({
+          op: "upsert_features",
+          features: [
+            {
+              id: "feat-force-1",
+              title: "Pending feature",
+              description: "Pending",
+              milestone: "m1",
+              fulfills: ["VAL-FORCE-001"],
+            },
+          ],
+        });
+        const forceSwarmTool = createSwarmTools({ engine: forceEngine }).find(
+          (t) => t.name === SWARM_TOOL,
+        )!;
+        const forcedDone = await forceSwarmTool.execute(
+          "tc-done-force",
+          { action: "done", summary: "Emergency force close", force: true } as any,
+          undefined,
+          undefined,
+          toolCtx,
+        );
+        assert.ok(!forcedDone.isError);
+        assert.equal(forceEngine.getSnapshot().run?.status, "completed");
+      } finally {
+        await forceEngine.dispose();
+      }
+    } finally {
+      releaseSlowWorker?.();
+      await engine.dispose();
+    }
+  });
+
+  it("5. injects Mission Goal Engine context into all 3 role prompts, renders mission/handoff cards, and keeps tool schemas 100% free of Union/Record", async () => {
+    const { engine, transport } = await createTestHarness({
+      stallWatchdogEnabled: false,
+    });
+    let workerBridge: SpawnMemberRequest["engineApi"] | undefined;
+    transport.onMember("dev-1", async ({ request }) => {
+      workerBridge = request.engineApi;
+    });
+
+    try {
+      await engine.manageMission({
+        op: "set_manifest",
+        commands: [{ name: "verify", command: "npm run typecheck && npm test" }],
+        boundaries: ["Do not modify auth.json"],
+      });
+      await engine.manageMission({
+        op: "upsert_assertions",
+        assertions: [
+          {
+            id: "VAL-UI-001",
+            title: "Mission card renders",
+            description: "Renders mission summary cleanly",
+          },
+        ],
+      });
+      await engine.manageMission({
+        op: "upsert_features",
+        features: [
+          {
+            id: "feat-ui",
+            title: "Render mission cards",
+            description: "Render mission cards in TUI",
+            milestone: "m-ui",
+            assignedMember: "dev-1",
+            fulfills: ["VAL-UI-001"],
+          },
+        ],
+      });
+
+      await engine.addMembers({ name: "dev-1", brief: "Implement feat-ui" });
+      await engine.addMembers({
+        name: "val-1",
+        role: "validator",
+        brief: "Audit VAL-UI-001",
+      });
+      await waitUntil(
+        () =>
+          engine.getSnapshot().run?.members["dev-1"]?.state === "waiting" &&
+          engine.getSnapshot().run?.members["val-1"]?.state === "waiting",
+      );
+      assert.ok(workerBridge);
+
+      const snapBefore = engine.getSnapshot();
+      const staticBefore = buildOrchestratorStaticSection(snapBefore);
+      const liveBefore = buildOrchestratorLiveStateSection(snapBefore);
+      const playbook = buildOrchestratorPlaybookSection(snapBefore);
+      const workerPrompt = buildMemberSystemPrompt(
+        snapBefore.run!,
+        snapBefore.run!.members["dev-1"]!,
+      );
+      const validatorPrompt = buildMemberSystemPrompt(
+        snapBefore.run!,
+        snapBefore.run!.members["val-1"]!,
+      );
+
+      // Artifact paths & manifest injected into Orchestrator, Worker, and Validator prompts
+      for (const promptText of [staticBefore, playbook, workerPrompt, validatorPrompt]) {
+        assert.ok(promptText.includes("mission.md"));
+        assert.ok(promptText.includes("validation-contract.md"));
+        assert.ok(promptText.includes("features.json"));
+        assert.ok(promptText.includes("npm run typecheck && npm test"));
+        assert.ok(promptText.includes("Do not modify auth.json"));
+      }
+      assert.ok(liveBefore.includes("VAL-UI-001") && liveBefore.includes("feat-ui"));
+      assert.ok(
+        workerPrompt.includes("YOUR FEATURE") &&
+          workerPrompt.includes("discovered_issues") &&
+          workerPrompt.includes("left_undone") &&
+          workerPrompt.includes("verification_evidence") &&
+          workerPrompt.includes("npx -y"),
+      );
+      assert.ok(
+        validatorPrompt.includes("verify_assertion") &&
+          validatorPrompt.includes("VAL-UI-001"),
+      );
+      assert.ok(
+        playbook.includes("upsert_assertions") &&
+          playbook.includes("Sealed Milestones"),
+      );
+
+      // Prompt-cache invariant: mutating feature/assertion progress does NOT alter buildOrchestratorStaticSection!
+      await engine.manageMission({
+        op: "update_feature",
+        featureId: "feat-ui",
+        featureStatus: "completed",
+      });
+      const staticAfter = buildOrchestratorStaticSection(engine.getSnapshot());
+      assert.equal(staticAfter, staticBefore);
+
+      // Custom tool cards for action="mission" and post_message handoff badges
+      const tools = createSwarmTools({ engine });
+      const swarmTool = tools.find((t) => t.name === SWARM_TOOL)!;
+      const postTool = tools.find((t) => t.name === POST_MESSAGE_TOOL)!;
+      const stubTheme = {
+        fg: (_c: string, t: string) => t,
+        bold: (t: string) => t,
+      } as any;
+
+      const missionCallCard = swarmTool.renderCall!(
+        {
+          action: "mission",
+          mission_op: "verify_assertion",
+          assertion_id: "VAL-UI-001",
+          assertion_status: "passed",
+        } as any,
+        stubTheme,
+        {} as any,
+      );
+      assert.ok(
+        missionCallCard.render(200).join("\n").includes("swarm mission verify_assertion") &&
+          missionCallCard.render(200).join("\n").includes("VAL-UI-001"),
+      );
+
+      const statusExec = await swarmTool.execute(
+        "tc-mission-card",
+        { action: "mission", mission_op: "status" } as any,
+        undefined,
+        undefined,
+        {} as unknown as ExtensionToolContext,
+      );
+      const missionResultCard = swarmTool.renderResult!(
+        statusExec as any,
+        { expanded: false, isPartial: false },
+        stubTheme,
+        {} as any,
+      );
+      const renderedMissionResult = missionResultCard.render(200).join("\n");
+      assert.ok(
+        renderedMissionResult.includes("Feat 1/1") &&
+          renderedMissionResult.includes("VAL 0/1"),
+      );
+
+      const postCallCard = postTool.renderCall!(
+        {
+          text: "@validator [done] Ready for audit",
+          feature_id: "feat-ui",
+          discovered_issues: ["issue-1"],
+          left_undone: ["todo-1"],
+          verification_evidence: "npm test passed",
+        } as any,
+        stubTheme,
+        {} as any,
+      );
+      const renderedPostCall = postCallCard.render(200).join("\n");
+      assert.ok(
+        renderedPostCall.includes("feat:feat-ui") &&
+          renderedPostCall.includes("+1 issue") &&
+          renderedPostCall.includes("!1 undone") &&
+          renderedPostCall.includes("✓evidence"),
+      );
+
+      // Strict schema invariant: ZERO anyOf / oneOf / patternProperties / non-boolean additionalProperties across all orchestrator & member tools!
+      const memberTools = createMemberScopedTools(workerBridge, {
+        name: "dev-1",
+        role: "worker",
+        runId: "run-dyn",
+      });
+      const checkFlatSchema = (node: unknown, pathStr: string): void => {
+        if (!node || typeof node !== "object") return;
+        if (Array.isArray(node)) {
+          node.forEach((child, idx) => checkFlatSchema(child, `${pathStr}[${idx}]`));
+          return;
+        }
+        const rec = node as Record<string, unknown>;
+        for (const forbidden of ["anyOf", "oneOf", "allOf", "patternProperties"]) {
+          assert.equal(
+            forbidden in rec,
+            false,
+            `Forbidden JSON Schema keyword "${forbidden}" at ${pathStr}`,
+          );
+        }
+        if ("additionalProperties" in rec && typeof rec.additionalProperties !== "boolean") {
+          assert.fail(`Type.Record / object additionalProperties found at ${pathStr}`);
+        }
+        for (const [k, v] of Object.entries(rec)) {
+          checkFlatSchema(v, `${pathStr}.${k}`);
+        }
+      };
+
+      for (const tool of [...tools, ...memberTools]) {
+        checkFlatSchema(tool.parameters, tool.name);
+      }
     } finally {
       await engine.dispose();
     }

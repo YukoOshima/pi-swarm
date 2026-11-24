@@ -10,30 +10,42 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import { type Static, type TSchema, Type } from "typebox";
 import {
+  ASSERTION_STATUSES,
   DEFAULT_CHANNEL,
+  FEATURE_STATUSES,
+  HANDOFF_RESOLUTIONS,
   ORCHESTRATOR_NAME,
   POST_MESSAGE_TOOL,
   READ_BOARD_TOOL,
   SWARM_ACTIONS,
   SWARM_CHANNEL_ACTIONS,
+  SWARM_MISSION_OPS,
   SWARM_TOOL,
   SWARM_WAIT_TOOL,
 } from "../constants.js";
 import {
+  type AssertionStatus,
   type AvailableModelInfo,
   type BoardMessage,
   type BoardMessageKind,
   type CallerRole,
+  type FeatureStatus,
+  type HandoffItemResolution,
   type ISwarmEngine,
   isSwarmProtocolError,
+  type ManageMissionInput,
+  type ManageMissionResult,
   type MemberEngineBridge,
   type MergeBranchResult,
+  type MissionAssertionInput,
+  type MissionFeatureInput,
   type ParkOrchestratorWaitResult,
   type ReadBoardResult,
   type SwarmChannelAction,
   type SwarmMemberRecord,
   type SwarmMemberRole,
   type SwarmMilestone,
+  type SwarmMissionOp,
   SwarmProtocolError,
   type SwarmRosterStatus,
   type SwarmRunState,
@@ -74,6 +86,7 @@ const MEMBER_SWARM_ACTIONS = [
   "stop",
   "kill",
   "channel",
+  "mission",
 ] as const;
 
 const MEMBER_CHANNEL_ACTIONS = ["list", "join", "leave"] as const;
@@ -131,7 +144,7 @@ function stringEnum<const T extends readonly string[]>(
 export const SwarmToolParamsSchema = Type.Object({
   action: stringEnum(SWARM_ACTIONS, {
     description:
-      'Swarm action: "title" | "add" | "status" | "models" | "model" | "steer" | "stop" | "kill" | "merge" | "channel" | "done".',
+      'Swarm action: "title" | "add" | "status" | "models" | "model" | "steer" | "stop" | "kill" | "merge" | "channel" | "mission" | "done".',
   }),
   title: Type.Optional(
     Type.String({ description: 'Run title (for action="title").' }),
@@ -269,10 +282,193 @@ export const SwarmToolParamsSchema = Type.Object({
       description: 'Optional channel topic for action="channel" op="create".',
     }),
   ),
+  mission_op: Type.Optional(
+    stringEnum(SWARM_MISSION_OPS, {
+      description:
+        'Sub-operation for action="mission": "status" | "upsert_assertions" | "remove_assertion" | "verify_assertion" | "upsert_features" | "update_feature" | "resolve_handoff" | "set_manifest".',
+    }),
+  ),
+  assertions: Type.Optional(
+    Type.Array(
+      Type.Object({
+        id: Type.String({
+          description: 'Assertion ID (e.g. "VAL-AUTH-001").',
+        }),
+        title: Type.String({
+          description: "Short assertion title.",
+        }),
+        description: Type.String({
+          description: "Concrete testable behavioral requirement.",
+        }),
+        evidence_required: Type.Optional(
+          Type.String({
+            description: "Required verification command/evidence to prove this assertion.",
+          }),
+        ),
+        status: Type.Optional(
+          stringEnum(ASSERTION_STATUSES, {
+            description: 'Optional assertion status ("pending" | "passed" | "failed" | "blocked").',
+          }),
+        ),
+      }),
+      {
+        description: 'VAL-* assertions to add or update for mission_op="upsert_assertions".',
+      },
+    ),
+  ),
+  assertion_id: Type.Optional(
+    Type.String({
+      description:
+        'Target VAL-* assertion ID for mission_op="verify_assertion" or "remove_assertion".',
+    }),
+  ),
+  assertion_status: Type.Optional(
+    stringEnum(ASSERTION_STATUSES, {
+      description:
+        'Verification outcome for mission_op="verify_assertion": "pending" | "passed" | "failed" | "blocked".',
+    }),
+  ),
+  evidence: Type.Optional(
+    Type.String({
+      description:
+        'Concrete command/inspection evidence (required when assertion_status is "passed" or "failed").',
+    }),
+  ),
+  features: Type.Optional(
+    Type.Array(
+      Type.Object({
+        id: Type.String({
+          description: 'Unique feature ID (e.g. "feat-auth-jwt").',
+        }),
+        title: Type.String({
+          description: "Short feature title.",
+        }),
+        description: Type.String({
+          description: "Feature implementation scope and details.",
+        }),
+        milestone: Type.String({
+          description: 'Milestone label this feature belongs to (never a sealed milestone).',
+        }),
+        depends_on: Type.Optional(
+          Type.Array(Type.String(), {
+            description: "Optional upstream feature IDs that must complete before this feature.",
+          }),
+        ),
+        files_owned: Type.Optional(
+          Type.Array(Type.String(), {
+            description: "Optional exclusive files/directories owned by this feature.",
+          }),
+        ),
+        preconditions: Type.Optional(
+          Type.Array(Type.String(), {
+            description: "Optional preconditions before starting.",
+          }),
+        ),
+        expected_behavior: Type.Optional(
+          Type.Array(Type.String(), {
+            description: "Optional expected observable behaviors.",
+          }),
+        ),
+        verification_steps: Type.Optional(
+          Type.Array(Type.String(), {
+            description: "Optional runnable verification steps.",
+          }),
+        ),
+        fulfills: Type.Optional(
+          Type.Array(Type.String(), {
+            description: "VAL-* assertion IDs claimed by this feature.",
+          }),
+        ),
+        status: Type.Optional(
+          stringEnum(FEATURE_STATUSES, {
+            description:
+              'Optional feature status: "pending" | "in_progress" | "completed" | "failed" | "cancelled".',
+          }),
+        ),
+        assigned_member: Type.Optional(
+          Type.String({
+            description: "Optional assigned member handle.",
+          }),
+        ),
+      }),
+      {
+        description: 'Mission features to add or update for mission_op="upsert_features".',
+      },
+    ),
+  ),
+  prepend: Type.Optional(
+    Type.Boolean({
+      description:
+        'For mission_op="upsert_features": when true, insert new urgent/fix features at the TOP of pending features.',
+    }),
+  ),
+  feature_id: Type.Optional(
+    Type.String({
+      description: 'Target feature ID for mission_op="update_feature".',
+    }),
+  ),
+  feature_status: Type.Optional(
+    stringEnum(FEATURE_STATUSES, {
+      description:
+        'Updated feature status for mission_op="update_feature": "pending" | "in_progress" | "completed" | "failed" | "cancelled".',
+    }),
+  ),
+  assigned_member: Type.Optional(
+    Type.String({
+      description: 'Assigned member handle for mission_op="update_feature".',
+    }),
+  ),
+  merged_commit_sha: Type.Optional(
+    Type.String({
+      description: 'Optional merged commit SHA for mission_op="update_feature".',
+    }),
+  ),
+  handoff_id: Type.Optional(
+    Type.String({
+      description: 'Open handoff item ID (e.g. "HO-5-1") for mission_op="resolve_handoff".',
+    }),
+  ),
+  resolution: Type.Optional(
+    stringEnum(HANDOFF_RESOLUTIONS, {
+      description: 'Handoff resolution for mission_op="resolve_handoff": "tracked" | "dismissed".',
+    }),
+  ),
+  tracked_feature_id: Type.Optional(
+    Type.String({
+      description:
+        'Feature ID tracking an open handoff item (required when resolution="tracked").',
+    }),
+  ),
+  justification: Type.Optional(
+    Type.String({
+      description:
+        'Concrete technical justification (>= 20 chars, no lazy deferrals) when resolution="dismissed".',
+    }),
+  ),
+  commands: Type.Optional(
+    Type.Array(
+      Type.Object({
+        name: Type.String({
+          description: 'Command key (e.g. "test", "typecheck", "lint", "build").',
+        }),
+        command: Type.String({
+          description: "Exact runnable shell command.",
+        }),
+      }),
+      {
+        description: 'Operational command entries for mission_op="set_manifest".',
+      },
+    ),
+  ),
+  boundaries: Type.Optional(
+    Type.Array(Type.String(), {
+      description: 'Operational boundary rules for mission_op="set_manifest".',
+    }),
+  ),
   force: Type.Optional(
     Type.Boolean({
       description:
-        "Force completion even if members are still working or unmerged.",
+        'Force override when explicitly authorized (for action="done", action="kill", or action="mission").',
     }),
   ),
   summary: Type.Optional(
@@ -311,6 +507,30 @@ export const PostMessageToolParamsSchema = Type.Object({
   kind: Type.Optional(
     stringEnum(BOARD_MESSAGE_KINDS, {
       description: 'Optional message kind (defaults to "chat").',
+    }),
+  ),
+  feature_id: Type.Optional(
+    Type.String({
+      description:
+        "Optional Mission feature ID this message/deliverable implements (auto-updates assigned feature on [done]).",
+    }),
+  ),
+  discovered_issues: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        "Optional non-blocking bugs or tech-debt items discovered while working (auto-appended as open handoff items).",
+    }),
+  ),
+  left_undone: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        "Optional incomplete items left undone on this feature (auto-appended as open incomplete_work handoff items).",
+    }),
+  ),
+  verification_evidence: Type.Optional(
+    Type.String({
+      description:
+        "Optional concrete verification evidence (commands run and exit/pass counts) for this deliverable.",
     }),
   ),
 });
@@ -563,6 +783,126 @@ function normalizeChannelAction(raw?: string): SwarmChannelAction {
     "INVALID_INPUT",
     `Unsupported channel op "${raw}". Expected one of: ${SWARM_CHANNEL_ACTIONS.join(", ")}.`,
   );
+}
+
+function normalizeMissionOp(raw?: string): SwarmMissionOp {
+  const value = (raw ?? "status").trim().toLowerCase();
+  if ((SWARM_MISSION_OPS as readonly string[]).includes(value)) {
+    return value as SwarmMissionOp;
+  }
+  throw new SwarmProtocolError(
+    "INVALID_INPUT",
+    `Unsupported mission_op "${raw}". Expected one of: ${SWARM_MISSION_OPS.join(", ")}.`,
+  );
+}
+
+function buildManageMissionInputFromParams(
+  params: Partial<SwarmToolParams>,
+  callerName: string,
+  callerRole: CallerRole,
+): ManageMissionInput {
+  const op = normalizeMissionOp(params.mission_op);
+  const assertions: MissionAssertionInput[] | undefined = Array.isArray(params.assertions)
+    ? params.assertions.map((a) => {
+        const raw = a as Record<string, unknown>;
+        const evidenceReq =
+          typeof a.evidence_required === "string"
+            ? a.evidence_required
+            : typeof raw.evidenceRequired === "string"
+              ? raw.evidenceRequired
+              : undefined;
+        return {
+          id: a.id,
+          title: a.title,
+          description: a.description,
+          ...(evidenceReq !== undefined ? { evidenceRequired: evidenceReq } : {}),
+          ...(a.status !== undefined ? { status: a.status as AssertionStatus } : {}),
+        };
+      })
+    : undefined;
+
+  const features: MissionFeatureInput[] | undefined = Array.isArray(params.features)
+    ? params.features.map((f) => {
+        const raw = f as Record<string, unknown>;
+        const dependsOn = Array.isArray(f.depends_on)
+          ? f.depends_on
+          : Array.isArray(raw.dependsOn)
+            ? (raw.dependsOn as string[])
+            : undefined;
+        const filesOwned = Array.isArray(f.files_owned)
+          ? f.files_owned
+          : Array.isArray(raw.filesOwned)
+            ? (raw.filesOwned as string[])
+            : undefined;
+        const expectedBehavior = Array.isArray(f.expected_behavior)
+          ? f.expected_behavior
+          : Array.isArray(raw.expectedBehavior)
+            ? (raw.expectedBehavior as string[])
+            : undefined;
+        const verificationSteps = Array.isArray(f.verification_steps)
+          ? f.verification_steps
+          : Array.isArray(raw.verificationSteps)
+            ? (raw.verificationSteps as string[])
+            : undefined;
+        const assignedMember =
+          typeof f.assigned_member === "string"
+            ? f.assigned_member
+            : typeof raw.assignedMember === "string"
+              ? raw.assignedMember
+              : undefined;
+        return {
+          id: f.id,
+          title: f.title,
+          description: f.description,
+          milestone: f.milestone,
+          ...(dependsOn !== undefined ? { dependsOn } : {}),
+          ...(filesOwned !== undefined ? { filesOwned } : {}),
+          ...(f.preconditions !== undefined ? { preconditions: f.preconditions } : {}),
+          ...(expectedBehavior !== undefined ? { expectedBehavior } : {}),
+          ...(verificationSteps !== undefined ? { verificationSteps } : {}),
+          ...(f.fulfills !== undefined ? { fulfills: f.fulfills } : {}),
+          ...(f.status !== undefined ? { status: f.status as FeatureStatus } : {}),
+          ...(assignedMember !== undefined ? { assignedMember } : {}),
+        };
+      })
+    : undefined;
+
+  return {
+    op,
+    ...(assertions !== undefined ? { assertions } : {}),
+    ...(params.assertion_id !== undefined ? { assertionId: params.assertion_id } : {}),
+    ...(params.assertion_status !== undefined
+      ? { assertionStatus: params.assertion_status as AssertionStatus }
+      : {}),
+    ...(params.evidence !== undefined ? { evidence: params.evidence } : {}),
+    ...(features !== undefined ? { features } : {}),
+    ...(params.prepend !== undefined ? { prepend: params.prepend } : {}),
+    ...(params.feature_id !== undefined ? { featureId: params.feature_id } : {}),
+    ...(params.feature_status !== undefined
+      ? { featureStatus: params.feature_status as FeatureStatus }
+      : {}),
+    ...(params.assigned_member !== undefined
+      ? { assignedMember: params.assigned_member }
+      : {}),
+    ...(params.merged_commit_sha !== undefined
+      ? { mergedCommitSha: params.merged_commit_sha }
+      : {}),
+    ...(params.handoff_id !== undefined ? { handoffId: params.handoff_id } : {}),
+    ...(params.resolution !== undefined
+      ? { resolution: params.resolution as HandoffItemResolution }
+      : {}),
+    ...(params.tracked_feature_id !== undefined
+      ? { trackedFeatureId: params.tracked_feature_id }
+      : {}),
+    ...(params.justification !== undefined
+      ? { justification: params.justification }
+      : {}),
+    ...(params.commands !== undefined ? { commands: params.commands } : {}),
+    ...(params.boundaries !== undefined ? { boundaries: params.boundaries } : {}),
+    ...(params.force !== undefined ? { force: params.force } : {}),
+    callerName,
+    callerRole,
+  };
 }
 
 // ============================================================================
@@ -854,6 +1194,65 @@ function renderSwarmCall(
       );
     }
 
+    case "mission": {
+      const missionOp =
+        typeof args?.mission_op === "string" && args.mission_op.trim()
+          ? args.mission_op.trim()
+          : "status";
+      const metaParts: string[] = [];
+      if (missionOp === "verify_assertion") {
+        if (typeof args?.assertion_id === "string" && args.assertion_id.trim()) {
+          metaParts.push(args.assertion_id.trim());
+        }
+        if (typeof args?.assertion_status === "string" && args.assertion_status.trim()) {
+          metaParts.push(`-> ${args.assertion_status.trim()}`);
+        }
+      } else if (missionOp === "upsert_assertions") {
+        const count = Array.isArray(args?.assertions) ? args.assertions.length : 0;
+        if (count > 0) metaParts.push(`${count} VAL`);
+      } else if (missionOp === "remove_assertion") {
+        if (typeof args?.assertion_id === "string" && args.assertion_id.trim()) {
+          metaParts.push(args.assertion_id.trim());
+        }
+      } else if (missionOp === "upsert_features") {
+        const count = Array.isArray(args?.features) ? args.features.length : 0;
+        if (count > 0) metaParts.push(`${count} feature(s)`);
+        if (args?.prepend === true) metaParts.push("prepend");
+      } else if (missionOp === "update_feature") {
+        if (typeof args?.feature_id === "string" && args.feature_id.trim()) {
+          metaParts.push(args.feature_id.trim());
+        }
+        if (typeof args?.feature_status === "string" && args.feature_status.trim()) {
+          metaParts.push(`-> ${args.feature_status.trim()}`);
+        }
+        if (typeof args?.assigned_member === "string" && args.assigned_member.trim()) {
+          metaParts.push(`@${args.assigned_member.trim().replace(/^@/, "")}`);
+        }
+      } else if (missionOp === "resolve_handoff") {
+        if (typeof args?.handoff_id === "string" && args.handoff_id.trim()) {
+          metaParts.push(args.handoff_id.trim());
+        }
+        if (typeof args?.resolution === "string" && args.resolution.trim()) {
+          metaParts.push(`-> ${args.resolution.trim()}`);
+        }
+      } else if (missionOp === "set_manifest") {
+        const cmdCount = Array.isArray(args?.commands) ? args.commands.length : 0;
+        const bndCount = Array.isArray(args?.boundaries) ? args.boundaries.length : 0;
+        if (cmdCount > 0) metaParts.push(`${cmdCount} cmd(s)`);
+        if (bndCount > 0) metaParts.push(`${bndCount} boundary(s)`);
+      }
+      if (args?.force === true) {
+        metaParts.push("[force]");
+      }
+      const metaSuffix =
+        metaParts.length > 0 ? ` ${theme.fg("muted", `(${metaParts.join(" · ")})`)}` : "";
+      return new Text(
+        `🎯 ${theme.fg("toolTitle", theme.bold(`swarm mission ${missionOp}`))}${metaSuffix}`,
+        0,
+        0,
+      );
+    }
+
     default:
       return new Text(
         `🐝 ${theme.fg("toolTitle", theme.bold(SWARM_TOOL))}${action ? ` ${theme.fg("muted", action)}` : ""}`,
@@ -997,6 +1396,45 @@ function renderSwarmResult(
     );
   }
 
+  // Mission Goal Engine summary card
+  if (
+    details &&
+    typeof details.op === "string" &&
+    (SWARM_MISSION_OPS as readonly string[]).includes(details.op) &&
+    typeof details.summary === "string"
+  ) {
+    const missionRes = details as unknown as ManageMissionResult;
+    const stats: string[] = [];
+    if (Array.isArray(missionRes.features) && missionRes.features.length > 0) {
+      const nonCancelled = missionRes.features.filter((f) => f.status !== "cancelled");
+      const doneFeat = nonCancelled.filter((f) => f.status === "completed").length;
+      stats.push(`Feat ${doneFeat}/${nonCancelled.length}`);
+    }
+    if (Array.isArray(missionRes.assertions) && missionRes.assertions.length > 0) {
+      const passedVal = missionRes.assertions.filter((a) => a.status === "passed").length;
+      stats.push(`VAL ${passedVal}/${missionRes.assertions.length}`);
+    }
+    if (Array.isArray(missionRes.milestones) && missionRes.milestones.length > 0) {
+      const sealedCount = missionRes.milestones.filter((m) => m.sealed).length;
+      if (sealedCount > 0) {
+        stats.push(`${sealedCount} sealed`);
+      }
+    }
+    if (Array.isArray(missionRes.handoffItems) && missionRes.handoffItems.length > 0) {
+      const openDebt = missionRes.handoffItems.filter((h) => h.resolution === "open").length;
+      if (openDebt > 0) {
+        stats.push(`!${openDebt} debt`);
+      }
+    }
+    const statsBadge = stats.length > 0 ? ` [${stats.join(" · ")}]` : "";
+    const firstLine = lines[0] ?? missionRes.summary;
+    return new Text(
+      `${theme.fg("success", "✓")} ${theme.fg("toolOutput", `${clipInline(firstLine, 86)}${statsBadge}`)}${expandHint}`,
+      0,
+      0,
+    );
+  }
+
   // Default 1–2 line summary
   if (lines.length === 1) {
     return new Text(
@@ -1010,6 +1448,37 @@ function renderSwarmResult(
     0,
     0,
   );
+}
+
+function formatHandoffBadges(fields: {
+  featureId?: unknown;
+  discoveredIssues?: unknown;
+  leftUndone?: unknown;
+  verificationEvidence?: unknown;
+}): string {
+  const badges: string[] = [];
+  if (typeof fields.featureId === "string" && fields.featureId.trim()) {
+    badges.push(`[feat:${sanitizeInline(fields.featureId.trim())}]`);
+  }
+  const issuesCount = Array.isArray(fields.discoveredIssues)
+    ? fields.discoveredIssues.filter((x) => typeof x === "string" && x.trim().length > 0).length
+    : 0;
+  if (issuesCount > 0) {
+    badges.push(`[+${issuesCount} issue${issuesCount === 1 ? "" : "s"}]`);
+  }
+  const undoneCount = Array.isArray(fields.leftUndone)
+    ? fields.leftUndone.filter((x) => typeof x === "string" && x.trim().length > 0).length
+    : 0;
+  if (undoneCount > 0) {
+    badges.push(`[!${undoneCount} undone]`);
+  }
+  if (
+    typeof fields.verificationEvidence === "string" &&
+    fields.verificationEvidence.trim()
+  ) {
+    badges.push("[✓evidence]");
+  }
+  return badges.length > 0 ? ` ${badges.join(" ")}` : "";
 }
 
 function renderPostMessageCall(
@@ -1026,8 +1495,14 @@ function renderPostMessageCall(
     typeof args?.kind === "string" && args.kind.trim() && args.kind !== "chat"
       ? ` [${args.kind.trim()}]`
       : "";
+  const handoffBadges = formatHandoffBadges({
+    featureId: args?.feature_id,
+    discoveredIssues: args?.discovered_issues,
+    leftUndone: args?.left_undone,
+    verificationEvidence: args?.verification_evidence,
+  });
 
-  const header = `📨 ${theme.fg("toolTitle", theme.bold(`post #${channel}`))} ${theme.fg("muted", "->")} ${theme.fg(targets.length > 0 ? "accent" : "muted", targetDisplay)}${kindBadge ? theme.fg("dim", kindBadge) : ""}`;
+  const header = `📨 ${theme.fg("toolTitle", theme.bold(`post #${channel}`))} ${theme.fg("muted", "->")} ${theme.fg(targets.length > 0 ? "accent" : "muted", targetDisplay)}${kindBadge ? theme.fg("dim", kindBadge) : ""}${handoffBadges ? theme.fg("accent", handoffBadges) : ""}`;
 
   if (!rawText.trim()) {
     return new Text(header, 0, 0);
@@ -1069,9 +1544,16 @@ function renderPostMessageResult(
         : []),
     ];
     const route = targets.length > 0 ? ` -> ${targets.join(", ")}` : "";
+    const handoffBadges = formatHandoffBadges({
+      featureId: msg.featureId,
+      discoveredIssues: msg.discoveredIssues,
+      leftUndone: msg.leftUndone,
+      verificationEvidence: msg.verificationEvidence,
+    });
+    const badgeStyled = handoffBadges ? theme.fg("accent", handoffBadges) : "";
     if (options?.expanded) {
       return new Text(
-        `${theme.fg("success", "✓")} ${theme.fg("toolOutput", `Posted #${msg.seq} to #${channel}${route}`)}\n${theme.fg("toolOutput", msg.text)}`,
+        `${theme.fg("success", "✓")} ${theme.fg("toolOutput", `Posted #${msg.seq} to #${channel}${route}`)}${badgeStyled}\n${theme.fg("toolOutput", msg.text)}`,
         0,
         0,
       );
@@ -1081,7 +1563,7 @@ function renderPostMessageResult(
       ? formatExpandHint(options, theme, context)
       : "";
     return new Text(
-      `${theme.fg("success", "✓")} ${theme.fg("toolOutput", `#${msg.seq} (#${channel}${route}):`)} ${theme.fg("muted", clipInline(msg.text, 72))}${expandHint}`,
+      `${theme.fg("success", "✓")} ${theme.fg("toolOutput", `#${msg.seq} (#${channel}${route}):`)}${badgeStyled} ${theme.fg("muted", clipInline(msg.text, 72))}${expandHint}`,
       0,
       0,
     );
@@ -1307,12 +1789,12 @@ export function createSwarmTool(deps: SwarmToolDeps): ToolDefinition {
     name: SWARM_TOOL,
     label: "Swarm",
     description:
-      'Manage the dynamic Pi Swarm: set run title/direction ("title"), spawn workers/validators/sharded groups with optional context forking or isolated worktrees ("add"), inspect roster/channels ("status"), list models ("models"), hot-switch & resume a waiting member model ("model"), steer/redirect a member mid-flight ("steer"), stop a member ("stop"), permanently retire a member ("kill"), land a share/branch worktree ("merge"), manage channels ("channel"), or complete the run ("done").',
+      'Manage the dynamic Pi Swarm & Mission Goal Engine: set run title/direction ("title"), spawn workers/validators/sharded groups with optional context forking or isolated worktrees ("add"), inspect roster/channels ("status"), list models ("models"), hot-switch & resume a waiting member model ("model"), steer/redirect a member mid-flight ("steer"), stop a member ("stop"), permanently retire a member ("kill"), land a share/branch worktree ("merge"), manage channels ("channel"), manage dynamic Mission VAL-* assertions/features/handoffs/manifest ("mission"), or complete the run ("done").',
     promptSnippet:
-      "Manage dynamic swarm members, steering, models, worktrees, channels, and run lifecycle.",
+      "Manage dynamic swarm members, mission features/assertions/handoffs, steering, models, worktrees, channels, and run lifecycle.",
     promptGuidelines: [
       `Use ${SWARM_TOOL} with action="add" to delegate technical work to named workers or independent read-only validators (workspace="share" for shared worktrees or workspace="branch" for isolated clones; fork="<member>|orchestrator" to branch conversation history).`,
-      `Use action="steer" to redirect a working or waiting member mid-flight; action="model" hot-switches and immediately resumes a member; never kill a waiting member as a pause; use action="stop" to pause it, action="merge" to land worktrees, action="kill" once integrated, and action="done" when complete.`,
+      `Use action="mission" to inspect or dynamically evolve VAL-* assertions, feature queue, operational commands/boundaries, and resolve open worker handoff items. Use action="steer" to redirect mid-flight, action="merge" to land worktrees, action="kill" once integrated, and action="done" when all features and VAL-* assertions pass.`,
     ],
     parameters: SwarmToolParamsSchema,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -1588,9 +2070,41 @@ export function createSwarmTool(deps: SwarmToolDeps): ToolDefinition {
               merged.changedFiles.length > 0
                 ? `\nChanged files (${merged.changedFiles.length}): ${shownFiles.join(", ")}${overflowFiles}`
                 : "\nChanged files: (none)";
-            const verifyLine = `\nNext: run post-merge verification (typecheck / tests) on ${baseBranch} before completing the run.`;
+            const extMerged = merged as MergeBranchResult & {
+              completedFeatureIds?: string[];
+              milestoneValidationCues?: Array<{
+                milestone: string;
+                assertionIds: string[];
+                validatorWoken?: string;
+                boardSeq?: number;
+                needsValidatorSpawn?: boolean;
+              }>;
+            };
+            const featureLine =
+              Array.isArray(extMerged.completedFeatureIds) &&
+              extMerged.completedFeatureIds.length > 0
+                ? `\nAuto-completed feature(s): ${extMerged.completedFeatureIds.join(", ")}`
+                : "";
+            const milestoneCueLines: string[] = [];
+            if (Array.isArray(extMerged.milestoneValidationCues)) {
+              for (const cue of extMerged.milestoneValidationCues) {
+                if (cue.validatorWoken) {
+                  milestoneCueLines.push(
+                    `\n🎯 Milestone "${cue.milestone}" features are all merged — auto-woke @${cue.validatorWoken} (#${cue.boardSeq ?? "?"} [milestone-review]) to verify: ${cue.assertionIds.join(", ")}.`,
+                  );
+                } else if (cue.needsValidatorSpawn) {
+                  milestoneCueLines.push(
+                    `\n⚠ Milestone "${cue.milestone}" features are all merged with pending validation assertions (${cue.assertionIds.join(", ")}) — no idle inherit @validator exists yet! Spawn @validator (role:"validator", workspace:"inherit") immediately to verify them via swarm{action:"mission", mission_op:"verify_assertion"}.`,
+                  );
+                }
+              }
+            }
+            const verifyLine =
+              milestoneCueLines.length > 0
+                ? milestoneCueLines.join("")
+                : `\nNext: run post-merge verification (typecheck / tests) on ${baseBranch} before completing the run.`;
             return okResult(
-              `Merged @${name} (${merged.strategy}) -> ${merged.mergedCommitSha.slice(0, 12)} (${merged.changedFiles.length} file(s)).${filesLine}${verifyLine}`,
+              `Merged @${name} (${merged.strategy}) -> ${merged.mergedCommitSha.slice(0, 12)} (${merged.changedFiles.length} file(s)).${filesLine}${featureLine}${verifyLine}`,
               { name, baseBranch, ...merged },
             );
           }
@@ -1605,6 +2119,22 @@ export function createSwarmTool(deps: SwarmToolDeps): ToolDefinition {
               callerName,
               callerRole,
             });
+            return okResult(result.summary, result);
+          }
+
+          case "mission": {
+            if (!deps.engine.manageMission) {
+              throw new SwarmProtocolError(
+                "NOT_FOUND",
+                "Mission Goal Engine management is not available on this SwarmEngine instance.",
+              );
+            }
+            const missionInput = buildManageMissionInputFromParams(
+              params,
+              callerName,
+              callerRole,
+            );
+            const result = await deps.engine.manageMission(missionInput);
             return okResult(result.summary, result);
           }
 
@@ -1633,6 +2163,7 @@ export function createSwarmTool(deps: SwarmToolDeps): ToolDefinition {
               }
             }
 
+            // Gate A: Working members
             if (!params.force && snapshot.workingMemberNames.length > 0) {
               throw new SwarmProtocolError(
                 "INVALID_INPUT",
@@ -1654,6 +2185,108 @@ export function createSwarmTool(deps: SwarmToolDeps): ToolDefinition {
                 (m.workspace === "share" || m.workspace === "branch") &&
                 !m.mergedCommitSha,
             );
+
+            if (!params.force && preDoneRun) {
+              // Gate B: Real Unmerged Commits ahead of baseBranch
+              if (unmergedMembers.length > 0) {
+                const engineWithUnmerged = deps.engine as ISwarmEngine & {
+                  getUnmergedMembersWithCommits?: () => Promise<
+                    Array<{ member: SwarmMemberRecord; commitsAhead: number }>
+                  >;
+                };
+                const unmergedAhead =
+                  (await engineWithUnmerged.getUnmergedMembersWithCommits?.()) ?? [];
+                if (unmergedAhead.length > 0) {
+                  const labels = unmergedAhead.map(
+                    ({ member: m, commitsAhead }) =>
+                      `@${m.name} (${m.branch ?? m.workspace}, ${commitsAhead} commit${commitsAhead === 1 ? "" : "s"} ahead)`,
+                  );
+                  throw new SwarmProtocolError(
+                    "INVALID_INPUT",
+                    `Cannot complete Swarm while unmerged worktree branch(es) have commits ahead of ${preDoneRun.baseBranch}: ${labels.join(", ")}. Merge ready branches via swarm{action:"merge", name} or kill obsolete branches via swarm{action:"kill", name} first (or pass force:true).`,
+                    {
+                      unmergedMembers: unmergedAhead.map(({ member: m, commitsAhead }) => ({
+                        name: m.name,
+                        branch: m.branch,
+                        commitsAhead,
+                      })),
+                    },
+                  );
+                }
+              }
+
+              // Gate C: Incomplete Features
+              if (preDoneRun.features && preDoneRun.features.length > 0) {
+                const incompleteFeatures = preDoneRun.features.filter(
+                  (f) =>
+                    f.status === "pending" ||
+                    f.status === "in_progress" ||
+                    f.status === "failed",
+                );
+                if (incompleteFeatures.length > 0) {
+                  throw new SwarmProtocolError(
+                    "INVALID_INPUT",
+                    `Cannot complete Mission while ${incompleteFeatures.length} feature(s) remain incomplete: ${incompleteFeatures.map((f) => `${f.id} [${f.status}]`).join(", ")}. Complete or cancel remaining features via swarm{action:"mission"} before calling done (or pass force:true).`,
+                    {
+                      incompleteFeatures: incompleteFeatures.map((f) => ({
+                        id: f.id,
+                        status: f.status,
+                      })),
+                    },
+                  );
+                }
+              }
+
+              // Gate D: Open Handoff Tech Debt
+              const openTechDebt = (preDoneRun.handoffItems ?? []).filter(
+                (h) =>
+                  h.resolution === "open" &&
+                  (h.type === "discovered_issue" || h.type === "incomplete_work"),
+              );
+              if (openTechDebt.length > 0) {
+                throw new SwarmProtocolError(
+                  "INVALID_INPUT",
+                  `Cannot complete Mission with ${openTechDebt.length} open handoff tech-debt item(s): ${openTechDebt.map((h) => `${h.id} (${h.type} from @${h.sourceMember}: "${h.summary.slice(0, 72)}")`).join("; ")}. Track follow-up features via swarm{action:"mission", mission_op:"upsert_features"} and resolve each item via swarm{action:"mission", mission_op:"resolve_handoff"} before calling done (or pass force:true).`,
+                  { openHandoffIds: openTechDebt.map((h) => h.id) },
+                );
+              }
+
+              // Gate E: 100% Validation Contract VAL-* Passed & Claimed by Completed Features
+              if (preDoneRun.assertions && preDoneRun.assertions.length > 0) {
+                const unpassedAssertions = preDoneRun.assertions.filter(
+                  (a) => a.status !== "passed",
+                );
+                const completedFulfills = new Set(
+                  (preDoneRun.features ?? [])
+                    .filter((f) => f.status === "completed")
+                    .flatMap((f) => f.fulfills),
+                );
+                const unclaimedByCompleted = preDoneRun.assertions.filter(
+                  (a) => !completedFulfills.has(a.id),
+                );
+                if (unpassedAssertions.length > 0 || unclaimedByCompleted.length > 0) {
+                  const reasons: string[] = [];
+                  if (unpassedAssertions.length > 0) {
+                    reasons.push(
+                      `unpassed VAL-* assertions: ${unpassedAssertions.map((a) => `${a.id} [${a.status}]`).join(", ")} (verify via @validator calling swarm{action:"mission", mission_op:"verify_assertion"})`,
+                    );
+                  }
+                  if (unclaimedByCompleted.length > 0) {
+                    reasons.push(
+                      `VAL-* assertions not claimed in fulfills[] of any "completed" feature: ${unclaimedByCompleted.map((a) => a.id).join(", ")} (ensure completed features claim 100% of assertions via swarm{action:"mission", mission_op:"upsert_features"})`,
+                    );
+                  }
+                  throw new SwarmProtocolError(
+                    "INVALID_INPUT",
+                    `Cannot complete Mission until 100% of Validation Contract passes and is claimed: ${reasons.join("; ")} (or pass force:true).`,
+                    {
+                      unpassedAssertionIds: unpassedAssertions.map((a) => a.id),
+                      unclaimedAssertionIds: unclaimedByCompleted.map((a) => a.id),
+                    },
+                  );
+                }
+              }
+            }
 
             const completed = await deps.engine.completeRun({
               summary,
@@ -1730,13 +2363,27 @@ export function createPostMessageTool(deps: SwarmToolDeps): ToolDefinition {
           text,
           channel: normalizeOptionalChannel(params.channel),
           kind: params.kind as BoardMessageKind | undefined,
+          ...(params.feature_id !== undefined ? { featureId: params.feature_id } : {}),
+          ...(params.discovered_issues !== undefined
+            ? { discoveredIssues: params.discovered_issues }
+            : {}),
+          ...(params.left_undone !== undefined ? { leftUndone: params.left_undone } : {}),
+          ...(params.verification_evidence !== undefined
+            ? { verificationEvidence: params.verification_evidence }
+            : {}),
         });
         const targets = [
           ...msg.mentions.map((m) => `@${m}`),
           ...msg.channelMentions.map((c) => `@#${c}`),
         ];
         const targetText = targets.length > 0 ? ` (notified: ${targets.join(", ")})` : "";
-        return okResult(`Posted #${msg.seq} to #${msg.channel}${targetText}.`, msg);
+        const handoffSummary = formatHandoffBadges({
+          featureId: msg.featureId,
+          discoveredIssues: msg.discoveredIssues,
+          leftUndone: msg.leftUndone,
+          verificationEvidence: msg.verificationEvidence,
+        });
+        return okResult(`Posted #${msg.seq} to #${msg.channel}${targetText}${handoffSummary}.`, msg);
       });
     },
     renderCall(args, theme, context) {
@@ -1932,6 +2579,30 @@ export function createMemberScopedTools(
           description: 'Optional message kind (defaults to "chat").',
         }),
       ),
+      feature_id: Type.Optional(
+        Type.String({
+          description:
+            "Optional Mission feature ID this deliverable implements (auto-updates assigned feature on [done]).",
+        }),
+      ),
+      discovered_issues: Type.Optional(
+        Type.Array(Type.String(), {
+          description:
+            "Optional non-blocking bugs or tech-debt items discovered while working (auto-recorded as open handoff items).",
+        }),
+      ),
+      left_undone: Type.Optional(
+        Type.Array(Type.String(), {
+          description:
+            "Optional incomplete items left undone on this feature (auto-recorded as open incomplete_work handoff items).",
+        }),
+      ),
+      verification_evidence: Type.Optional(
+        Type.String({
+          description:
+            "Optional concrete verification evidence (commands run and exit/pass counts) for this deliverable.",
+        }),
+      ),
     }),
     async execute(_toolCallId, params) {
       return runToolSafe(async () => {
@@ -1943,6 +2614,14 @@ export function createMemberScopedTools(
           text,
           channel: normalizeOptionalChannel(params.channel),
           kind: params.kind as BoardMessageKind | undefined,
+          ...(params.feature_id !== undefined ? { featureId: params.feature_id } : {}),
+          ...(params.discovered_issues !== undefined
+            ? { discoveredIssues: params.discovered_issues }
+            : {}),
+          ...(params.left_undone !== undefined ? { leftUndone: params.left_undone } : {}),
+          ...(params.verification_evidence !== undefined
+            ? { verificationEvidence: params.verification_evidence }
+            : {}),
         });
         const targets = [
           ...msg.mentions.map((m) => `@${m}`),
@@ -1952,7 +2631,13 @@ export function createMemberScopedTools(
           targets.length > 0
             ? ` (notified: ${targets.join(", ")})`
             : " (no @mention included — no peer was woken)";
-        return okResult(`Posted #${msg.seq} to #${msg.channel}${targetText}.`, msg);
+        const handoffSummary = formatHandoffBadges({
+          featureId: msg.featureId,
+          discoveredIssues: msg.discoveredIssues,
+          leftUndone: msg.leftUndone,
+          verificationEvidence: msg.verificationEvidence,
+        });
+        return okResult(`Posted #${msg.seq} to #${msg.channel}${targetText}${handoffSummary}.`, msg);
       });
     },
     renderCall(args, theme, context) {
@@ -2089,14 +2774,14 @@ export function createMemberScopedTools(
     label: "Swarm",
     description:
       member.role === "validator"
-        ? 'Scoped Swarm helper tool for read-only validators: inspect roster ("status"), list models ("models"), spawn read-only validator helpers ("add"), switch model for self or own helpers ("model"), steer/stop/kill own helpers ("steer"/"stop"/"kill"), or list/join/leave channels ("channel").'
-        : 'Scoped Swarm helper tool for workers: inspect roster ("status"), list models ("models"), spawn helper workers/validators reporting back to you ("add"), switch model for self or own helpers ("model"), steer/stop/kill own helpers ("steer"/"stop"/"kill"), or list/join/leave channels ("channel"). Cannot call title/merge/done or touch other members.',
+        ? 'Scoped Swarm helper tool for read-only validators: inspect roster ("status"), list models ("models"), inspect Mission status or verify VAL-* assertions ("mission"), spawn read-only validator helpers ("add"), switch model for self or own helpers ("model"), steer/stop/kill own helpers ("steer"/"stop"/"kill"), or list/join/leave channels ("channel").'
+        : 'Scoped Swarm helper tool for workers: inspect roster ("status"), list models ("models"), inspect Mission status or update your own assigned feature ("mission"), spawn helper workers/validators reporting back to you ("add"), switch model for self or own helpers ("model"), steer/stop/kill own helpers ("steer"/"stop"/"kill"), or list/join/leave channels ("channel"). Cannot call title/merge/done, self-verify VAL-* assertions, or touch other members.',
     promptSnippet:
-      "Inspect swarm status/models, manage your own helpers (add/model/steer/stop/kill), or join/leave channels.",
+      "Inspect swarm/mission status, verify VAL-* assertions (validator) or update own feature (worker), manage your own helpers, or join/leave channels.",
     parameters: Type.Object({
       action: stringEnum(MEMBER_SWARM_ACTIONS, {
         description:
-          'Allowed member actions: "status" | "models" | "add" | "model" | "steer" | "stop" | "kill" | "channel".',
+          'Allowed member actions: "status" | "models" | "add" | "model" | "steer" | "stop" | "kill" | "channel" | "mission".',
       }),
       name: Type.Optional(
         Type.String({
@@ -2167,6 +2852,50 @@ export function createMemberScopedTools(
       ),
       channel: Type.Optional(
         Type.String({ description: 'Channel name for action="channel".' }),
+      ),
+      mission_op: Type.Optional(
+        stringEnum(SWARM_MISSION_OPS, {
+          description:
+            'Sub-operation for action="mission": "status" | "verify_assertion" (validator) | "update_feature" (worker own feature).',
+        }),
+      ),
+      assertion_id: Type.Optional(
+        Type.String({
+          description: 'Target VAL-* assertion ID for mission_op="verify_assertion".',
+        }),
+      ),
+      assertion_status: Type.Optional(
+        stringEnum(ASSERTION_STATUSES, {
+          description:
+            'Verification outcome for mission_op="verify_assertion": "pending" | "passed" | "failed" | "blocked".',
+        }),
+      ),
+      evidence: Type.Optional(
+        Type.String({
+          description:
+            'Concrete command/inspection evidence (required when assertion_status is "passed" or "failed").',
+        }),
+      ),
+      feature_id: Type.Optional(
+        Type.String({
+          description: 'Target feature ID for mission_op="update_feature".',
+        }),
+      ),
+      feature_status: Type.Optional(
+        stringEnum(FEATURE_STATUSES, {
+          description:
+            'Updated feature status for mission_op="update_feature": "pending" | "in_progress" | "completed" | "failed" | "cancelled".',
+        }),
+      ),
+      assigned_member: Type.Optional(
+        Type.String({
+          description: 'Optional assigned member handle for mission_op="update_feature".',
+        }),
+      ),
+      merged_commit_sha: Type.Optional(
+        Type.String({
+          description: 'Optional merged commit SHA for mission_op="update_feature".',
+        }),
       ),
       force: Type.Optional(
         Type.Boolean({
@@ -2326,6 +3055,22 @@ export function createMemberScopedTools(
               callerName: member.name,
               callerRole: member.role,
             });
+            return okResult(res.summary, res);
+          }
+
+          case "mission": {
+            if (!bridge.manageMission) {
+              throw new SwarmProtocolError(
+                "PERMISSION_DENIED",
+                `Mission Goal Engine management is not available in this member bridge context.`,
+              );
+            }
+            const missionInput = buildManageMissionInputFromParams(
+              params as Partial<SwarmToolParams>,
+              member.name,
+              member.role,
+            );
+            const res = await bridge.manageMission(missionInput);
             return okResult(res.summary, res);
           }
 

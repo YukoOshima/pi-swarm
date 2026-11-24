@@ -4,13 +4,19 @@ import {
   POST_MESSAGE_TOOL,
   READ_BOARD_TOOL,
   SWARM_DIR,
+  SWARM_FEATURES_FILE,
+  SWARM_MISSION_FILE,
+  SWARM_RUNS_DIR,
   SWARM_TOOL,
+  SWARM_VALIDATION_CONTRACT_FILE,
   SWARM_WAIT_TOOL,
 } from "../constants.js";
 import type {
   BoardMessage,
+  FeatureStatus,
   SwarmChannelRecord,
   SwarmMemberRecord,
+  SwarmMilestone,
   SwarmRoleModelConfig,
   SwarmRoleModels,
   SwarmRunState,
@@ -24,6 +30,192 @@ import type {
 function formatRoleConfig(cfg?: SwarmRoleModelConfig): string {
   const model = cfg?.model?.trim() || "host-default";
   return cfg?.thinkingLevel ? `${model} (${cfg.thinkingLevel})` : model;
+}
+
+function formatMessageHandoffInline(msg: BoardMessage): string {
+  const tags: string[] = [];
+  if (msg.featureId) {
+    tags.push(`[feat:${msg.featureId}]`);
+  }
+  if (msg.discoveredIssues && msg.discoveredIssues.length > 0) {
+    tags.push(`[+${msg.discoveredIssues.length} issue]`);
+  }
+  if (msg.leftUndone && msg.leftUndone.length > 0) {
+    tags.push(`[!${msg.leftUndone.length} undone]`);
+  }
+  if (msg.verificationEvidence) {
+    tags.push("[✓evidence]");
+  }
+  return tags.length > 0 ? ` ${tags.join(" ")}` : "";
+}
+
+function formatMessageHandoffBlock(msg: BoardMessage): string {
+  const lines: string[] = [];
+  if (msg.featureId) {
+    lines.push(`- Feature: \`${msg.featureId}\``);
+  }
+  if (msg.verificationEvidence) {
+    lines.push(`- Verification Evidence: ${msg.verificationEvidence}`);
+  }
+  if (msg.discoveredIssues && msg.discoveredIssues.length > 0) {
+    lines.push(`- Discovered Issues: ${msg.discoveredIssues.join("; ")}`);
+  }
+  if (msg.leftUndone && msg.leftUndone.length > 0) {
+    lines.push(`- Left Undone: ${msg.leftUndone.join("; ")}`);
+  }
+  return lines.length > 0 ? `\n${lines.join("\n")}` : "";
+}
+
+function formatFeatureBadge(status: FeatureStatus): string {
+  switch (status) {
+    case "completed":
+      return "[✓]";
+    case "in_progress":
+      return "[▸]";
+    case "failed":
+      return "[!]";
+    case "cancelled":
+      return "[~]";
+    default:
+      return "[ ]";
+  }
+}
+
+function formatMilestoneBadge(m: SwarmMilestone): string {
+  const glyph =
+    m.status === "done"
+      ? "[✓]"
+      : m.status === "in_progress"
+        ? "[▸]"
+        : m.status === "blocked"
+          ? "[!]"
+          : "[ ]";
+  return `${glyph} ${m.label} (${m.status})${m.sealed ? " [sealed]" : ""}`;
+}
+
+function formatMissionArtifactPaths(runId: string): string {
+  const base = `${SWARM_DIR}/${SWARM_RUNS_DIR}/${runId}`;
+  return `\`${base}/${SWARM_MISSION_FILE}\`, \`${base}/${SWARM_VALIDATION_CONTRACT_FILE}\`, \`${base}/${SWARM_FEATURES_FILE}\``;
+}
+
+function buildMissionManifestLines(run: SwarmRunState): string[] {
+  const lines: string[] = [];
+  if (run.commands && run.commands.length > 0) {
+    lines.push(
+      `- **Operational Commands**: ${run.commands.map((c) => `\`${c.name}\`: \`${c.command}\``).join(" | ")}`,
+    );
+  }
+  if (run.boundaries && run.boundaries.length > 0) {
+    lines.push(`- **Mission Boundaries**: ${run.boundaries.join(" · ")}`);
+  }
+  return lines;
+}
+
+function buildMissionGoalSummarySection(
+  run: SwarmRunState,
+  options?: { highlightMember?: string; includeManifest?: boolean },
+): string | null {
+  const milestones = run.milestones ?? [];
+  const features = run.features ?? [];
+  const assertions = run.assertions ?? [];
+  const handoffs = run.handoffItems ?? [];
+  const openHandoffs = handoffs.filter((h) => h.resolution === "open");
+  const hasManifest =
+    options?.includeManifest !== false &&
+    ((run.commands?.length ?? 0) > 0 || (run.boundaries?.length ?? 0) > 0);
+
+  if (
+    milestones.length === 0 &&
+    features.length === 0 &&
+    assertions.length === 0 &&
+    openHandoffs.length === 0 &&
+    !hasManifest
+  ) {
+    return null;
+  }
+
+  const lines: string[] = [
+    "### Mission Goal Progress & Validation Contract",
+    `- **Mission Artifacts**: ${formatMissionArtifactPaths(run.id)}`,
+  ];
+
+  if (options?.includeManifest !== false) {
+    lines.push(...buildMissionManifestLines(run));
+  }
+
+  if (milestones.length > 0) {
+    lines.push(`- **Milestones**: ${milestones.map(formatMilestoneBadge).join(" · ")}`);
+  }
+
+  if (features.length > 0) {
+    const nonCancelled = features.filter((f) => f.status !== "cancelled");
+    const completedCount = nonCancelled.filter((f) => f.status === "completed").length;
+    lines.push(
+      `- **Feature Queue (${completedCount}/${nonCancelled.length} completed)**:`,
+    );
+    const preview = features.slice(0, 12);
+    for (const f of preview) {
+      const assignedTag = f.assignedMember
+        ? options?.highlightMember === f.assignedMember
+          ? ` **[@${f.assignedMember} — YOUR FEATURE]**`
+          : ` (@${f.assignedMember})`
+        : "";
+      const depsTag =
+        f.dependsOn && f.dependsOn.length > 0
+          ? ` dependsOn=[${f.dependsOn.join(",")}]`
+          : "";
+      const fulfillsTag =
+        f.fulfills.length > 0 ? ` fulfills=[${f.fulfills.join(",")}]` : "";
+      lines.push(
+        `  - ${formatFeatureBadge(f.status)} \`${f.id}\` [${f.milestone}] ${f.title}${assignedTag}${depsTag}${fulfillsTag}`,
+      );
+    }
+    if (features.length > preview.length) {
+      lines.push(
+        `  - ... +${features.length - preview.length} more feature(s) (inspect via \`${SWARM_TOOL}{action:"mission", mission_op:"status"}\`)`,
+      );
+    }
+  }
+
+  if (assertions.length > 0) {
+    const passed = assertions.filter((a) => a.status === "passed").length;
+    const failed = assertions.filter((a) => a.status === "failed").length;
+    const pending = assertions.filter((a) => a.status === "pending").length;
+    const blocked = assertions.filter((a) => a.status === "blocked").length;
+    const claimedSet = new Set(
+      features
+        .filter((f) => f.status !== "cancelled")
+        .flatMap((f) => f.fulfills),
+    );
+    const unclaimed = assertions.filter((a) => !claimedSet.has(a.id));
+    lines.push(
+      `- **Validation Contract (\`VAL-*\`: ${passed}/${assertions.length} passed · ${pending} pending · ${failed} failed${blocked > 0 ? ` · ${blocked} blocked` : ""})**:`,
+    );
+    for (const a of assertions.slice(0, 14)) {
+      const verifier = a.verifiedBy ? ` by @${a.verifiedBy}` : "";
+      lines.push(`  - \`${a.id}\` [${a.status}]${verifier}: ${a.title}`);
+    }
+    if (assertions.length > 14) {
+      lines.push(`  - ... +${assertions.length - 14} more assertion(s)`);
+    }
+    if (unclaimed.length > 0) {
+      lines.push(
+        `  - ⚠ **Unclaimed \`VAL-*\` Assertions**: ${unclaimed.map((a) => `\`${a.id}\``).join(", ")} (assign to feature \`fulfills[]\`)`,
+      );
+    }
+  }
+
+  if (openHandoffs.length > 0) {
+    lines.push(`- **Open Handoff Tech-Debt (${openHandoffs.length})**:`);
+    for (const h of openHandoffs.slice(0, 8)) {
+      const featPart = h.sourceFeatureId ? ` on \`${h.sourceFeatureId}\`` : "";
+      lines.push(
+        `  - \`${h.id}\` (${h.type} from \`@${h.sourceMember}\`${featPart}): ${h.summary.replace(/\s+/g, " ").slice(0, 160)}`,
+      );
+    }
+  }
+
+  return lines.join("\n");
 }
 
 /**
@@ -41,9 +233,10 @@ export function formatBoardExcerptLine(msg: BoardMessage, maxChars = 240): strin
   const targetPart = targets.length > 0 ? ` -> ${targets.join(",")}` : "";
   const channelPart = `#${msg.channel || DEFAULT_CHANNEL}`;
   const kindPart = msg.kind && msg.kind !== "chat" ? ` (${msg.kind})` : "";
+  const handoffPart = formatMessageHandoffInline(msg);
   const compact = msg.text.replace(/\s+/g, " ").trim();
   const clipped = compact.length > maxChars ? `${compact.slice(0, maxChars - 1)}…` : compact;
-  return `#${msg.seq} [${channelPart}] ${msg.from}${targetPart}${kindPart}: ${clipped}`;
+  return `#${msg.seq} [${channelPart}] ${msg.from}${targetPart}${kindPart}${handoffPart}: ${clipped}`;
 }
 
 /**
@@ -78,14 +271,17 @@ export function formatBoardEntryFull(
   const targetPart = targets.length > 0 ? ` -> ${targets.join(",")}` : "";
   const channelPart = `#${msg.channel || DEFAULT_CHANNEL}`;
   const kindTag = msg.kind && msg.kind !== "chat" ? ` (${msg.kind})` : "";
-  const header = `#${msg.seq} [${channelPart}] ${msg.from}${targetPart}${kindTag}:`;
+  const handoffInline = formatMessageHandoffInline(msg);
+  const header = `#${msg.seq} [${channelPart}] ${msg.from}${targetPart}${kindTag}${handoffInline}:`;
 
   const body = msg.text.trimEnd();
+  const handoffBlock = formatMessageHandoffBlock(msg);
   if (maxChars !== undefined && body.length > maxChars) {
     const remaining = body.length - maxChars;
-    return `${header}\n${body.slice(0, maxChars)}\n... [truncated ${remaining} chars; call ${READ_BOARD_TOOL}{seqs:[${msg.seq}]} for full message]`;
+    return `${header}\n${body.slice(0, maxChars)}\n... [truncated ${remaining} chars; call ${READ_BOARD_TOOL}{seqs:[${msg.seq}]} for full message]${handoffBlock}`;
   }
-  return body.length > 0 ? `${header}\n${body}` : header;
+  const combinedBody = `${body}${handoffBlock}`;
+  return combinedBody.length > 0 ? `${header}\n${combinedBody}` : header;
 }
 
 // ============================================================================
@@ -144,7 +340,7 @@ function buildOrchestratorPlaybookCore(validatorEnabled: boolean): string {
     `- **Zero-Copy \`#seq\` & \`@mention\` Discipline**: \`@name\` is a wakeup doorbell, never a CC. Use \`@<prefix>\` for sharded groups, \`@#<channel>\` for channel broadcasts (NEVER \`@#main\`), and \`@all\` only for genuine swarm-wide rules or plan changes.${validatorEnabled ? " Avoid writing `@validator` (or another peer's `@handle`) in prose when addressing a worker unless you intend to wake that peer right now — refer to them without `@` (e.g. \"the validator\") for future handoffs." : " Avoid writing another peer's `@handle` in prose when addressing a worker unless you intend to wake that peer right now."}`,
     "",
     "## 4. Core Swarm Tools (4 Tools)",
-    `- \`${SWARM_TOOL}\`: \`title\`, \`add\`, \`status\`, \`models\`, \`model\` (auto-resumes switched member), \`steer\`, \`stop\`, \`kill\`, \`merge\`, \`channel\`, \`done\`.`,
+    `- \`${SWARM_TOOL}\`: \`title\`, \`add\`, \`status\`, \`models\`, \`model\` (auto-resumes switched member), \`steer\`, \`stop\`, \`kill\`, \`merge\`, \`channel\`, \`mission\` (\`status\`, \`upsert_assertions\`, \`remove_assertion\`, \`verify_assertion\`, \`upsert_features\`, \`update_feature\`, \`resolve_handoff\`, \`set_manifest\`), \`done\`.`,
     `- \`${POST_MESSAGE_TOOL}\` / \`${READ_BOARD_TOOL}\`: Post to the shared board, read messages (\`#seq\`/\`since\`/\`channel\`/\`search\`), or inspect roster (\`status:true\`).`,
     `- \`${SWARM_WAIT_TOOL}\`: End your turn cleanly (non-blocking) and sleep until woken by a member, \`all_idle\`, or user input. Always pass the highest read \`#seq\` as \`since\`.`,
     "",
@@ -153,6 +349,12 @@ function buildOrchestratorPlaybookCore(validatorEnabled: boolean): string {
     `- **Hot Model Switch**: Calling \`${SWARM_TOOL}{action:"model", name, model}\` on a \`waiting\` member hot-switches while keeping conversation history AND automatically resumes it to continue unfinished work.`,
     `- **Context Forking**: Pass \`fork:"orchestrator"\` or \`fork:"<member>"\` on \`${SWARM_TOOL}{action:"add"}\` when a new member benefits from branching existing conversation history.`,
     "- **3-Role Models**: `orchestrator` (host session), `worker` (default for `role:\"worker\"`), `validator` (default for `role:\"validator\"`).",
+    "",
+    "## 6. Dynamic Mission Goal Engine & Contract Evolution",
+    `- **Living Contract & Feature Queue**: When mid-run gaps surface or the user changes requirements, evolve the contract and queue dynamically via \`${SWARM_TOOL}{action:"mission", mission_op:"upsert_assertions"}\` + \`${SWARM_TOOL}{action:"mission", mission_op:"upsert_features"}\` (use \`prepend:true\` for urgent fix features; \`remove_assertion\` when scope is dropped; \`set_manifest\` to update \`commands\`/\`boundaries\`). Modified \`"passed"\` assertions automatically reset to \`"pending"\` for re-verification.`,
+    `- **Never Bypass Sealed Milestones**: Once all features and \`VAL-*\` assertions of a milestone pass, it becomes \`[sealed]\`. Place any new or follow-up work into a new milestone (e.g. \`<milestone>-followup\` or \`misc-fixes\`) so zero code bypasses validation.`,
+    `- **Zero Open Handoff Tech Debt**: Resolve every worker \`discovered_issue\` and \`incomplete_work\` item via \`upsert_features\` + \`${SWARM_TOOL}{action:"mission", mission_op:"resolve_handoff", handoff_id, resolution:"tracked", tracked_feature_id}\` (or \`resolution:"dismissed"\` ONLY with concrete technical proof >= 20 chars — lazy excuses like \`"low priority"\` or \`"fix later"\` are rejected).`,
+    `- **End-of-Mission Hard Gates**: \`${SWARM_TOOL}{action:"done"}\` enforces 0 working members, 0 unmerged commits ahead of \`baseBranch\`, 0 incomplete features, 0 open handoff tech-debt items, and 100% \`VAL-*\` assertions \`"passed"\` and claimed by \`"completed"\` features.`,
   ].join("\n");
 }
 
@@ -169,7 +371,7 @@ function buildHumanSteeringSection(humanSteeringText: string): string {
   return [
     "### ⚡ Live User Direction Update",
     `The user just sent a dynamic message while the Swarm is running: "${cleanSteer}".`,
-    `Adjust active/parked workers immediately using \`${SWARM_TOOL}{action:"steer"}\`, \`${SWARM_TOOL}{action:"stop"/"kill"}\`, \`${SWARM_TOOL}{action:"title"}\`, \`${SWARM_TOOL}{action:"add"}\`, or \`${POST_MESSAGE_TOOL}\`, and report clearly.`,
+    `Adjust active/parked workers immediately using \`${SWARM_TOOL}{action:"steer"}\`, \`${SWARM_TOOL}{action:"stop"/"kill"}\`, \`${SWARM_TOOL}{action:"title"}\`, \`${SWARM_TOOL}{action:"mission"}\` (\`upsert_assertions\`/\`upsert_features\`/\`remove_assertion\`/\`set_manifest\`), \`${SWARM_TOOL}{action:"add"}\`, or \`${POST_MESSAGE_TOOL}\`, and report clearly.`,
   ].join("\n");
 }
 
@@ -258,6 +460,45 @@ function buildActionNeededSection(
     );
   }
 
+  const failedFeatures = (run.features ?? []).filter((f) => f.status === "failed");
+  if (failedFeatures.length > 0) {
+    items.push(
+      `- **Failed Features (${failedFeatures.length})**: ${failedFeatures.map((f) => `\`${f.id}\``).join(", ")} — inspect failure reports and assign/wake a worker (or \`upsert_features\` with \`prepend:true\`) to resolve before calling \`done\`.`,
+    );
+  }
+
+  const openDebt = (run.handoffItems ?? []).filter(
+    (h) =>
+      h.resolution === "open" &&
+      (h.type === "discovered_issue" || h.type === "incomplete_work"),
+  );
+  if (openDebt.length > 0) {
+    items.push(
+      `- **Open Handoff Tech-Debt (${openDebt.length})**: ${openDebt.map((h) => `\`${h.id}\``).join(", ")} — create follow-up feature(s) via \`upsert_features\` and link with \`${SWARM_TOOL}{action:"mission", mission_op:"resolve_handoff", handoff_id, resolution:"tracked", tracked_feature_id}\` (or dismiss ONLY with concrete technical proof >= 20 chars).`,
+    );
+  }
+
+  if (run.validatorEnabled && (run.features?.length ?? 0) > 0 && (run.assertions?.length ?? 0) > 0) {
+    const assertionMap = new Map((run.assertions ?? []).map((a) => [a.id, a]));
+    for (const ms of run.milestones ?? []) {
+      if (ms.sealed) continue;
+      const msFeatures = (run.features ?? []).filter(
+        (f) => f.milestone === ms.label && f.status !== "cancelled",
+      );
+      if (msFeatures.length === 0 || !msFeatures.every((f) => f.status === "completed")) {
+        continue;
+      }
+      const unpassedIds = [...new Set(msFeatures.flatMap((f) => f.fulfills))].filter(
+        (id) => assertionMap.get(id)?.status !== "passed",
+      );
+      if (unpassedIds.length > 0) {
+        items.push(
+          `- **Milestone \`${ms.label}\` Awaiting Validation**: All features completed; wake or spawn \`role:"validator"\` to verify ${unpassedIds.map((id) => `\`${id}\``).join(", ")} via \`${SWARM_TOOL}{action:"mission", mission_op:"verify_assertion"}\` and seal \`${ms.label}\`.`,
+        );
+      }
+    }
+  }
+
   const activeWorkingCount = Math.max(
     workingSet.size,
     members.filter((m) => m.state === "working").length,
@@ -303,6 +544,7 @@ export function buildOrchestratorStaticSection(snapshot: SwarmSnapshot): string 
     `- **Base Branch**: \`${run.baseBranch}\``,
     `- **Max Concurrency**: ${run.maxConcurrency}`,
     `- **Validator Policy**: ${run.validatorEnabled ? "ON" : "OFF"}`,
+    `- **Mission Artifacts**: ${formatMissionArtifactPaths(run.id)}`,
     `- **Objective**: ${run.objective}`,
   ];
   if (run.strategy.trim()) {
@@ -311,6 +553,7 @@ export function buildOrchestratorStaticSection(snapshot: SwarmSnapshot): string 
   if (run.acceptanceCriteria.trim()) {
     contractLines.push(`- **Acceptance Criteria**: ${run.acceptanceCriteria.trim()}`);
   }
+  contractLines.push(...buildMissionManifestLines(run));
   sections.push(contractLines.join("\n"));
 
   return sections.join("\n\n");
@@ -356,6 +599,13 @@ export function buildOrchestratorLiveStateSection(
   const actionNeeded = buildActionNeededSection(run, snapshot, members);
   if (actionNeeded) {
     sections.push(actionNeeded);
+  }
+
+  const missionSummary = buildMissionGoalSummarySection(run, {
+    includeManifest: false,
+  });
+  if (missionSummary) {
+    sections.push(missionSummary);
   }
 
   const customChannels = Object.values(run.channels).filter(
@@ -425,6 +675,7 @@ export function buildOrchestratorPlaybookSection(
     `- **Concurrency**: ${snapshot.workingMemberNames.length}/${run.maxConcurrency} working | ${snapshot.waitingMemberNames.length} warm waiting | Validator Policy: ${run.validatorEnabled ? "ON" : "OFF"}`,
     formatRoleModelsLine(snapshot.roleModels),
     `- **Usage**: ${snapshot.totalTokens} tokens | $${snapshot.totalCost.toFixed(4)}`,
+    `- **Mission Artifacts**: ${formatMissionArtifactPaths(run.id)}`,
     `- **Objective**: ${run.objective}`,
   ];
 
@@ -434,6 +685,7 @@ export function buildOrchestratorPlaybookSection(
   if (run.acceptanceCriteria.trim()) {
     stateHeader.push(`- **Acceptance Criteria**: ${run.acceptanceCriteria.trim()}`);
   }
+  stateHeader.push(...buildMissionManifestLines(run));
   if (snapshot.rateLimitUntil && snapshot.rateLimitUntil > Date.now()) {
     const secs = Math.ceil((snapshot.rateLimitUntil - Date.now()) / 1000);
     stateHeader.push(
@@ -450,6 +702,13 @@ export function buildOrchestratorPlaybookSection(
   const actionNeeded = buildActionNeededSection(run, snapshot, members);
   if (actionNeeded) {
     sections.push(actionNeeded);
+  }
+
+  const missionSummary = buildMissionGoalSummarySection(run, {
+    includeManifest: false,
+  });
+  if (missionSummary) {
+    sections.push(missionSummary);
   }
 
   // Channels compact summary
@@ -548,6 +807,7 @@ export function buildMemberSystemPrompt(
     `- **Handle**: \`@${member.name}\` (role: \`${member.role}\`${member.groupPrefix ? `, group: \`@${member.groupPrefix}\`` : ""})`,
     `- **Parent**: \`@${member.parentName}\``,
     `- **Run**: ${run.title} (\`${run.id}\`) | Base Branch: \`${run.baseBranch}\``,
+    `- **Mission Artifacts**: ${formatMissionArtifactPaths(run.id)}`,
     `- **Run Objective**: ${run.objective}`,
     `- **Workspace**: ${workspaceDesc}`,
     `- **Channels**: ${member.channels.map((c) => `#${c}`).join(", ")} (default post channel: \`#${primaryChannel}\`; \`#main\` is always visible)`,
@@ -561,13 +821,22 @@ export function buildMemberSystemPrompt(
   if (run.acceptanceCriteria.trim()) {
     headerLines.push(`- **Acceptance Criteria**: ${run.acceptanceCriteria.trim()}`);
   }
+  headerLines.push(...buildMissionManifestLines(run));
   sections.push(headerLines.join("\n"));
+
+  const memberMissionSummary = buildMissionGoalSummarySection(run, {
+    highlightMember: member.name,
+    includeManifest: false,
+  });
+  if (memberMissionSummary) {
+    sections.push(memberMissionSummary);
+  }
 
   // Shared board & warm session protocol (shared across workers and validators)
   sections.push(
     [
       "## Shared Message Board & Warm Session Rules",
-      `1. **Tools**: Use \`${POST_MESSAGE_TOOL}\` to communicate, \`${READ_BOARD_TOOL}\` (\`since?\`, \`seqs?\`, \`limit?\`, \`channel?\`, \`status?\`) to inspect prior posts or roster, and \`${SWARM_WAIT_TOOL}\` (\`since\`, \`mentions_only?\`) to park cleanly in warm \`waiting\` state when idle.`,
+      `1. **Tools**: Use \`${POST_MESSAGE_TOOL}\` to communicate, \`${READ_BOARD_TOOL}\` (\`since?\`, \`seqs?\`, \`limit?\`, \`channel?\`, \`status?\`) to inspect prior posts or roster, \`${SWARM_TOOL}{action:"mission", mission_op:"status"}\` to inspect live milestones/features/\`VAL-*\` assertions, and \`${SWARM_WAIT_TOOL}\` (\`since\`, \`mentions_only?\`) to park cleanly in warm \`waiting\` state when idle.`,
       "2. **Zero-Copy `#seq` Refs**: Reference earlier board posts by sequence number (e.g. `#4`, `#6`) and fetch them with `read_board{seqs:[4,6]}` — never copy-paste large reports.",
       `3. **\`@mention\` Discipline**: \`@name\` is a wakeup doorbell, never a CC. Tag ONLY the peer(s) who must act next (follow your brief's next-peer doorbell, e.g. \`@validator\`, without waking \`@${ORCHESTRATOR_NAME}\` on intermediate handoffs). Tag \`@${member.parentName}\` when your deliverable has no downstream peer or you hit a blocker only they can resolve.`,
       `4. **Completion Convention**: Start your final deliverable post with \`[done]\` right after the \`@mention\` (e.g. \`@<next-peer-or-${member.parentName}> [done] <concise summary of results, files/commits, and verification>\`).`,
@@ -581,26 +850,28 @@ export function buildMemberSystemPrompt(
       [
         "## Independent Read-Only Validator Rules (Strictly Enforced)",
         "1. **STRICTLY READ-ONLY — NEVER Edit Files**: You are an independent auditor. NEVER create, edit, or delete files, stage changes, or make git commits. `write`, `edit`, `powershell`, and mutating `bash` commands are blocked by protocol.",
-        `2. **Verify Independently**: Treat worker reports as untrusted claims. For \`share\`/\`branch\` workers, audit directly inside each author's isolated worktree \`cwd\` (\`git -C "<cwd>" status --short\`, \`git -C "<cwd>" diff ${run.baseBranch}...HEAD\`, \`git -C "<cwd>" show\`, reading files under \`<cwd>/\`, and running slice typechecks/tests inside \`<cwd>\`) against the Run Objective, Acceptance Criteria, and your brief.`,
-        "3. **Peer-to-Peer Fix Loop**: If you find bugs, regressions, edge-case failures, or missing requirements, post concrete actionable findings (file path, line number, reproduction/command output, and concrete fix) directly to `@<author>` on the board — do NOT bother `@orchestrator` on intermediate bug bounces — then call `swarm_wait` to await their fix and re-audit!",
-        `4. **Sign-Off**: Post \`@${member.parentName} [done] <evidence-backed audit report>\` ONLY when every check passes with zero blocking defects (or escalate clearly to \`@${member.parentName}\` if blocked).`,
-        `5. **Read-Only Helpers**: You may spawn read-only \`role:"validator"\` sub-auditors via \`${SWARM_TOOL}{action:"add"}\` if your audit splits cleanly across independent areas. Tell helpers to report to \`@${member.name}\`, and \`${SWARM_TOOL}{action:"kill"}\` them once integrated.`,
+        `2. **Verify Independently**: Treat worker reports as untrusted claims. Run the configured operational \`commands\` (\`test\`/\`typecheck\`/\`lint\`) and inspect code/runtime behavior directly. For \`share\`/\`branch\` workers, audit inside each author's isolated worktree \`cwd\` (\`git -C "<cwd>" status --short\`, \`git -C "<cwd>" diff ${run.baseBranch}...HEAD\`, \`git -C "<cwd>" show\`, reading files under \`<cwd>/\`, and running slice typechecks/tests inside \`<cwd>\`) against the Run Objective, Acceptance Criteria, \`VAL-*\` Validation Contract, and your brief.`,
+        `3. **Stamp \`VAL-*\` Validation Assertions**: For every \`VAL-*\` assertion in scope (check \`${SWARM_TOOL}{action:"mission", mission_op:"status"}\`), record your verdict via \`${SWARM_TOOL}{action:"mission", mission_op:"verify_assertion", assertion_id, assertion_status, evidence}\` (\`assertion_status:"passed"\` or \`"failed"\` with concrete command/code evidence, or \`"blocked"\`). Passing all assertions of a completed milestone automatically seals that milestone.`,
+        "4. **Peer-to-Peer Fix Loop**: If you find bugs, regressions, edge-case failures, or missing requirements, stamp affected `VAL-*` assertions `\"failed\"` with actionable evidence and post concrete findings (file path, line number, reproduction/command output, and concrete fix) directly to `@<author>` on the board — do NOT bother `@orchestrator` on intermediate bug bounces — then call `swarm_wait` to await their fix and re-audit!",
+        `5. **Sign-Off**: Post \`@${member.parentName} [done] <evidence-backed audit report>\` ONLY when every check and \`VAL-*\` assertion in scope passes with zero blocking defects (or escalate clearly to \`@${member.parentName}\` if blocked).`,
+        `6. **Read-Only Helpers**: You may spawn read-only \`role:"validator"\` sub-auditors via \`${SWARM_TOOL}{action:"add"}\` if your audit splits cleanly across independent areas. Tell helpers to report to \`@${member.name}\`, and \`${SWARM_TOOL}{action:"kill"}\` them once integrated.`,
       ].join("\n"),
     );
     sections.push(buildValidatorPeerWorktreesSection(run, member));
   } else {
     const workspaceCommitRule =
       member.workspace === "inherit"
-        ? `2. **Shared Checkout Discipline**: You are working in \`inherit\` mode at \`${member.cwd}\`. Touch ONLY files owned by your brief so you never collide with sibling workers.`
-        : `2. **Isolated Worktree Commits**: You are working in an isolated worktree at \`${member.cwd}\` on branch \`${member.branch ?? "swarm"}\`. Respect your brief's exclusive file ownership (never edit off-limits files), and commit all intended changes cleanly on your branch with a clean \`git status\` before posting \`[done]\` (include \`commit=<sha>\` and \`workspace=${member.cwd}\` in your \`[done]\` report). NEVER run \`git merge\`, \`git push\`, \`git worktree\`, or switch to \`${run.baseBranch}\` — only \`@${ORCHESTRATOR_NAME}\` merges worktrees.`;
+        ? `2. **Shared Checkout & Boundaries Discipline**: You are working in \`inherit\` mode at \`${member.cwd}\`. Strictly obey Mission Boundaries and touch ONLY files owned by your brief so you never collide with sibling workers.`
+        : `2. **Isolated Worktree Commits & Boundaries**: You are working in an isolated worktree at \`${member.cwd}\` on branch \`${member.branch ?? "swarm"}\`. Strictly obey Mission Boundaries and your brief's exclusive file ownership (never edit off-limits files), and commit all intended changes cleanly on your branch with a clean \`git status\` before posting \`[done]\` (include \`commit=<sha>\` and \`workspace=${member.cwd}\` in your \`[done]\` report). NEVER run \`git merge\`, \`git push\`, \`git worktree\`, or switch to \`${run.baseBranch}\` — only \`@${ORCHESTRATOR_NAME}\` merges worktrees.`;
 
     sections.push(
       [
         "## Worker Execution & Helper Rules",
         `1. **Protected Paths**: NEVER touch \`${SWARM_DIR}/\`, \`.swarm/\`, or \`.git/\` directly — use Swarm tools instead.`,
         workspaceCommitRule,
-        `3. **Verify Before Reporting**: Run the concrete verification commands from your brief (typechecks, tests, build checks) inside \`${member.cwd}\` before posting \`[done]\`. Batch independent read, inspection, or verification shell commands into a single compound \`bash\` call (e.g. \`git status --short && npm run typecheck && npm test\`) instead of running 4–5 serial single-command \`bash\` turns.`,
-        `4. **Spawning & Managing Own Helpers**: You may call \`${SWARM_TOOL}{action:"add", name, brief, ...}\` when your assignment splits into independent pieces or needs an investigator/helper. Tell helpers to report back to \`@${member.name}\` by name. You may call \`${SWARM_TOOL}{action:"model"}\` on yourself (safely deferred to turn end with automatic resume on the new model) or your own waiting helpers, \`${SWARM_TOOL}{action:"steer"/"stop"}\` on your own helpers, and MUST call \`${SWARM_TOOL}{action:"kill"}\` on your own helpers once you integrate their work. You cannot kill other members or call \`title\`/\`merge\`/\`done\`.`,
+        `3. **Verify Using Operational Commands**: Run the configured operational \`commands\` (from Mission Manifest and your brief — never guess \`npx -y <random-pkg>\` when operational commands are configured!) inside \`${member.cwd}\` before posting \`[done]\`. Batch independent read, inspection, or verification shell commands into a single compound \`bash\` call (e.g. \`git status --short && npm run typecheck && npm test\`) instead of running 4–5 serial single-command \`bash\` turns.`,
+        `4. **Structured Feature Handoffs**: When finishing or handing off a Mission feature via \`${POST_MESSAGE_TOOL}\`, always pass structured handoff fields: \`feature_id\` (e.g. \`"feat-auth"\`), \`verification_evidence\` (exact commands & outputs passed), \`discovered_issues\` (any out-of-scope bugs/debt spotted), and \`left_undone\` (any incomplete edge cases). You may also claim or update your assigned feature status via \`${SWARM_TOOL}{action:"mission", mission_op:"update_feature", feature_id, feature_status}\`.`,
+        `5. **Spawning & Managing Own Helpers**: You may call \`${SWARM_TOOL}{action:"add", name, brief, ...}\` when your assignment splits into independent pieces or needs an investigator/helper. Tell helpers to report back to \`@${member.name}\` by name. You may call \`${SWARM_TOOL}{action:"model"}\` on yourself (safely deferred to turn end with automatic resume on the new model) or your own waiting helpers, \`${SWARM_TOOL}{action:"steer"/"stop"}\` on your own helpers, and MUST call \`${SWARM_TOOL}{action:"kill"}\` on your own helpers once you integrate their work. You cannot kill other members, verify \`VAL-*\` assertions, or call \`title\`/\`merge\`/\`done\`.`,
       ].join("\n"),
     );
   }
@@ -645,7 +916,7 @@ export function buildWakeupPrompt(
   ];
   if (member.role === "validator") {
     lines.push(
-      `Validator audit reminder: unmerged \`share\`/\`branch\` worker commits live in each author's isolated worktree \`cwd\` (not \`${member.cwd}\`) — run \`git -C "<cwd>" status --short\`, \`git -C "<cwd>" diff <baseBranch>...HEAD\`, and \`cd "<cwd>" && <slice test command>\` (call \`${READ_BOARD_TOOL}{status:true}\` if you need a peer's \`cwd\`/\`branch\`/merge status).`,
+      `Validator audit reminder: unmerged \`share\`/\`branch\` worker commits live in each author's isolated worktree \`cwd\` (not \`${member.cwd}\`) — run \`git -C "<cwd>" status --short\`, \`git -C "<cwd>" diff <baseBranch>...HEAD\`, and \`cd "<cwd>" && <slice test command>\` (call \`${READ_BOARD_TOOL}{status:true}\` if you need a peer's \`cwd\`/\`branch\`/merge status), and stamp verified \`VAL-*\` assertions via \`${SWARM_TOOL}{action:"mission", mission_op:"verify_assertion", assertion_id, assertion_status, evidence}\`.`,
       "",
     );
   }
