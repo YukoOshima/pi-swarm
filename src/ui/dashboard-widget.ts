@@ -2,7 +2,12 @@ import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { Component, TUI } from "@earendil-works/pi-tui";
 import { ORCHESTRATOR_NAME } from "../constants.js";
 import type {
+  AssertionStatus,
   BoardMessage,
+  FeatureStatus,
+  MissionAssertion,
+  MissionFeature,
+  MissionHandoffItem,
   SwarmChannelRecord,
   SwarmDraftMode,
   SwarmEvent,
@@ -259,13 +264,20 @@ function formatPhaseMilestones(
   if (!phase && milestones.length === 0) return undefined;
 
   const doneCount = milestones.filter((m) => m.status === "done").length;
+  const sealedCount = milestones.filter((m) => Boolean(m.sealed)).length;
   const totalCount = milestones.length;
+  const sealedSuffix =
+    sealedCount > 0
+      ? theme
+        ? ` ${theme.fg("success", `[S] ${sealedCount}`)}`
+        : ` [S] ${sealedCount}`
+      : "";
 
   if (phase && totalCount > 0) {
     const ratio = `[${doneCount}/${totalCount}]`;
     return theme
-      ? `${theme.fg("muted", "Phase:")} ${theme.fg("accent", phase)} ${theme.fg(doneCount === totalCount ? "success" : "muted", ratio)}`
-      : `Phase: ${phase} ${ratio}`;
+      ? `${theme.fg("muted", "Phase:")} ${theme.fg("accent", phase)} ${theme.fg(doneCount === totalCount ? "success" : "muted", ratio)}${sealedSuffix}`
+      : `Phase: ${phase} ${ratio}${sealedSuffix}`;
   }
   if (phase) {
     return theme
@@ -274,8 +286,230 @@ function formatPhaseMilestones(
   }
   const ratio = `[${doneCount}/${totalCount}]`;
   return theme
-    ? `${theme.fg("muted", "Milestones:")} ${theme.fg(doneCount === totalCount ? "success" : "accent", ratio)}`
-    : `Milestones: ${ratio}`;
+    ? `${theme.fg("muted", "Milestones:")} ${theme.fg(doneCount === totalCount ? "success" : "accent", ratio)}${sealedSuffix}`
+    : `Milestones: ${ratio}${sealedSuffix}`;
+}
+
+interface GoalProgressSummary {
+  features: MissionFeature[];
+  featDone: number;
+  featTotal: number;
+  featInProgress: number;
+  featFailed: number;
+  assertions: MissionAssertion[];
+  valPassed: number;
+  valTotal: number;
+  valFailed: number;
+  valBlocked: number;
+  openDebtItems: MissionHandoffItem[];
+  openHandoffs: MissionHandoffItem[];
+  sealedMilestoneLabels: string[];
+  hasCompactBadges: boolean;
+  hasExpandedSection: boolean;
+}
+
+function summarizeGoalProgress(run: SwarmRunState): GoalProgressSummary {
+  const features = run.features ?? [];
+  const nonCancelled = features.filter((f) => f.status !== "cancelled");
+  const featTotal =
+    features.length > 0
+      ? nonCancelled.length > 0
+        ? nonCancelled.length
+        : features.length
+      : 0;
+  const featDone = nonCancelled.filter((f) => f.status === "completed").length;
+  const featInProgress = nonCancelled.filter((f) => f.status === "in_progress").length;
+  const featFailed = nonCancelled.filter((f) => f.status === "failed").length;
+
+  const assertions = run.assertions ?? [];
+  const valTotal = assertions.length;
+  const valPassed = assertions.filter((a) => a.status === "passed").length;
+  const valFailed = assertions.filter((a) => a.status === "failed").length;
+  const valBlocked = assertions.filter((a) => a.status === "blocked").length;
+
+  const handoffItems = run.handoffItems ?? [];
+  const openHandoffs = handoffItems.filter((h) => h.resolution === "open");
+  const openDebtItems = openHandoffs.filter(
+    (h) => h.type === "discovered_issue" || h.type === "incomplete_work",
+  );
+
+  const sealedMilestoneLabels = (run.milestones ?? [])
+    .filter((m) => Boolean(m.sealed))
+    .map((m) => sanitizePlainText(m.label))
+    .filter(Boolean);
+
+  const hasCompactBadges =
+    features.length > 0 || assertions.length > 0 || openDebtItems.length > 0;
+  const hasExpandedSection =
+    hasCompactBadges || sealedMilestoneLabels.length > 0;
+
+  return {
+    features,
+    featDone,
+    featTotal,
+    featInProgress,
+    featFailed,
+    assertions,
+    valPassed,
+    valTotal,
+    valFailed,
+    valBlocked,
+    openDebtItems,
+    openHandoffs,
+    sealedMilestoneLabels,
+    hasCompactBadges,
+    hasExpandedSection,
+  };
+}
+
+function formatAsciiProgressBar(done: number, total: number, cells = 4): string {
+  if (total <= 0 || cells <= 0) return "";
+  const clampedDone = Math.max(0, Math.min(total, done));
+  let filled = Math.round((clampedDone / total) * cells);
+  if (clampedDone < total && filled >= cells) {
+    filled = Math.max(0, cells - 1);
+  }
+  if (clampedDone > 0 && filled === 0 && cells >= 4 && clampedDone / total >= 0.15) {
+    filled = 1;
+  }
+  return `[${"█".repeat(filled)}${"░".repeat(cells - filled)}]`;
+}
+
+function formatFeatureStatusGlyph(status: FeatureStatus, theme?: Theme): string {
+  switch (status) {
+    case "completed":
+      return theme ? theme.fg("success", "[✓]") : "[✓]";
+    case "in_progress":
+      return theme ? theme.fg("accent", "[▸]") : "[▸]";
+    case "failed":
+      return theme ? theme.fg("error", "[!]") : "[!]";
+    case "cancelled":
+      return theme ? theme.fg("dim", "[~]") : "[~]";
+    case "pending":
+      return theme ? theme.fg("muted", "[ ]") : "[ ]";
+  }
+}
+
+function formatAssertionStatusGlyph(status: AssertionStatus, theme?: Theme): string {
+  switch (status) {
+    case "passed":
+      return theme ? theme.fg("success", "[✓]") : "[✓]";
+    case "failed":
+      return theme ? theme.fg("error", "[✗]") : "[✗]";
+    case "blocked":
+      return theme ? theme.fg("warning", "[!]") : "[!]";
+    case "pending":
+      return theme ? theme.fg("muted", "[ ]") : "[ ]";
+  }
+}
+
+function formatCompactGoalBadges(
+  goal: GoalProgressSummary,
+  options?: { includeBar?: boolean; includeSealed?: boolean; theme?: Theme },
+): string {
+  const theme = options?.theme;
+  const includeBar = options?.includeBar ?? false;
+  const includeSealed = options?.includeSealed ?? false;
+  const sep = theme ? theme.fg("dim", " · ") : " · ";
+  const parts: string[] = [];
+
+  if (goal.features.length > 0) {
+    const bar = includeBar
+      ? `${formatAsciiProgressBar(goal.featDone, goal.featTotal, 4)} `
+      : "";
+    const ratioRaw = `${bar}${goal.featDone}/${goal.featTotal}`;
+    if (theme) {
+      const ratioColor =
+        goal.featFailed > 0
+          ? "error"
+          : goal.featDone === goal.featTotal && goal.featTotal > 0
+            ? "success"
+            : "accent";
+      parts.push(`${theme.fg("muted", "Feat")} ${theme.fg(ratioColor, ratioRaw)}`);
+    } else {
+      parts.push(`Feat ${ratioRaw}`);
+    }
+  }
+
+  if (goal.assertions.length > 0) {
+    const bar =
+      includeBar && goal.features.length === 0
+        ? `${formatAsciiProgressBar(goal.valPassed, goal.valTotal, 4)} `
+        : "";
+    const ratioRaw = `${bar}${goal.valPassed}/${goal.valTotal}`;
+    if (theme) {
+      const valColor =
+        goal.valFailed > 0
+          ? "error"
+          : goal.valPassed === goal.valTotal && goal.valTotal > 0
+            ? "success"
+            : "accent";
+      parts.push(`${theme.fg("muted", "VAL")} ${theme.fg(valColor, ratioRaw)}`);
+    } else {
+      parts.push(`VAL ${ratioRaw}`);
+    }
+  }
+
+  if (includeSealed && goal.sealedMilestoneLabels.length > 0) {
+    const sealedRaw = `[S] ${goal.sealedMilestoneLabels.length}`;
+    parts.push(theme ? theme.fg("success", sealedRaw) : sealedRaw);
+  }
+
+  if (goal.openDebtItems.length > 0) {
+    const debtRaw = `!${goal.openDebtItems.length} debt`;
+    parts.push(theme ? theme.fg("warning", debtRaw) : debtRaw);
+  }
+
+  return parts.join(sep);
+}
+
+function selectGoalPreviewFeatures(
+  features: readonly MissionFeature[],
+  limit: number,
+): MissionFeature[] {
+  if (limit <= 0 || features.length === 0) return [];
+  if (features.length <= limit) return [...features];
+
+  const rank = (s: FeatureStatus): number => {
+    switch (s) {
+      case "failed":
+        return 0;
+      case "in_progress":
+        return 1;
+      case "pending":
+        return 2;
+      case "completed":
+        return 3;
+      case "cancelled":
+        return 4;
+    }
+  };
+
+  const indexed = features.map((f, idx) => ({ f, idx }));
+  const chosenIndices = new Set<number>();
+
+  // Ensure at least one completed feature is represented when space >= 3 so progress is visible alongside active/failed work
+  if (limit >= 3) {
+    const lastCompleted = [...indexed]
+      .reverse()
+      .find((item) => item.f.status === "completed");
+    if (lastCompleted) {
+      chosenIndices.add(lastCompleted.idx);
+    }
+  }
+
+  const prioritized = [...indexed].sort(
+    (a, b) => rank(a.f.status) - rank(b.f.status) || a.idx - b.idx,
+  );
+  for (const item of prioritized) {
+    if (chosenIndices.size >= limit) break;
+    chosenIndices.add(item.idx);
+  }
+
+  return indexed
+    .filter((item) => chosenIndices.has(item.idx))
+    .sort((a, b) => rank(a.f.status) - rank(b.f.status) || a.idx - b.idx)
+    .map((item) => item.f);
 }
 
 function resolveEffectiveRoleModels(
@@ -496,6 +730,16 @@ export class SwarmDashboardComponent implements Component {
     }
 
     const metaParts: string[] = [];
+    const goal = summarizeGoalProgress(run);
+    if (goal.hasCompactBadges) {
+      metaParts.push(
+        formatCompactGoalBadges(goal, {
+          includeBar: false,
+          includeSealed: false,
+          theme: this.theme,
+        }),
+      );
+    }
     if (mergedCount > 0) {
       metaParts.push(this.theme.fg("success", `${mergedCount} merged`));
     } else if (memberCount > 0) {
@@ -597,8 +841,9 @@ export class SwarmDashboardComponent implements Component {
       lines.push(fitLine(joinColumns(`  ${modelsPill}`, shortcutTag, width), width));
     }
 
-    // Mission phase & milestones progress (when set)
+    // Mission phase & milestones progress (when set) + live Goal Progress badges
     const phaseProgress = formatPhaseMilestones(run, this.theme);
+    const goal = summarizeGoalProgress(run);
     if (phaseProgress) {
       const costRight =
         snapshot.totalCost > 0
@@ -609,6 +854,20 @@ export class SwarmDashboardComponent implements Component {
           ? fitLine(joinColumns(`  ${phaseProgress}`, costRight, width), width)
           : fitLine(`  ${phaseProgress}`, width),
       );
+    }
+    if (goal.hasCompactBadges) {
+      const goalBadges = formatCompactGoalBadges(goal, {
+        includeBar: width >= 68,
+        includeSealed: width >= 60 && !phaseProgress,
+        theme: this.theme,
+      });
+      const lead = width >= 68 ? `${this.theme.fg("accent", "◆")} ` : "";
+      const activeFeat = goal.features.find((f) => f.status === "in_progress");
+      const activeTail =
+        activeFeat && width >= 88
+          ? `${this.theme.fg("dim", " · ")}${this.theme.fg("accent", "▸")} ${this.theme.bold(sanitizePlainText(activeFeat.id))}: ${this.theme.fg("muted", sanitizePlainText(activeFeat.title))}`
+          : "";
+      lines.push(fitLine(`  ${lead}${goalBadges}${activeTail}`, width));
     }
 
     // Active working members (up to 4 + "+N more"), or awaiting-orchestrator hint when active with 0 working
@@ -709,8 +968,10 @@ export class SwarmDashboardComponent implements Component {
     }
 
     // Phase & Milestones progress (when set)
+    const goal = summarizeGoalProgress(run);
+    const tightGoalHeight = goal.hasExpandedSection && maxInner <= 12;
     const phaseProgress = formatPhaseMilestones(run, this.theme);
-    if (phaseProgress) {
+    if (phaseProgress && !tightGoalHeight) {
       body.push(fitLine(phaseProgress, innerWidth));
     }
 
@@ -727,39 +988,181 @@ export class SwarmDashboardComponent implements Component {
     );
     body.push(fitLine(`${modelsPrefix}${modelsLine}`, innerWidth));
 
-    // Channels summary (skip only on ultra-cramped heights so roster & newest board post stay visible)
+    // Channels summary (skip on cramped heights so Goal Progress, roster & newest board post stay visible)
     const channelsText = formatChannelsSummaryInline(run, this.theme);
-    if (maxInner - body.length >= 7) {
+    if ((!goal.hasExpandedSection || maxInner >= 14) && maxInner - body.length >= 7) {
       body.push(
         fitLine(`${this.theme.fg("muted", "Channels: ")}${channelsText}`, innerWidth),
       );
     }
 
-    // Active idle status hint when 0 working and >0 waiting/stopped
-    if (run.status === "active" && workingCount === 0 && waitingCount > 0 && maxInner - body.length >= 6) {
-      const idleHint = `${this.theme.fg("warning", "⏳ 0 working")}${this.theme.fg("muted", ` — awaiting @${ORCHESTRATOR_NAME} next step`)}`;
+    // Active idle status hint when 0 working and >0 waiting/stopped (1-cell safe glyphs inside renderBox)
+    if (run.status === "active" && workingCount === 0 && waitingCount > 0 && maxInner - body.length >= (goal.hasExpandedSection ? 8 : 6)) {
+      const idleHint = `${this.theme.fg("warning", "◇ 0 working")}${this.theme.fg("muted", ` — awaiting @${ORCHESTRATOR_NAME} next step`)}`;
       body.push(fitLine(idleHint, innerWidth));
-    } else if (run.status === "active" && workingCount === 0 && stoppedCount > 0 && maxInner - body.length >= 6) {
-      const stoppedHint = `${this.theme.fg("warning", `⏳ 0 working · ${stoppedCount} stopped`)}${this.theme.fg("muted", " — press Alt+S to retry or /swarm resume")}`;
+    } else if (run.status === "active" && workingCount === 0 && stoppedCount > 0 && maxInner - body.length >= (goal.hasExpandedSection ? 8 : 6)) {
+      const stoppedHint = `${this.theme.fg("warning", `! 0 working · ${stoppedCount} stopped`)}${this.theme.fg("muted", " — press Alt+S to retry or /swarm resume")}`;
       body.push(fitLine(stoppedHint, innerWidth));
     }
 
     // Rate-limit notice if active
-    if (snapshot.rateLimitUntil && snapshot.rateLimitUntil > nowMs && maxInner - body.length >= 5) {
+    if (snapshot.rateLimitUntil && snapshot.rateLimitUntil > nowMs && maxInner - body.length >= (goal.hasExpandedSection ? 7 : 5)) {
       const rem = formatDuration(snapshot.rateLimitUntil - nowMs);
       const reason = snapshot.rateLimitReason
         ? ` — ${sanitizePlainText(snapshot.rateLimitReason)}`
         : "";
       body.push(
         fitLine(
-          this.theme.fg("warning", `⏳ Rate-limit backoff (${rem})${reason}`),
+          this.theme.fg("warning", `! Rate-limit backoff (${rem})${reason}`),
           innerWidth,
         ),
       );
     }
 
-    // Full Roster table (Name | Role | State | Model | Workspace | Turns | Activity)
+    // Live Goal Progress section (features, VAL-* contract ratio, sealed milestones [S], open debt)
     const members = getSortedMembers(run);
+    const recentBoard = snapshot.recentBoard.slice(-this.maxRecentBoard);
+    if (goal.hasExpandedSection) {
+      if (maxInner <= 8) {
+        const badges = formatCompactGoalBadges(goal, {
+          includeBar: innerWidth >= 68,
+          includeSealed: true,
+          theme: this.theme,
+        });
+        body.push(
+          fitLine(`${this.theme.fg("accent", "◆ Goal Progress:")} ${badges}`, innerWidth),
+        );
+      } else if (maxInner <= 13) {
+        const plainBadges = formatCompactGoalBadges(goal, {
+          includeBar: innerWidth >= 78,
+          includeSealed: false,
+        });
+        const sealedLabel =
+          goal.sealedMilestoneLabels.length > 0
+            ? ` · [S] ${goal.sealedMilestoneLabels[0]}${goal.sealedMilestoneLabels.length > 1 ? `+${goal.sealedMilestoneLabels.length - 1}` : ""}`
+            : "";
+        const ruleTitle =
+          innerWidth >= 56 && (plainBadges || sealedLabel)
+            ? `Goal Progress (${plainBadges}${plainBadges ? sealedLabel : sealedLabel.replace(/^ · /, "")})`
+            : "Goal Progress";
+        body.push(renderHorizontalRule(innerWidth, ruleTitle, this.theme));
+
+        if (innerWidth < 56) {
+          const compactBadges = formatCompactGoalBadges(goal, {
+            includeBar: false,
+            includeSealed: true,
+            theme: this.theme,
+          });
+          const miniFeats = selectGoalPreviewFeatures(goal.features, 2)
+            .map(
+              (f) =>
+                `${formatFeatureStatusGlyph(f.status, this.theme)} ${sanitizePlainText(f.id)}`,
+            )
+            .join(" ");
+          body.push(
+            fitLine(
+              miniFeats ? `${compactBadges} · ${miniFeats}` : compactBadges,
+              innerWidth,
+            ),
+          );
+        } else if (goal.features.length > 0) {
+          const pillFeats = selectGoalPreviewFeatures(goal.features, 4).map((f) => {
+            const g = formatFeatureStatusGlyph(f.status, this.theme);
+            const owner =
+              innerWidth >= 88 && f.assignedMember
+                ? ` ${this.theme.fg("dim", `(@${sanitizePlainText(f.assignedMember)})`)}`
+                : "";
+            return `${g} ${this.theme.bold(sanitizePlainText(f.id))}${owner}`;
+          });
+          body.push(
+            fitLine(`  ${pillFeats.join(this.theme.fg("dim", " · "))}`, innerWidth),
+          );
+        } else if (goal.assertions.length > 0) {
+          const pillVals = goal.assertions.slice(0, 4).map(
+            (a) =>
+              `${formatAssertionStatusGlyph(a.status, this.theme)} ${sanitizePlainText(a.id)}`,
+          );
+          body.push(
+            fitLine(`  ${pillVals.join(this.theme.fg("dim", " · "))}`, innerWidth),
+          );
+        } else if (goal.sealedMilestoneLabels.length > 0) {
+          body.push(
+            fitLine(
+              `  ${this.theme.fg("success", "[S]")} ${this.theme.fg("muted", goal.sealedMilestoneLabels.join(", "))}`,
+              innerWidth,
+            ),
+          );
+        }
+      } else {
+        body.push(renderHorizontalRule(innerWidth, "Goal Progress", this.theme));
+        const badges = formatCompactGoalBadges(goal, {
+          includeBar: innerWidth >= 56,
+          includeSealed: false,
+          theme: this.theme,
+        });
+        const sealedStr =
+          goal.sealedMilestoneLabels.length > 0
+            ? `${badges ? this.theme.fg("dim", " · ") : ""}${this.theme.fg("success", "[S]")} ${this.theme.fg("muted", goal.sealedMilestoneLabels.join(", "))}`
+            : "";
+        body.push(fitLine(`  ${badges}${sealedStr}`, innerWidth));
+
+        const minRosterAndBoardReserve =
+          (members.length > 0 ? 4 : 2) + (recentBoard.length > 0 ? 2 : 0);
+        const itemSlotBudget = Math.min(
+          maxInner >= 20 ? 4 : 3,
+          Math.max(0, maxInner - body.length - minRosterAndBoardReserve),
+        );
+        if (itemSlotBudget > 0 && goal.features.length > 0) {
+          const sealedSet = new Set(goal.sealedMilestoneLabels);
+          const previewCount =
+            goal.features.length > itemSlotBudget && itemSlotBudget >= 2
+              ? itemSlotBudget - 1
+              : itemSlotBudget;
+          const previewFeats = selectGoalPreviewFeatures(goal.features, previewCount);
+          for (const f of previewFeats) {
+            const glyph = formatFeatureStatusGlyph(f.status, this.theme);
+            const msClean = sanitizePlainText(f.milestone);
+            const msBadge = msClean
+              ? ` ${this.theme.fg("muted", `[${msClean}${sealedSet.has(msClean) ? " [S]" : ""}]`)}`
+              : "";
+            const ownerBadge = f.assignedMember
+              ? ` ${this.theme.fg("accent", `@${sanitizePlainText(f.assignedMember)}`)}`
+              : "";
+            const fulfillsBadge =
+              f.fulfills.length > 0 && innerWidth >= 72
+                ? ` ${this.theme.fg("dim", `-> ${f.fulfills.map(sanitizePlainText).join(",")}`)}`
+                : "";
+            body.push(
+              fitLine(
+                `  ${glyph} ${this.theme.bold(sanitizePlainText(f.id))}: ${sanitizePlainText(f.title)}${msBadge}${ownerBadge}${fulfillsBadge}`,
+                innerWidth,
+              ),
+            );
+          }
+          if (goal.features.length > previewFeats.length && body.length < maxInner - minRosterAndBoardReserve) {
+            const hidden = goal.features.length - previewFeats.length;
+            body.push(
+              fitLine(
+                this.theme.fg("dim", `  … +${hidden} more feature${hidden === 1 ? "" : "s"}`),
+                innerWidth,
+              ),
+            );
+          }
+        } else if (itemSlotBudget > 0 && goal.assertions.length > 0) {
+          for (const a of goal.assertions.slice(0, itemSlotBudget)) {
+            const glyph = formatAssertionStatusGlyph(a.status, this.theme);
+            body.push(
+              fitLine(
+                `  ${glyph} ${this.theme.bold(sanitizePlainText(a.id))}: ${sanitizePlainText(a.title)}`,
+                innerWidth,
+              ),
+            );
+          }
+        }
+      }
+    }
+
+    // Full Roster table (Name | Role | State | Model | Workspace | Turns | Activity)
     body.push(
       renderHorizontalRule(
         innerWidth,
@@ -767,8 +1170,6 @@ export class SwarmDashboardComponent implements Component {
         this.theme,
       ),
     );
-
-    const recentBoard = snapshot.recentBoard.slice(-this.maxRecentBoard);
 
     if (members.length === 0) {
       body.push(
@@ -1034,6 +1435,15 @@ export function formatStatusLine(
     leadTokens.join(" "),
     formatFleetSummary(workingCount, waitingCount, stoppedCount, mergedCount),
   ];
+  const goal = summarizeGoalProgress(run);
+  if (goal.hasCompactBadges) {
+    parts.push(
+      formatCompactGoalBadges(goal, {
+        includeBar: false,
+        includeSealed: false,
+      }),
+    );
+  }
   if (run.status === "active" && workingCount === 0 && waitingCount > 0) {
     parts.push(`⏳ awaiting @${ORCHESTRATOR_NAME}`);
   }
@@ -1133,6 +1543,151 @@ export function formatZeroTurnStatusDashboard(
       ? ` (${sanitizePlainText(snapshot.rateLimitReason)})`
       : "";
     out.push(`- **Rate-Limit Backoff:** ${rem} remaining${reason}`);
+  }
+
+  const goal = summarizeGoalProgress(run);
+  if (goal.hasExpandedSection) {
+    const goalSegments: string[] = [];
+    if (goal.features.length > 0) {
+      goalSegments.push(`Features ${goal.featDone}/${goal.featTotal} completed`);
+    }
+    if (goal.assertions.length > 0) {
+      goalSegments.push(
+        `Validation Contract ${goal.valPassed}/${goal.valTotal} \`VAL-*\` passed`,
+      );
+    }
+    if (goal.sealedMilestoneLabels.length > 0) {
+      goalSegments.push(
+        `Sealed: ${goal.sealedMilestoneLabels.map((m) => `\`${escapeMdCell(m)}\` \`[S]\``).join(", ")}`,
+      );
+    }
+    if (goal.openDebtItems.length > 0) {
+      goalSegments.push(`Open Debt: !${goal.openDebtItems.length}`);
+    }
+    if (goalSegments.length > 0) {
+      out.push(`- **Goal Progress:** ${goalSegments.join(" · ")}`);
+    }
+  }
+  if (run.lastAudit) {
+    const auditorPart = run.lastAudit.auditor
+      ? ` by \`@${escapeMdCell(run.lastAudit.auditor)}\``
+      : "";
+    out.push(
+      `- **Last Audit:** \`${escapeMdCell(run.lastAudit.verdict)}\`${auditorPart} — ${sanitizePlainText(run.lastAudit.summary)}`,
+    );
+  }
+
+  const sealedMilestoneSet = new Set(goal.sealedMilestoneLabels);
+
+  // Mission Features Table
+  if (run.features && run.features.length > 0) {
+    out.push("");
+    out.push(
+      `#### Mission Features (${goal.featDone}/${goal.featTotal} completed)`,
+    );
+    out.push("| ID | Milestone | Status | Assigned | Fulfills |");
+    out.push("| --- | --- | --- | --- | --- |");
+    for (const f of run.features) {
+      const idCell = f.title
+        ? `\`${escapeMdCell(f.id)}\` — ${escapeMdCell(f.title)}`
+        : `\`${escapeMdCell(f.id)}\``;
+      const msClean = sanitizePlainText(f.milestone);
+      const msCell = msClean
+        ? `${escapeMdCell(msClean)}${sealedMilestoneSet.has(msClean) ? " `[S]`" : ""}`
+        : "—";
+      const shaSuffix = f.mergedCommitSha
+        ? ` (\`${escapeMdCell(f.mergedCommitSha.slice(0, 7))}\`)`
+        : "";
+      const statusCell = `${formatFeatureStatusGlyph(f.status)} \`${escapeMdCell(f.status)}\`${shaSuffix}`;
+      const assignedCell = f.assignedMember
+        ? `\`@${escapeMdCell(f.assignedMember)}\``
+        : "—";
+      const fulfillsCell =
+        f.fulfills.length > 0
+          ? f.fulfills.map((v) => `\`${escapeMdCell(v)}\``).join(", ")
+          : "—";
+      out.push(
+        `| ${idCell} | ${msCell} | ${statusCell} | ${assignedCell} | ${fulfillsCell} |`,
+      );
+    }
+  }
+
+  // Validation Contract (VAL-*) Table
+  if (run.assertions && run.assertions.length > 0) {
+    out.push("");
+    out.push(
+      `#### Validation Contract (${goal.valPassed}/${goal.valTotal} passed)`,
+    );
+    out.push("| ID | Status | Verified By | Title / Evidence |");
+    out.push("| --- | --- | --- | --- |");
+    for (const a of run.assertions) {
+      const statusCell = `${formatAssertionStatusGlyph(a.status)} \`${escapeMdCell(a.status)}\``;
+      const verifiedCell = a.verifiedBy
+        ? `\`@${escapeMdCell(a.verifiedBy)}\`${a.verifiedByRole ? ` (${escapeMdCell(a.verifiedByRole)})` : ""}`
+        : "—";
+      const evidenceSuffix = a.evidence
+        ? ` — _${escapeMdCell(a.evidence)}_`
+        : a.evidenceRequired
+          ? ` _(req: ${escapeMdCell(a.evidenceRequired)})_`
+          : "";
+      const titleEvidenceCell = `${escapeMdCell(a.title)}${evidenceSuffix}`;
+      out.push(
+        `| \`${escapeMdCell(a.id)}\` | ${statusCell} | ${verifiedCell} | ${titleEvidenceCell} |`,
+      );
+    }
+  }
+
+  // Open Handoff Tech-Debt
+  if (run.handoffItems && run.handoffItems.length > 0) {
+    out.push("");
+    const openCount = goal.openHandoffs.length;
+    out.push(
+      `#### Open Handoff Tech-Debt (${openCount} open / ${run.handoffItems.length} total)`,
+    );
+    const orderedHandoffs = [
+      ...run.handoffItems.filter((h) => h.resolution === "open"),
+      ...run.handoffItems.filter((h) => h.resolution !== "open"),
+    ];
+    out.push("| ID | Type | Source | Resolution | Summary |");
+    out.push("| --- | --- | --- | --- | --- |");
+    for (const h of orderedHandoffs) {
+      const srcFeat = h.sourceFeatureId
+        ? ` (\`${escapeMdCell(h.sourceFeatureId)}\`)`
+        : "";
+      const sourceCell = `\`@${escapeMdCell(h.sourceMember)}\`${srcFeat}`;
+      const tracked = h.trackedFeatureId
+        ? ` -> \`${escapeMdCell(h.trackedFeatureId)}\``
+        : "";
+      const resCell = `\`${escapeMdCell(h.resolution)}\`${tracked}`;
+      const justSuffix = h.justification
+        ? ` _(${escapeMdCell(h.justification)})_`
+        : "";
+      out.push(
+        `| \`${escapeMdCell(h.id)}\` | \`${escapeMdCell(h.type)}\` | ${sourceCell} | ${resCell} | ${escapeMdCell(h.summary)}${justSuffix} |`,
+      );
+    }
+  }
+
+  // Commands & Boundaries
+  const hasCommands = Boolean(run.commands && run.commands.length > 0);
+  const hasBoundaries = Boolean(run.boundaries && run.boundaries.length > 0);
+  if (hasCommands || hasBoundaries) {
+    out.push("");
+    out.push("#### Commands & Boundaries");
+    if (hasCommands && run.commands) {
+      out.push("| Command | Shell |");
+      out.push("| --- | --- |");
+      for (const cmd of run.commands) {
+        out.push(
+          `| \`${escapeMdCell(cmd.name)}\` | \`${escapeMdCell(cmd.command)}\` |`,
+        );
+      }
+    }
+    if (hasBoundaries && run.boundaries) {
+      for (const b of run.boundaries) {
+        out.push(`- **Boundary:** ${sanitizePlainText(b)}`);
+      }
+    }
   }
 
   // 3-Role Models
@@ -1247,6 +1802,9 @@ export function formatZeroTurnStatusDashboard(
 
   return out.join("\n");
 }
+
+/** Alias for `/swarm status` zero-turn Markdown formatter. */
+export const formatZeroTurnStatusView = formatZeroTurnStatusDashboard;
 
 /**
  * Zero-LLM-turn formatter for `/swarm board [N]` — Antigravity-Swarm-style

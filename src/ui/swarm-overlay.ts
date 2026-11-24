@@ -11,11 +11,16 @@ import {
 import { DEFAULT_CHANNEL, DEFAULT_SWARM_SETTINGS, ORCHESTRATOR_NAME } from "../constants.js";
 import { parseModelSpec } from "../store/index.js";
 import type {
+  AssertionStatus,
   AvailableModelInfo,
   BoardMessage,
   DiffSummary,
+  FeatureStatus,
   ISwarmEngine,
   IWorktreeManager,
+  MissionAssertion,
+  MissionFeature,
+  MissionHandoffItem,
   SwarmMemberRecord,
   SwarmRunState,
   SwarmSnapshot,
@@ -60,12 +65,15 @@ import {
 } from "./text-utils.js";
 
 export type SwarmOverlayTab = "board" | "members" | "graph" | "search";
+export type SwarmOverlayGraphView = "graph" | "contract";
 
 export interface SwarmOverlayOptions {
   onModalEnter?: () => void;
   onModalExit?: () => void;
   /** Initial active tab (default: "board"). */
   initialTab?: SwarmOverlayTab;
+  /** Initial sub-view on the Graph tab ("graph" | "contract", default: "graph"). */
+  initialGraphView?: SwarmOverlayGraphView;
   /** Optional member name to pre-select on the Members tab. */
   initialMemberName?: string;
   /** Optional channel filter to pre-select on the Board tab ("*" for all). */
@@ -186,6 +194,444 @@ function countOverlayFleetStates(
   };
 }
 
+interface OverlayGoalSummary {
+  features: MissionFeature[];
+  featDone: number;
+  featTotal: number;
+  featFailed: number;
+  assertions: MissionAssertion[];
+  valPassed: number;
+  valTotal: number;
+  valFailed: number;
+  openHandoffs: MissionHandoffItem[];
+  openDebtItems: MissionHandoffItem[];
+  sealedMilestones: string[];
+  hasPipelineGoal: boolean;
+  hasMissionInspector: boolean;
+}
+
+function summarizeOverlayGoal(run: SwarmRunState): OverlayGoalSummary {
+  const features = run.features ?? [];
+  const nonCancelled = features.filter((f) => f.status !== "cancelled");
+  const featTotal =
+    features.length > 0
+      ? nonCancelled.length > 0
+        ? nonCancelled.length
+        : features.length
+      : 0;
+  const featDone = nonCancelled.filter((f) => f.status === "completed").length;
+  const featFailed = nonCancelled.filter((f) => f.status === "failed").length;
+
+  const assertions = run.assertions ?? [];
+  const valTotal = assertions.length;
+  const valPassed = assertions.filter((a) => a.status === "passed").length;
+  const valFailed = assertions.filter((a) => a.status === "failed").length;
+
+  const openHandoffs = (run.handoffItems ?? []).filter(
+    (h) => h.resolution === "open",
+  );
+  const openDebtItems = openHandoffs.filter(
+    (h) => h.type === "discovered_issue" || h.type === "incomplete_work",
+  );
+
+  const sealedMilestones = (run.milestones ?? [])
+    .filter((m) => Boolean(m.sealed))
+    .map((m) => sanitizePlainText(m.label))
+    .filter(Boolean);
+
+  const hasPipelineGoal =
+    features.length > 0 ||
+    assertions.length > 0 ||
+    sealedMilestones.length > 0 ||
+    openDebtItems.length > 0;
+  const hasMissionInspector =
+    hasPipelineGoal ||
+    openHandoffs.length > 0 ||
+    Boolean(run.commands?.length || run.boundaries?.length || run.lastAudit);
+
+  return {
+    features,
+    featDone,
+    featTotal,
+    featFailed,
+    assertions,
+    valPassed,
+    valTotal,
+    valFailed,
+    openHandoffs,
+    openDebtItems,
+    sealedMilestones,
+    hasPipelineGoal,
+    hasMissionInspector,
+  };
+}
+
+function overlayProgressBar(done: number, total: number, cells = 4): string {
+  if (total <= 0 || cells <= 0) return "";
+  const clamped = Math.max(0, Math.min(total, done));
+  let filled = Math.round((clamped / total) * cells);
+  if (clamped < total && filled >= cells) filled = Math.max(0, cells - 1);
+  if (clamped > 0 && filled === 0 && cells >= 4 && clamped / total >= 0.15) {
+    filled = 1;
+  }
+  return `[${"█".repeat(filled)}${"░".repeat(cells - filled)}]`;
+}
+
+function overlayFeatureGlyph(status: FeatureStatus, theme?: Theme): string {
+  switch (status) {
+    case "completed":
+      return theme ? theme.fg("success", "[✓]") : "[✓]";
+    case "in_progress":
+      return theme ? theme.fg("accent", "[▸]") : "[▸]";
+    case "failed":
+      return theme ? theme.fg("error", "[!]") : "[!]";
+    case "cancelled":
+      return theme ? theme.fg("dim", "[~]") : "[~]";
+    case "pending":
+      return theme ? theme.fg("muted", "[ ]") : "[ ]";
+  }
+}
+
+function overlayAssertionGlyph(status: AssertionStatus, theme?: Theme): string {
+  switch (status) {
+    case "passed":
+      return theme ? theme.fg("success", "[✓]") : "[✓]";
+    case "failed":
+      return theme ? theme.fg("error", "[✗]") : "[✗]";
+    case "blocked":
+      return theme ? theme.fg("warning", "[!]") : "[!]";
+    case "pending":
+      return theme ? theme.fg("muted", "[ ]") : "[ ]";
+  }
+}
+
+function buildMissionContractLines(
+  run: SwarmRunState,
+  width: number,
+  theme?: Theme,
+): string[] {
+  const targetWidth = Math.max(0, Math.floor(width));
+  if (targetWidth === 0) return [];
+
+  const goal = summarizeOverlayGoal(run);
+  const sealedSet = new Set(goal.sealedMilestones);
+  const sep = theme ? theme.fg("dim", " · ") : " · ";
+  const lines: string[] = [];
+
+  lines.push(
+    targetWidth >= 46
+      ? renderHorizontalRule(
+          targetWidth,
+          "Mission Contract & Features [v: Spawn Graph]",
+          theme,
+        )
+      : renderHorizontalRule(targetWidth, "Contract & Features", theme),
+  );
+
+  // Overview progress bar & contract summary
+  const overviewParts: string[] = [];
+  if (goal.features.length > 0) {
+    const bar =
+      targetWidth >= 56
+        ? `${overlayProgressBar(goal.featDone, goal.featTotal, 4)} `
+        : "";
+    const ratio = `${bar}${goal.featDone}/${goal.featTotal}`;
+    overviewParts.push(
+      theme
+        ? `${theme.fg("muted", "Features")} ${theme.fg(goal.featFailed > 0 ? "error" : goal.featDone === goal.featTotal && goal.featTotal > 0 ? "success" : "accent", ratio)}`
+        : `Features ${ratio}`,
+    );
+  }
+  if (goal.assertions.length > 0) {
+    const ratio = `${goal.valPassed}/${goal.valTotal}`;
+    overviewParts.push(
+      theme
+        ? `${theme.fg("muted", "VAL")} ${theme.fg(goal.valFailed > 0 ? "error" : goal.valPassed === goal.valTotal && goal.valTotal > 0 ? "success" : "accent", ratio)}`
+        : `VAL ${ratio}`,
+    );
+  }
+  if (goal.sealedMilestones.length > 0) {
+    const sRaw = `[S] ${goal.sealedMilestones.length} sealed`;
+    overviewParts.push(theme ? theme.fg("success", sRaw) : sRaw);
+  }
+  if (goal.openDebtItems.length > 0) {
+    const dRaw = `!${goal.openDebtItems.length} debt`;
+    overviewParts.push(theme ? theme.fg("warning", dRaw) : dRaw);
+  }
+  if (overviewParts.length > 0) {
+    const lead = theme ? theme.fg("accent", "◆") : "◆";
+    lines.push(fitLine(`${lead} ${overviewParts.join(sep)}`, targetWidth));
+  }
+  if (run.lastAudit) {
+    const verdictRaw = `[${sanitizePlainText(run.lastAudit.verdict).toUpperCase()}]`;
+    const verdictStyled = theme
+      ? theme.fg(
+          run.lastAudit.verdict === "approved" ? "success" : "error",
+          verdictRaw,
+        )
+      : verdictRaw;
+    const auditorStr = run.lastAudit.auditor
+      ? ` by @${sanitizePlainText(run.lastAudit.auditor)}`
+      : "";
+    lines.push(
+      fitLine(
+        `  ${theme ? theme.fg("muted", "Audit:") : "Audit:"} ${verdictStyled}${theme ? theme.fg("dim", auditorStr) : auditorStr} — ${sanitizePlainText(run.lastAudit.summary)}`,
+        targetWidth,
+      ),
+    );
+  }
+
+  // 1. Milestones ([S] sealed)
+  const milestones = run.milestones ?? [];
+  if (milestones.length > 0) {
+    const doneMs = milestones.filter((m) => m.status === "done").length;
+    lines.push(
+      renderHorizontalRule(
+        targetWidth,
+        `Milestones (${doneMs}/${milestones.length})`,
+        theme,
+      ),
+    );
+    for (const ms of milestones) {
+      const msGlyphRaw =
+        ms.status === "done"
+          ? "[✓]"
+          : ms.status === "in_progress"
+            ? "[▸]"
+            : ms.status === "blocked"
+              ? "[!]"
+              : "[ ]";
+      const msGlyph = theme
+        ? theme.fg(
+            ms.status === "done"
+              ? "success"
+              : ms.status === "in_progress"
+                ? "accent"
+                : ms.status === "blocked"
+                  ? "error"
+                  : "muted",
+            msGlyphRaw,
+          )
+        : msGlyphRaw;
+      const cleanLabel = sanitizePlainText(ms.label);
+      const labelStyled = theme ? theme.bold(cleanLabel) : cleanLabel;
+      const sealedBadge = ms.sealed
+        ? ` ${theme ? theme.fg("success", "[S]") : "[S]"}`
+        : "";
+      const ownerBadge = ms.owner
+        ? ` ${theme ? theme.fg("dim", `(@${sanitizePlainText(ms.owner)})`) : `(@${sanitizePlainText(ms.owner)})`}`
+        : "";
+      const statusText = theme ? theme.fg("muted", ms.status) : ms.status;
+      lines.push(
+        fitLine(
+          `  ${msGlyph} ${labelStyled}${sealedBadge} — ${statusText}${ownerBadge}`,
+          targetWidth,
+        ),
+      );
+    }
+  }
+
+  // 2. Ordered Features ([✓] completed, [▸] in_progress, [ ] pending, [!] failed, [~] cancelled)
+  lines.push(
+    renderHorizontalRule(
+      targetWidth,
+      `Features (${goal.featDone}/${goal.featTotal})`,
+      theme,
+    ),
+  );
+  if (goal.features.length === 0) {
+    const emptyFeat = "  (no mission features defined)";
+    lines.push(fitLine(theme ? theme.fg("muted", emptyFeat) : emptyFeat, targetWidth));
+  } else {
+    for (const f of goal.features) {
+      const glyph = overlayFeatureGlyph(f.status, theme);
+      const cleanId = sanitizePlainText(f.id);
+      const idStyled = theme ? theme.bold(cleanId) : cleanId;
+      const cleanMs = sanitizePlainText(f.milestone);
+      const msRaw = cleanMs
+        ? `[${cleanMs}${sealedSet.has(cleanMs) ? " [S]" : ""}]`
+        : "";
+      const msStyled = msRaw ? (theme ? theme.fg("muted", msRaw) : msRaw) : "";
+      const assignedRaw = f.assignedMember
+        ? `@${sanitizePlainText(f.assignedMember)}`
+        : "unassigned";
+      const assignedStyled = theme
+        ? f.assignedMember
+          ? theme.fg("accent", assignedRaw)
+          : theme.fg("dim", assignedRaw)
+        : assignedRaw;
+      const shaRaw = f.mergedCommitSha
+        ? `(${sanitizePlainText(f.mergedCommitSha).slice(0, 7)})`
+        : "";
+      const shaStyled = shaRaw ? (theme ? theme.fg("success", shaRaw) : shaRaw) : "";
+      const cleanTitle = sanitizePlainText(f.title);
+      const fulfillsPlain =
+        f.fulfills.length > 0
+          ? `fulfills: ${f.fulfills.map(sanitizePlainText).join(", ")}`
+          : "";
+      const depsPlain =
+        f.dependsOn && f.dependsOn.length > 0
+          ? `dependsOn: ${f.dependsOn.map(sanitizePlainText).join(", ")}`
+          : "";
+
+      const headSegments = [
+        `  ${glyph} ${idStyled}`,
+        msStyled,
+        `(${assignedStyled})`,
+        shaStyled,
+      ].filter(Boolean);
+      const primaryLine = cleanTitle
+        ? `${headSegments.join(" ")}: ${cleanTitle}`
+        : headSegments.join(" ");
+
+      const metaTailPlain = [fulfillsPlain, depsPlain].filter(Boolean).join(" · ");
+      const metaTailStyled = metaTailPlain
+        ? theme
+          ? theme.fg("dim", metaTailPlain)
+          : metaTailPlain
+        : "";
+
+      if (!metaTailStyled) {
+        lines.push(fitLine(primaryLine, targetWidth));
+      } else {
+        const singleCandidate = `${primaryLine}${sep}${metaTailStyled}`;
+        if (visibleWidth(singleCandidate) <= targetWidth) {
+          lines.push(fitLine(singleCandidate, targetWidth));
+        } else {
+          lines.push(fitLine(primaryLine, targetWidth));
+          lines.push(fitLine(`      ${metaTailStyled}`, targetWidth));
+        }
+      }
+    }
+  }
+
+  // 3. Validation Contract Assertions (VAL-* + verifiedBy + evidence)
+  lines.push(
+    renderHorizontalRule(
+      targetWidth,
+      `Validation Assertions (${goal.valPassed}/${goal.valTotal} passed)`,
+      theme,
+    ),
+  );
+  if (goal.assertions.length === 0) {
+    const emptyVal = "  (no validation assertions defined)";
+    lines.push(fitLine(theme ? theme.fg("muted", emptyVal) : emptyVal, targetWidth));
+  } else {
+    for (const a of goal.assertions) {
+      const glyph = overlayAssertionGlyph(a.status, theme);
+      const cleanId = sanitizePlainText(a.id);
+      const idStyled = theme ? theme.bold(cleanId) : cleanId;
+      const statusStyled = theme
+        ? theme.fg(
+            a.status === "passed"
+              ? "success"
+              : a.status === "failed"
+                ? "error"
+                : a.status === "blocked"
+                  ? "warning"
+                  : "muted",
+            `[${a.status}]`,
+          )
+        : `[${a.status}]`;
+      const verifiedRaw = a.verifiedBy
+        ? `@${sanitizePlainText(a.verifiedBy)}`
+        : "unverified";
+      const verifiedStyled = theme
+        ? a.verifiedBy
+          ? theme.fg("accent", verifiedRaw)
+          : theme.fg("dim", verifiedRaw)
+        : verifiedRaw;
+      const cleanTitle = sanitizePlainText(a.title);
+      lines.push(
+        fitLine(
+          `  ${glyph} ${idStyled} ${statusStyled} (${verifiedStyled}): ${cleanTitle}`,
+          targetWidth,
+        ),
+      );
+
+      const evRaw = a.evidence
+        ? `evidence: ${sanitizePlainText(a.evidence)}`
+        : a.evidenceRequired
+          ? `requires: ${sanitizePlainText(a.evidenceRequired)}`
+          : "";
+      if (evRaw) {
+        lines.push(
+          fitLine(
+            `      ${theme ? theme.fg("muted", evRaw) : evRaw}`,
+            targetWidth,
+          ),
+        );
+      }
+    }
+  }
+
+  // 4. Open Handoff Items
+  if (goal.openHandoffs.length > 0) {
+    lines.push(
+      renderHorizontalRule(
+        targetWidth,
+        `Open Handoffs (${goal.openHandoffs.length})`,
+        theme,
+      ),
+    );
+    for (const h of goal.openHandoffs) {
+      const hGlyphRaw = h.type === "critical_context" ? "[*]" : "[!]";
+      const hGlyph = theme
+        ? theme.fg(
+            h.type === "critical_context" ? "accent" : "warning",
+            hGlyphRaw,
+          )
+        : hGlyphRaw;
+      const idStyled = theme
+        ? theme.bold(sanitizePlainText(h.id))
+        : sanitizePlainText(h.id);
+      const typeStyled = theme ? theme.fg("muted", `[${h.type}]`) : `[${h.type}]`;
+      const srcStr = `@${sanitizePlainText(h.sourceMember)}${h.sourceFeatureId ? ` (${sanitizePlainText(h.sourceFeatureId)})` : ""}`;
+      const srcStyled = theme ? theme.fg("accent", srcStr) : srcStr;
+      lines.push(
+        fitLine(
+          `  ${hGlyph} ${idStyled} ${typeStyled} ${srcStyled}: ${sanitizePlainText(h.summary)}`,
+          targetWidth,
+        ),
+      );
+    }
+  }
+
+  // 5. Commands & Boundaries
+  const hasCommands = Boolean(run.commands && run.commands.length > 0);
+  const hasBoundaries = Boolean(run.boundaries && run.boundaries.length > 0);
+  if (hasCommands || hasBoundaries) {
+    lines.push(
+      renderHorizontalRule(targetWidth, "Commands & Boundaries", theme),
+    );
+    for (const cmd of run.commands ?? []) {
+      const nameStr = sanitizePlainText(cmd.name);
+      const cmdStr = sanitizePlainText(cmd.command);
+      lines.push(
+        fitLine(
+          theme
+            ? `  ${theme.fg("accent", "$")} ${theme.bold(nameStr)}: ${theme.fg("muted", cmdStr)}`
+            : `  $ ${nameStr}: ${cmdStr}`,
+          targetWidth,
+        ),
+      );
+    }
+    for (const b of run.boundaries ?? []) {
+      const cleanB = sanitizePlainText(b);
+      lines.push(
+        fitLine(
+          theme
+            ? `  ${theme.fg("warning", "!")} ${theme.fg("muted", cleanB)}`
+            : `  ! ${cleanB}`,
+          targetWidth,
+        ),
+      );
+    }
+  }
+
+  return lines.map((l) => fitLine(l, targetWidth));
+}
+
 function formatOverlayPhaseMilestones(
   run: SwarmRunState,
   theme: Theme,
@@ -195,17 +641,20 @@ function formatOverlayPhaseMilestones(
   if (!phase && milestones.length === 0) return undefined;
 
   const doneCount = milestones.filter((m) => m.status === "done").length;
+  const sealedCount = milestones.filter((m) => Boolean(m.sealed)).length;
   const totalCount = milestones.length;
+  const sealedPart =
+    sealedCount > 0 ? ` ${theme.fg("success", `[S] ${sealedCount}`)}` : "";
 
   if (phase && totalCount > 0) {
     const ratio = `[${doneCount}/${totalCount}]`;
-    return `${theme.fg("muted", "Phase:")} ${theme.fg("accent", phase)} ${theme.fg(doneCount === totalCount ? "success" : "muted", ratio)}`;
+    return `${theme.fg("muted", "Phase:")} ${theme.fg("accent", phase)} ${theme.fg(doneCount === totalCount ? "success" : "muted", ratio)}${sealedPart}`;
   }
   if (phase) {
     return `${theme.fg("muted", "Phase:")} ${theme.fg("accent", phase)}`;
   }
   const ratio = `[${doneCount}/${totalCount}]`;
-  return `${theme.fg("muted", "Milestones:")} ${theme.fg(doneCount === totalCount ? "success" : "accent", ratio)}`;
+  return `${theme.fg("muted", "Milestones:")} ${theme.fg(doneCount === totalCount ? "success" : "accent", ratio)}${sealedPart}`;
 }
 
 function formatErrorMessage(err: unknown): string {
@@ -273,7 +722,8 @@ export class SwarmOverlayComponent implements Component, Focusable {
   } | null = null;
   private diffRequestId = 0;
 
-  // Graph tab state
+  // Graph / Mission Contract tab state
+  private graphViewMode: SwarmOverlayGraphView;
   private graphScrollOffset = 0;
   private graphCache:
     | {
@@ -282,6 +732,7 @@ export class SwarmOverlayComponent implements Component, Focusable {
         boardLen: number;
         lastSeq: number;
         width: number;
+        mode: SwarmOverlayGraphView;
         lines: string[];
       }
     | undefined;
@@ -329,6 +780,7 @@ export class SwarmOverlayComponent implements Component, Focusable {
     this.spinnerIntervalMs = Math.max(40, options?.spinnerIntervalMs ?? 120);
     this.now = options?.now ?? (() => Date.now());
     this.activeTab = options?.initialTab ?? "board";
+    this.graphViewMode = options?.initialGraphView ?? "graph";
     this.channelFilter = options?.initialChannel ?? "*";
     this.snapshot = engine.getSnapshot();
     this.currentRunId = this.snapshot.activeRunId ?? this.snapshot.run?.id ?? null;
@@ -380,6 +832,8 @@ export class SwarmOverlayComponent implements Component, Focusable {
         this.memberDetailScrollOffset = 0;
         this.pendingKillConfirm = undefined;
         this.expandedPost = null;
+        this.graphViewMode = "graph";
+        this.graphScrollOffset = 0;
         this.graphCache = undefined;
         this.lastBoardRefreshRunId = null;
         this.lastBoardRefreshHead = null;
@@ -1674,6 +2128,14 @@ export class SwarmOverlayComponent implements Component, Focusable {
   }
 
   private handleGraphTabInput(data: string, ch: string | undefined): void {
+    if (ch === "v" || ch === "V") {
+      this.graphViewMode =
+        this.graphViewMode === "contract" ? "graph" : "contract";
+      this.graphScrollOffset = 0;
+      this.graphCache = undefined;
+      this.tui.requestRender();
+      return;
+    }
     if (matchesKey(data, Key.up) || ch === "k") {
       this.graphScrollOffset = Math.max(0, this.graphScrollOffset - 1);
       this.tui.requestRender();
@@ -1691,6 +2153,16 @@ export class SwarmOverlayComponent implements Component, Focusable {
     }
     if (matchesKey(data, Key.pageDown)) {
       this.graphScrollOffset += 6;
+      this.tui.requestRender();
+      return;
+    }
+    if (ch === "g" || matchesKey(data, Key.home)) {
+      this.graphScrollOffset = 0;
+      this.tui.requestRender();
+      return;
+    }
+    if (ch === "G" || matchesKey(data, Key.end)) {
+      this.graphScrollOffset += 10_000;
       this.tui.requestRender();
     }
   }
@@ -2372,19 +2844,86 @@ export class SwarmOverlayComponent implements Component, Focusable {
       cached.revision === run.revision &&
       cached.boardLen === this.boardMessages.length &&
       cached.lastSeq === lastSeq &&
-      cached.width === innerWidth
+      cached.width === innerWidth &&
+      cached.mode === this.graphViewMode
     ) {
       allLines = cached.lines;
-    } else {
-      allLines = buildSwarmGraphLines(run, this.boardMessages, innerWidth, {
-        theme: this.theme,
-      });
+    } else if (this.graphViewMode === "contract") {
+      allLines = buildMissionContractLines(run, innerWidth, this.theme);
       this.graphCache = {
         runId: run.id,
         revision: run.revision,
         boardLen: this.boardMessages.length,
         lastSeq,
         width: innerWidth,
+        mode: this.graphViewMode,
+        lines: allLines,
+      };
+    } else {
+      const baseGraph = buildSwarmGraphLines(
+        run,
+        this.boardMessages,
+        innerWidth,
+        {
+          theme: this.theme,
+        },
+      );
+      const goal = summarizeOverlayGoal(run);
+      if (goal.hasMissionInspector) {
+        const sep = this.theme.fg("dim", " · ");
+        const summaryParts: string[] = [];
+        if (goal.features.length > 0) {
+          summaryParts.push(
+            `${this.theme.fg("muted", "Features")} ${this.theme.fg(goal.featFailed > 0 ? "error" : goal.featDone === goal.featTotal && goal.featTotal > 0 ? "success" : "accent", `${goal.featDone}/${goal.featTotal}`)}`,
+          );
+        }
+        if (goal.assertions.length > 0) {
+          summaryParts.push(
+            `${this.theme.fg("muted", "VAL")} ${this.theme.fg(goal.valFailed > 0 ? "error" : goal.valPassed === goal.valTotal && goal.valTotal > 0 ? "success" : "accent", `${goal.valPassed}/${goal.valTotal}`)}`,
+          );
+        }
+        if (goal.sealedMilestones.length > 0) {
+          summaryParts.push(
+            `${this.theme.fg("success", "[S]")} ${this.theme.fg("muted", goal.sealedMilestones.join(", "))}`,
+          );
+        }
+        if (goal.openDebtItems.length > 0) {
+          summaryParts.push(
+            this.theme.fg("warning", `!${goal.openDebtItems.length} debt`),
+          );
+        }
+        const headerRule =
+          innerWidth >= 48
+            ? renderHorizontalRule(
+                innerWidth,
+                "Mission Contract & Features [v: inspect]",
+                this.theme,
+              )
+            : renderHorizontalRule(
+                innerWidth,
+                "Mission [v: inspect]",
+                this.theme,
+              );
+        const topBanner: string[] = [headerRule];
+        if (summaryParts.length > 0) {
+          topBanner.push(
+            fitLine(
+              `  ${this.theme.fg("accent", "◆")} ${summaryParts.join(sep)}`,
+              innerWidth,
+            ),
+          );
+        }
+        allLines = [...topBanner, ...baseGraph];
+      } else {
+        allLines = baseGraph;
+      }
+      this.graphCache = {
+        runId: run.id,
+        revision: run.revision,
+        boardLen: this.boardMessages.length,
+        lastSeq,
+        width: innerWidth,
+        mode: this.graphViewMode,
         lines: allLines,
       };
     }
@@ -2543,6 +3082,55 @@ export class SwarmOverlayComponent implements Component, Focusable {
     const pipelineRight = `${workingSeg}${sep}${waitingSeg}${stoppedSeg}${sep}${mergedSeg}`;
 
     const phasePart = formatOverlayPhaseMilestones(run, this.theme);
+    const goal = summarizeOverlayGoal(run);
+
+    if (goal.hasPipelineGoal) {
+      const featLabel = innerWidth >= 52 ? "Features" : "Feat";
+      const featSeg =
+        goal.features.length > 0
+          ? `${this.theme.fg("muted", featLabel)} ${this.theme.fg(goal.featFailed > 0 ? "error" : goal.featDone === goal.featTotal && goal.featTotal > 0 ? "success" : "accent", `${goal.featDone}/${goal.featTotal}`)}`
+          : "";
+      const valSeg =
+        goal.assertions.length > 0
+          ? `${this.theme.fg("muted", "VAL")} ${this.theme.fg(goal.valFailed > 0 ? "error" : goal.valPassed === goal.valTotal && goal.valTotal > 0 ? "success" : "accent", `${goal.valPassed}/${goal.valTotal}`)}`
+          : "";
+      const sealedSeg =
+        goal.sealedMilestones.length > 0
+          ? this.theme.fg("success", `[S] ${goal.sealedMilestones.length}`)
+          : "";
+      const debtSeg =
+        goal.openDebtItems.length > 0
+          ? this.theme.fg("warning", `!${goal.openDebtItems.length} debt`)
+          : "";
+
+      const phaseHasSealed = Boolean(phasePart && goal.sealedMilestones.length > 0);
+      const withPhaseParts = [
+        phasePart ?? "",
+        featSeg,
+        valSeg,
+        ...(phaseHasSealed ? [] : [sealedSeg]),
+        debtSeg,
+      ].filter(Boolean);
+      const coreGoalParts = [featSeg, valSeg, sealedSeg, debtSeg].filter(Boolean);
+
+      const withPhaseLeft = withPhaseParts.join(sep);
+      const coreGoalLeft = coreGoalParts.join(sep);
+      const compactFleetRight = `${this.theme.fg(workingCount > 0 ? "accent" : "muted", `${workingCount}w`)}/${this.theme.fg("muted", `${waitingCount}wait`)}${stoppedCount > 0 ? `/${this.theme.fg("warning", `${stoppedCount}stop`)}` : ""}${mergedCount > 0 ? `/${this.theme.fg("success", `${mergedCount}m`)}` : ""}`;
+
+      if (innerWidth < 48) {
+        return fitLine(`${coreGoalLeft}${sep}${compactFleetRight}`, innerWidth);
+      }
+      if (visibleWidth(withPhaseLeft) + 2 + visibleWidth(pipelineRight) <= innerWidth) {
+        return joinColumns(withPhaseLeft, pipelineRight, innerWidth, 2);
+      }
+      if (visibleWidth(coreGoalLeft) + 2 + visibleWidth(pipelineRight) <= innerWidth) {
+        return joinColumns(coreGoalLeft, pipelineRight, innerWidth, 2);
+      }
+      if (visibleWidth(withPhaseLeft) + 2 + visibleWidth(compactFleetRight) <= innerWidth) {
+        return joinColumns(withPhaseLeft, compactFleetRight, innerWidth, 2);
+      }
+      return joinColumns(coreGoalLeft, compactFleetRight, innerWidth, 2);
+    }
 
     if (innerWidth < 48) {
       return fitLine(
@@ -2667,7 +3255,7 @@ export class SwarmOverlayComponent implements Component, Focusable {
       if (this.activeTab === "board") {
         text = `[Enter] read · [p] post · [c] channel · [1-4/Tab] tabs${globalSuffix}`;
       } else if (this.activeTab === "graph") {
-        text = `[↑↓/jk] scroll · [1-4/Tab] tabs${globalSuffix}`;
+        text = `[v] Contract/Graph · [↑↓/jk] scroll · [1-4/Tab] tabs${globalSuffix}`;
       } else {
         text = this.searchFocused
           ? "Type to search · [↑↓] select · [Tab] switch tab · [Esc] finish typing"
@@ -2678,7 +3266,10 @@ export class SwarmOverlayComponent implements Component, Focusable {
       if (this.activeTab === "board") {
         text = `[Enter] read · [p] post · [c] ch${midSuffix}`;
       } else if (this.activeTab === "graph") {
-        text = `[↑↓/jk] scroll · [1-4] tabs${midSuffix}`;
+        text =
+          innerWidth >= 90
+            ? `[v] Contract/Graph · [↑↓/jk] scroll${midSuffix}`
+            : "[v] Contract/Graph · [↑↓/jk] scroll · [?] help · [Esc/q] close";
       } else {
         text = this.searchFocused
           ? "Type to filter · [↑↓] select · [Tab] tab · [Esc] browse"
@@ -2689,7 +3280,12 @@ export class SwarmOverlayComponent implements Component, Focusable {
       if (this.activeTab === "board") {
         text = `[Enter] read · [p] post · [c] ch${tightSuffix}`;
       } else if (this.activeTab === "graph") {
-        text = `[↑↓/jk] scroll · [1-4] tabs${tightSuffix}`;
+        text =
+          innerWidth >= 62
+            ? `[v] Contract/Graph · [↑↓/jk] scroll${tightSuffix}`
+            : innerWidth >= 48
+              ? "[v] Contract/Graph · [↑↓] · [?] · [q] close"
+              : "[v] view · [↑↓] · [q] close";
       } else {
         text = this.searchFocused
           ? "Type filter · [↑↓] sel · [Tab] tab · [Esc] browse"
@@ -2727,13 +3323,13 @@ export class SwarmOverlayComponent implements Component, Focusable {
         fitLine("  1-4 / Tab / Shift+Tab   Switch Board, Members, Graph, Search tabs", innerWidth),
         fitLine("  j / k or ↑ / ↓          Navigate Down / Up across all tabs", innerWidth),
         fitLine("  M / P / ? / Esc or q    Mission Models / Pause-Resume / Help / Close", innerWidth),
-        renderHorizontalRule(innerWidth, undefined, this.theme),
         fitLine(this.theme.fg("accent", this.theme.bold("Board [1] & Search [4]")), innerWidth),
         fitLine("  Enter / c / p / /       Read full post / Channel filter / Post / Search", innerWidth),
-        renderHorizontalRule(innerWidth, undefined, this.theme),
         fitLine(this.theme.fg("accent", this.theme.bold("Members Tab [2]")), innerWidth),
         fitLine("  w / r / m / g / x / K   Steer / Retry / Model / Merge / Stop / Kill", innerWidth),
         fitLine("  Enter / l / d / [ ]     Toggle Brief & Logs / Git Diff / Scroll detail", innerWidth),
+        fitLine(this.theme.fg("accent", this.theme.bold("Graph & Mission Tab [3]")), innerWidth),
+        fitLine("  [v] Contract/Graph      Toggle Mission Contract & Features / Spawn Graph", innerWidth),
       ];
       const maxEntries = Math.max(1, maxInnerLines - 2);
       const outHelp = helpBody.slice(0, maxEntries);
