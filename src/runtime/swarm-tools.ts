@@ -3,6 +3,7 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import {
   defineTool,
   type ExtensionAPI,
+  type ExtensionContext,
   type Theme,
   type ToolDefinition,
   type ToolRenderResultOptions,
@@ -39,6 +40,7 @@ import {
   type MergeBranchResult,
   type MissionAssertionInput,
   type MissionFeatureInput,
+  type MissionServiceEntry,
   type ParkOrchestratorWaitResult,
   type ReadBoardResult,
   type SwarmChannelAction,
@@ -285,7 +287,7 @@ export const SwarmToolParamsSchema = Type.Object({
   mission_op: Type.Optional(
     stringEnum(SWARM_MISSION_OPS, {
       description:
-        'Sub-operation for action="mission": "status" | "upsert_assertions" | "remove_assertion" | "verify_assertion" | "upsert_features" | "update_feature" | "resolve_handoff" | "set_manifest".',
+        'Sub-operation for action="mission": "status" | "upsert_assertions" | "remove_assertion" | "verify_assertion" | "override_assertion" | "upsert_features" | "update_feature" | "dispatch_ready" | "resolve_handoff" | "set_manifest" | "read_library" | "write_library".',
     }),
   ),
   assertions: Type.Optional(
@@ -319,7 +321,7 @@ export const SwarmToolParamsSchema = Type.Object({
   assertion_id: Type.Optional(
     Type.String({
       description:
-        'Target VAL-* assertion ID for mission_op="verify_assertion" or "remove_assertion".',
+        'Target VAL-* assertion ID for mission_op="verify_assertion", "override_assertion", or "remove_assertion".',
     }),
   ),
   assertion_status: Type.Optional(
@@ -442,14 +444,14 @@ export const SwarmToolParamsSchema = Type.Object({
   justification: Type.Optional(
     Type.String({
       description:
-        'Concrete technical justification (>= 20 chars, no lazy deferrals) when resolution="dismissed".',
+        'Concrete technical justification (>= 20 chars for resolve_handoff resolution="dismissed"; >= 30 chars for audited mission_op="override_assertion"; no lazy deferrals).',
     }),
   ),
   commands: Type.Optional(
     Type.Array(
       Type.Object({
         name: Type.String({
-          description: 'Command key (e.g. "test", "typecheck", "lint", "build").',
+          description: 'Command key (e.g. "init", "test", "typecheck", "lint", "build").',
         }),
         command: Type.String({
           description: "Exact runnable shell command.",
@@ -460,15 +462,78 @@ export const SwarmToolParamsSchema = Type.Object({
       },
     ),
   ),
+  services: Type.Optional(
+    Type.Array(
+      Type.Object({
+        name: Type.String({
+          description: 'Unique service name (e.g. "api", "web", "redis").',
+        }),
+        start: Type.String({
+          description: "Shell command to start the service.",
+        }),
+        stop: Type.Optional(
+          Type.String({
+            description: "Optional shell command to stop the service.",
+          }),
+        ),
+        healthcheck: Type.Optional(
+          Type.String({
+            description: "Optional healthcheck URL or command.",
+          }),
+        ),
+        port: Type.Optional(
+          Type.Integer({
+            minimum: 1,
+            maximum: 65535,
+            description:
+              "Optional reserved TCP port (1..65535; must be unique across services).",
+          }),
+        ),
+        depends_on: Type.Optional(
+          Type.Array(Type.String(), {
+            description: "Optional upstream service names this service depends on.",
+          }),
+        ),
+      }),
+      {
+        description: 'Service and port manifest entries for mission_op="set_manifest".',
+      },
+    ),
+  ),
   boundaries: Type.Optional(
     Type.Array(Type.String(), {
       description: 'Operational boundary rules for mission_op="set_manifest".',
     }),
   ),
+  library_topic: Type.Optional(
+    Type.String({
+      description:
+        'Shared library topic name (e.g. "architecture", "environment", "testing") for mission_op="read_library" or "write_library" (omit on read_library to list topics).',
+    }),
+  ),
+  library_content: Type.Optional(
+    Type.String({
+      description: 'Markdown content to write or append for mission_op="write_library".',
+    }),
+  ),
+  library_append: Type.Optional(
+    Type.Boolean({
+      description:
+        'For mission_op="write_library": when true, append to existing topic content instead of replacing.',
+    }),
+  ),
+  max_dispatch: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      maximum: 64,
+      description:
+        'Optional cap on parallel workers spawned in one batch for mission_op="dispatch_ready".',
+    }),
+  ),
   force: Type.Optional(
     Type.Boolean({
       description:
-        'Force override when explicitly authorized (for action="done", action="kill", or action="mission").',
+        'Force override when explicitly authorized (for action="kill", action="mission", or human /swarm done --force; LLM orchestrator cannot use force:true on action="done").',
     }),
   ),
   summary: Type.Optional(
@@ -512,7 +577,7 @@ export const PostMessageToolParamsSchema = Type.Object({
   feature_id: Type.Optional(
     Type.String({
       description:
-        "Optional Mission feature ID this message/deliverable implements (auto-updates assigned feature on [done]).",
+        "Mission feature ID this message/deliverable implements (auto-updates assigned feature on [done]; required when multiple features are assigned to you).",
     }),
   ),
   discovered_issues: Type.Optional(
@@ -530,7 +595,7 @@ export const PostMessageToolParamsSchema = Type.Object({
   verification_evidence: Type.Optional(
     Type.String({
       description:
-        "Optional concrete verification evidence (commands run and exit/pass counts) for this deliverable.",
+        "Concrete verification evidence (>= 10 chars with exact commands run and exit/pass counts; required when reporting [done] on a Mission feature unless left_undone is non-empty).",
     }),
   ),
 });
@@ -800,6 +865,7 @@ function buildManageMissionInputFromParams(
   params: Partial<SwarmToolParams>,
   callerName: string,
   callerRole: CallerRole,
+  hostContext?: ExtensionContext,
 ): ManageMissionInput {
   const op = normalizeMissionOp(params.mission_op);
   const assertions: MissionAssertionInput[] | undefined = Array.isArray(params.assertions)
@@ -867,6 +933,25 @@ function buildManageMissionInputFromParams(
       })
     : undefined;
 
+  const services: MissionServiceEntry[] | undefined = Array.isArray(params.services)
+    ? params.services.map((s) => {
+        const raw = s as Record<string, unknown>;
+        const dependsOn = Array.isArray(s.depends_on)
+          ? s.depends_on
+          : Array.isArray(raw.dependsOn)
+            ? (raw.dependsOn as string[])
+            : undefined;
+        return {
+          name: s.name,
+          start: s.start,
+          ...(s.stop !== undefined ? { stop: s.stop } : {}),
+          ...(s.healthcheck !== undefined ? { healthcheck: s.healthcheck } : {}),
+          ...(s.port !== undefined ? { port: s.port } : {}),
+          ...(dependsOn !== undefined ? { dependsOn } : {}),
+        };
+      })
+    : undefined;
+
   return {
     op,
     ...(assertions !== undefined ? { assertions } : {}),
@@ -898,7 +983,17 @@ function buildManageMissionInputFromParams(
       ? { justification: params.justification }
       : {}),
     ...(params.commands !== undefined ? { commands: params.commands } : {}),
+    ...(services !== undefined ? { services } : {}),
     ...(params.boundaries !== undefined ? { boundaries: params.boundaries } : {}),
+    ...(params.library_topic !== undefined ? { libraryTopic: params.library_topic } : {}),
+    ...(params.library_content !== undefined
+      ? { libraryContent: params.library_content }
+      : {}),
+    ...(params.library_append !== undefined
+      ? { libraryAppend: params.library_append }
+      : {}),
+    ...(params.max_dispatch !== undefined ? { maxDispatch: params.max_dispatch } : {}),
+    ...(hostContext !== undefined ? { hostContext } : {}),
     ...(params.force !== undefined ? { force: params.force } : {}),
     callerName,
     callerRole,
@@ -1207,6 +1302,11 @@ function renderSwarmCall(
         if (typeof args?.assertion_status === "string" && args.assertion_status.trim()) {
           metaParts.push(`-> ${args.assertion_status.trim()}`);
         }
+      } else if (missionOp === "override_assertion") {
+        if (typeof args?.assertion_id === "string" && args.assertion_id.trim()) {
+          metaParts.push(args.assertion_id.trim());
+        }
+        metaParts.push("[OVERRIDE]");
       } else if (missionOp === "upsert_assertions") {
         const count = Array.isArray(args?.assertions) ? args.assertions.length : 0;
         if (count > 0) metaParts.push(`${count} VAL`);
@@ -1228,6 +1328,10 @@ function renderSwarmCall(
         if (typeof args?.assigned_member === "string" && args.assigned_member.trim()) {
           metaParts.push(`@${args.assigned_member.trim().replace(/^@/, "")}`);
         }
+      } else if (missionOp === "dispatch_ready") {
+        if (typeof args?.max_dispatch === "number" && Number.isFinite(args.max_dispatch)) {
+          metaParts.push(`max=${Math.floor(args.max_dispatch)}`);
+        }
       } else if (missionOp === "resolve_handoff") {
         if (typeof args?.handoff_id === "string" && args.handoff_id.trim()) {
           metaParts.push(args.handoff_id.trim());
@@ -1237,9 +1341,24 @@ function renderSwarmCall(
         }
       } else if (missionOp === "set_manifest") {
         const cmdCount = Array.isArray(args?.commands) ? args.commands.length : 0;
+        const svcCount = Array.isArray(args?.services) ? args.services.length : 0;
         const bndCount = Array.isArray(args?.boundaries) ? args.boundaries.length : 0;
         if (cmdCount > 0) metaParts.push(`${cmdCount} cmd(s)`);
+        if (svcCount > 0) metaParts.push(`${svcCount} svc(s)`);
         if (bndCount > 0) metaParts.push(`${bndCount} boundary(s)`);
+      } else if (missionOp === "read_library") {
+        if (typeof args?.library_topic === "string" && args.library_topic.trim()) {
+          metaParts.push(`${args.library_topic.trim()}.md`);
+        } else {
+          metaParts.push("list topics");
+        }
+      } else if (missionOp === "write_library") {
+        if (typeof args?.library_topic === "string" && args.library_topic.trim()) {
+          metaParts.push(`${args.library_topic.trim()}.md`);
+        }
+        if (args?.library_append === true) {
+          metaParts.push("append");
+        }
       }
       if (args?.force === true) {
         metaParts.push("[force]");
@@ -2076,6 +2195,7 @@ export function createSwarmTool(deps: SwarmToolDeps): ToolDefinition {
                 milestone: string;
                 assertionIds: string[];
                 validatorWoken?: string;
+                validatorSpawned?: string;
                 boardSeq?: number;
                 needsValidatorSpawn?: boolean;
               }>;
@@ -2088,7 +2208,11 @@ export function createSwarmTool(deps: SwarmToolDeps): ToolDefinition {
             const milestoneCueLines: string[] = [];
             if (Array.isArray(extMerged.milestoneValidationCues)) {
               for (const cue of extMerged.milestoneValidationCues) {
-                if (cue.validatorWoken) {
+                if (cue.validatorSpawned) {
+                  milestoneCueLines.push(
+                    `\n🎯 Milestone "${cue.milestone}" features are all merged — auto-spawned @${cue.validatorSpawned} (#${cue.boardSeq ?? "?"} [milestone-review], dual-layer scrutiny + behavioral validation) to verify: ${cue.assertionIds.join(", ")}.`,
+                  );
+                } else if (cue.validatorWoken) {
                   milestoneCueLines.push(
                     `\n🎯 Milestone "${cue.milestone}" features are all merged — auto-woke @${cue.validatorWoken} (#${cue.boardSeq ?? "?"} [milestone-review]) to verify: ${cue.assertionIds.join(", ")}.`,
                   );
@@ -2133,6 +2257,7 @@ export function createSwarmTool(deps: SwarmToolDeps): ToolDefinition {
               params,
               callerName,
               callerRole,
+              ctx,
             );
             const result = await deps.engine.manageMission(missionInput);
             return okResult(result.summary, result);
@@ -2147,8 +2272,17 @@ export function createSwarmTool(deps: SwarmToolDeps): ToolDefinition {
               );
             }
 
+            const humanForce = params.force === true && callerRole === "human";
+            if (params.force === true && callerRole !== "human") {
+              throw new SwarmProtocolError(
+                "PERMISSION_DENIED",
+                'LLM orchestrator cannot pass force:true on swarm{action:"done"} to bypass Mission Goal Gates (unmerged commits, incomplete features, open handoff tech-debt, or unpassed VAL-* assertions). Only human /swarm done --force may force-close; for justified assertion exceptions, use audited swarm{action:"mission", mission_op:"override_assertion", assertion_id, justification}.',
+                { callerRole },
+              );
+            }
+
             let snapshot = deps.engine.getSnapshot();
-            if (!params.force && snapshot.workingMemberNames.length > 0) {
+            if (!humanForce && snapshot.workingMemberNames.length > 0) {
               // Allow in-flight post-turn persistence (e.g. just-resolved turn flushing run.json) to settle briefly
               for (
                 let attempt = 0;
@@ -2164,10 +2298,10 @@ export function createSwarmTool(deps: SwarmToolDeps): ToolDefinition {
             }
 
             // Gate A: Working members
-            if (!params.force && snapshot.workingMemberNames.length > 0) {
+            if (!humanForce && snapshot.workingMemberNames.length > 0) {
               throw new SwarmProtocolError(
                 "INVALID_INPUT",
-                `Cannot complete Swarm while member(s) are still working: ${snapshot.workingMemberNames.map((n) => "@" + n).join(", ")}. Call swarm_wait to let them finish, or stop/kill them first (or pass force:true).`,
+                `Cannot complete Swarm while member(s) are still working: ${snapshot.workingMemberNames.map((n) => "@" + n).join(", ")}. Call swarm_wait to let them finish, or stop/kill them first.`,
               );
             }
 
@@ -2186,7 +2320,7 @@ export function createSwarmTool(deps: SwarmToolDeps): ToolDefinition {
                 !m.mergedCommitSha,
             );
 
-            if (!params.force && preDoneRun) {
+            if (!humanForce && preDoneRun) {
               // Gate B: Real Unmerged Commits ahead of baseBranch
               if (unmergedMembers.length > 0) {
                 const engineWithUnmerged = deps.engine as ISwarmEngine & {
@@ -2203,7 +2337,7 @@ export function createSwarmTool(deps: SwarmToolDeps): ToolDefinition {
                   );
                   throw new SwarmProtocolError(
                     "INVALID_INPUT",
-                    `Cannot complete Swarm while unmerged worktree branch(es) have commits ahead of ${preDoneRun.baseBranch}: ${labels.join(", ")}. Merge ready branches via swarm{action:"merge", name} or kill obsolete branches via swarm{action:"kill", name} first (or pass force:true).`,
+                    `Cannot complete Swarm while unmerged worktree branch(es) have commits ahead of ${preDoneRun.baseBranch}: ${labels.join(", ")}. Merge ready branches via swarm{action:"merge", name} or kill obsolete branches via swarm{action:"kill", name} first.`,
                     {
                       unmergedMembers: unmergedAhead.map(({ member: m, commitsAhead }) => ({
                         name: m.name,
@@ -2226,7 +2360,7 @@ export function createSwarmTool(deps: SwarmToolDeps): ToolDefinition {
                 if (incompleteFeatures.length > 0) {
                   throw new SwarmProtocolError(
                     "INVALID_INPUT",
-                    `Cannot complete Mission while ${incompleteFeatures.length} feature(s) remain incomplete: ${incompleteFeatures.map((f) => `${f.id} [${f.status}]`).join(", ")}. Complete or cancel remaining features via swarm{action:"mission"} before calling done (or pass force:true).`,
+                    `Cannot complete Mission while ${incompleteFeatures.length} feature(s) remain incomplete: ${incompleteFeatures.map((f) => `${f.id} [${f.status}]`).join(", ")}. Complete or cancel remaining features via swarm{action:"mission"} before calling done.`,
                     {
                       incompleteFeatures: incompleteFeatures.map((f) => ({
                         id: f.id,
@@ -2246,7 +2380,7 @@ export function createSwarmTool(deps: SwarmToolDeps): ToolDefinition {
               if (openTechDebt.length > 0) {
                 throw new SwarmProtocolError(
                   "INVALID_INPUT",
-                  `Cannot complete Mission with ${openTechDebt.length} open handoff tech-debt item(s): ${openTechDebt.map((h) => `${h.id} (${h.type} from @${h.sourceMember}: "${h.summary.slice(0, 72)}")`).join("; ")}. Track follow-up features via swarm{action:"mission", mission_op:"upsert_features"} and resolve each item via swarm{action:"mission", mission_op:"resolve_handoff"} before calling done (or pass force:true).`,
+                  `Cannot complete Mission with ${openTechDebt.length} open handoff tech-debt item(s): ${openTechDebt.map((h) => `${h.id} (${h.type} from @${h.sourceMember}: "${h.summary.slice(0, 72)}")`).join("; ")}. Track follow-up features via swarm{action:"mission", mission_op:"upsert_features"} and resolve each item via swarm{action:"mission", mission_op:"resolve_handoff"} before calling done.`,
                   { openHandoffIds: openTechDebt.map((h) => h.id) },
                 );
               }
@@ -2268,7 +2402,7 @@ export function createSwarmTool(deps: SwarmToolDeps): ToolDefinition {
                   const reasons: string[] = [];
                   if (unpassedAssertions.length > 0) {
                     reasons.push(
-                      `unpassed VAL-* assertions: ${unpassedAssertions.map((a) => `${a.id} [${a.status}]`).join(", ")} (verify via @validator calling swarm{action:"mission", mission_op:"verify_assertion"})`,
+                      `unpassed VAL-* assertions: ${unpassedAssertions.map((a) => `${a.id} [${a.status}]`).join(", ")} (verify via @validator calling swarm{action:"mission", mission_op:"verify_assertion"}, or use audited mission_op:"override_assertion" with >=30 char justification)`,
                     );
                   }
                   if (unclaimedByCompleted.length > 0) {
@@ -2278,7 +2412,7 @@ export function createSwarmTool(deps: SwarmToolDeps): ToolDefinition {
                   }
                   throw new SwarmProtocolError(
                     "INVALID_INPUT",
-                    `Cannot complete Mission until 100% of Validation Contract passes and is claimed: ${reasons.join("; ")} (or pass force:true).`,
+                    `Cannot complete Mission until 100% of Validation Contract passes and is claimed: ${reasons.join("; ")}.`,
                     {
                       unpassedAssertionIds: unpassedAssertions.map((a) => a.id),
                       unclaimedAssertionIds: unclaimedByCompleted.map((a) => a.id),
@@ -2560,10 +2694,10 @@ export function createMemberScopedTools(
     name: POST_MESSAGE_TOOL,
     label: "Post Message",
     description:
-      "Post a concise message to the shared Swarm message board. Use `@name` as a wakeup doorbell only for peers who must act next; start completion posts with `[done]` after `@<peer-or-parent>`.",
-    promptSnippet: "Post a concise message (with @mentions) to the shared Swarm board.",
+      "Post a concise message to the shared Swarm message board. Use `@name` as a wakeup doorbell only for peers who must act next; start completion posts with `[done]` after `@<peer-or-parent>`. When reporting `[done]` on a Mission feature, you MUST include `verification_evidence` (>= 10 chars with exact commands & results run, unless `left_undone` is non-empty) and `feature_id` (if multiple features are assigned) plus any `discovered_issues` / `left_undone`.",
+    promptSnippet: "Post a concise message (with @mentions and structured [done] handoff fields) to the shared Swarm board.",
     promptGuidelines: [
-      `Use ${POST_MESSAGE_TOOL} for concise handoffs, questions, findings, or final [done] reports. Reference earlier posts as #seq instead of copying them.`,
+      `Use ${POST_MESSAGE_TOOL} for concise handoffs, questions, findings, or final [done] reports. Reference earlier posts as #seq instead of copying them. When reporting [done] on a Mission feature, always pass verification_evidence (>= 10 chars) and any discovered_issues / left_undone.`,
     ],
     parameters: Type.Object({
       text: Type.String({
@@ -2582,7 +2716,7 @@ export function createMemberScopedTools(
       feature_id: Type.Optional(
         Type.String({
           description:
-            "Optional Mission feature ID this deliverable implements (auto-updates assigned feature on [done]).",
+            "Mission feature ID this deliverable implements (auto-updates assigned feature on [done]; required when multiple features are assigned to you).",
         }),
       ),
       discovered_issues: Type.Optional(
@@ -2600,7 +2734,7 @@ export function createMemberScopedTools(
       verification_evidence: Type.Optional(
         Type.String({
           description:
-            "Optional concrete verification evidence (commands run and exit/pass counts) for this deliverable.",
+            "Concrete verification evidence (>= 10 chars with exact commands run and exit/pass counts; required when reporting [done] on a Mission feature unless left_undone is non-empty).",
         }),
       ),
     }),
@@ -2774,10 +2908,10 @@ export function createMemberScopedTools(
     label: "Swarm",
     description:
       member.role === "validator"
-        ? 'Scoped Swarm helper tool for read-only validators: inspect roster ("status"), list models ("models"), inspect Mission status or verify VAL-* assertions ("mission"), spawn read-only validator helpers ("add"), switch model for self or own helpers ("model"), steer/stop/kill own helpers ("steer"/"stop"/"kill"), or list/join/leave channels ("channel").'
-        : 'Scoped Swarm helper tool for workers: inspect roster ("status"), list models ("models"), inspect Mission status or update your own assigned feature ("mission"), spawn helper workers/validators reporting back to you ("add"), switch model for self or own helpers ("model"), steer/stop/kill own helpers ("steer"/"stop"/"kill"), or list/join/leave channels ("channel"). Cannot call title/merge/done, self-verify VAL-* assertions, or touch other members.',
+        ? 'Scoped Swarm helper tool for read-only validators: inspect roster ("status"), list models ("models"), inspect Mission status, read/write shared library topics, or verify VAL-* assertions ("mission"), spawn read-only validator helpers ("add"), switch model for self or own helpers ("model"), steer/stop/kill own helpers ("steer"/"stop"/"kill"), or list/join/leave channels ("channel").'
+        : 'Scoped Swarm helper tool for workers: inspect roster ("status"), list models ("models"), inspect Mission status, read/write shared library topics, or update your own assigned feature ("mission"), spawn helper workers/validators reporting back to you ("add"), switch model for self or own helpers ("model"), steer/stop/kill own helpers ("steer"/"stop"/"kill"), or list/join/leave channels ("channel"). Cannot call title/merge/done, self-verify or override VAL-* assertions, or touch other members.',
     promptSnippet:
-      "Inspect swarm/mission status, verify VAL-* assertions (validator) or update own feature (worker), manage your own helpers, or join/leave channels.",
+      "Inspect swarm/mission status, read/write shared library, verify VAL-* assertions (validator) or update own feature (worker), manage your own helpers, or join/leave channels.",
     parameters: Type.Object({
       action: stringEnum(MEMBER_SWARM_ACTIONS, {
         description:
@@ -2856,7 +2990,7 @@ export function createMemberScopedTools(
       mission_op: Type.Optional(
         stringEnum(SWARM_MISSION_OPS, {
           description:
-            'Sub-operation for action="mission": "status" | "verify_assertion" (validator) | "update_feature" (worker own feature).',
+            'Sub-operation for action="mission": "status" | "read_library" | "write_library" | "verify_assertion" (validator) | "update_feature" (worker own feature).',
         }),
       ),
       assertion_id: Type.Optional(
@@ -2895,6 +3029,46 @@ export function createMemberScopedTools(
       merged_commit_sha: Type.Optional(
         Type.String({
           description: 'Optional merged commit SHA for mission_op="update_feature".',
+        }),
+      ),
+      library_topic: Type.Optional(
+        Type.String({
+          description:
+            'Shared library topic name (e.g. "architecture", "environment", "testing") for mission_op="read_library" or "write_library" (omit on read_library to list topics).',
+        }),
+      ),
+      library_content: Type.Optional(
+        Type.String({
+          description: 'Markdown content to write or append for mission_op="write_library".',
+        }),
+      ),
+      library_append: Type.Optional(
+        Type.Boolean({
+          description:
+            'For mission_op="write_library": when true, append to existing topic content instead of replacing.',
+        }),
+      ),
+      justification: Type.Optional(
+        Type.String({
+          description: 'Optional justification string.',
+        }),
+      ),
+      services: Type.Optional(
+        Type.Array(
+          Type.Object({
+            name: Type.String(),
+            start: Type.String(),
+            stop: Type.Optional(Type.String()),
+            healthcheck: Type.Optional(Type.String()),
+            port: Type.Optional(Type.Integer({ minimum: 1, maximum: 65535 })),
+            depends_on: Type.Optional(Type.Array(Type.String())),
+          }),
+        ),
+      ),
+      max_dispatch: Type.Optional(
+        Type.Integer({
+          minimum: 1,
+          maximum: 64,
         }),
       ),
       force: Type.Optional(

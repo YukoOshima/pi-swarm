@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
@@ -47,6 +47,7 @@ import {
   selectFallbackModel,
   SwarmEngine,
 } from "../src/runtime/index.js";
+import { SwarmStore } from "../src/store/index.js";
 import {
   type AgentTurnResult,
   type AutoRebaseResult,
@@ -177,6 +178,7 @@ class MockSwarmStore implements ISwarmStore {
       ...(input.features ? { features: cloneState(input.features) } : {}),
       ...(input.handoffItems ? { handoffItems: cloneState(input.handoffItems) } : {}),
       ...(input.commands ? { commands: cloneState(input.commands) } : {}),
+      ...(input.services ? { services: cloneState(input.services) } : {}),
       ...(input.boundaries ? { boundaries: cloneState(input.boundaries) } : {}),
       revision: 1,
       members: {},
@@ -297,6 +299,13 @@ class MockSwarmStore implements ISwarmStore {
         delete run.commands;
       } else {
         run.commands = cloneState(patch.commands);
+      }
+    }
+    if (patch.services !== undefined) {
+      if (patch.services === null) {
+        delete run.services;
+      } else {
+        run.services = cloneState(patch.services);
       }
     }
     if (patch.boundaries !== undefined) {
@@ -8171,6 +8180,7 @@ describe("SwarmEngine & Runtime — v0.8.0 Dynamic Mission Goal Engine", () => {
       await workerBridge.postMessage({
         text: "@orchestrator [done] Implemented feat-1",
         featureId: "feat-1",
+        verificationEvidence: "npm test -> 8/8 passed",
         discoveredIssues: [
           "Race condition when refresh endpoint receives concurrent requests",
           "Duplicate CSS utility in legacy header",
@@ -8396,7 +8406,7 @@ describe("SwarmEngine & Runtime — v0.8.0 Dynamic Mission Goal Engine", () => {
       const sealedMCore = finalRun.milestones?.find((m) => m.label === "m-core")!;
       assert.equal(sealedMCore.sealed, true);
 
-      // Also verify: open left_undone prevents premature auto-completion on mergeMember, and missing validator emits needsValidatorSpawn cue!
+      // Also verify: open left_undone prevents premature auto-completion on mergeMember, and missing validator auto-spawns @validator-2!
       await engine.killMember("validator", { reason: "retire first validator" });
       await engine.manageMission({
         op: "upsert_assertions",
@@ -8476,8 +8486,12 @@ describe("SwarmEngine & Runtime — v0.8.0 Dynamic Mission Goal Engine", () => {
       assert.ok(!m2MergeToolRes.isError);
       const m2MergeText = (m2MergeToolRes.content[0] as any)?.text ?? "";
       assert.ok(
-        m2MergeText.includes("m2-noval") && m2MergeText.includes("validator"),
-        "merge output must prompt Orchestrator to spawn @validator when no idle validator exists yet",
+        m2MergeText.includes("m2-noval") &&
+          m2MergeText.includes("auto-spawned @validator-2"),
+        "merge output must report auto-spawned @validator-2 when prior validator was killed",
+      );
+      await waitUntil(
+        () => engine.getSnapshot().run?.members["validator-2"]?.state === "waiting",
       );
     } finally {
       await engine.dispose();
@@ -8651,7 +8665,7 @@ describe("SwarmEngine & Runtime — v0.8.0 Dynamic Mission Goal Engine", () => {
       assert.ok(!doneRes.isError);
       assert.equal(engine.getSnapshot().run?.status, "completed");
 
-      // Also verify force:true bypasses incomplete feature/assertion gates on an emergency close
+      // Also verify LLM orchestrator force:true is rejected with PERMISSION_DENIED, while human force:true bypasses gates cleanly
       const { engine: forceEngine } = await createTestHarness({
         stallWatchdogEnabled: false,
       });
@@ -8672,10 +8686,26 @@ describe("SwarmEngine & Runtime — v0.8.0 Dynamic Mission Goal Engine", () => {
             },
           ],
         });
-        const forceSwarmTool = createSwarmTools({ engine: forceEngine }).find(
+        const orchForceTool = createSwarmTools({ engine: forceEngine }).find(
           (t) => t.name === SWARM_TOOL,
         )!;
-        const forcedDone = await forceSwarmTool.execute(
+        const blockedLlmForce = await orchForceTool.execute(
+          "tc-done-force-llm",
+          { action: "done", summary: "LLM tried force close", force: true } as any,
+          undefined,
+          undefined,
+          toolCtx,
+        );
+        assert.equal(blockedLlmForce.isError, true);
+        assert.equal((blockedLlmForce.details as any)?.errorCode, "PERMISSION_DENIED");
+        assert.equal(forceEngine.getSnapshot().run?.status, "active");
+
+        const humanForceTool = createSwarmTools({
+          engine: forceEngine,
+          getCallerRole: () => "human",
+          getCallerName: () => "human",
+        }).find((t) => t.name === SWARM_TOOL)!;
+        const forcedDone = await humanForceTool.execute(
           "tc-done-force",
           { action: "done", summary: "Emergency force close", force: true } as any,
           undefined,
@@ -8887,6 +8917,1073 @@ describe("SwarmEngine & Runtime — v0.8.0 Dynamic Mission Goal Engine", () => {
       }
     } finally {
       await engine.dispose();
+    }
+  });
+});
+
+// ============================================================================
+// Suite 20. v0.9.0 Runtime Gap Closure (Gaps 1, 2, 3, 4, 6)
+// ============================================================================
+
+describe("SwarmEngine & Runtime — v0.9.0 Gap Closure", () => {
+  it("1. [Gap 1] blocks LLM force:true on swarm{action:'done'} with PERMISSION_DENIED, allows human force:true, and supports audited override_assertion (>=30 chars + [OVERRIDE] event + milestone auto-sealing)", async () => {
+    const { engine, store, transport } = await createTestHarness({
+      stallWatchdogEnabled: false,
+    });
+    let workerBridge: SpawnMemberRequest["engineApi"] | undefined;
+    let validatorBridge: SpawnMemberRequest["engineApi"] | undefined;
+
+    transport.onMember("worker-ovr", async ({ request }) => {
+      workerBridge = request.engineApi;
+    });
+    transport.onMember("val-ovr", async ({ request }) => {
+      validatorBridge = request.engineApi;
+    });
+
+    try {
+      const toolCtx = {} as unknown as ExtensionToolContext;
+      const orchSwarmTool = createSwarmTools({ engine }).find(
+        (t) => t.name === SWARM_TOOL,
+      )!;
+      const humanSwarmTool = createSwarmTools({
+        engine,
+        getCallerRole: () => "human",
+        getCallerName: () => "human",
+      }).find((t) => t.name === SWARM_TOOL)!;
+
+      await engine.manageMission({
+        op: "upsert_assertions",
+        assertions: [
+          {
+            id: "VAL-OVR-001",
+            title: "Live Stripe webhook signature verification",
+            description: "Verifies Stripe webhook against live sandbox endpoint.",
+          },
+          {
+            id: "VAL-OVR-002",
+            title: "Local unit verification",
+            description: "Passes local unit suite.",
+          },
+        ],
+      });
+      await engine.manageMission({
+        op: "upsert_features",
+        features: [
+          {
+            id: "feat-ovr-1",
+            title: "Webhook handler",
+            description: "Implement Stripe webhook handler",
+            milestone: "m-ovr",
+            status: "completed",
+            fulfills: ["VAL-OVR-001", "VAL-OVR-002"],
+          },
+        ],
+      });
+
+      await engine.addMembers({ name: "worker-ovr", brief: "Check webhook" });
+      await engine.addMembers({
+        name: "val-ovr",
+        role: "validator",
+        brief: "Audit VAL-OVR-002",
+      });
+      await waitUntil(
+        () =>
+          engine.getSnapshot().run?.members["worker-ovr"]?.state === "waiting" &&
+          engine.getSnapshot().run?.members["val-ovr"]?.state === "waiting",
+      );
+      assert.ok(workerBridge);
+      assert.ok(validatorBridge);
+
+      // Validator verifies VAL-OVR-002 normally, leaving VAL-OVR-001 pending
+      await validatorBridge.manageMission!({
+        op: "verify_assertion",
+        assertionId: "VAL-OVR-002",
+        assertionStatus: "passed",
+        evidence: "npm test -- webhook.test.ts: 9/9 passed",
+      });
+
+      // LLM orchestrator attempting force:true on done MUST fail with PERMISSION_DENIED!
+      const llmForceRes = await orchSwarmTool.execute(
+        "tc-llm-force-ban",
+        {
+          action: "done",
+          summary: "Trying to sneak past unpassed VAL-OVR-001",
+          force: true,
+        } as any,
+        undefined,
+        undefined,
+        toolCtx,
+      );
+      assert.equal(llmForceRes.isError, true);
+      assert.equal((llmForceRes.details as any)?.errorCode, "PERMISSION_DENIED");
+      const llmForceText = (llmForceRes.content[0] as any)?.text ?? "";
+      assert.ok(
+        llmForceText.includes("LLM orchestrator cannot pass force:true") &&
+          llmForceText.includes("override_assertion"),
+      );
+      assert.equal(engine.getSnapshot().run?.status, "active");
+
+      // Worker & validator MUST be rejected with PERMISSION_DENIED on override_assertion
+      await assert.rejects(
+        () =>
+          workerBridge!.manageMission!({
+            op: "override_assertion",
+            assertionId: "VAL-OVR-001",
+            justification:
+              "Worker trying to override an assertion with a 55-char note.",
+          }),
+        (err: unknown) =>
+          err instanceof SwarmProtocolError && err.code === "PERMISSION_DENIED",
+      );
+      await assert.rejects(
+        () =>
+          validatorBridge!.manageMission!({
+            op: "override_assertion",
+            assertionId: "VAL-OVR-001",
+            justification:
+              "Validator trying to override instead of verifying with evidence.",
+          }),
+        (err: unknown) =>
+          err instanceof SwarmProtocolError && err.code === "PERMISSION_DENIED",
+      );
+
+      // Reject short (<30 chars) and lazy override excuses
+      const badOverrideJustifications = [
+        "Too short (<30 chars)",
+        "low priority item that does not affect core checkout flow today",
+        "non-blocking check for local dev environment without credentials",
+        "will fix later once CI secrets are provisioned in staging repo",
+        "later in wave 3 when external sandbox credentials become ready",
+        "todo: wire live stripe cli listener in follow-up milestone soon",
+        "n/a because local offline environment cannot reach external api",
+        "minor edge case that only triggers on live stripe webhook calls",
+        "ignore for now because sandbox api key is unavailable locally!!",
+        "skip live webhook check because network egress is restricted here",
+        "force passing this assertion to unblock mission completion gate",
+      ];
+      for (const badExcuse of badOverrideJustifications) {
+        await assert.rejects(
+          () =>
+            engine.manageMission({
+              op: "override_assertion",
+              assertionId: "VAL-OVR-001",
+              justification: badExcuse,
+            }),
+          (err: unknown) =>
+            err instanceof SwarmProtocolError && err.code === "INVALID_INPUT",
+          `Expected override excuse to be rejected: "${badExcuse}"`,
+        );
+      }
+
+      // Audited override_assertion (>= 30 chars concrete justification) succeeds, stamps [OVERRIDE], logs audit_completed, and auto-seals m-ovr!
+      const validJustification =
+        "Air-gapped CI runner blocks outbound api.stripe.com egress; HMAC-SHA256 signature verification proved deterministically via signed fixture vectors in tests/webhook.test.ts.";
+      const ovrToolRes = await orchSwarmTool.execute(
+        "tc-ovr-ok",
+        {
+          action: "mission",
+          mission_op: "override_assertion",
+          assertion_id: "VAL-OVR-001",
+          justification: validJustification,
+        } as any,
+        undefined,
+        undefined,
+        toolCtx,
+      );
+      assert.ok(!ovrToolRes.isError);
+
+      const updatedVal = engine
+        .getSnapshot()
+        .run?.assertions?.find((a) => a.id === "VAL-OVR-001")!;
+      assert.equal(updatedVal.status, "passed");
+      assert.equal(updatedVal.overridden, true);
+      assert.equal(updatedVal.overrideJustification, validJustification);
+      assert.equal(updatedVal.evidence, `[OVERRIDE] ${validJustification}`);
+      assert.equal(updatedVal.verifiedBy, ORCHESTRATOR_NAME);
+      assert.equal(updatedVal.verifiedByRole, "orchestrator");
+
+      const sealedMs = engine
+        .getSnapshot()
+        .run?.milestones?.find((m) => m.label === "m-ovr")!;
+      assert.equal(sealedMs.status, "done");
+      assert.equal(sealedMs.sealed, true);
+
+      const auditEvents = store.events.filter(
+        (e) =>
+          e.type === "audit_completed" &&
+          (e.data as any)?.op === "override_assertion" &&
+          (e.data as any)?.assertionId === "VAL-OVR-001",
+      );
+      assert.equal(auditEvents.length, 1);
+      assert.equal((auditEvents[0]!.data as any)?.overridden, true);
+
+      // Now normal orchestrator done (without force) passes all 5 Goal Gates cleanly!
+      const cleanDone = await orchSwarmTool.execute(
+        "tc-done-after-ovr",
+        {
+          action: "done",
+          summary: "Completed with 1 verified + 1 audited override assertion.",
+        } as any,
+        undefined,
+        undefined,
+        toolCtx,
+      );
+      assert.ok(!cleanDone.isError);
+      assert.equal(engine.getSnapshot().run?.status, "completed");
+
+      // Separate run: verify human callerRole CAN still force-close via /swarm done --force when gates are unmet
+      const { engine: humanEngine } = await createTestHarness({
+        stallWatchdogEnabled: false,
+      });
+      try {
+        await humanEngine.manageMission({
+          op: "upsert_assertions",
+          assertions: [
+            { id: "VAL-HUMAN-1", title: "Unfinished", description: "Unfinished" },
+          ],
+        });
+        const humanTool2 = createSwarmTools({
+          engine: humanEngine,
+          getCallerRole: () => "human",
+          getCallerName: () => "human",
+        }).find((t) => t.name === SWARM_TOOL)!;
+        const humanForced = await humanTool2.execute(
+          "tc-human-force",
+          {
+            action: "done",
+            summary: "Human CLI /swarm done --force",
+            force: true,
+          } as any,
+          undefined,
+          undefined,
+          toolCtx,
+        );
+        assert.ok(!humanForced.isError);
+        assert.equal(humanEngine.getSnapshot().run?.status, "completed");
+        void humanSwarmTool;
+      } finally {
+        await humanEngine.dispose();
+      }
+    } finally {
+      await engine.dispose();
+    }
+  });
+
+  it("2. [Gap 2] dispatches DAG-ready & filesOwned-disjoint features onto fresh share worktrees via dispatch_ready and runs worktree init commands before worker turn 1", async () => {
+    const tmpRoot = await mkdtemp(path.join(os.tmpdir(), "pi-swarm-v090-dispatch-"));
+    const store = new MockSwarmStore();
+    const worktree = new MockWorktreeManager();
+    // Point worktrees at real directories under tmpRoot so the shell `init` command executes inside each isolated cwd!
+    store.getWorktreePath = (runId: string, memberName: string) =>
+      path.join(tmpRoot, runId, `wt-${memberName}`);
+    const origCreateWt = worktree.createWorktree.bind(worktree);
+    worktree.createWorktree = async (opts) => {
+      await mkdir(opts.worktreePath, { recursive: true });
+      return origCreateWt(opts);
+    };
+
+    const transport = new ScriptedTransport();
+    const initMarkersObservedOnFirstTurn = new Map<string, string>();
+    const holdTurn = new Map<string, () => void>();
+
+    transport.setDefaultHandler(async ({ request, turnIndex }) => {
+      if (turnIndex === 1 && request.workspace === "share") {
+        const markerFile = path.join(request.cwd, ".init-marker");
+        const content = await readFile(markerFile, "utf8").catch(() => "MISSING");
+        initMarkersObservedOnFirstTurn.set(request.name, content.trim());
+      }
+      if (request.name === "feat-auth" || request.name === "feat-billing") {
+        await new Promise<void>((resolve) => {
+          holdTurn.set(request.name, resolve);
+        });
+      }
+      return { outcome: "waiting", summary: `${request.name} ready` };
+    });
+
+    const engine = new SwarmEngine({
+      store,
+      worktree,
+      transport,
+      settings: { stallWatchdogEnabled: false, maxConcurrency: 4 },
+    });
+
+    try {
+      const run = await store.createRun({
+        id: "run-q",
+        title: "Queue Runner & Init Hook Test",
+        objective: "Dispatch DAG-ready features safely",
+        baseBranch: "main",
+        ownerSessionId: "sess-q",
+        maxConcurrency: 4,
+        commands: [
+          { name: "init", command: "printf 'init-ok:%s' \"$(basename \"$PWD\")\" > .init-marker" },
+          { name: "test", command: "npm test" },
+        ],
+      });
+      await engine.startRun(run.id);
+
+      await engine.manageMission({
+        op: "upsert_assertions",
+        assertions: [
+          { id: "VAL-Q-1", title: "Auth slice", description: "Auth works" },
+          { id: "VAL-Q-2", title: "Billing slice", description: "Billing works" },
+          { id: "VAL-Q-3", title: "Auth session overlap", description: "Session works" },
+          { id: "VAL-Q-4", title: "Downstream route", description: "Route works" },
+        ],
+      });
+
+      await engine.manageMission({
+        op: "upsert_features",
+        features: [
+          {
+            id: "feat-auth",
+            title: "Auth JWT core",
+            description: "Implement src/auth/jwt.ts",
+            milestone: "m1",
+            filesOwned: ["src/auth/jwt.ts"],
+            fulfills: ["VAL-Q-1"],
+          },
+          {
+            id: "feat-billing",
+            title: "Stripe billing",
+            description: "Implement src/billing/stripe.ts",
+            milestone: "m1",
+            filesOwned: ["src/billing/stripe.ts"],
+            fulfills: ["VAL-Q-2"],
+          },
+          {
+            id: "feat-auth-overlap",
+            title: "Auth directory refactor",
+            description: "Touches parent directory src/auth (collides with feat-auth!)",
+            milestone: "m1",
+            filesOwned: ["src/auth"],
+            fulfills: ["VAL-Q-3"],
+          },
+          {
+            id: "feat-routes",
+            title: "Protected routes depending on feat-auth",
+            description: "Depends on feat-auth completing first",
+            milestone: "m1",
+            dependsOn: ["feat-auth"],
+            filesOwned: ["src/routes/protected.ts"],
+            fulfills: ["VAL-Q-4"],
+          },
+        ],
+      });
+
+      // Non-orchestrator cannot call dispatch_ready
+      await assert.rejects(
+        () =>
+          engine.manageMission({
+            op: "dispatch_ready",
+            callerRole: "worker",
+            callerName: "rogue",
+          }),
+        (err: unknown) =>
+          err instanceof SwarmProtocolError && err.code === "PERMISSION_DENIED",
+      );
+
+      // Wave 1 dispatch_ready: dispatches ONLY feat-auth & feat-billing (skips feat-auth-overlap due to parent/child path prefix collision, and skips feat-routes due to unmet dependsOn!)
+      const swarmTool = createSwarmTools({ engine }).find((t) => t.name === SWARM_TOOL)!;
+      const wave1ToolRes = await swarmTool.execute(
+        "tc-dispatch-1",
+        { action: "mission", mission_op: "dispatch_ready" } as any,
+        undefined,
+        undefined,
+        {} as unknown as ExtensionToolContext,
+      );
+      assert.ok(!wave1ToolRes.isError);
+      const wave1 = wave1ToolRes.details as any;
+      assert.deepEqual(wave1.dispatchedFeatures, ["feat-auth", "feat-billing"]);
+      assert.deepEqual(wave1.spawnedMembers, ["feat-auth", "feat-billing"]);
+
+      await waitUntil(
+        () => holdTurn.has("feat-auth") && holdTurn.has("feat-billing"),
+      );
+
+      // Verify `init` shell command executed in BOTH isolated share worktrees BEFORE worker turn 1!
+      assert.equal(
+        initMarkersObservedOnFirstTurn.get("feat-auth"),
+        "init-ok:wt-feat-auth",
+      );
+      assert.equal(
+        initMarkersObservedOnFirstTurn.get("feat-billing"),
+        "init-ok:wt-feat-billing",
+      );
+
+      // Verify both spawned workers are fresh, clean-context, isolated `share` workers and features are `in_progress`
+      const snapWave1 = engine.getSnapshot().run!;
+      assert.equal(snapWave1.members["feat-auth"]?.workspace, "share");
+      assert.equal(snapWave1.members["feat-auth"]?.forkedFrom, undefined);
+      assert.equal(
+        snapWave1.features?.find((f) => f.id === "feat-auth")?.status,
+        "in_progress",
+      );
+      assert.equal(
+        snapWave1.features?.find((f) => f.id === "feat-auth")?.assignedMember,
+        "feat-auth",
+      );
+      assert.equal(
+        snapWave1.features?.find((f) => f.id === "feat-auth-overlap")?.status,
+        "pending",
+      );
+      assert.equal(
+        snapWave1.features?.find((f) => f.id === "feat-routes")?.status,
+        "pending",
+      );
+
+      // Calling dispatch_ready again while feat-auth is still in_progress dispatches 0 features
+      const midWave = await engine.manageMission({ op: "dispatch_ready" });
+      assert.deepEqual(midWave.dispatchedFeatures, []);
+
+      // Finish & merge feat-auth & feat-billing -> unblocks BOTH feat-auth-overlap AND feat-routes!
+      holdTurn.get("feat-auth")!();
+      holdTurn.get("feat-billing")!();
+      await waitUntil(
+        () =>
+          engine.getSnapshot().run?.members["feat-auth"]?.state === "waiting" &&
+          engine.getSnapshot().run?.members["feat-billing"]?.state === "waiting",
+      );
+      await engine.postMessage({
+        from: "feat-auth",
+        fromRole: "worker",
+        text: "@orchestrator [done] Auth JWT complete",
+        featureId: "feat-auth",
+        verificationEvidence: "npm test -- jwt.test.ts -> 7/7 passed",
+      });
+      await engine.postMessage({
+        from: "feat-billing",
+        fromRole: "worker",
+        text: "@orchestrator [done] Billing complete",
+        featureId: "feat-billing",
+        verificationEvidence: "npm test -- stripe.test.ts -> 5/5 passed",
+      });
+      await engine.mergeMember("feat-auth");
+      await engine.mergeMember("feat-billing");
+
+      // Wave 2 with maxDispatch: 1 caps batch size to 1, then next call dispatches the remaining ready feature!
+      const wave2a = await engine.manageMission({
+        op: "dispatch_ready",
+        maxDispatch: 1,
+      });
+      assert.deepEqual(wave2a.dispatchedFeatures, ["feat-auth-overlap"]);
+      await waitUntil(
+        () =>
+          engine.getSnapshot().run?.members["feat-auth-overlap"]?.state === "waiting",
+      );
+
+      const wave2b = await engine.manageMission({ op: "dispatch_ready" });
+      assert.deepEqual(wave2b.dispatchedFeatures, ["feat-routes"]);
+      await waitUntil(
+        () => engine.getSnapshot().run?.members["feat-routes"]?.state === "waiting",
+      );
+
+      // Verify failing `init` command records warning in logTail WITHOUT crashing addMembers!
+      await engine.manageMission({
+        op: "set_manifest",
+        force: true,
+        commands: [{ name: "init", command: "echo 'missing-Optional-Bin' >&2 && exit 7" }],
+      });
+      await engine.addMembers({
+        name: "warn-worker",
+        workspace: "share",
+        brief: "Check non-fatal init warning",
+      });
+      await waitUntil(
+        () => engine.getSnapshot().run?.members["warn-worker"]?.state === "waiting",
+      );
+      const warnMember = engine.getSnapshot().run!.members["warn-worker"]!;
+      assert.ok(
+        warnMember.logTail.some(
+          (line) => line.includes("[init]") && line.includes("code 7"),
+        ),
+        `Expected non-zero init warning in logTail, got: ${JSON.stringify(warnMember.logTail)}`,
+      );
+    } finally {
+      for (const release of holdTurn.values()) {
+        release();
+      }
+      await engine.dispose();
+      await rm(tmpRoot, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  it("3. [Gap 3] auto-spawns @validator on mergeMember with Dual-Layer brief, revives stopped validator with Incremental Re-Validation after fixes, and spawns @validator-2 if prior validator was killed", async () => {
+    const { engine, transport } = await createTestHarness({
+      stallWatchdogEnabled: false,
+    });
+    const validatorPrompts: Array<{ name: string; call: number; prompt: string }> = [];
+
+    transport.onMember("validator*", async ({ request, prompt }) => {
+      const call =
+        validatorPrompts.filter((p) => p.name === request.name).length + 1;
+      validatorPrompts.push({ name: request.name, call, prompt });
+      if (request.name === "validator" && call === 1) {
+        // Initial milestone review: VAL-DL-001 passes, VAL-DL-002 fails; validator parks as `stopped` to test revival!
+        await request.engineApi!.manageMission!({
+          op: "verify_assertion",
+          assertionId: "VAL-DL-001",
+          assertionStatus: "passed",
+          evidence: "npm test -- login.test.ts: 5/5 passed",
+        });
+        await request.engineApi!.manageMission!({
+          op: "verify_assertion",
+          assertionId: "VAL-DL-002",
+          assertionStatus: "failed",
+          evidence: "Rate limiter returned 200 instead of 429 on 6th burst request",
+        });
+        return { outcome: "stopped", summary: "parked cold after initial audit" };
+      }
+      if (request.name === "validator" && call === 2) {
+        // Incremental re-validation after fix: verify VAL-DL-002 passes -> seals m-dl-1!
+        await request.engineApi!.manageMission!({
+          op: "verify_assertion",
+          assertionId: "VAL-DL-002",
+          assertionStatus: "passed",
+          evidence: "Re-tested burst endpoint: 6th request returns 429 Retry-After",
+        });
+      }
+      return { outcome: "waiting", summary: "audit complete" };
+    });
+
+    try {
+      await engine.manageMission({
+        op: "set_manifest",
+        commands: [
+          { name: "typecheck", command: "npm run typecheck" },
+          { name: "test", command: "npm test" },
+        ],
+        services: [
+          {
+            name: "api",
+            start: "npm run start:api",
+            port: 4100,
+            healthcheck: "http://127.0.0.1:4100/healthz",
+          },
+        ],
+      });
+      await engine.manageMission({
+        op: "upsert_assertions",
+        assertions: [
+          {
+            id: "VAL-DL-001",
+            title: "Login endpoint issues token",
+            description: "POST /login returns 200 + JWT.",
+          },
+          {
+            id: "VAL-DL-002",
+            title: "Login burst rate limiter",
+            description: "6th request within 10s returns 429.",
+          },
+          {
+            id: "VAL-DL-003",
+            title: "Milestone 2 health endpoint",
+            description: "GET /healthz returns 200.",
+          },
+        ],
+      });
+      await engine.manageMission({
+        op: "upsert_features",
+        features: [
+          {
+            id: "feat-login",
+            title: "Login & rate limit",
+            description: "Implement login & limiter",
+            milestone: "m-dl-1",
+            fulfills: ["VAL-DL-001", "VAL-DL-002"],
+          },
+        ],
+      });
+
+      // Dispatch & finish feat-login WITHOUT any validator spawned yet
+      await engine.manageMission({ op: "dispatch_ready" });
+      await waitUntil(
+        () => engine.getSnapshot().run?.members["feat-login"]?.state === "waiting",
+      );
+      await engine.postMessage({
+        from: "feat-login",
+        fromRole: "worker",
+        text: "@orchestrator [done] Implemented login",
+        featureId: "feat-login",
+        verificationEvidence: "npm run typecheck && npm test -> 10/10 passed",
+      });
+
+      // Merging feat-login MUST auto-spawn @validator (role:"validator", workspace:"inherit") with Dual-Layer brief!
+      const merge1 = (await engine.mergeMember("feat-login")) as any;
+      assert.ok(merge1);
+      assert.equal(merge1.milestoneValidationCues?.[0]?.validatorSpawned, "validator");
+      assert.equal(
+        engine.getSnapshot().run?.members.validator?.role,
+        "validator",
+      );
+      assert.equal(
+        engine.getSnapshot().run?.members.validator?.workspace,
+        "inherit",
+      );
+
+      // Wait for @validator turn 1 to finish and park in `stopped`
+      await waitUntil(
+        () =>
+          validatorPrompts.length === 1 &&
+          engine.getSnapshot().run?.members.validator?.state === "stopped",
+      );
+      assert.ok(
+        validatorPrompts[0]!.prompt.includes("[milestone-review]") &&
+          validatorPrompts[0]!.prompt.includes("Layer 1 (Scrutiny)") &&
+          validatorPrompts[0]!.prompt.includes("Layer 2 (Behavioral") &&
+          validatorPrompts[0]!.prompt.includes("write_library") &&
+          validatorPrompts[0]!.prompt.includes("api:4100"),
+      );
+
+      // Now add fix feature feat-login-fix in m-dl-1, complete & merge it -> revives `stopped` @validator with Incremental Re-Validation!
+      await engine.manageMission({
+        op: "upsert_features",
+        prepend: true,
+        features: [
+          {
+            id: "feat-login-fix",
+            title: "Fix burst limiter threshold",
+            description: "Return 429 on 6th request",
+            milestone: "m-dl-1",
+            fulfills: ["VAL-DL-002"],
+          },
+        ],
+      });
+      await engine.manageMission({ op: "dispatch_ready" });
+      await waitUntil(
+        () =>
+          engine.getSnapshot().run?.members["feat-login-fix"]?.state === "waiting",
+      );
+      await engine.postMessage({
+        from: "feat-login-fix",
+        fromRole: "worker",
+        text: "@orchestrator [done] Fixed burst threshold",
+        featureId: "feat-login-fix",
+        verificationEvidence: "npm test -- limiter.test.ts -> 6/6 passed",
+      });
+
+      const mergeFix = (await engine.mergeMember("feat-login-fix")) as any;
+      assert.equal(mergeFix.milestoneValidationCues?.[0]?.validatorWoken, "validator");
+
+      await waitUntil(
+        () =>
+          validatorPrompts.length === 2 &&
+          engine.getSnapshot().run?.members.validator?.state === "waiting",
+      );
+      assert.ok(
+        validatorPrompts[1]!.prompt.includes("Incremental Re-Validation") &&
+          validatorPrompts[1]!.prompt.includes("VAL-DL-001") &&
+          validatorPrompts[1]!.prompt.includes("VAL-DL-002 [failed]"),
+        "revived validator prompt must instruct Incremental Re-Validation focusing on unpassed VAL-DL-002 while noting passed VAL-DL-001",
+      );
+      assert.equal(
+        engine.getSnapshot().run?.milestones?.find((m) => m.label === "m-dl-1")?.sealed,
+        true,
+      );
+
+      // Retire @validator (`killed`) and complete milestone 2 -> auto-spawns @validator-2!
+      await engine.killMember("validator", { reason: "retire m1 validator" });
+      await engine.manageMission({
+        op: "upsert_features",
+        features: [
+          {
+            id: "feat-m2-health",
+            title: "Healthcheck endpoint",
+            description: "Add /healthz",
+            milestone: "m-dl-2",
+            fulfills: ["VAL-DL-003"],
+          },
+        ],
+      });
+      await engine.manageMission({ op: "dispatch_ready" });
+      await waitUntil(
+        () =>
+          engine.getSnapshot().run?.members["feat-m2-health"]?.state === "waiting",
+      );
+      await engine.postMessage({
+        from: "feat-m2-health",
+        fromRole: "worker",
+        text: "@orchestrator [done] Added /healthz",
+        featureId: "feat-m2-health",
+        verificationEvidence: "npm test -- health.test.ts -> 3/3 passed",
+      });
+
+      const mergeM2 = (await engine.mergeMember("feat-m2-health")) as any;
+      assert.equal(
+        mergeM2.milestoneValidationCues?.[0]?.validatorSpawned,
+        "validator-2",
+      );
+      await waitUntil(
+        () => engine.getSnapshot().run?.members["validator-2"]?.state === "waiting",
+      );
+    } finally {
+      await engine.dispose();
+    }
+  });
+
+  it("4. [Gap 4] enforces mandatory structured worker handoff (verification_evidence >= 10 chars & explicit feature_id on multi-feature assignment) when reporting [done]", async () => {
+    const { engine, transport } = await createTestHarness({
+      stallWatchdogEnabled: false,
+    });
+    let workerBridge: SpawnMemberRequest["engineApi"] | undefined;
+    transport.onMember("author-ho", async ({ request }) => {
+      workerBridge = request.engineApi;
+    });
+
+    try {
+      await engine.manageMission({
+        op: "upsert_features",
+        features: [
+          {
+            id: "feat-ho-1",
+            title: "Feature 1",
+            description: "Implement feature 1",
+            milestone: "m-ho",
+            assignedMember: "author-ho",
+            status: "in_progress",
+          },
+          {
+            id: "feat-ho-2",
+            title: "Feature 2",
+            description: "Implement feature 2",
+            milestone: "m-ho",
+          },
+        ],
+      });
+
+      await engine.addMembers({
+        name: "author-ho",
+        workspace: "share",
+        brief: "Implement feat-ho-1",
+      });
+      await waitUntil(
+        () => engine.getSnapshot().run?.members["author-ho"]?.state === "waiting",
+      );
+      assert.ok(workerBridge);
+
+      const memberPostTool = createMemberScopedTools(workerBridge, {
+        name: "author-ho",
+        role: "worker",
+        runId: "run-dyn",
+      }).find((t) => t.name === POST_MESSAGE_TOOL)!;
+      assert.ok(memberPostTool.description.includes("verification_evidence"));
+
+      // 1) Missing verification_evidence when uniquely assigned to feat-ho-1 (even with feature_id omitted!) -> INVALID_INPUT
+      const missingEvRes = await memberPostTool.execute(
+        "tc-ho-missing",
+        {
+          text: "@orchestrator [done] Finished feat-ho-1",
+        } as any,
+        undefined,
+        undefined,
+        {} as unknown as ExtensionToolContext,
+      );
+      assert.equal(missingEvRes.isError, true);
+      assert.equal((missingEvRes.details as any)?.errorCode, "INVALID_INPUT");
+      assert.ok(
+        ((missingEvRes.content[0] as any)?.text ?? "").includes("feat-ho-1") &&
+          ((missingEvRes.content[0] as any)?.text ?? "").includes("verification_evidence"),
+      );
+
+      // 2) Too-short (< 10 chars) verification_evidence -> INVALID_INPUT
+      await assert.rejects(
+        () =>
+          workerBridge!.postMessage({
+            text: "@orchestrator [done] Finished feat-ho-1",
+            featureId: "feat-ho-1",
+            verificationEvidence: "ok pass",
+          }),
+        (err: unknown) =>
+          err instanceof SwarmProtocolError && err.code === "INVALID_INPUT",
+      );
+
+      // 3) Multiple active features assigned to same worker without explicit feature_id -> INVALID_INPUT
+      await engine.manageMission({
+        op: "update_feature",
+        featureId: "feat-ho-2",
+        assignedMember: "author-ho",
+        featureStatus: "in_progress",
+      });
+      await assert.rejects(
+        () =>
+          workerBridge!.postMessage({
+            text: "@orchestrator [done] Finished one of my features",
+            verificationEvidence: "npm test -> 14/14 passed",
+          }),
+        (err: unknown) =>
+          err instanceof SwarmProtocolError &&
+          err.code === "INVALID_INPUT" &&
+          err.message.includes("Multiple Mission features are assigned to you"),
+      );
+
+      // 4) Non-empty left_undone allows reporting [done] without verification_evidence (explaining why work stopped incomplete)
+      const partialMsg = await workerBridge.postMessage({
+        text: "@orchestrator [done] Stopped on blocker in feat-ho-2",
+        featureId: "feat-ho-2",
+        leftUndone: ["Waiting on upstream schema migration in billing table"],
+      });
+      assert.equal(partialMsg.featureId, "feat-ho-2");
+      assert.equal(engine.getSnapshot().run?.handoffItems?.length, 1);
+
+      // 5) Valid verification_evidence (>= 10 chars) + explicit feature_id succeeds cleanly!
+      const okDoneRes = await memberPostTool.execute(
+        "tc-ho-ok",
+        {
+          text: "@orchestrator [done] commit=1234567 Completed feat-ho-1",
+          feature_id: "feat-ho-1",
+          verification_evidence: "npm run typecheck && npm test -> 22/22 passed",
+          discovered_issues: ["Minor log formatting nit in cli.ts"],
+        } as any,
+        undefined,
+        undefined,
+        {} as unknown as ExtensionToolContext,
+      );
+      assert.ok(!okDoneRes.isError);
+      assert.equal(
+        (okDoneRes.details as BoardMessage).verificationEvidence,
+        "npm run typecheck && npm test -> 22/22 passed",
+      );
+    } finally {
+      await engine.dispose();
+    }
+  });
+
+  it("5. [Gap 6] validates services port/name uniqueness, shares persistent library/ topics across orchestrator/worker/validator, and injects v0.9.0 prompts with flat schemas", async () => {
+    const tmpProject = await mkdtemp(path.join(os.tmpdir(), "pi-swarm-v090-lib-"));
+    const realStore = new SwarmStore(tmpProject);
+    const worktree = new MockWorktreeManager();
+    const transport = new ScriptedTransport();
+
+    let workerBridge: SpawnMemberRequest["engineApi"] | undefined;
+    let validatorBridge: SpawnMemberRequest["engineApi"] | undefined;
+    transport.onMember("lib-worker", async ({ request }) => {
+      workerBridge = request.engineApi;
+    });
+    transport.onMember("lib-val", async ({ request }) => {
+      validatorBridge = request.engineApi;
+    });
+
+    const engine = new SwarmEngine({
+      store: realStore,
+      worktree,
+      transport,
+      settings: { stallWatchdogEnabled: false },
+    });
+
+    try {
+      const run = await realStore.createRun({
+        id: "run-lib",
+        title: "Services & Library Test",
+        objective: "Share knowledge & enforce port boundaries",
+        baseBranch: "main",
+        ownerSessionId: "sess-lib",
+      });
+      await engine.startRun(run.id);
+
+      const orchTools = createSwarmTools({ engine });
+      const orchSwarmTool = orchTools.find((t) => t.name === SWARM_TOOL)!;
+      const toolCtx = {} as unknown as ExtensionToolContext;
+
+      // 1) Duplicate service names & duplicate ports across services MUST fail with INVALID_INPUT
+      await assert.rejects(
+        () =>
+          engine.manageMission({
+            op: "set_manifest",
+            services: [
+              { name: "api", start: "npm run api", port: 3000 },
+              { name: "API", start: "npm run api2", port: 3001 },
+            ],
+          }),
+        (err: unknown) =>
+          err instanceof SwarmProtocolError && err.code === "INVALID_INPUT",
+      );
+      await assert.rejects(
+        () =>
+          engine.manageMission({
+            op: "set_manifest",
+            services: [
+              { name: "api", start: "npm run api", port: 4500 },
+              { name: "worker-svc", start: "npm run worker", port: 4500 },
+            ],
+          }),
+        (err: unknown) =>
+          err instanceof SwarmProtocolError &&
+          err.code === "INVALID_INPUT" &&
+          err.message.includes("4500"),
+      );
+
+      // Valid services manifest via swarmTool
+      const setSvcRes = await orchSwarmTool.execute(
+        "tc-set-svc",
+        {
+          action: "mission",
+          mission_op: "set_manifest",
+          commands: [{ name: "test", command: "npm test" }],
+          services: [
+            {
+              name: "api",
+              start: "npm run dev:api",
+              stop: "pkill -f dev:api",
+              healthcheck: "http://127.0.0.1:4500/health",
+              port: 4500,
+            },
+            {
+              name: "web",
+              start: "npm run dev:web",
+              healthcheck: "http://127.0.0.1:5173",
+              port: 5173,
+              depends_on: ["api"],
+            },
+          ],
+          boundaries: ["Never bind ports outside services.json"],
+        } as any,
+        undefined,
+        undefined,
+        toolCtx,
+      );
+      assert.ok(!setSvcRes.isError);
+      assert.equal(engine.getSnapshot().run?.services?.length, 2);
+
+      // Adding a third service colliding with existing port 4500 (without force replace) MUST also fail!
+      await assert.rejects(
+        () =>
+          engine.manageMission({
+            op: "set_manifest",
+            services: [{ name: "metrics", start: "npm run metrics", port: 4500 }],
+          }),
+        (err: unknown) =>
+          err instanceof SwarmProtocolError && err.code === "INVALID_INPUT",
+      );
+
+      await engine.addMembers({ name: "lib-worker", brief: "Explore & write library" });
+      await engine.addMembers({
+        name: "lib-val",
+        role: "validator",
+        brief: "Validate & record testing notes",
+      });
+      await waitUntil(
+        () =>
+          engine.getSnapshot().run?.members["lib-worker"]?.state === "waiting" &&
+          engine.getSnapshot().run?.members["lib-val"]?.state === "waiting",
+      );
+      assert.ok(workerBridge);
+      assert.ok(validatorBridge);
+
+      const workerSwarmTool = createMemberScopedTools(workerBridge, {
+        name: "lib-worker",
+        role: "worker",
+        runId: run.id,
+      }).find((t) => t.name === SWARM_TOOL)!;
+      const validatorSwarmTool = createMemberScopedTools(validatorBridge, {
+        name: "lib-val",
+        role: "validator",
+        runId: run.id,
+      }).find((t) => t.name === SWARM_TOOL)!;
+
+      // 2) read_library without topic lists default initialized topics (architecture, environment, testing)
+      const listRes = await workerSwarmTool.execute(
+        "tc-lib-list",
+        { action: "mission", mission_op: "read_library" } as any,
+        undefined,
+        undefined,
+        toolCtx,
+      );
+      assert.ok(!listRes.isError);
+      assert.deepEqual((listRes.details as any).libraryTopics, [
+        "architecture",
+        "environment",
+        "testing",
+      ]);
+
+      // 3) Worker writes/appends environment discoveries; Validator appends testing notes; Orchestrator reads both!
+      const workerWrite = await workerSwarmTool.execute(
+        "tc-lib-worker-write",
+        {
+          action: "mission",
+          mission_op: "write_library",
+          library_topic: "environment",
+          library_content: "- API requires PORT=4500 and NODE_ENV=test",
+          library_append: true,
+        } as any,
+        undefined,
+        undefined,
+        toolCtx,
+      );
+      assert.ok(!workerWrite.isError);
+
+      const valWrite = await validatorSwarmTool.execute(
+        "tc-lib-val-write",
+        {
+          action: "mission",
+          mission_op: "write_library",
+          library_topic: "testing",
+          library_content: "- Run healthcheck curl -sf http://127.0.0.1:4500/health before E2E suite",
+          library_append: true,
+        } as any,
+        undefined,
+        undefined,
+        toolCtx,
+      );
+      assert.ok(!valWrite.isError);
+
+      const orchReadEnv = await orchSwarmTool.execute(
+        "tc-lib-orch-read-env",
+        {
+          action: "mission",
+          mission_op: "read_library",
+          library_topic: "environment",
+        } as any,
+        undefined,
+        undefined,
+        toolCtx,
+      );
+      assert.ok(!orchReadEnv.isError);
+      assert.ok(
+        ((orchReadEnv.details as any).libraryContent as string).includes(
+          "PORT=4500 and NODE_ENV=test",
+        ),
+      );
+
+      const onDiskTesting = await readFile(
+        path.join(tmpProject, ".pi/swarm/runs", run.id, "library/testing.md"),
+        "utf8",
+      );
+      assert.ok(onDiskTesting.includes("http://127.0.0.1:4500/health"));
+
+      // 4) Role prompts inject services, ports, healthchecks, library/, mission-worker-base startup discipline, and dual-layer incremental validator guidance
+      const snap = engine.getSnapshot();
+      const staticSec = buildOrchestratorStaticSection(snap);
+      const playbookSec = buildOrchestratorPlaybookSection(snap);
+      const workerSys = buildMemberSystemPrompt(
+        snap.run!,
+        snap.run!.members["lib-worker"]!,
+      );
+      const valSys = buildMemberSystemPrompt(
+        snap.run!,
+        snap.run!.members["lib-val"]!,
+      );
+
+      for (const p of [staticSec, playbookSec, workerSys, valSys]) {
+        assert.ok(p.includes("port 4500") && p.includes("port 5173"));
+        assert.ok(p.includes("http://127.0.0.1:4500/health"));
+        assert.ok(p.includes(`.pi/swarm/runs/${run.id}/library/`));
+        assert.ok(p.includes("read_library") && p.includes("write_library"));
+      }
+      assert.ok(
+        workerSys.includes("mission-worker-base") &&
+          workerSys.includes("verification_evidence"),
+      );
+      assert.ok(
+        valSys.includes("scrutiny") &&
+          valSys.includes("Incremental Re-Validation"),
+      );
+      assert.ok(
+        playbookSec.includes("dispatch_ready") &&
+          playbookSec.includes("override_assertion"),
+      );
+    } finally {
+      await engine.dispose();
+      await rm(tmpProject, { recursive: true, force: true }).catch(() => {});
     }
   });
 });
