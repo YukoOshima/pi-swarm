@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import path from "node:path";
@@ -9,16 +10,23 @@ import {
   ASSERTION_STATUSES,
   CHANNEL_NAME_PATTERN,
   DEFAULT_CHANNEL,
+  DEFAULT_LIBRARY_TOPICS,
   DEFAULT_SWARM_SETTINGS,
   FEATURE_STATUSES,
   HANDOFF_RESOLUTIONS,
   MEMBER_NAME_PATTERN,
   MONITOR_NAME,
   ORCHESTRATOR_NAME,
+  POST_MESSAGE_TOOL,
   RESERVED_MEMBER_NAMES,
   SWARM_BRANCH_PREFIX,
+  SWARM_DIR,
+  SWARM_LIBRARY_DIR,
   SWARM_MAX_BOARD_HOPS,
   SWARM_MISSION_OPS,
+  SWARM_RUNS_DIR,
+  SWARM_TOOL,
+  SWARM_WAIT_TOOL,
 } from "../constants.js";
 import {
   type AddHelperInput,
@@ -49,6 +57,7 @@ import {
   type MissionCommandEntry,
   type MissionFeature,
   type MissionHandoffItem,
+  type MissionServiceEntry,
   type ParkOrchestratorWaitOptions,
   type ParkOrchestratorWaitResult,
   type PersistentAgentHandle,
@@ -349,6 +358,261 @@ const VALID_HANDOFF_RESOLUTION_SET: ReadonlySet<HandoffItemResolution> =
 const LAZY_JUSTIFICATION_RE =
   /\b(?:low[\s-]+priority|non[\s-]+blocking|will\s+handle\s+later|handle\s+later|fix\s+later|todo|minor\s+issue|do\s+it\s+later|defer(?:red|ring)?\s+for\s+now)\b/i;
 
+const LAZY_OVERRIDE_EXCUSE_RE =
+  /^(low[\s-]*priority|non[\s-]*blocking|will\s+(handle|fix|do)\s+later|later|todo|n\/a|minor|ignore|skip|force)\b/i;
+
+const LIBRARY_TOPIC_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
+
+function normalizeLibraryTopicName(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed || !LIBRARY_TOPIC_RE.test(trimmed) || isPrototypeKey(trimmed)) {
+    throw new SwarmProtocolError(
+      "INVALID_INPUT",
+      `Invalid library_topic "${raw}". Expected alphanumeric/hyphen/underscore topic name matching ${LIBRARY_TOPIC_RE.source}.`,
+      { libraryTopic: raw },
+    );
+  }
+  return trimmed.toLowerCase();
+}
+
+function normalizeOwnedPath(raw: string): string | null {
+  let p = raw.trim().replace(/\\/g, "/");
+  if (!p) return null;
+  while (p.startsWith("./")) {
+    p = p.slice(2);
+  }
+  p = p.replace(/^\/+/, "").replace(/\/+/g, "/");
+  if (p === "." || p === "*" || p === "**" || p === "") {
+    return "";
+  }
+  p = p.replace(/\/\*+$/, "").replace(/\/+$/, "");
+  if (p === "." || p === "*" || p === "**") {
+    return "";
+  }
+  return p;
+}
+
+function singleOwnedPathsCollide(a: string, b: string): boolean {
+  if (a === "" || b === "") return true;
+  if (a === b) return true;
+  return a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+}
+
+function ownedPathsOverlap(
+  pathsA: readonly string[] | undefined,
+  pathsB: readonly string[] | undefined,
+): boolean {
+  if (!pathsA?.length || !pathsB?.length) return false;
+  const normA = pathsA
+    .map(normalizeOwnedPath)
+    .filter((p): p is string => p !== null);
+  const normB = pathsB
+    .map(normalizeOwnedPath)
+    .filter((p): p is string => p !== null);
+  if (normA.length === 0 || normB.length === 0) return false;
+  for (const a of normA) {
+    for (const b of normB) {
+      if (singleOwnedPathsCollide(a, b)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function uniqueHandleFromFeatureId(
+  featureId: string,
+  run: SwarmRunState,
+  liveNames: Iterable<string>,
+  reservedLower?: Set<string>,
+): string {
+  let slug = featureId
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  if (!slug || !/^[a-z]/.test(slug)) {
+    slug = slug ? `w-${slug}` : "worker";
+  }
+  if (RESERVED_SET.has(slug) || isPrototypeKey(slug)) {
+    slug = `w-${slug}`;
+  }
+  const base = slug.slice(0, 26).replace(/-+$/g, "") || "worker";
+  const taken = new Set<string>(reservedLower ?? []);
+  for (const name of Object.keys(run.members)) {
+    taken.add(name.toLowerCase());
+  }
+  for (const name of liveNames) {
+    taken.add(name.toLowerCase());
+  }
+  if (!taken.has(base) && MEMBER_NAME_PATTERN.test(base) && !RESERVED_SET.has(base)) {
+    reservedLower?.add(base);
+    return base;
+  }
+  for (let idx = 2; idx <= 9999; idx++) {
+    const suffix = `-${idx}`;
+    const prefix =
+      base.slice(0, Math.max(1, 32 - suffix.length)).replace(/-+$/g, "") || "w";
+    const candidate = `${prefix}${suffix}`;
+    if (
+      !taken.has(candidate) &&
+      MEMBER_NAME_PATTERN.test(candidate) &&
+      !RESERVED_SET.has(candidate)
+    ) {
+      reservedLower?.add(candidate);
+      return candidate;
+    }
+  }
+  const fallback = `w-${randomBytes(3).toString("hex")}`;
+  reservedLower?.add(fallback);
+  return fallback;
+}
+
+function uniqueValidatorHandle(
+  run: SwarmRunState,
+  liveNames: Iterable<string>,
+): string {
+  const taken = new Set<string>();
+  for (const name of Object.keys(run.members)) {
+    taken.add(name.toLowerCase());
+  }
+  for (const name of liveNames) {
+    taken.add(name.toLowerCase());
+  }
+  if (!taken.has("validator")) {
+    return "validator";
+  }
+  for (let idx = 2; idx <= 9999; idx++) {
+    const candidate = `validator-${idx}`;
+    if (!taken.has(candidate)) {
+      return candidate;
+    }
+  }
+  return `validator-${randomBytes(2).toString("hex")}`;
+}
+
+function buildFeatureWorkerBrief(
+  run: SwarmRunState,
+  feat: MissionFeature,
+): string {
+  const assertionMap = new Map((run.assertions ?? []).map((a) => [a.id, a]));
+  const fulfilledDetails = feat.fulfills.map((id) => {
+    const a = assertionMap.get(id);
+    if (!a) return `  - \`${id}\``;
+    const evPart = a.evidenceRequired ? ` (required evidence: ${a.evidenceRequired})` : "";
+    return `  - \`${a.id}\`: ${a.title} — ${a.description}${evPart}`;
+  });
+  const cmdSummary =
+    run.commands && run.commands.length > 0
+      ? run.commands
+          .filter((c) => c.name.trim().toLowerCase() !== "init")
+          .map((c) => `${c.name}: \`${c.command}\``)
+          .join(" | ")
+      : "(inspect package.json / repo scripts)";
+  const svcSummary =
+    run.services && run.services.length > 0
+      ? run.services
+          .map(
+            (s) =>
+              `${s.name}${s.port !== undefined ? `:${s.port}` : ""} (start: \`${s.start}\`${s.healthcheck ? `, healthcheck: \`${s.healthcheck}\`` : ""})`,
+          )
+          .join(" | ")
+      : "";
+  const ownedFilesText =
+    feat.filesOwned && feat.filesOwned.length > 0
+      ? feat.filesOwned.map((p) => `\`${p}\``).join(", ")
+      : "(scoped to this feature only — do not touch files owned by sibling features)";
+
+  const lines: string[] = [
+    `Implement Mission Feature \`${feat.id}\` — **${feat.title}** (milestone: \`${feat.milestone}\`).`,
+    "",
+    `Scope: ${feat.description || feat.title}`,
+  ];
+  if (feat.preconditions && feat.preconditions.length > 0) {
+    lines.push(`Preconditions: ${feat.preconditions.join("; ")}`);
+  }
+  if (feat.expectedBehavior && feat.expectedBehavior.length > 0) {
+    lines.push(`Expected Behavior: ${feat.expectedBehavior.join("; ")}`);
+  }
+  lines.push(
+    "",
+    "(a) Exclusive File Ownership & Boundaries:",
+    `- Owned files/paths: ${ownedFilesText}. Do NOT edit files outside your ownership slice.`,
+  );
+  if (run.boundaries && run.boundaries.length > 0) {
+    lines.push(`- Mission boundaries: ${run.boundaries.join(" · ")}`);
+  }
+  lines.push(
+    "",
+    "(b) Validation Contract & Shared Library:",
+    `- Startup step 1: Read shared Mission Library (\`${SWARM_DIR}/${SWARM_RUNS_DIR}/${run.id}/${SWARM_LIBRARY_DIR}/\`) via \`${SWARM_TOOL}{action:"mission", mission_op:"read_library"}\` to reuse architecture/environment/testing notes, and record non-obvious discoveries via \`mission_op:"write_library"\` (\`library_append:true\`).`,
+  );
+  if (fulfilledDetails.length > 0) {
+    lines.push("- Fulfilled VAL-* assertions:", ...fulfilledDetails);
+  }
+  lines.push(
+    "",
+    "(c) Baseline Check & Verification Commands:",
+    `- Operational commands: ${cmdSummary}`,
+  );
+  if (svcSummary) {
+    lines.push(`- Services & reserved ports: ${svcSummary}`);
+  }
+  if (feat.verificationSteps && feat.verificationSteps.length > 0) {
+    lines.push(`- Feature verification steps: ${feat.verificationSteps.join(" && ")}`);
+  }
+  lines.push(
+    "- Verify baseline health before editing, implement and verify all changes inside your isolated `share` worktree, and commit cleanly on your branch (`git status` clean).",
+    "",
+    "(d) Next-Peer Doorbell & Mandatory Structured Handoff:",
+    `- Report completion via \`${POST_MESSAGE_TOOL}\` starting with \`@${ORCHESTRATOR_NAME} [done] commit=<sha> workspace=<cwd> <concise summary>\` AND pass \`feature_id: "${feat.id}"\`, \`verification_evidence\` (>= 10 chars with exact commands & pass counts), plus any \`discovered_issues\` / \`left_undone\`, then call \`${SWARM_WAIT_TOOL}\`.`,
+  );
+  return lines.join("\n");
+}
+
+function buildMilestoneValidationBrief(
+  run: SwarmRunState,
+  milestoneLabel: string,
+  mFeatures: readonly MissionFeature[],
+  pendingOrFailed: readonly MissionAssertion[],
+  alreadyPassed: readonly MissionAssertion[],
+): string {
+  const nonInitCommands = (run.commands ?? []).filter(
+    (c) => c.name.trim().toLowerCase() !== "init",
+  );
+  const cmdManifest =
+    nonInitCommands.length > 0
+      ? nonInitCommands.map((c) => `${c.name}: \`${c.command}\``).join(" | ")
+      : "(inspect package.json / repo test & typecheck scripts)";
+  const mergedFeatureSummary = mFeatures
+    .map((f) =>
+      f.mergedCommitSha ? `${f.id} (${f.mergedCommitSha.slice(0, 8)})` : f.id,
+    )
+    .join(", ");
+  const unpassedDetails = pendingOrFailed
+    .map(
+      (a) =>
+        `${a.id} [${a.status}] (${a.title}${a.evidenceRequired ? ` — required: ${a.evidenceRequired}` : ""})`,
+    )
+    .join("; ");
+  const isIncremental = alreadyPassed.length > 0;
+  const svcLine =
+    run.services && run.services.length > 0
+      ? ` Exercise configured services/ports (${run.services.map((s) => `${s.name}${s.port !== undefined ? `:${s.port}` : ""}${s.healthcheck ? ` [${s.healthcheck}]` : ""}`).join(", ")}).`
+      : "";
+
+  const layer2Instruction = isIncremental
+    ? `Layer 2 (Behavioral / Surface — Incremental Re-Validation): ${alreadyPassed.length} assertion(s) in milestone "${milestoneLabel}" already passed (${alreadyPassed.map((a) => a.id).join(", ")}); focus behavioral testing on the remaining unpassed VAL-* assertion(s) (${unpassedDetails}) plus a fast regression check that previously passed assertions still hold.${svcLine}`
+    : `Layer 2 (Behavioral / Surface Validation): Behaviorally test and verify each milestone VAL-* assertion against real execution/outputs: ${unpassedDetails}.${svcLine}`;
+
+  return [
+    `[milestone-review] All features in milestone "${milestoneLabel}" (${mergedFeatureSummary}) are completed and merged onto \`${run.baseBranch}\`. Execute Dual-Layer Milestone Validation now:`,
+    `1. Layer 1 (Scrutiny): Run operational commands (${cmdManifest}) on \`${run.baseBranch}\` and review the merged commits/diffs for milestone "${milestoneLabel}".`,
+    `2. ${layer2Instruction}`,
+    `3. Stamp every verified assertion via \`${SWARM_TOOL}{action:"mission", mission_op:"verify_assertion", assertion_id, assertion_status, evidence}\` and record reusable testing/environment findings in \`${SWARM_DIR}/${SWARM_RUNS_DIR}/${run.id}/${SWARM_LIBRARY_DIR}/testing.md\` via \`${SWARM_TOOL}{action:"mission", mission_op:"write_library", library_topic:"testing", library_content:"...", library_append:true}\`, then report your verdict to \`@${ORCHESTRATOR_NAME} [done] ...\` and call \`${SWARM_WAIT_TOOL}\`.`,
+  ].join("\n");
+}
+
 function isActiveFeatureStatus(status: FeatureStatus): boolean {
   return status === "failed" || status === "in_progress" || status === "pending";
 }
@@ -588,6 +852,7 @@ function formatMissionStatusSummary(run: SwarmRunState): string {
   const handoffs = run.handoffItems ?? [];
   const milestones = run.milestones ?? [];
   const commands = run.commands ?? [];
+  const services = run.services ?? [];
   const boundaries = run.boundaries ?? [];
 
   const nonCancelledFeatures = features.filter((f) => f.status !== "cancelled");
@@ -595,15 +860,18 @@ function formatMissionStatusSummary(run: SwarmRunState): string {
     (f) => f.status === "completed",
   ).length;
   const passedAssertions = assertions.filter((a) => a.status === "passed").length;
+  const overriddenAssertions = assertions.filter((a) => a.overridden === true).length;
   const pendingAssertions = assertions.filter((a) => a.status === "pending").length;
   const failedAssertions = assertions.filter((a) => a.status === "failed").length;
   const blockedAssertions = assertions.filter((a) => a.status === "blocked").length;
   const openHandoffs = handoffs.filter((h) => h.resolution === "open");
+  const overrideHeader =
+    overriddenAssertions > 0 ? ` (${overriddenAssertions} [OVERRIDE])` : "";
 
   const lines: string[] = [
     `# Mission Goal Status — "${run.title}" (${run.id})`,
-    `Status: ${run.status}${run.phase ? ` | Phase: ${run.phase}` : ""} | Features: ${completedFeatures}/${nonCancelledFeatures.length} completed | VAL: ${passedAssertions}/${assertions.length} passed | Open Handoffs: ${openHandoffs.length}`,
-    `Artifacts: .pi/swarm/runs/${run.id}/mission.md · .pi/swarm/runs/${run.id}/validation-contract.md · .pi/swarm/runs/${run.id}/features.json`,
+    `Status: ${run.status}${run.phase ? ` | Phase: ${run.phase}` : ""} | Features: ${completedFeatures}/${nonCancelledFeatures.length} completed | VAL: ${passedAssertions}/${assertions.length} passed${overrideHeader} | Open Handoffs: ${openHandoffs.length}`,
+    `Artifacts: .pi/swarm/runs/${run.id}/mission.md · .pi/swarm/runs/${run.id}/validation-contract.md · .pi/swarm/runs/${run.id}/features.json · .pi/swarm/runs/${run.id}/services.json · .pi/swarm/runs/${run.id}/library/`,
   ];
 
   lines.push("");
@@ -613,6 +881,20 @@ function formatMissionStatusSummary(run: SwarmRunState): string {
   } else {
     for (const cmd of commands) {
       lines.push(`- \`${cmd.name}\`: \`${cmd.command}\``);
+    }
+  }
+  if (services.length > 0) {
+    for (const svc of services) {
+      const portPart = svc.port !== undefined ? ` (port ${svc.port})` : "";
+      const hcPart = svc.healthcheck ? ` | healthcheck: \`${svc.healthcheck}\`` : "";
+      const stopPart = svc.stop ? ` | stop: \`${svc.stop}\`` : "";
+      const depPart =
+        svc.dependsOn && svc.dependsOn.length > 0
+          ? ` | dependsOn=[${svc.dependsOn.join(",")}]`
+          : "";
+      lines.push(
+        `- Service \`${svc.name}\`${portPart}: start \`${svc.start}\`${hcPart}${stopPart}${depPart}`,
+      );
     }
   }
   if (boundaries.length === 0) {
@@ -666,7 +948,9 @@ function formatMissionStatusSummary(run: SwarmRunState): string {
     for (const a of assertions) {
       const badge =
         a.status === "passed"
-          ? "[✓ passed]"
+          ? a.overridden
+            ? "[✓ passed · OVERRIDE]"
+            : "[✓ passed]"
           : a.status === "failed"
             ? "[! failed]"
             : a.status === "blocked"
@@ -858,6 +1142,7 @@ export class SwarmEngine implements ISwarmEngine {
   private attachRunChain: Promise<void> = Promise.resolve();
   private roleModelsChain: Promise<void> = Promise.resolve();
   private missionChain: Promise<void> = Promise.resolve();
+  private readonly fallbackLibrary = new Map<string, Map<string, string>>();
 
   constructor(deps: SwarmEngineDeps) {
     this.store = deps.store;
@@ -1700,6 +1985,7 @@ export class SwarmEngine implements ISwarmEngine {
       spec: (typeof specs)[number];
       cwd: string;
       branch?: string;
+      initWarning?: string;
     }> = [];
     const provisionedWorktrees: Array<{ worktreePath: string; branch?: string }> = [];
 
@@ -1707,6 +1993,7 @@ export class SwarmEngine implements ISwarmEngine {
       for (const spec of specs) {
         let cwd: string;
         let branch: string | undefined;
+        let initWarning: string | undefined;
 
         if (workspaceMode === "share" || workspaceMode === "branch") {
           branch = `${SWARM_BRANCH_PREFIX}${safeRunBranchSegment}/${spec.name}`;
@@ -1720,6 +2007,13 @@ export class SwarmEngine implements ISwarmEngine {
           cwd = createdWt.worktreePath;
           branch = createdWt.branch;
           provisionedWorktrees.push({ worktreePath: cwd, branch });
+          const initRes = await this.executeWorktreeInitCommand(
+            this.cachedRun ?? run,
+            cwd,
+          );
+          if (!initRes.ok && initRes.warning) {
+            initWarning = initRes.warning;
+          }
         } else {
           cwd =
             parentMember && parentMember.workspace !== "inherit"
@@ -1727,7 +2021,7 @@ export class SwarmEngine implements ISwarmEngine {
               : this.worktree.repoRoot;
         }
 
-        preparedSpecs.push({ spec, cwd, branch });
+        preparedSpecs.push({ spec, cwd, branch, initWarning });
       }
     } catch (err) {
       for (const wt of provisionedWorktrees) {
@@ -1742,7 +2036,7 @@ export class SwarmEngine implements ISwarmEngine {
     const registeredWorktrees = new Set<string>();
     const preRegisteredLiveNames: string[] = [];
     try {
-      for (const { spec, cwd, branch } of preparedSpecs) {
+      for (const { spec, cwd, branch, initWarning } of preparedSpecs) {
         const agentId = this.generateAgentIdFn(spec.name);
         // Register LiveMember SYNCHRONOUSLY as spawning BEFORE store.addMember so concurrent peer
         // @all / @<prefix> posts during registration queue into pendingWakes instead of spawning duplicates!
@@ -1759,7 +2053,7 @@ export class SwarmEngine implements ISwarmEngine {
           deliveredSeqs: new Set<number>(),
           triedModels: new Set<string>(effectiveModel ? [effectiveModel] : []),
           lastMessages: seedMessages ? sanitizeForkSeedMessages(seedMessages) : [],
-          logTail: [],
+          logTail: initWarning ? [initWarning] : [],
           currentActivity: "queued to start",
           turnStartPostSeq: 0,
           lastSilentSummary: undefined,
@@ -1822,12 +2116,18 @@ export class SwarmEngine implements ISwarmEngine {
           briefSeq: briefMsg.seq,
           lastReadSeq: briefMsg.seq,
           currentActivity: "queued to start",
+          ...(initWarning ? { logLine: initWarning } : {}),
           actor: callerName,
         });
         this.setCachedRun(updatedRun);
 
         const memberRecord = getOwnMember(updatedRun, spec.name)!;
-        live.logTail = [...memberRecord.logTail];
+        live.logTail =
+          memberRecord.logTail.length > 0
+            ? [...memberRecord.logTail]
+            : initWarning
+              ? [initWarning]
+              : [];
         createdRecords.push(memberRecord);
 
         this.emitEngineEvent("board_posted", `Posted brief #${briefMsg.seq} for @${spec.name}`, {
@@ -1950,7 +2250,7 @@ export class SwarmEngine implements ISwarmEngine {
       (handle) => knownMembers.has(handle),
     );
 
-    const featureId =
+    const rawFeatureId =
       typeof input.featureId === "string" && input.featureId.trim()
         ? input.featureId.trim()
         : undefined;
@@ -1970,6 +2270,55 @@ export class SwarmEngine implements ISwarmEngine {
       typeof input.verificationEvidence === "string" && input.verificationEvidence.trim()
         ? input.verificationEvidence.trim()
         : undefined;
+
+    // Enforce mandatory structured worker handoff on [done] when Mission features exist!
+    const isWorkerSenderPreCheck =
+      input.fromRole === "worker" || senderMember?.role === "worker";
+    const isCompletionPostPreCheck =
+      input.kind === "done" || /\[done\]/i.test(text);
+    let featureId = rawFeatureId;
+
+    if (
+      isWorkerSenderPreCheck &&
+      isCompletionPostPreCheck &&
+      run.features &&
+      run.features.length > 0
+    ) {
+      const workerHandle = senderMember?.name ?? input.from.trim().replace(/^@/, "");
+      let targetFeature: MissionFeature | undefined;
+      if (featureId) {
+        targetFeature = run.features.find((f) => f.id === featureId);
+      } else {
+        const assignedActive = run.features.filter(
+          (f) =>
+            f.assignedMember === workerHandle &&
+            (f.status === "in_progress" || f.status === "pending"),
+        );
+        if (assignedActive.length > 1) {
+          throw new SwarmProtocolError(
+            "INVALID_INPUT",
+            `Multiple Mission features are assigned to you (${assignedActive.map((f) => f.id).join(", ")}); pass feature_id explicitly on post_message when reporting [done].`,
+            { assignedFeatures: assignedActive.map((f) => f.id) },
+          );
+        }
+        if (assignedActive.length === 1) {
+          targetFeature = assignedActive[0];
+          featureId = targetFeature.id;
+        }
+      }
+
+      if (targetFeature && targetFeature.status !== "cancelled") {
+        const hasUndoneItems = Boolean(leftUndone && leftUndone.length > 0);
+        const evidenceLen = verificationEvidence?.trim().length ?? 0;
+        if (!hasUndoneItems && evidenceLen < 10) {
+          throw new SwarmProtocolError(
+            "INVALID_INPUT",
+            `Structured handoff required when reporting [done] on Mission feature "${targetFeature.id}": provide verification_evidence (>= 10 chars with exact commands & results run) plus any discovered_issues[] / left_undone[].`,
+            { featureId: targetFeature.id },
+          );
+        }
+      }
+    }
 
     const msg = await this.store.postBoardMessage(run.id, {
       ...input,
@@ -2015,7 +2364,7 @@ export class SwarmEngine implements ISwarmEngine {
     const isWorkerSender =
       normalizedMsg.fromRole === "worker" || senderMember?.role === "worker";
     const isDonePost =
-      normalizedMsg.kind === "done" || /(?:^|\s)\[done\](?=\s|$|:)/i.test(text);
+      normalizedMsg.kind === "done" || /\[done\]/i.test(text);
 
     let latestRun: SwarmRunState;
     if (hasDiscovered || hasUndone || (featureId && isWorkerSender)) {
@@ -3627,13 +3976,15 @@ export class SwarmEngine implements ISwarmEngine {
       milestone: string;
       assertionIds: string[];
       validatorWoken?: string;
+      validatorSpawned?: string;
       boardSeq?: number;
       needsValidatorSpawn?: boolean;
     }> = [];
 
     if (updated.validatorEnabled && touchedMilestones.size > 0) {
       for (const milestoneLabel of touchedMilestones) {
-        const mFeatures = (updated.features ?? []).filter(
+        const currentRunForVal = this.cachedRun ?? updated;
+        const mFeatures = (currentRunForVal.features ?? []).filter(
           (f) => f.milestone === milestoneLabel && f.status !== "cancelled",
         );
         if (mFeatures.length === 0) continue;
@@ -3641,7 +3992,7 @@ export class SwarmEngine implements ISwarmEngine {
         const allCompletedAndMerged = mFeatures.every((f) => {
           if (f.status !== "completed") return false;
           if (!f.assignedMember) return true;
-          const assigned = getOwnMember(updated, f.assignedMember);
+          const assigned = getOwnMember(currentRunForVal, f.assignedMember);
           if (!assigned || !isIsolatedWorktreeWorkspace(assigned.workspace)) {
             return true;
           }
@@ -3654,58 +4005,89 @@ export class SwarmEngine implements ISwarmEngine {
         );
         const candidateAssertions =
           claimedValIds.length > 0
-            ? (updated.assertions ?? []).filter((a) => claimedValIds.includes(a.id))
-            : (updated.milestones?.length ?? 0) <= 1
-              ? (updated.assertions ?? [])
+            ? (currentRunForVal.assertions ?? []).filter((a) => claimedValIds.includes(a.id))
+            : (currentRunForVal.milestones?.length ?? 0) <= 1
+              ? (currentRunForVal.assertions ?? [])
               : [];
+        const alreadyPassed = candidateAssertions.filter(
+          (a) => a.status === "passed",
+        );
         const pendingOrFailed = candidateAssertions.filter(
           (a) => a.status === "pending" || a.status === "failed",
         );
         if (pendingOrFailed.length === 0) continue;
 
-        const idleValidator = updated.memberOrder
-          .map((n) => getOwnMember(updated, n))
-          .find((m): m is SwarmMemberRecord => {
-            if (
-              !m ||
-              m.role !== "validator" ||
-              m.workspace !== "inherit" ||
-              m.state !== "waiting" ||
-              m.humanStopped
-            ) {
-              return false;
-            }
-            const vLive = this.liveMembers.get(m.name);
-            return (
-              !vLive?.spawning &&
-              !vLive?.waking &&
-              !vLive?.turnActive &&
-              !vLive?.switchingModel &&
-              vLive?.handle?.getState() !== "working"
-            );
-          });
-
+        const dualLayerBrief = buildMilestoneValidationBrief(
+          currentRunForVal,
+          milestoneLabel,
+          mFeatures,
+          pendingOrFailed,
+          alreadyPassed,
+        );
         const assertionIds = pendingOrFailed.map((a) => a.id);
-        if (idleValidator) {
-          const cmdManifest =
-            updated.commands && updated.commands.length > 0
-              ? updated.commands.map((c) => `${c.name}: \`${c.command}\``).join(" | ")
-              : "(inspect package.json / brief)";
-          const valSummary = pendingOrFailed
-            .map((a) => `${a.id} [${a.status}]`)
-            .join(", ");
+
+        const orderedValidators = currentRunForVal.memberOrder
+          .map((n) => getOwnMember(currentRunForVal, n))
+          .filter(
+            (m): m is SwarmMemberRecord =>
+              Boolean(
+                m &&
+                  m.role === "validator" &&
+                  m.workspace === "inherit" &&
+                  m.state !== "killed" &&
+                  !m.humanStopped,
+              ),
+          );
+
+        const parkableValidator = orderedValidators.find((m) => {
+          if (m.state !== "waiting" && m.state !== "stopped") {
+            return false;
+          }
+          const vLive = this.liveMembers.get(m.name);
+          return (
+            !vLive?.spawning &&
+            !vLive?.waking &&
+            !vLive?.turnActive &&
+            !vLive?.switchingModel &&
+            vLive?.handle?.getState() !== "working"
+          );
+        });
+        const targetExistingValidator = parkableValidator ?? orderedValidators[0];
+
+        if (targetExistingValidator) {
           const cuePost = await this.postMessage({
             from: ORCHESTRATOR_NAME,
             fromRole: "orchestrator",
-            channel: idleValidator.channels[0] ?? DEFAULT_CHANNEL,
+            channel: targetExistingValidator.channels[0] ?? DEFAULT_CHANNEL,
             kind: "review",
-            text: `@${idleValidator.name} [milestone-review] All features in milestone "${milestoneLabel}" (${mFeatures.map((f) => f.id).join(", ")}) are completed and merged onto ${updated.baseBranch}. Run verification commands (${cmdManifest}) on ${updated.baseBranch} and verify each assertion via swarm{action:"mission", mission_op:"verify_assertion", assertion_id, assertion_status, evidence}: ${valSummary}.`,
+            text: `@${targetExistingValidator.name} ${dualLayerBrief}`,
           });
           milestoneValidationCues.push({
             milestone: milestoneLabel,
             assertionIds,
-            validatorWoken: idleValidator.name,
+            validatorWoken: targetExistingValidator.name,
             boardSeq: cuePost.seq,
+          });
+        } else if (!this.disposed && !this.runDonePosted && currentRunForVal.status === "active") {
+          const validatorName = uniqueValidatorHandle(
+            currentRunForVal,
+            this.liveMembers.keys(),
+          );
+          const spawnedValidators = await this.addMembers({
+            name: validatorName,
+            role: "validator",
+            workspace: "inherit",
+            brief: dualLayerBrief,
+            callerName: ORCHESTRATOR_NAME,
+            callerRole: "orchestrator",
+            hostContext: this.hostContext,
+          });
+          const spawnedVal = spawnedValidators[0]!;
+          milestoneValidationCues.push({
+            milestone: milestoneLabel,
+            assertionIds,
+            validatorSpawned: spawnedVal.name,
+            ...(spawnedVal.briefSeq !== undefined ? { boardSeq: spawnedVal.briefSeq } : {}),
           });
         } else {
           milestoneValidationCues.push({
@@ -3960,6 +4342,7 @@ export class SwarmEngine implements ISwarmEngine {
     if (op === "status") {
       const latest = await this.store.loadRun(run.id);
       await this.refreshCache(latest);
+      const libraryTopics = await this.listMissionLibraryTopics(latest.id);
       return {
         op: "status",
         assertions: latest.assertions ? [...latest.assertions] : [],
@@ -3967,9 +4350,50 @@ export class SwarmEngine implements ISwarmEngine {
         handoffItems: latest.handoffItems ? [...latest.handoffItems] : [],
         milestones: latest.milestones ? [...latest.milestones] : [],
         commands: latest.commands ? [...latest.commands] : [],
+        services: latest.services ? [...latest.services] : [],
         boundaries: latest.boundaries ? [...latest.boundaries] : [],
+        libraryTopics,
         ...(latest.lastAudit ? { lastAudit: { ...latest.lastAudit } } : {}),
         summary: formatMissionStatusSummary(latest),
+      };
+    }
+
+    if (op === "read_library") {
+      if (callerRole === "monitor") {
+        throw new SwarmProtocolError(
+          "PERMISSION_DENIED",
+          `Role "${callerRole}" cannot read Mission library topics.`,
+        );
+      }
+      const rawTopic = input.libraryTopic?.trim() ?? "";
+      if (rawTopic) {
+        const safeTopic = normalizeLibraryTopicName(rawTopic);
+        const content = await this.readMissionLibraryTopic(run.id, safeTopic);
+        if (content === null) {
+          const topics = await this.listMissionLibraryTopics(run.id);
+          return {
+            op: "read_library",
+            libraryTopic: safeTopic,
+            libraryContent: "",
+            libraryTopics: topics,
+            summary: `Shared library topic "${safeTopic}" does not exist yet in .pi/swarm/runs/${run.id}/library/${topics.length > 0 ? ` (available: ${topics.map((t) => `${t}.md`).join(", ")})` : ""}.`,
+          };
+        }
+        return {
+          op: "read_library",
+          libraryTopic: safeTopic,
+          libraryContent: content,
+          summary: `# Shared Library (${safeTopic}.md)\nPath: .pi/swarm/runs/${run.id}/library/${safeTopic}.md\n\n${content}`,
+        };
+      }
+      const topics = await this.listMissionLibraryTopics(run.id);
+      return {
+        op: "read_library",
+        libraryTopics: topics,
+        summary:
+          topics.length > 0
+            ? `Shared Library topics in .pi/swarm/runs/${run.id}/library/ (${topics.length}): ${topics.map((t) => `${t}.md`).join(", ")}.`
+            : `Shared Library in .pi/swarm/runs/${run.id}/library/ has no topics yet.`,
       };
     }
 
@@ -3978,6 +4402,246 @@ export class SwarmEngine implements ISwarmEngine {
         "INVALID_INPUT",
         `Cannot mutate Mission state on a ${this.runDonePosted ? "completing" : run.status} Swarm run.`,
       );
+    }
+
+    if (op === "dispatch_ready") {
+      if (!isOrchestratorOrHuman(callerRole)) {
+        throw new SwarmProtocolError(
+          "PERMISSION_DENIED",
+          `Role "${callerRole}" (@${callerName}) cannot dispatch Mission features. Only @${ORCHESTRATOR_NAME} or human may run mission_op="dispatch_ready".`,
+        );
+      }
+      if (
+        input.maxDispatch !== undefined &&
+        (!Number.isInteger(input.maxDispatch) || input.maxDispatch < 1)
+      ) {
+        throw new SwarmProtocolError(
+          "INVALID_INPUT",
+          `Invalid max_dispatch=${String(input.maxDispatch)}; expected positive integer.`,
+        );
+      }
+      if (input.hostContext) {
+        this.hostContext = input.hostContext;
+      }
+
+      interface PlannedDispatch {
+        feature: MissionFeature;
+        handleName: string;
+        brief: string;
+      }
+
+      const reservation = await this.withMissionLock(async () => {
+        const state = await this.store.loadRun(run.id);
+        if (state.status === "completed" || state.status === "abandoned") {
+          throw new SwarmProtocolError(
+            "INVALID_INPUT",
+            `Cannot dispatch Mission features on a ${state.status} Swarm run.`,
+          );
+        }
+        const features = (state.features ?? []).map((f) => ({ ...f }));
+        const workingCount = this.getSnapshot().workingMemberNames.length;
+        const rawSlots = state.maxConcurrency - workingCount;
+        const availableConcurrencySlots =
+          workingCount === 0 ? Math.max(1, rawSlots) : Math.max(0, rawSlots);
+        const dispatchCap = Math.min(
+          input.maxDispatch ?? Number.POSITIVE_INFINITY,
+          availableConcurrencySlots,
+        );
+
+        const featureById = new Map(features.map((f) => [f.id, f]));
+        const inProgressFeatures = features.filter(
+          (f) => f.status === "in_progress",
+        );
+        const planned: PlannedDispatch[] = [];
+        const reservedHandles = new Set<string>();
+
+        for (const feat of features) {
+          if (planned.length >= dispatchCap) {
+            break;
+          }
+          if (feat.status !== "pending") {
+            continue;
+          }
+          const depsSatisfied = (feat.dependsOn ?? []).every((depId) => {
+            const dep = featureById.get(depId);
+            return Boolean(
+              dep && (dep.status === "completed" || dep.status === "cancelled"),
+            );
+          });
+          if (!depsSatisfied) {
+            continue;
+          }
+          const collidesWithInProgress = inProgressFeatures.some((active) =>
+            ownedPathsOverlap(feat.filesOwned, active.filesOwned),
+          );
+          if (collidesWithInProgress) {
+            continue;
+          }
+          const collidesWithBatch = planned.some((earlier) =>
+            ownedPathsOverlap(feat.filesOwned, earlier.feature.filesOwned),
+          );
+          if (collidesWithBatch) {
+            continue;
+          }
+
+          const handleName = uniqueHandleFromFeatureId(
+            feat.id,
+            state,
+            this.liveMembers.keys(),
+            reservedHandles,
+          );
+          const brief = buildFeatureWorkerBrief(state, feat);
+          planned.push({ feature: feat, handleName, brief });
+        }
+
+        if (planned.length === 0) {
+          return {
+            planned,
+            state,
+            workingCount,
+            availableConcurrencySlots,
+          };
+        }
+
+        const nowIso = new Date(this.nowFn()).toISOString();
+        const plannedById = new Map(planned.map((p) => [p.feature.id, p]));
+        const nextFeatures = features.map((f) => {
+          const item = plannedById.get(f.id);
+          if (!item) return f;
+          return {
+            ...f,
+            status: "in_progress" as FeatureStatus,
+            assignedMember: item.handleName,
+            updatedAt: nowIso,
+          };
+        });
+        const ordered = orderMissionFeatures(nextFeatures);
+        const milestoneSync = syncMissionMilestones(
+          state.milestones,
+          ordered,
+          state.assertions ?? [],
+          nowIso,
+        );
+        const saved = await this.store.updateRun(run.id, {
+          features: ordered,
+          milestones: milestoneSync.milestones,
+          actor: callerName,
+        });
+        await this.refreshCache(saved);
+        return {
+          planned,
+          state: saved,
+          workingCount,
+          availableConcurrencySlots,
+        };
+      });
+
+      if (reservation.planned.length === 0) {
+        const pendingCount = (reservation.state.features ?? []).filter(
+          (f) => f.status === "pending",
+        ).length;
+        const summary =
+          pendingCount === 0
+            ? "No pending features remaining in Mission queue."
+            : reservation.availableConcurrencySlots <= 0
+              ? `No concurrency slots currently available (${reservation.workingCount}/${reservation.state.maxConcurrency} working); call swarm_wait for active workers to finish.`
+              : `0 of ${pendingCount} pending feature(s) are ready right now (blocked on upstream dependsOn or overlapping filesOwned with active in_progress features).`;
+        return {
+          op: "dispatch_ready",
+          dispatchedFeatures: [],
+          spawnedMembers: [],
+          features: reservation.state.features ?? [],
+          milestones: reservation.state.milestones ?? [],
+          summary,
+        };
+      }
+
+      const dispatchedFeatures: string[] = [];
+      const spawnedMembers: string[] = [];
+      const spawnedFeatureSet = new Set<string>();
+
+      try {
+        for (const item of reservation.planned) {
+          const added = await this.addMembers({
+            name: item.handleName,
+            role: "worker",
+            workspace: "share",
+            brief: item.brief,
+            callerName,
+            callerRole,
+            hostContext: input.hostContext ?? this.hostContext,
+          });
+          const spawned = added[0]!;
+          spawnedFeatureSet.add(item.feature.id);
+          dispatchedFeatures.push(item.feature.id);
+          spawnedMembers.push(spawned.name);
+        }
+      } catch (err) {
+        const unspawnedIds = new Set(
+          reservation.planned
+            .map((p) => p.feature.id)
+            .filter((id) => !spawnedFeatureSet.has(id)),
+        );
+        if (unspawnedIds.size > 0) {
+          await this.withMissionLock(async () => {
+            const cur = await this.store.loadRun(run.id);
+            const nowIso = new Date(this.nowFn()).toISOString();
+            const revertedFeatures = (cur.features ?? []).map((f) => {
+              if (!unspawnedIds.has(f.id)) return { ...f };
+              const copy: MissionFeature = {
+                ...f,
+                status: "pending",
+                updatedAt: nowIso,
+              };
+              delete copy.assignedMember;
+              return copy;
+            });
+            const ordered = orderMissionFeatures(revertedFeatures);
+            const ms = syncMissionMilestones(
+              cur.milestones,
+              ordered,
+              cur.assertions ?? [],
+              nowIso,
+            );
+            const revertedRun = await this.store.updateRun(run.id, {
+              features: ordered,
+              milestones: ms.milestones,
+              actor: callerName,
+            });
+            await this.refreshCache(revertedRun);
+          }).catch(() => {});
+        }
+        throw err;
+      }
+
+      return this.withMissionLock(async () => {
+        const finalState = await this.store.loadRun(run.id);
+        const pairSummary = reservation.planned
+          .map((p, idx) => `${p.feature.id} -> @${spawnedMembers[idx] ?? p.handleName}`)
+          .join(", ");
+        const summary = `Dispatched ${dispatchedFeatures.length} ready feature(s) to fresh isolated share worktrees: ${pairSummary}.`;
+        await this.store.appendEvent({
+          runId: run.id,
+          type: "mission_updated",
+          actor: callerName,
+          summary,
+          data: {
+            op: "dispatch_ready",
+            dispatchedFeatures,
+            spawnedMembers,
+          },
+        });
+        await this.refreshCache(finalState);
+        this.emitEngineEvent("snapshot_changed", summary);
+        return {
+          op: "dispatch_ready",
+          dispatchedFeatures,
+          spawnedMembers,
+          features: finalState.features ?? [],
+          milestones: finalState.milestones ?? [],
+          summary,
+        };
+      });
     }
 
     return this.withMissionLock(async () => {
@@ -4083,6 +4747,8 @@ export class SwarmEngine implements ISwarmEngine {
                   : prev.evidence;
               let nextVerifiedBy = prev.verifiedBy;
               let nextVerifiedByRole = prev.verifiedByRole;
+              let nextOverridden = prev.overridden;
+              let nextOverrideJustification = prev.overrideJustification;
 
               // Droid Rule: modifying description or evidenceRequired of a "passed" assertion resets it to "pending"!
               if (prev.status === "passed" && requirementChanged && !input.force) {
@@ -4090,6 +4756,8 @@ export class SwarmEngine implements ISwarmEngine {
                 nextEvidence = undefined;
                 nextVerifiedBy = undefined;
                 nextVerifiedByRole = undefined;
+                nextOverridden = undefined;
+                nextOverrideJustification = undefined;
                 resetToPendingIds.push(id);
               }
 
@@ -4102,6 +4770,10 @@ export class SwarmEngine implements ISwarmEngine {
                 ...(nextEvidence ? { evidence: nextEvidence } : {}),
                 ...(nextVerifiedBy ? { verifiedBy: nextVerifiedBy } : {}),
                 ...(nextVerifiedByRole ? { verifiedByRole: nextVerifiedByRole } : {}),
+                ...(nextOverridden ? { overridden: nextOverridden } : {}),
+                ...(nextOverrideJustification
+                  ? { overrideJustification: nextOverrideJustification }
+                  : {}),
                 updatedAt: nowIso,
               };
               updatedCount += 1;
@@ -4335,8 +5007,13 @@ export class SwarmEngine implements ISwarmEngine {
               };
               return reset;
             }
+            const {
+              overridden: _prevOverridden,
+              overrideJustification: _prevOverrideJustification,
+              ...restAssertion
+            } = a;
             return {
-              ...a,
+              ...restAssertion,
               status: assertionStatus,
               ...(evidence ? { evidence } : {}),
               verifiedBy: callerName,
@@ -4418,6 +5095,117 @@ export class SwarmEngine implements ISwarmEngine {
               verifiedByRole: callerRole,
               newlySealedMilestones: milestoneSync.newlySealed,
               unsealedMilestones: milestoneSync.unsealed,
+            },
+          });
+          await this.refreshCache(updatedRun);
+          this.emitEngineEvent("snapshot_changed", summary);
+
+          return {
+            op,
+            assertions: updatedRun.assertions ?? [],
+            features: updatedRun.features ?? [],
+            milestones: updatedRun.milestones ?? [],
+            summary,
+          };
+        }
+
+        case "override_assertion": {
+          if (!isOrchestratorOrHuman(callerRole)) {
+            throw new SwarmProtocolError(
+              "PERMISSION_DENIED",
+              `Role "${callerRole}" (@${callerName}) cannot override VAL-* assertions. Only @${ORCHESTRATOR_NAME} or human may perform an audited override_assertion.`,
+              { callerName, callerRole },
+            );
+          }
+          const assertionId = input.assertionId?.trim() ?? "";
+          if (!assertionId) {
+            throw new SwarmProtocolError(
+              "INVALID_INPUT",
+              'assertion_id is required for mission_op="override_assertion".',
+            );
+          }
+          const trimmedJustification = input.justification?.trim() ?? "";
+          if (trimmedJustification.length < 30) {
+            throw new SwarmProtocolError(
+              "INVALID_INPUT",
+              `Audited override_assertion for "${assertionId}" requires a concrete technical "justification" of at least 30 characters (received ${trimmedJustification.length}).`,
+              { assertionId, length: trimmedJustification.length },
+            );
+          }
+          const lazyMatch =
+            LAZY_OVERRIDE_EXCUSE_RE.exec(trimmedJustification) ??
+            LAZY_JUSTIFICATION_RE.exec(trimmedJustification);
+          if (lazyMatch) {
+            throw new SwarmProtocolError(
+              "INVALID_INPUT",
+              `Lazy override justification rejected ("${lazyMatch[0]}") for "${assertionId}". Provide a concrete technical justification (>= 30 chars) explaining why external/environmental constraints require overriding this assertion.`,
+              { assertionId, matchedPhrase: lazyMatch[0] },
+            );
+          }
+
+          const currentAssertions = state.assertions ?? [];
+          const targetIdx = currentAssertions.findIndex((a) => a.id === assertionId);
+          if (targetIdx < 0) {
+            throw new SwarmProtocolError(
+              "NOT_FOUND",
+              `Assertion "${assertionId}" not found in Validation Contract.`,
+              { assertionId },
+            );
+          }
+
+          const overrideEvidence = `[OVERRIDE] ${trimmedJustification}`;
+          const nextAssertions: MissionAssertion[] = currentAssertions.map((a, idx) => {
+            if (idx !== targetIdx) return { ...a };
+            return {
+              ...a,
+              status: "passed",
+              overridden: true,
+              overrideJustification: trimmedJustification,
+              evidence: overrideEvidence,
+              verifiedBy: callerName,
+              verifiedByRole: callerRole,
+              updatedAt: nowIso,
+            };
+          });
+
+          const milestoneSync = syncMissionMilestones(
+            state.milestones,
+            state.features ?? [],
+            nextAssertions,
+            nowIso,
+          );
+          const updatedRun = await this.store.updateRun(run.id, {
+            assertions: nextAssertions,
+            milestones: milestoneSync.milestones,
+            actor: callerName,
+          });
+
+          const passedCount = nextAssertions.filter((a) => a.status === "passed").length;
+          const notes: string[] = [
+            `[OVERRIDE] Assertion ${assertionId} marked "passed" via audited override by @${callerName} (${passedCount}/${nextAssertions.length} VAL passed): ${trimmedJustification.slice(0, 120)}.`,
+          ];
+          if (milestoneSync.newlySealed.length > 0) {
+            notes.push(
+              `Sealed milestone(s): ${milestoneSync.newlySealed.join(", ")} [sealed].`,
+            );
+          }
+          const summary = notes.join(" ");
+
+          await this.store.appendEvent({
+            runId: run.id,
+            type: "audit_completed",
+            actor: callerName,
+            summary,
+            data: {
+              op: "override_assertion",
+              assertionId,
+              status: "passed",
+              overridden: true,
+              overrideJustification: trimmedJustification,
+              evidence: overrideEvidence,
+              verifiedBy: callerName,
+              verifiedByRole: callerRole,
+              newlySealedMilestones: milestoneSync.newlySealed,
             },
           });
           await this.refreshCache(updatedRun);
@@ -4942,13 +5730,17 @@ export class SwarmEngine implements ISwarmEngine {
           if (!isOrchestratorOrHuman(callerRole)) {
             throw new SwarmProtocolError(
               "PERMISSION_DENIED",
-              `Role "${callerRole}" (@${callerName}) cannot modify Mission commands or boundaries.`,
+              `Role "${callerRole}" (@${callerName}) cannot modify Mission commands, services, or boundaries.`,
             );
           }
-          if (input.commands === undefined && input.boundaries === undefined) {
+          if (
+            input.commands === undefined &&
+            input.services === undefined &&
+            input.boundaries === undefined
+          ) {
             throw new SwarmProtocolError(
               "INVALID_INPUT",
-              'Provide "commands" and/or "boundaries" for mission_op="set_manifest".',
+              'Provide "commands", "services", and/or "boundaries" for mission_op="set_manifest".',
             );
           }
 
@@ -4975,6 +5767,100 @@ export class SwarmEngine implements ISwarmEngine {
             nextCommands = Array.from(cmdMap.values());
           }
 
+          let nextServices = state.services ? [...state.services] : undefined;
+          if (input.services !== undefined) {
+            const seenBatchNames = new Set<string>();
+            const svcMap = new Map<string, MissionServiceEntry>();
+            if (!input.force && state.services) {
+              for (const existingSvc of state.services) {
+                svcMap.set(existingSvc.name.toLowerCase(), {
+                  ...existingSvc,
+                  ...(existingSvc.dependsOn ? { dependsOn: [...existingSvc.dependsOn] } : {}),
+                });
+              }
+            }
+            for (const entry of input.services) {
+              const name = typeof entry?.name === "string" ? entry.name.trim() : "";
+              const start = typeof entry?.start === "string" ? entry.start.trim() : "";
+              if (!name || isPrototypeKey(name) || !start) {
+                throw new SwarmProtocolError(
+                  "INVALID_INPUT",
+                  "Each service entry in set_manifest requires non-empty name and start command.",
+                );
+              }
+              const lowerName = name.toLowerCase();
+              if (seenBatchNames.has(lowerName)) {
+                throw new SwarmProtocolError(
+                  "INVALID_INPUT",
+                  `Duplicate service name "${name}" in set_manifest.`,
+                  { serviceName: name },
+                );
+              }
+              seenBatchNames.add(lowerName);
+
+              let port: number | undefined;
+              if (entry.port !== undefined) {
+                if (
+                  typeof entry.port !== "number" ||
+                  !Number.isInteger(entry.port) ||
+                  entry.port < 1 ||
+                  entry.port > 65535
+                ) {
+                  throw new SwarmProtocolError(
+                    "INVALID_INPUT",
+                    `Invalid port "${String(entry.port)}" for service "${name}" (expected integer 1..65535).`,
+                    { serviceName: name, port: entry.port },
+                  );
+                }
+                port = entry.port;
+              }
+
+              const stop =
+                typeof entry.stop === "string" && entry.stop.trim()
+                  ? entry.stop.trim()
+                  : undefined;
+              const healthcheck =
+                typeof entry.healthcheck === "string" && entry.healthcheck.trim()
+                  ? entry.healthcheck.trim()
+                  : undefined;
+              const dependsOn = Array.isArray(entry.dependsOn)
+                ? entry.dependsOn
+                    .filter((d): d is string => typeof d === "string")
+                    .map((d) => d.trim())
+                    .filter(Boolean)
+                : undefined;
+
+              svcMap.set(lowerName, {
+                name,
+                start,
+                ...(stop ? { stop } : {}),
+                ...(healthcheck ? { healthcheck } : {}),
+                ...(port !== undefined ? { port } : {}),
+                ...(dependsOn && dependsOn.length > 0 ? { dependsOn } : {}),
+              });
+            }
+
+            const candidateServices = Array.from(svcMap.values());
+            const portOwners = new Map<number, string>();
+            for (const svc of candidateServices) {
+              if (svc.port !== undefined) {
+                const existingOwner = portOwners.get(svc.port);
+                if (
+                  existingOwner &&
+                  existingOwner.toLowerCase() !== svc.name.toLowerCase()
+                ) {
+                  throw new SwarmProtocolError(
+                    "INVALID_INPUT",
+                    `Duplicate service port ${svc.port} across services "${existingOwner}" and "${svc.name}". Each service must declare a unique port.`,
+                    { port: svc.port, services: [existingOwner, svc.name] },
+                  );
+                }
+                portOwners.set(svc.port, svc.name);
+              }
+            }
+            nextServices = candidateServices;
+          }
+
           let nextBoundaries = state.boundaries ? [...state.boundaries] : undefined;
           if (input.boundaries !== undefined) {
             const incoming = input.boundaries
@@ -4992,10 +5878,15 @@ export class SwarmEngine implements ISwarmEngine {
 
           const updatedRun = await this.store.updateRun(run.id, {
             ...(nextCommands !== undefined ? { commands: nextCommands } : {}),
+            ...(nextServices !== undefined ? { services: nextServices } : {}),
             ...(nextBoundaries !== undefined ? { boundaries: nextBoundaries } : {}),
             actor: callerName,
           });
-          const summary = `Updated Mission manifest (${updatedRun.commands?.length ?? 0} command(s), ${updatedRun.boundaries?.length ?? 0} boundary rule(s)).`;
+          const svcSuffix =
+            (updatedRun.services?.length ?? 0) > 0
+              ? `, ${updatedRun.services!.length} service(s)`
+              : "";
+          const summary = `Updated Mission manifest (${updatedRun.commands?.length ?? 0} command(s)${svcSuffix}, ${updatedRun.boundaries?.length ?? 0} boundary rule(s)).`;
 
           await this.store.appendEvent({
             runId: run.id,
@@ -5005,6 +5896,7 @@ export class SwarmEngine implements ISwarmEngine {
             data: {
               op,
               commandsCount: updatedRun.commands?.length ?? 0,
+              servicesCount: updatedRun.services?.length ?? 0,
               boundariesCount: updatedRun.boundaries?.length ?? 0,
             },
           });
@@ -5014,7 +5906,65 @@ export class SwarmEngine implements ISwarmEngine {
           return {
             op,
             commands: updatedRun.commands ?? [],
+            services: updatedRun.services ?? [],
             boundaries: updatedRun.boundaries ?? [],
+            summary,
+          };
+        }
+
+        case "write_library": {
+          if (callerRole === "monitor") {
+            throw new SwarmProtocolError(
+              "PERMISSION_DENIED",
+              `Role "${callerRole}" cannot write to Mission library.`,
+            );
+          }
+          const rawTopic = input.libraryTopic?.trim() ?? "";
+          if (!rawTopic) {
+            throw new SwarmProtocolError(
+              "INVALID_INPUT",
+              'library_topic is required for mission_op="write_library".',
+            );
+          }
+          const safeTopic = normalizeLibraryTopicName(rawTopic);
+          const content = input.libraryContent;
+          if (typeof content !== "string" || content.trim().length === 0) {
+            throw new SwarmProtocolError(
+              "INVALID_INPUT",
+              `Non-empty "library_content" is required for mission_op="write_library" (topic "${safeTopic}").`,
+              { libraryTopic: safeTopic },
+            );
+          }
+
+          const written = await this.writeMissionLibraryTopic(
+            run.id,
+            safeTopic,
+            content,
+            {
+              append: Boolean(input.libraryAppend),
+              actor: callerName,
+            },
+          );
+          const summary = `${input.libraryAppend ? "Appended to" : "Updated"} shared library topic "${written.topic}" (.pi/swarm/runs/${run.id}/library/${written.topic}.md) by @${callerName}.`;
+
+          await this.store.appendEvent({
+            runId: run.id,
+            type: "mission_updated",
+            actor: callerName,
+            summary,
+            data: {
+              op: "write_library",
+              topic: written.topic,
+              append: Boolean(input.libraryAppend),
+              callerRole,
+            },
+          });
+          this.emitEngineEvent("snapshot_changed", summary);
+
+          return {
+            op: "write_library",
+            libraryTopic: written.topic,
+            libraryContent: written.content,
             summary,
           };
         }
@@ -5022,6 +5972,181 @@ export class SwarmEngine implements ISwarmEngine {
         default:
           throw new SwarmProtocolError("INVALID_INPUT", `Unsupported mission_op: ${String(op)}`);
       }
+    });
+  }
+
+  private getOrInitFallbackLibrary(runId: string): Map<string, string> {
+    let map = this.fallbackLibrary.get(runId);
+    if (!map) {
+      map = new Map<string, string>();
+      for (const defaultTopic of DEFAULT_LIBRARY_TOPICS) {
+        map.set(
+          defaultTopic,
+          `# ${defaultTopic[0]!.toUpperCase()}${defaultTopic.slice(1)} Notes\n`,
+        );
+      }
+      this.fallbackLibrary.set(runId, map);
+    }
+    return map;
+  }
+
+  private async readMissionLibraryTopic(
+    runId: string,
+    topic: string,
+  ): Promise<string | null> {
+    if (this.store.readLibraryTopic) {
+      return this.store.readLibraryTopic(runId, topic);
+    }
+    const map = this.getOrInitFallbackLibrary(runId);
+    return map.has(topic) ? (map.get(topic) ?? null) : null;
+  }
+
+  private async writeMissionLibraryTopic(
+    runId: string,
+    topic: string,
+    content: string,
+    options?: { append?: boolean; actor?: string },
+  ): Promise<{ topic: string; path: string; content: string }> {
+    if (this.store.writeLibraryTopic) {
+      return this.store.writeLibraryTopic(runId, topic, content, options);
+    }
+    const map = this.getOrInitFallbackLibrary(runId);
+    let nextContent = content;
+    if (options?.append) {
+      const existing = map.get(topic) ?? "";
+      if (existing.length === 0) {
+        nextContent = content;
+      } else if (existing.endsWith("\n") || content.startsWith("\n")) {
+        nextContent = `${existing}${content}`;
+      } else {
+        nextContent = `${existing}\n${content}`;
+      }
+    }
+    map.set(topic, nextContent);
+    return {
+      topic,
+      path: `${this.store.getRunDir(runId)}/${SWARM_LIBRARY_DIR}/${topic}.md`,
+      content: nextContent,
+    };
+  }
+
+  private async listMissionLibraryTopics(runId: string): Promise<string[]> {
+    if (this.store.listLibraryTopics) {
+      const listed = await this.store.listLibraryTopics(runId);
+      return listed.map((item) => item.topic);
+    }
+    const map = this.getOrInitFallbackLibrary(runId);
+    return Array.from(map.keys()).sort((a, b) => a.localeCompare(b));
+  }
+
+  private async executeWorktreeInitCommand(
+    run: SwarmRunState,
+    cwd: string,
+  ): Promise<{ ok: boolean; command?: string; warning?: string }> {
+    const initEntry = (run.commands ?? []).find(
+      (c) =>
+        typeof c.name === "string" &&
+        c.name.trim().toLowerCase() === "init" &&
+        typeof c.command === "string" &&
+        c.command.trim().length > 0,
+    );
+    if (!initEntry) {
+      return { ok: true };
+    }
+    const command = initEntry.command.trim();
+    const timeoutMs = Math.max(
+      500,
+      this.getEffectiveSettings().gitTimeoutMs || 30_000,
+    );
+
+    return new Promise((resolve) => {
+      let settled = false;
+      let timedOut = false;
+      let outputTail = "";
+
+      const finish = (res: { ok: boolean; command?: string; warning?: string }): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(res);
+      };
+
+      const appendOutput = (chunk: Buffer | string): void => {
+        const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+        if (!text) return;
+        outputTail = (outputTail + text).slice(-1200);
+      };
+
+      let child: ReturnType<typeof spawn>;
+      try {
+        child = spawn(command, {
+          cwd,
+          shell: true,
+          stdio: ["ignore", "pipe", "pipe"],
+          env: process.env,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        clearTimeout(undefined);
+        resolve({
+          ok: false,
+          command,
+          warning: `[init] Worktree init command "${command}" failed to launch in ${cwd}: ${msg}`,
+        });
+        return;
+      }
+
+      const timer = setTimeout(() => {
+        timedOut = true;
+        try {
+          child.kill("SIGTERM");
+        } catch {
+          // ignore
+        }
+        const forceKill = setTimeout(() => {
+          try {
+            child.kill("SIGKILL");
+          } catch {
+            // ignore
+          }
+        }, 200);
+        forceKill.unref?.();
+        finish({
+          ok: false,
+          command,
+          warning: `[init] Worktree init command "${command}" timed out after ${timeoutMs}ms in ${cwd}.`,
+        });
+      }, timeoutMs);
+      timer.unref?.();
+
+      child.stdout?.on("data", appendOutput);
+      child.stderr?.on("data", appendOutput);
+
+      child.on("error", (err) => {
+        finish({
+          ok: false,
+          command,
+          warning: `[init] Worktree init command "${command}" failed in ${cwd}: ${err.message}`,
+        });
+      });
+
+      child.on("close", (code, signal) => {
+        if (timedOut) {
+          return;
+        }
+        if (code === 0) {
+          finish({ ok: true, command });
+          return;
+        }
+        const compactTail = outputTail.replace(/\s+/g, " ").trim().slice(0, 240);
+        const exitDesc =
+          code !== null ? `code ${code}` : `signal ${String(signal ?? "unknown")}`;
+        finish({
+          ok: false,
+          command,
+          warning: `[init] Worktree init command "${command}" exited with ${exitDesc} in ${cwd}${compactTail ? `: ${compactTail}` : ""}`,
+        });
+      });
     });
   }
 
@@ -5806,6 +6931,13 @@ export class SwarmEngine implements ISwarmEngine {
             reuseExistingBranch: true,
             mode: member.workspace,
           });
+          const reviveInitRes = await this.executeWorktreeInitCommand(run, member.cwd);
+          if (!reviveInitRes.ok && reviveInitRes.warning) {
+            live.logTail = [...live.logTail, reviveInitRes.warning].slice(-50);
+            await this.store
+              .updateMember(runId, memberName, { logLine: reviveInitRes.warning })
+              .catch(() => {});
+          }
           if (isCancelled()) {
             if (isCurrentAttempt()) {
               live.waking = false;
