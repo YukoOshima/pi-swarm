@@ -30,7 +30,9 @@ import {
   SWARM_CORE_TOOLS,
   SWARM_DIR,
   SWARM_EVENTS_FILE,
+  SWARM_FEATURES_FILE,
   SWARM_FOCUS_ENTRY,
+  SWARM_MISSION_FILE,
   SWARM_QUESTIONNAIRE_TOOL,
   SWARM_ROSTER_FILE,
   SWARM_RUNS_DIR,
@@ -38,6 +40,8 @@ import {
   SWARM_STATE_FILE,
   SWARM_STATUS_KEY,
   SWARM_TOOL,
+  SWARM_VALIDATION_CONTRACT_FILE,
+  SWARM_VALIDATION_STATE_FILE,
   SWARM_WAIT_TOOL,
   SWARM_WAKEUP_CUSTOM_TYPE,
   SWARM_WIDGET_KEY,
@@ -45,17 +49,24 @@ import {
 import {
   SWARM_STATUS_CUSTOM_TYPE,
   SWARM_SUBCOMMANDS,
+  buildLaunchKickoffPrompt,
   createPiSwarmExtension,
   parseSwarmCommand,
 } from "../src/index.js";
+import { SwarmEngine } from "../src/runtime/index.js";
 import { SwarmStore, WorktreeManager } from "../src/store/index.js";
 import {
   type AgentTurnResult,
   type IQuestionnaireUI,
+  type ISwarmEngine,
   type ISwarmTransport,
   type IWorktreeManager,
+  type ManageMissionInput,
+  type MissionAssertion,
+  type MissionFeature,
   type ModelSwitchResult,
   type PersistentAgentHandle,
+  type ProposedSwarmPlan,
   type SpawnMemberRequest,
   type SwarmEvent,
   type SwarmMemberRole,
@@ -4839,5 +4850,1065 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
 
     await rehydrateHost.emit("session_shutdown", { reason: "quit" });
     await host.emit("session_shutdown", { reason: "quit" });
+  });
+
+  it("18. v0.8.0: handlePlanConfirmed persists & tweaks Mission artifacts (assertions, features, milestones, commands, boundaries), enriches kickoff & mid-mission steering, routes /swarm contract & /swarm mission, and renders Rich Mission Complete Card stats", async () => {
+    const repoDir = await createTempGitRepo("v080-mission-lifecycle");
+    tempDirs.push(repoDir);
+    const store = new SwarmStore(repoDir);
+
+    // 1. Verify exact 21-item SWARM_SUBCOMMANDS order & single-word aliases (contract, mission, goal)
+    assert.deepEqual(
+      SWARM_SUBCOMMANDS.map((c) => c.name),
+      [
+        "direct",
+        "tweak",
+        "status",
+        "board",
+        "graph",
+        "tasks",
+        "ui",
+        "models",
+        "model",
+        "steer",
+        "merge",
+        "kill",
+        "done",
+        "pause",
+        "resume",
+        "cancel",
+        "teardown",
+        "runs",
+        "focus",
+        "settings",
+        "help",
+      ],
+    );
+    assert.equal(SWARM_SUBCOMMANDS.length, 21);
+    assert.deepEqual(parseSwarmCommand("contract"), { kind: "status", rest: "" });
+    assert.deepEqual(parseSwarmCommand("mission"), { kind: "status", rest: "" });
+    assert.deepEqual(parseSwarmCommand("goal"), { kind: "status", rest: "" });
+    // Multi-word natural goal phrases still enter interactive drafting cleanly
+    assert.deepEqual(parseSwarmCommand("goal build oauth2 service"), {
+      kind: "goal",
+      rest: "goal build oauth2 service",
+    });
+    assert.deepEqual(parseSwarmCommand("contract validation pipeline"), {
+      kind: "goal",
+      rest: "contract validation pipeline",
+    });
+
+    const nowIso = "2026-11-24T10:00:00.000Z";
+    const initialAssertions: MissionAssertion[] = [
+      {
+        id: "VAL-AUTH-001",
+        title: "Login endpoint issues signed token",
+        description: "POST /login returns 200 with signed JWT for valid user.",
+        evidenceRequired: "Integration test output showing 200 and valid JWT payload",
+        status: "pending",
+        updatedAt: nowIso,
+      },
+      {
+        id: "VAL-AUDIT-001",
+        title: "Audit log records login attempts",
+        description: "Every login attempt appends an entry to audit log.",
+        evidenceRequired: "Unit test verifying audit log append",
+        status: "pending",
+        updatedAt: nowIso,
+      },
+    ];
+    const initialFeatures: MissionFeature[] = [
+      {
+        id: "feat-auth",
+        title: "Implement POST /login JWT handler",
+        description: "Add login handler and token signing",
+        milestone: "m1-auth",
+        filesOwned: ["src/auth.ts"],
+        fulfills: ["VAL-AUTH-001"],
+        status: "pending",
+        updatedAt: nowIso,
+      },
+      {
+        id: "feat-audit",
+        title: "Implement login audit logger",
+        description: "Record structured login audit events",
+        milestone: "m2-observability",
+        dependsOn: ["feat-auth"],
+        filesOwned: ["src/audit.ts"],
+        fulfills: ["VAL-AUDIT-001"],
+        status: "pending",
+        updatedAt: nowIso,
+      },
+    ];
+
+    let nextPlanOverlay: Partial<ProposedSwarmPlan> | undefined = {
+      assertions: initialAssertions,
+      features: initialFeatures,
+      commands: [
+        { name: "test", command: "npm test" },
+        { name: "typecheck", command: "npm run typecheck" },
+      ],
+      boundaries: ["Do not modify legacy-db/"],
+    };
+
+    const mockTransport: ISwarmTransport = {
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        const tracker = createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async () => ({
+            agentId: request.agentId,
+            name: request.name,
+            role: request.role,
+            outcome: "waiting",
+            summary: `${request.name} ready`,
+            tokens: 400,
+            cost: 0.004,
+          }),
+        });
+        return tracker.handle;
+      },
+    };
+
+    const mockUI: IQuestionnaireUI = {
+      async askQuestion() {
+        return { cancelled: false, answer: "JWT", isCustom: false };
+      },
+      async askQuestionnaire() {
+        return { cancelled: false, answers: {}, items: [] };
+      },
+      async confirmProposal(_ctx, plan) {
+        if (nextPlanOverlay) {
+          if (!plan.assertions && nextPlanOverlay.assertions) {
+            plan.assertions = nextPlanOverlay.assertions;
+          }
+          if (!plan.features && nextPlanOverlay.features) {
+            plan.features = nextPlanOverlay.features;
+          }
+          if (!plan.milestones && nextPlanOverlay.milestones) {
+            plan.milestones = nextPlanOverlay.milestones;
+          }
+          if (!plan.commands && nextPlanOverlay.commands) {
+            plan.commands = nextPlanOverlay.commands;
+          }
+          if (!plan.boundaries && nextPlanOverlay.boundaries) {
+            plan.boundaries = nextPlanOverlay.boundaries;
+          }
+        }
+        return {
+          action: "confirm",
+          validatorEnabled: plan.validatorEnabled,
+          maxConcurrency: plan.maxConcurrency,
+        };
+      },
+    };
+
+    const host = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-v080-lifecycle",
+    });
+    createPiSwarmExtension({
+      transportFactory: () => mockTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: false,
+      }),
+      questionnaireUI: mockUI,
+    })(host.pi);
+    await host.emit("session_start", { reason: "startup" });
+
+    // Verify top-level commands remain strictly ["swarm", "swarm-direct"] and /swarm help documents aliases
+    assert.deepEqual(Array.from(host.commands.keys()).sort(), [
+      "swarm",
+      "swarm-direct",
+    ]);
+    await host.runCommand("swarm", "help");
+    const helpCard = String(
+      host.sentMessages[host.sentMessages.length - 1]!.message.content,
+    );
+    assert.match(helpCard, /\/swarm contract/);
+    assert.match(helpCard, /\/swarm mission/);
+
+    // 2. Launch interactive /swarm run -> handlePlanConfirmed persists assertions, features, milestones, commands, boundaries
+    await host.runCommand("swarm", "Build Mission-driven auth & audit system");
+    host.setIdle(false);
+    const planRes = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Auth & Audit Mission",
+      objective: "Deliver verified JWT auth and audit trail",
+      strategy: "Milestone 1 auth -> Milestone 2 audit + independent validation",
+      acceptance_criteria: "All VAL-* assertions verified with test evidence",
+      base_branch: "main",
+      assertions: [
+        {
+          id: "VAL-AUTH-001",
+          title: "Login endpoint issues signed token",
+          description: "POST /login returns 200 with signed JWT for valid user.",
+          evidence_required: "Integration test output showing 200 and valid JWT payload",
+        },
+        {
+          id: "VAL-AUDIT-001",
+          title: "Audit log records login attempts",
+          description: "Every login attempt appends an entry to audit log.",
+          evidence_required: "Unit test verifying audit log append",
+        },
+      ],
+      features: [
+        {
+          id: "feat-auth",
+          title: "Implement POST /login JWT handler",
+          description: "Add login handler and token signing",
+          milestone: "m1-auth",
+          files_owned: ["src/auth.ts"],
+          fulfills: ["VAL-AUTH-001"],
+        },
+        {
+          id: "feat-audit",
+          title: "Implement login audit logger",
+          description: "Record structured login audit events",
+          milestone: "m2-observability",
+          depends_on: ["feat-auth"],
+          files_owned: ["src/audit.ts"],
+          fulfills: ["VAL-AUDIT-001"],
+        },
+      ],
+      commands: [
+        { name: "test", command: "npm test" },
+        { name: "typecheck", command: "npm run typecheck" },
+      ],
+      boundaries: ["Do not modify legacy-db/"],
+    });
+    assert.equal(planRes.isError, undefined, JSON.stringify(planRes));
+    const runId: string = planRes.details.runId;
+    assert.ok(runId);
+
+    const persistedRun = await store.loadRun(runId);
+    assert.equal(persistedRun.assertions?.length, 2);
+    assert.equal(persistedRun.features?.length, 2);
+    assert.deepEqual(
+      persistedRun.milestones?.map((m) => ({ label: m.label, status: m.status })),
+      [
+        { label: "m1-auth", status: "pending" },
+        { label: "m2-observability", status: "pending" },
+      ],
+    );
+    assert.deepEqual(persistedRun.commands, [
+      { name: "test", command: "npm test" },
+      { name: "typecheck", command: "npm run typecheck" },
+    ]);
+    assert.deepEqual(persistedRun.boundaries, ["Do not modify legacy-db/"]);
+
+    // Verify materialized Mission artifacts on disk (.pi/swarm/runs/<runId>/)
+    const runDir = path.join(repoDir, SWARM_DIR, SWARM_RUNS_DIR, runId);
+    assert.equal(await pathExists(path.join(runDir, SWARM_MISSION_FILE)), true);
+    assert.equal(
+      await pathExists(path.join(runDir, SWARM_VALIDATION_CONTRACT_FILE)),
+      true,
+    );
+    assert.equal(
+      await pathExists(path.join(runDir, SWARM_VALIDATION_STATE_FILE)),
+      true,
+    );
+    assert.equal(await pathExists(path.join(runDir, SWARM_FEATURES_FILE)), true);
+
+    // Flush kickoff wakeup and verify Mission Goal summary (`Features: 2`, `Contract: 2 VAL-* assertions`, `Commands:`)
+    host.setIdle(true);
+    await host.emit("agent_settled", { aborted: false });
+    const kickoffMsg = host.sentMessages
+      .filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE)
+      .pop()!;
+    const kickoffText = String(kickoffMsg.message.content);
+    assert.match(kickoffText, /Features: 2/);
+    assert.match(kickoffText, /Contract: 2 VAL-\* assertions/);
+    assert.match(kickoffText, /\*\*Commands:\*\*.*`test`: `npm test`/);
+    assert.equal(
+      buildLaunchKickoffPrompt(persistedRun, []).includes("Contract: 2 VAL-* assertions"),
+      true,
+    );
+    await host.emit("before_agent_start", {
+      messageType: "custom",
+      systemPromptOptions: { sections: {} },
+    });
+
+    // 3. Simulate Milestone 1 completion + seal, then test `/swarm tweak` dynamic merge & sealed guard!
+    await store.updateRun(runId, {
+      features: [
+        {
+          ...persistedRun.features![0]!,
+          status: "completed",
+          assignedMember: "auth-worker",
+          mergedCommitSha: "deadbeef1234",
+          updatedAt: "2026-11-24T10:10:00.000Z",
+        },
+        persistedRun.features![1]!,
+      ],
+      assertions: [
+        {
+          ...persistedRun.assertions![0]!,
+          status: "passed",
+          evidence: "24/24 auth tests passed",
+          verifiedBy: "validator",
+          verifiedByRole: "validator",
+          updatedAt: "2026-11-24T10:10:00.000Z",
+        },
+        {
+          ...persistedRun.assertions![1]!,
+          status: "passed",
+          evidence: "Initial audit log unit test passed",
+          verifiedBy: "validator",
+          verifiedByRole: "validator",
+          updatedAt: "2026-11-24T10:11:00.000Z",
+        },
+      ],
+      milestones: [
+        {
+          label: "m1-auth",
+          status: "done",
+          sealed: true,
+          sealedAt: "2026-11-24T10:10:00.000Z",
+        },
+        {
+          label: "m2-observability",
+          status: "in_progress",
+        },
+      ],
+    });
+
+    // 3a. Sealed milestone guard: adding a NEW feature into sealed `m1-auth` during tweak is rejected cleanly!
+    await host.runCommand("swarm", "tweak Try sneaking feature into sealed m1-auth");
+    nextPlanOverlay = {
+      assertions: initialAssertions,
+      features: [
+        ...initialFeatures,
+        {
+          id: "feat-sneak",
+          title: "Sneak into sealed milestone",
+          description: "Should be blocked",
+          milestone: "m1-auth",
+          fulfills: [],
+          status: "pending",
+          updatedAt: nowIso,
+        },
+      ],
+    };
+    const badTweakRes = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Auth & Audit Mission",
+      objective: "Deliver verified JWT auth and audit trail",
+      strategy: "Invalid sealed milestone addition",
+      acceptance_criteria: "All VAL-* assertions pass",
+      base_branch: "main",
+      assertions: [
+        {
+          id: "VAL-AUTH-001",
+          title: "Login endpoint issues signed token",
+          description: "POST /login returns 200 with signed JWT for valid user.",
+          evidence_required: "Integration test output showing 200 and valid JWT payload",
+        },
+        {
+          id: "VAL-AUDIT-001",
+          title: "Audit log records login attempts",
+          description: "Every login attempt appends an entry to audit log.",
+          evidence_required: "Unit test verifying audit log append",
+        },
+      ],
+      features: [
+        {
+          id: "feat-auth",
+          title: "Implement POST /login JWT handler",
+          description: "Add login handler and token signing",
+          milestone: "m1-auth",
+          fulfills: ["VAL-AUTH-001"],
+        },
+        {
+          id: "feat-sneak",
+          title: "Sneak into sealed milestone",
+          description: "Should be blocked",
+          milestone: "m1-auth",
+          fulfills: ["VAL-AUDIT-001"],
+        },
+      ],
+    });
+    assert.equal(badTweakRes.isError, true);
+    assert.match(String(badTweakRes.content[0].text), /sealed milestone/i);
+
+    // 3b. Valid `/swarm tweak`: preserves `passed` on unchanged VAL-AUTH-001 & `completed` on feat-auth,
+    // resets modified VAL-AUDIT-001 back to `pending`, and appends VAL-RATE-001 + feat-ratelimit + new command/boundary!
+    nextPlanOverlay = {
+      assertions: [
+        {
+          id: "VAL-AUTH-001",
+          title: "Login endpoint issues signed token",
+          description: "POST /login returns 200 with signed JWT for valid user.",
+          evidenceRequired: "Integration test output showing 200 and valid JWT payload",
+          status: "pending",
+          updatedAt: nowIso,
+        },
+        {
+          id: "VAL-AUDIT-001",
+          title: "Audit log records login attempts with IP",
+          description: "Every login attempt appends an entry INCLUDING client IP to audit log.",
+          evidenceRequired: "Unit test verifying audit log append with IP",
+          status: "pending",
+          updatedAt: nowIso,
+        },
+        {
+          id: "VAL-RATE-001",
+          title: "Rate limiter blocks brute-force bursts",
+          description: "More than 5 failed logins/min returns 429 Too Many Requests.",
+          evidenceRequired: "Integration test asserting 429 response",
+          status: "pending",
+          updatedAt: nowIso,
+        },
+      ],
+      features: [
+        {
+          id: "feat-auth",
+          title: "Implement POST /login JWT handler",
+          description: "Add login handler and token signing",
+          milestone: "m1-auth",
+          filesOwned: ["src/auth.ts"],
+          fulfills: ["VAL-AUTH-001"],
+          status: "pending",
+          updatedAt: nowIso,
+        },
+        {
+          id: "feat-audit",
+          title: "Implement login audit logger with IP",
+          description: "Record structured login audit events with IP",
+          milestone: "m2-observability",
+          dependsOn: ["feat-auth"],
+          filesOwned: ["src/audit.ts"],
+          fulfills: ["VAL-AUDIT-001"],
+          status: "pending",
+          updatedAt: nowIso,
+        },
+        {
+          id: "feat-ratelimit",
+          title: "Add login rate limiter",
+          description: "Enforce 5/min failed login rate limit",
+          milestone: "m2-observability",
+          dependsOn: ["feat-auth"],
+          filesOwned: ["src/ratelimit.ts"],
+          fulfills: ["VAL-RATE-001"],
+          status: "pending",
+          updatedAt: nowIso,
+        },
+      ],
+      commands: [{ name: "lint", command: "npm run lint" }],
+      boundaries: ["Port range restricted to 4100-4199"],
+    };
+
+    host.setIdle(false);
+    const goodTweakRes = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Auth, Audit & Rate-Limit Mission",
+      objective: "Deliver verified JWT auth, IP audit logs, and brute-force rate limiting",
+      strategy: "Preserve sealed m1-auth; execute m2-observability in parallel",
+      acceptance_criteria: "All 3 VAL-* assertions pass",
+      base_branch: "main",
+      assertions: [
+        {
+          id: "VAL-AUTH-001",
+          title: "Login endpoint issues signed token",
+          description: "POST /login returns 200 with signed JWT for valid user.",
+          evidence_required: "Integration test output showing 200 and valid JWT payload",
+        },
+        {
+          id: "VAL-AUDIT-001",
+          title: "Audit log records login attempts with IP",
+          description: "Every login attempt appends an entry INCLUDING client IP to audit log.",
+          evidence_required: "Unit test verifying audit log append with IP",
+        },
+        {
+          id: "VAL-RATE-001",
+          title: "Rate limiter blocks brute-force bursts",
+          description: "More than 5 failed logins/min returns 429 Too Many Requests.",
+          evidence_required: "Integration test asserting 429 response",
+        },
+      ],
+      features: [
+        {
+          id: "feat-auth",
+          title: "Implement POST /login JWT handler",
+          description: "Add login handler and token signing",
+          milestone: "m1-auth",
+          files_owned: ["src/auth.ts"],
+          fulfills: ["VAL-AUTH-001"],
+        },
+        {
+          id: "feat-audit",
+          title: "Implement login audit logger with IP",
+          description: "Record structured login audit events with IP",
+          milestone: "m2-observability",
+          depends_on: ["feat-auth"],
+          files_owned: ["src/audit.ts"],
+          fulfills: ["VAL-AUDIT-001"],
+        },
+        {
+          id: "feat-ratelimit",
+          title: "Add login rate limiter",
+          description: "Enforce 5/min failed login rate limit",
+          milestone: "m2-observability",
+          depends_on: ["feat-auth"],
+          files_owned: ["src/ratelimit.ts"],
+          fulfills: ["VAL-RATE-001"],
+        },
+      ],
+      commands: [{ name: "lint", command: "npm run lint" }],
+      boundaries: ["Port range restricted to 4100-4199"],
+    });
+    assert.equal(goodTweakRes.isError, undefined, JSON.stringify(goodTweakRes));
+
+    const tweakedRun = await store.loadRun(runId);
+    const valAuth = tweakedRun.assertions?.find((a) => a.id === "VAL-AUTH-001");
+    const valAudit = tweakedRun.assertions?.find((a) => a.id === "VAL-AUDIT-001");
+    const valRate = tweakedRun.assertions?.find((a) => a.id === "VAL-RATE-001");
+    assert.equal(valAuth?.status, "passed", "Unchanged passed assertion must stay passed");
+    assert.equal(valAuth?.evidence, "24/24 auth tests passed");
+    assert.equal(
+      valAudit?.status,
+      "pending",
+      "Modified assertion must reset from passed to pending",
+    );
+    assert.equal(valAudit?.evidence, undefined);
+    assert.equal(valRate?.status, "pending");
+
+    const featAuth = tweakedRun.features?.find((f) => f.id === "feat-auth");
+    const featRate = tweakedRun.features?.find((f) => f.id === "feat-ratelimit");
+    assert.equal(featAuth?.status, "completed", "Completed feature must stay completed");
+    assert.equal(featAuth?.mergedCommitSha, "deadbeef1234");
+    assert.equal(featRate?.status, "pending");
+    assert.equal(
+      tweakedRun.milestones?.find((m) => m.label === "m1-auth")?.sealed,
+      true,
+      "Untouched sealed milestone must stay sealed",
+    );
+    assert.deepEqual(
+      tweakedRun.commands?.map((c) => c.name),
+      ["test", "typecheck", "lint"],
+    );
+    assert.deepEqual(tweakedRun.boundaries, [
+      "Do not modify legacy-db/",
+      "Port range restricted to 4100-4199",
+    ]);
+
+    // Flush tweak kickoff
+    host.setIdle(true);
+    await host.emit("agent_settled", { aborted: false });
+    await host.emit("before_agent_start", {
+      messageType: "custom",
+      systemPromptOptions: { sections: {} },
+    });
+
+    // 4. Mid-mission user instruction injects Droid Shared-Truth Sync Rule into sections.swarm_state
+    await host.emit("input", {
+      source: "interactive",
+      text: "Also enforce X-RateLimit-Remaining response header",
+    });
+    const steerSections: Record<string, string> = {};
+    await host.emit("before_agent_start", {
+      messageType: "user",
+      prompt: "Also enforce X-RateLimit-Remaining response header",
+      systemPromptOptions: { sections: steerSections },
+    });
+    assert.match(steerSections.swarm_state ?? "", /Live User Direction Update/);
+    assert.match(steerSections.swarm_state ?? "", /Shared-Truth Rule/);
+    assert.match(steerSections.swarm_state ?? "", /action:"mission"/);
+    assert.match(steerSections.swarm_state ?? "", /action:"title"/);
+
+    // Zero-turn aliases `/swarm contract`, `/swarm mission`, `/swarm goal` execute status view without drafting
+    const userMsgsBeforeAliases = host.sentUserMessages.length;
+    const statusMsgsBeforeAliases = host.sentMessages.filter(
+      (m) => m.message.customType === SWARM_STATUS_CUSTOM_TYPE,
+    ).length;
+    await host.runCommand("swarm", "contract");
+    await host.runCommand("swarm", "mission");
+    await host.runCommand("swarm", "goal");
+    assert.equal(host.sentUserMessages.length, userMsgsBeforeAliases);
+    assert.equal(
+      host.sentMessages.filter((m) => m.message.customType === SWARM_STATUS_CUSTOM_TYPE)
+        .length - statusMsgsBeforeAliases,
+      3,
+    );
+
+    // 5. Complete all features, pass all VAL-* assertions, seal both milestones, resolve handoff, and verify Rich Mission Complete Card!
+    await store.updateRun(runId, {
+      features: tweakedRun.features!.map((f) => ({
+        ...f,
+        status: "completed",
+        assignedMember: f.assignedMember ?? "worker-m2",
+        mergedCommitSha: f.mergedCommitSha ?? "cafebabe5678",
+        updatedAt: "2026-11-24T10:30:00.000Z",
+      })),
+      assertions: tweakedRun.assertions!.map((a) => ({
+        ...a,
+        status: "passed",
+        evidence: `Verified ${a.id} via integration suite`,
+        verifiedBy: "validator",
+        verifiedByRole: "validator",
+        updatedAt: "2026-11-24T10:30:00.000Z",
+      })),
+      milestones: [
+        {
+          label: "m1-auth",
+          status: "done",
+          sealed: true,
+          sealedAt: "2026-11-24T10:10:00.000Z",
+        },
+        {
+          label: "m2-observability",
+          status: "done",
+          sealed: true,
+          sealedAt: "2026-11-24T10:30:00.000Z",
+        },
+      ],
+      handoffItems: [
+        {
+          id: "handoff-1",
+          type: "discovered_issue",
+          sourceMember: "auth-worker",
+          sourceFeatureId: "feat-auth",
+          summary: "Add brute-force rate limit protection on /login",
+          resolution: "tracked",
+          trackedFeatureId: "feat-ratelimit",
+          createdAt: "2026-11-24T10:09:00.000Z",
+          resolvedAt: "2026-11-24T10:15:00.000Z",
+        },
+        {
+          id: "handoff-2",
+          type: "critical_context",
+          sourceMember: "worker-m2",
+          sourceFeatureId: "feat-audit",
+          summary: "Proxy X-Forwarded-For already normalized by upstream ingress middleware",
+          resolution: "dismissed",
+          justification: "Upstream ingress already strips spoofed X-Forwarded-For headers in src/middleware.ts",
+          createdAt: "2026-11-24T10:20:00.000Z",
+          resolvedAt: "2026-11-24T10:25:00.000Z",
+        },
+      ],
+    });
+    await host.runCommand("swarm", `focus ${runId}`);
+
+    const doneRes = await host.executeTool(SWARM_TOOL, {
+      action: "done",
+      summary: "All 3 features, 3 VAL-* assertions, and 2 handoff items verified and sealed.",
+    });
+    assert.equal(doneRes.isError, undefined, JSON.stringify(doneRes));
+
+    const completeCardMsg = host.sentMessages
+      .filter(
+        (m) =>
+          m.message.customType === SWARM_STATUS_CUSTOM_TYPE &&
+          (m.message.details as { missionCompleteCard?: boolean } | undefined)
+            ?.missionCompleteCard === true,
+      )
+      .pop()!;
+    assert.ok(completeCardMsg, "Expected Rich Mission Complete Card");
+    const completeCardText = String(completeCardMsg.message.content);
+    assert.match(completeCardText, /Validation Contract:.*3\/3 VAL-\* passed/);
+    assert.match(completeCardText, /Features:.*3\/3 completed/);
+    assert.match(completeCardText, /Sealed Milestones:.*2\/2 sealed/);
+    assert.match(completeCardText, /Tech-Debt Handoffs:.*2\/2 resolved \(1 tracked, 1 dismissed\)/);
+
+    const cardDetails = completeCardMsg.message.details as Record<string, unknown>;
+    assert.equal(cardDetails.assertionsPassed, 3);
+    assert.equal(cardDetails.assertionsTotal, 3);
+    assert.equal(cardDetails.featuresCompleted, 3);
+    assert.equal(cardDetails.featuresTotal, 3);
+    assert.equal(cardDetails.milestonesSealed, 2);
+    assert.equal(cardDetails.handoffsResolved, 2);
+
+    await host.emit("session_shutdown", { reason: "quit" });
+  });
+
+  it("19. v0.8.0: Sisyphus agent_settled auto-continuation advances unfinished Goal runs, honors [NEEDS_HUMAN] & swarm_wait, trips no-progress circuit breaker after stagnant turns, resets on input/resume, and forwards manageMission", async () => {
+    const repoDir = await createTempGitRepo("v080-sisyphus-guard");
+    tempDirs.push(repoDir);
+    const store = new SwarmStore(repoDir);
+
+    let releaseWaitWorker!: () => void;
+    const waitWorkerGate = new Promise<void>((r) => {
+      releaseWaitWorker = r;
+    });
+
+    const mockTransport: ISwarmTransport = {
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        const tracker = createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async () => {
+            if (request.name === "gated-worker") {
+              await waitWorkerGate;
+            }
+            return {
+              agentId: request.agentId,
+              name: request.name,
+              role: request.role,
+              outcome: "waiting",
+              summary: `${request.name} parked`,
+              tokens: 50,
+              cost: 0.0005,
+            };
+          },
+        });
+        return tracker.handle;
+      },
+    };
+
+    // Track `manageMission` calls through toolEngineProxy (both pre- and post-runtime merge)
+    const manageMissionCalls: ManageMissionInput[] = [];
+    const engineProto = SwarmEngine.prototype as unknown as ISwarmEngine;
+    const origManageMission = engineProto.manageMission;
+    engineProto.manageMission = async function (
+      this: ISwarmEngine,
+      input: ManageMissionInput,
+    ) {
+      manageMissionCalls.push(input);
+      if (typeof origManageMission === "function") {
+        return origManageMission.call(this, input);
+      }
+      return {
+        op: input.op,
+        summary: `Mock manageMission(${input.op})`,
+      };
+    };
+
+    try {
+      const host = createMockPiHarness(repoDir, {
+        mode: "tui",
+        sessionId: "sess-v080-sisyphus",
+      });
+      createPiSwarmExtension({
+        transportFactory: () => mockTransport,
+        settingsLoader: async () => ({
+          ...DEFAULT_SWARM_SETTINGS,
+          stallWatchdogEnabled: false,
+        }),
+      })(host.pi);
+      await host.emit("session_start", { reason: "startup" });
+
+      // Seed an active Goal Mission with unfinished features, unpassed VAL-*, and an open handoff item
+      const goalRun = await store.createRun({
+        title: "Sisyphus Goal Run",
+        objective: "Relentlessly complete every feature and VAL-* assertion",
+        strategy: "Wave 1 -> Validator -> Done",
+        acceptanceCriteria: "VAL-CORE-001 and VAL-CORE-002 passed",
+        baseBranch: "main",
+        ownerSessionId: "sess-v080-sisyphus",
+        ownerPid: process.pid,
+        maxConcurrency: 4,
+        validatorEnabled: true,
+        milestones: [{ label: "m1-core", status: "in_progress" }],
+        assertions: [
+          {
+            id: "VAL-CORE-001",
+            title: "Core parser handles streaming chunks",
+            description: "Streaming chunks parse without data loss",
+            status: "pending",
+            updatedAt: "2026-11-24T11:00:00.000Z",
+          },
+          {
+            id: "VAL-CORE-002",
+            title: "Malformed chunk returns structured error",
+            description: "Invalid UTF-8 frame returns PARSE_ERROR",
+            status: "failed",
+            evidence: "Returned generic Error instead of PARSE_ERROR",
+            updatedAt: "2026-11-24T11:00:00.000Z",
+          },
+        ],
+        features: [
+          {
+            id: "feat-stream",
+            title: "Streaming parser",
+            description: "Implement chunked stream parser",
+            milestone: "m1-core",
+            fulfills: ["VAL-CORE-001"],
+            status: "pending",
+            updatedAt: "2026-11-24T11:00:00.000Z",
+          },
+          {
+            id: "feat-error",
+            title: "Structured error codes",
+            description: "Return PARSE_ERROR on malformed input",
+            milestone: "m1-core",
+            fulfills: ["VAL-CORE-002"],
+            status: "failed",
+            updatedAt: "2026-11-24T11:00:00.000Z",
+          },
+        ],
+        handoffItems: [
+          {
+            id: "handoff-open-1",
+            type: "incomplete_work",
+            sourceMember: "worker-1",
+            sourceFeatureId: "feat-error",
+            summary: "Edge-case empty buffer check still needed",
+            resolution: "open",
+            createdAt: "2026-11-24T11:00:00.000Z",
+          },
+        ],
+      });
+
+      await host.runCommand("swarm", `focus ${goalRun.id}`);
+
+      const getGoalCheckpoints = () =>
+        host.sentMessages.filter(
+          (m) =>
+            m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE &&
+            (m.message.details as { goalCheckpoint?: boolean } | undefined)
+              ?.goalCheckpoint === true,
+        );
+
+      // Before activation in this session, passive agent_settled must NOT fire auto-continuation
+      await host.emit("agent_settled", { aborted: false });
+      assert.equal(getGoalCheckpoints().length, 0);
+
+      // 1. Activate run via before_agent_start, then stop prematurely without swarm_wait or done -> Checkpoint #1 fires!
+      await host.emit("before_agent_start", {
+        messageType: "user",
+        prompt: "Begin working on the mission",
+        systemPromptOptions: { sections: {} },
+      });
+      await host.emit("turn_end", {
+        turnIndex: 0,
+        message: makeAssistantMsg("I inspected the repo and will continue shortly."),
+      });
+      await host.emit("agent_settled", { aborted: false });
+
+      assert.equal(getGoalCheckpoints().length, 1, "Expected Sisyphus Goal Checkpoint #1");
+      const cp1 = getGoalCheckpoints()[0]!;
+      assert.equal(cp1.options?.triggerTurn, true);
+      assert.equal(cp1.options?.deliverAs, "followUp");
+      const cp1Text = String(cp1.message.content);
+      assert.match(cp1Text, /🎯 Pi Swarm Goal Checkpoint/);
+      assert.match(cp1Text, /feat-stream/);
+      assert.match(cp1Text, /feat-error/);
+      assert.match(cp1Text, /VAL-CORE-001/);
+      assert.match(cp1Text, /VAL-CORE-002/);
+      assert.match(cp1Text, /handoff-open-1/);
+      assert.match(cp1Text, /\[NEEDS_HUMAN\]/);
+
+      // Verify renderSwarmWakeupMessage renders Goal Checkpoint badge cleanly at 40..120 cols
+      const wakeupRenderer = host.messageRenderers.get(SWARM_WAKEUP_CUSTOM_TYPE)!;
+      const mockTheme = {
+        fg: (_c: string, t: string) => t,
+        bg: (_c: string, t: string) => t,
+        bold: (t: string) => t,
+      } as unknown as Theme;
+      const renderOpts = {
+        expanded: false,
+        outputPad: 1,
+        keyText: () => "ctrl+o",
+        keyHint: (_kb: string, desc: string) => `ctrl+o ${desc}`,
+      };
+      for (const width of [40, 60, 80, 120]) {
+        const comp = wakeupRenderer(
+          cp1.message as any,
+          renderOpts,
+          mockTheme,
+        )!;
+        for (const line of comp.render(width)) {
+          assert.ok(visibleWidth(line) <= width);
+        }
+      }
+      assert.match(
+        stripTerminalSequences(
+          wakeupRenderer(cp1.message as any, renderOpts, mockTheme)!
+            .render(100)
+            .join("\n"),
+        ),
+        /GOAL CHECKPOINT/,
+      );
+
+      // 2. Stagnant turn #1 (zero state progress: same revision & boardHead) -> Checkpoint #2 fires (stagnantTurns = 1)
+      await host.emit("before_agent_start", {
+        messageType: "custom",
+        systemPromptOptions: { sections: {} },
+      });
+      await host.emit("agent_settled", { aborted: false });
+      assert.equal(getGoalCheckpoints().length, 2, "Expected 2nd chance checkpoint on stagnantTurns=1");
+
+      // 3. Stagnant turn #2 (still zero state progress: stagnantTurns >= 2) -> Circuit breaker trips cleanly!
+      const notifsBeforeTrip = host.notifications.length;
+      await host.emit("before_agent_start", {
+        messageType: "custom",
+        systemPromptOptions: { sections: {} },
+      });
+      await host.emit("agent_settled", { aborted: false });
+      assert.equal(
+        getGoalCheckpoints().length,
+        2,
+        "Circuit breaker must halt auto-continuation at stagnantTurns >= 2",
+      );
+      assert.ok(
+        host.notifications
+          .slice(notifsBeforeTrip)
+          .some(
+            (n) =>
+              n.level === "warning" &&
+              /Auto-continue paused \(no state progress\) — send guidance or \/swarm resume/.test(
+                n.message,
+              ),
+          ),
+        "Expected warning toast when no-progress circuit breaker trips",
+      );
+
+      // 4. `/swarm resume` resets the circuit breaker cleanly so auto-continuation re-arms!
+      await host.runCommand("swarm", "resume");
+      await host.emit("before_agent_start", {
+        messageType: "user",
+        prompt: "Proceed with wave 1",
+        systemPromptOptions: { sections: {} },
+      });
+      await host.emit("agent_settled", { aborted: false });
+      assert.equal(
+        getGoalCheckpoints().length,
+        3,
+        "/swarm resume must reset circuit breaker and re-arm auto-continuation",
+      );
+
+      // 5. `[NEEDS_HUMAN]` escape hatch pauses auto-continuation immediately and notifies cleanly!
+      const notifsBeforeHuman = host.notifications.length;
+      await host.emit("before_agent_start", {
+        messageType: "custom",
+        systemPromptOptions: { sections: {} },
+      });
+      host.setSessionMessages([
+        makeAssistantMsg(
+          "Blocked: need production staging endpoint URL from user before running integration checks. [NEEDS_HUMAN]",
+        ),
+      ]);
+      await host.emit("agent_settled", { aborted: false });
+      assert.equal(
+        getGoalCheckpoints().length,
+        3,
+        "[NEEDS_HUMAN] must suppress auto-continuation",
+      );
+      assert.ok(
+        host.notifications
+          .slice(notifsBeforeHuman)
+          .some((n) => /🐝 Mission awaiting human input/.test(n.message)),
+        "Expected clean '🐝 Mission awaiting human input' notification on [NEEDS_HUMAN]",
+      );
+
+      // User input clears `[NEEDS_HUMAN]` + resets circuit breaker; when a worker is spawned & `swarm_wait` is armed, auto-continuation stays asleep!
+      host.setSessionMessages([]);
+      await host.emit("input", {
+        source: "interactive",
+        text: "Use http://127.0.0.1:4120 as staging URL",
+      });
+      await host.emit("before_agent_start", {
+        messageType: "user",
+        prompt: "Use http://127.0.0.1:4120 as staging URL",
+        systemPromptOptions: { sections: {} },
+      });
+      const spawnRes = await host.executeTool(SWARM_TOOL, {
+        action: "add",
+        name: "gated-worker",
+        role: "worker",
+        workspace: "inherit",
+        brief: "Implement feat-stream and feat-error",
+      });
+      assert.equal(spawnRes.isError, undefined);
+      const boardHeadBeforeWait = Number(
+        (await host.executeTool(READ_BOARD_TOOL, { since: 0 })).details?.head ?? 1,
+      );
+      const waitParkRes = await host.executeTool(SWARM_WAIT_TOOL, {
+        since: boardHeadBeforeWait,
+        mentions_only: true,
+      });
+      assert.equal(waitParkRes.details?.parked, true);
+      await host.emit("agent_settled", { aborted: false });
+      assert.equal(
+        getGoalCheckpoints().length,
+        3,
+        "Armed swarm_wait must NOT trigger premature-stop Goal Checkpoint",
+      );
+      releaseWaitWorker();
+      await waitFor(async () => {
+        const r = await store.loadRun(goalRun.id);
+        return r.members["gated-worker"]?.state === "waiting";
+      });
+
+      // If `swarm{action:"mission"}` is supported by runtime, verify toolEngineProxy forwards & guards ownership
+      if (typeof origManageMission === "function") {
+        const statusMissionRes = await host.executeTool(SWARM_TOOL, {
+          action: "mission",
+          mission_op: "status",
+        });
+        assert.equal(statusMissionRes.isError, undefined);
+        assert.ok(manageMissionCalls.length >= 1);
+
+        const foreign = createMockPiHarness(repoDir, {
+          mode: "tui",
+          sessionId: "foreign-v080-observer",
+        });
+        createPiSwarmExtension({
+          transportFactory: () => mockTransport,
+          settingsLoader: async () => ({
+            ...DEFAULT_SWARM_SETTINGS,
+            stallWatchdogEnabled: false,
+          }),
+        })(foreign.pi);
+        await foreign.emit("session_start", { reason: "startup" });
+        await foreign.runCommand("swarm", `focus ${goalRun.id}`);
+
+        const foreignReadRes = await foreign.executeTool(SWARM_TOOL, {
+          action: "mission",
+          mission_op: "status",
+        });
+        assert.equal(foreignReadRes.isError, undefined);
+
+        const foreignMutateRes = await foreign.executeTool(SWARM_TOOL, {
+          action: "mission",
+          mission_op: "set_manifest",
+          commands: [{ name: "test", command: "echo hijacked" }],
+        });
+        assert.equal(foreignMutateRes.isError, true);
+        assert.match(foreignMutateRes.content[0].text, /OWNERSHIP_CONFLICT/);
+        await foreign.emit("session_shutdown", { reason: "quit" });
+      }
+
+      // Finish all items and verify `done` stops all further Sisyphus checkpoints
+      const latestGoalRun = await store.loadRun(goalRun.id);
+      await store.updateRun(goalRun.id, {
+        features: latestGoalRun.features!.map((f) => ({
+          ...f,
+          status: "completed",
+          mergedCommitSha: "11223344",
+        })),
+        assertions: latestGoalRun.assertions!.map((a) => ({
+          ...a,
+          status: "passed",
+          evidence: "Verified cleanly",
+          verifiedBy: "validator",
+          verifiedByRole: "validator",
+        })),
+        milestones: [{ label: "m1-core", status: "done", sealed: true }],
+        handoffItems: latestGoalRun.handoffItems!.map((h) => ({
+          ...h,
+          resolution: "tracked",
+          trackedFeatureId: "feat-error",
+          resolvedAt: "2026-11-24T11:20:00.000Z",
+        })),
+      });
+      await host.runCommand("swarm", `focus ${goalRun.id}`);
+      const doneGoalRes = await host.executeTool(SWARM_TOOL, {
+        action: "done",
+        summary: "Completed Sisyphus Goal Run",
+      });
+      assert.equal(doneGoalRes.isError, undefined, JSON.stringify(doneGoalRes));
+
+      await host.emit("agent_settled", { aborted: false });
+      assert.equal(
+        getGoalCheckpoints().length,
+        3,
+        "Completed run must never emit Goal Checkpoints after done",
+      );
+
+      await host.emit("session_shutdown", { reason: "quit" });
+    } finally {
+      if (origManageMission) {
+        engineProto.manageMission = origManageMission;
+      } else {
+        delete engineProto.manageMission;
+      }
+    }
   });
 });
