@@ -40,6 +40,8 @@ import {
   IDLE_SWARM_TOOLS,
   InitialMemberProposalSchema,
   isDraftActive,
+  mergeTweakedMissionContract,
+  promptExistingDraftConflict,
   ProposeSwarmPlanParamsSchema,
   registerDraftingTools,
   rehydrateDraft,
@@ -5097,5 +5099,1359 @@ describe("v0.9.0 mandatory contract schema, services manifest & adversarial cont
     assert.equal(/replaceControlCharacters/.test(draftPromptsSource), false);
     assert.equal(/tower/i.test(draftToolsSource), false);
     assert.equal(/tower/i.test(draftPromptsSource), false);
+  });
+});
+
+// ============================================================================
+// 13. Drafting Contract Hardening (VAL-CONTRACT-001/002 & VAL-DRAFT-001/002)
+// ============================================================================
+
+describe("drafting-contract-hardening: VAL-CONTRACT-001, VAL-CONTRACT-002, VAL-DRAFT-001, VAL-DRAFT-002", () => {
+  it("VAL-CONTRACT-001: detects static files_owned overlaps for parallel same-milestone features while permitting transitive depends_on ordering, cross-milestone reuse, and disjoint sibling prefixes", async () => {
+    const makePairPlan = (
+      filesA: string[],
+      filesB: string[],
+      opts?: {
+        milestoneB?: string;
+        dependsOnB?: string[];
+      },
+    ): ProposeSwarmPlanInput => ({
+      ...makeSamplePlanParams(),
+      assertions: [
+        { id: "VAL-OV-1", title: "A", description: "Behavior A" },
+        { id: "VAL-OV-2", title: "B", description: "Behavior B" },
+      ],
+      features: [
+        {
+          id: "feat-a",
+          title: "Feature A",
+          description: "Slice A",
+          milestone: "M1: Core",
+          files_owned: filesA,
+          fulfills: ["VAL-OV-1"],
+        },
+        {
+          id: "feat-b",
+          title: "Feature B",
+          description: "Slice B",
+          milestone: opts?.milestoneB ?? "M1: Core",
+          ...(opts?.dependsOnB ? { depends_on: opts.dependsOnB } : {}),
+          files_owned: filesB,
+          fulfills: ["VAL-OV-2"],
+        },
+      ],
+    });
+
+    // 1. Overlapping cases (must fail validation with INVALID_INPUT)
+    const overlappingPairs: Array<[string, string[], string[]]> = [
+      ["exact file match", ["src/index.ts"], ["src/index.ts"]],
+      ["leading ./ and backslashes", ["./src/drafting/draft-tools.ts"], ["src\\drafting\\draft-tools.ts"]],
+      ["directory and contained file", ["src/drafting"], ["src/drafting/draft-tools.ts"]],
+      ["trailing slash directory and file", ["src/drafting/"], ["src/drafting/draft-state.ts"]],
+      ["wildcard dir /* and file", ["src/drafting/*"], ["src/drafting/draft-tools.ts"]],
+      ["recursive dir /** and nested file", ["src/drafting/**"], ["src/drafting/sub/helper.ts"]],
+      ["identical wildcard path", ["src/drafting/*.ts"], ["src/drafting/*.ts"]],
+      ["directory enclosing wildcard path", ["src/drafting/"], ["src/drafting/*.ts"]],
+      ["repo root . and any file", ["."], ["src/index.ts"]],
+    ];
+
+    for (const [label, filesA, filesB] of overlappingPairs) {
+      const res = validateProposedSwarmPlan(makePairPlan(filesA, filesB));
+      assert.equal(
+        res.valid,
+        false,
+        `Expected overlap rejection for case "${label}" (${filesA.join(",")} vs ${filesB.join(",")})`,
+      );
+      if (!res.valid) {
+        assert.equal(res.issues[0]?.code, "INVALID_INPUT");
+        assert.match(res.issues[0]?.message ?? "", /Overlapping files_owned/i);
+        assert.match(res.issues[0]?.message ?? "", /feat-a/);
+        assert.match(res.issues[0]?.message ?? "", /feat-b/);
+      }
+    }
+
+    // 2. Non-overlapping / properly ordered cases (must pass validation)
+    const allowedPairs: Array<
+      [string, string[], string[], { milestoneB?: string; dependsOnB?: string[] }?]
+    > = [
+      ["disjoint sibling directory prefix (src/draft vs src/drafting/x.ts)", ["src/draft"], ["src/drafting/draft-tools.ts"]],
+      ["disjoint files in same dir", ["src/drafting/draft-state.ts"], ["src/drafting/draft-tools.ts"]],
+      ["disjoint filename suffix (src/a.ts vs src/a.ts.bak)", ["src/a.ts"], ["src/a.ts.bak"]],
+      ["disjoint prefix wildcards (src/auth-*.ts vs src/ui-*.ts)", ["src/auth-*.ts"], ["src/ui-*.ts"]],
+      ["disjoint extension wildcards (*.ts vs *.md)", ["src/drafting/*.ts"], ["src/drafting/*.md"]],
+      ["direct depends_on ordering in same milestone", ["src/shared.ts"], ["src/shared.ts"], { dependsOnB: ["feat-a"] }],
+      ["different milestones without depends_on", ["src/shared.ts"], ["src/shared.ts"], { milestoneB: "M2: Follow-up" }],
+    ];
+
+    for (const [label, filesA, filesB, opts] of allowedPairs) {
+      const res = validateProposedSwarmPlan(makePairPlan(filesA, filesB, opts));
+      assert.equal(
+        res.valid,
+        true,
+        `Expected valid plan for case "${label}", got: ${res.valid ? "" : JSON.stringify(res.issues)}`,
+      );
+    }
+
+    // 3. Transitive depends_on chain (feat-c -> feat-b -> feat-a) in the SAME milestone permits shared files_owned between feat-a and feat-c
+    const transitivePlan = validateProposedSwarmPlan({
+      ...makeSamplePlanParams(),
+      assertions: [
+        { id: "VAL-T-1", title: "Step 1", description: "Step 1" },
+        { id: "VAL-T-2", title: "Step 2", description: "Step 2" },
+        { id: "VAL-T-3", title: "Step 3", description: "Step 3" },
+      ],
+      features: [
+        {
+          id: "feat-a",
+          title: "Step 1",
+          description: "Base edit",
+          milestone: "M1",
+          files_owned: ["src/shared.ts"],
+          fulfills: ["VAL-T-1"],
+        },
+        {
+          id: "feat-b",
+          title: "Step 2",
+          description: "Middle step",
+          milestone: "M1",
+          depends_on: ["feat-a"],
+          files_owned: ["src/mid.ts"],
+          fulfills: ["VAL-T-2"],
+        },
+        {
+          id: "feat-c",
+          title: "Step 3",
+          description: "Follow-up edit to shared.ts after feat-b",
+          milestone: "M1",
+          depends_on: ["feat-b"],
+          files_owned: ["src/shared.ts"],
+          fulfills: ["VAL-T-3"],
+        },
+      ],
+    });
+    assert.equal(
+      transitivePlan.valid,
+      true,
+      `Transitive depends_on chain must allow shared files_owned: ${transitivePlan.valid ? "" : JSON.stringify(transitivePlan.issues)}`,
+    );
+
+    // 4. propose_swarm_plan tool rejects overlapping files_owned BEFORE reviewProposedContract & confirmProposal
+    const harness = new MockPiHarness();
+    let reviewCalls = 0;
+    let confirmCalls = 0;
+    const controller = registerDraftingTools(harness.api, {
+      worktree: createMockWorktree(),
+      ui: {
+        askQuestion: async () => ({ cancelled: true, isCustom: false }),
+        askQuestionnaire: async () => ({ cancelled: true, answers: {}, items: [] }),
+        confirmProposal: async () => {
+          confirmCalls += 1;
+          return { action: "confirm", validatorEnabled: true, maxConcurrency: 3 };
+        },
+      },
+      getSettings: () => ({ ...DEFAULT_SWARM_SETTINGS }),
+      onPlanConfirmed: async (plan) => createMockRun(plan),
+      reviewProposedContract: async () => {
+        reviewCalls += 1;
+        return { approved: true, summary: "ok", findings: [] };
+      },
+    });
+    controller.start({ seed: "Overlap gate test" });
+
+    const proposeTool = harness.registeredTools.get(PROPOSE_SWARM_PLAN_TOOL);
+    const execRes = await proposeTool.execute(
+      "tc-file-overlap",
+      proposeTool.prepareArguments(makePairPlan(["src/drafting/"], ["src/drafting/draft-tools.ts"])),
+      undefined,
+      undefined,
+      harness.createContext(),
+    );
+    assert.equal(execRes.isError, true);
+    assert.equal(reviewCalls, 0);
+    assert.equal(confirmCalls, 0);
+    assert.equal((execRes.details as ProposeSwarmPlanToolDetails).errorCode, "INVALID_INPUT");
+    assert.match(execRes.content[0].text, /Overlapping files_owned/i);
+
+    // 5. Tweak-mode effective merged ownership/deps/status validation:
+    const tweakBaseRun: SwarmRunState = {
+      ...createMockRun({
+        title: "Tweak Overlap Base",
+        objective: "Test effective merged validation",
+        strategy: "Wave 1",
+        acceptanceCriteria: "npm test",
+        baseBranch: "main",
+        maxConcurrency: 4,
+        validatorEnabled: true,
+      }),
+      assertions: [
+        { id: "VAL-TW-1", title: "A", description: "A", status: "pending", updatedAt: "2026-11-24T10:00:00.000Z" },
+        { id: "VAL-TW-2", title: "B", description: "B", status: "pending", updatedAt: "2026-11-24T10:00:00.000Z" },
+      ],
+      features: [
+        {
+          id: "feat-a",
+          title: "A",
+          description: "A",
+          milestone: "M1",
+          filesOwned: ["src/shared.ts"],
+          fulfills: ["VAL-TW-1"],
+          status: "in_progress",
+          updatedAt: "2026-11-24T10:00:00.000Z",
+        },
+        {
+          id: "feat-b",
+          title: "B",
+          description: "B",
+          milestone: "M1",
+          filesOwned: ["src/other.ts"],
+          fulfills: ["VAL-TW-2"],
+          status: "pending",
+          updatedAt: "2026-11-24T10:00:00.000Z",
+        },
+      ],
+    };
+
+    // 5a. Existing in_progress feat-a owns src/shared.ts; tweak omits files_owned on feat-a + gives src/shared.ts to feat-b -> REJECTED!
+    const inheritedOverlap = validateProposedSwarmPlan(
+      {
+        ...makeSamplePlanParams(),
+        assertions: [
+          { id: "VAL-TW-1", title: "A", description: "A" },
+          { id: "VAL-TW-2", title: "B", description: "B" },
+        ],
+        features: [
+          {
+            id: "feat-a",
+            title: "A",
+            description: "A",
+            milestone: "M1",
+            fulfills: ["VAL-TW-1"],
+          },
+          {
+            id: "feat-b",
+            title: "B",
+            description: "B",
+            milestone: "M1",
+            files_owned: ["src/shared.ts"],
+            fulfills: ["VAL-TW-2"],
+          },
+        ],
+      },
+      { mode: "tweak", existingRun: tweakBaseRun },
+    );
+    assert.equal(inheritedOverlap.valid, false);
+    if (!inheritedOverlap.valid) {
+      assert.match(inheritedOverlap.issues[0]?.message ?? "", /Overlapping files_owned/i);
+    }
+
+    // 5b. Existing feat-a dependsOn feat-b; tweak gives both src/shared.ts while omitting depends_on on feat-a -> ACCEPTED (inherits dependsOn)!
+    const runWithDep: SwarmRunState = {
+      ...tweakBaseRun,
+      features: [
+        { ...tweakBaseRun.features![0]!, dependsOn: ["feat-b"], status: "pending" },
+        tweakBaseRun.features![1]!,
+      ],
+    };
+    const inheritedOrder = validateProposedSwarmPlan(
+      {
+        ...makeSamplePlanParams(),
+        assertions: [
+          { id: "VAL-TW-1", title: "A", description: "A" },
+          { id: "VAL-TW-2", title: "B", description: "B" },
+        ],
+        features: [
+          {
+            id: "feat-a",
+            title: "A",
+            description: "A",
+            milestone: "M1",
+            files_owned: ["src/shared.ts"],
+            fulfills: ["VAL-TW-1"],
+          },
+          {
+            id: "feat-b",
+            title: "B",
+            description: "B",
+            milestone: "M1",
+            files_owned: ["src/shared.ts"],
+            fulfills: ["VAL-TW-2"],
+          },
+        ],
+      },
+      { mode: "tweak", existingRun: runWithDep },
+    );
+    assert.equal(
+      inheritedOrder.valid,
+      true,
+      `Inherited dependsOn must prevent false overlap rejection: ${inheritedOrder.valid ? "" : JSON.stringify(inheritedOrder.issues)}`,
+    );
+
+    // 5c. Existing feat-a dependsOn feat-b; tweak omits feat-a.depends_on and adds feat-b.depends_on: ["feat-a"] -> REJECTED (inherited cycle)!
+    const inheritedCycle = validateProposedSwarmPlan(
+      {
+        ...makeSamplePlanParams(),
+        assertions: [
+          { id: "VAL-TW-1", title: "A", description: "A" },
+          { id: "VAL-TW-2", title: "B", description: "B" },
+        ],
+        features: [
+          {
+            id: "feat-a",
+            title: "A",
+            description: "A",
+            milestone: "M1",
+            fulfills: ["VAL-TW-1"],
+          },
+          {
+            id: "feat-b",
+            title: "B",
+            description: "B",
+            milestone: "M1",
+            depends_on: ["feat-a"],
+            fulfills: ["VAL-TW-2"],
+          },
+        ],
+      },
+      { mode: "tweak", existingRun: runWithDep },
+    );
+    assert.equal(inheritedCycle.valid, false);
+    if (!inheritedCycle.valid) {
+      assert.match(inheritedCycle.issues[0]?.message ?? "", /Dependency cycle/i);
+    }
+
+    // 5d. Existing cancelled feat-a owns src/shared.ts; tweak requeues feat-a (now live "pending") alongside feat-b owning src/shared.ts -> REJECTED!
+    const runWithCancelled: SwarmRunState = {
+      ...tweakBaseRun,
+      features: [
+        { ...tweakBaseRun.features![0]!, status: "cancelled" },
+        tweakBaseRun.features![1]!,
+      ],
+    };
+    const requeuedOverlap = validateProposedSwarmPlan(
+      {
+        ...makeSamplePlanParams(),
+        assertions: [
+          { id: "VAL-TW-1", title: "A", description: "A" },
+          { id: "VAL-TW-2", title: "B", description: "B" },
+        ],
+        features: [
+          {
+            id: "feat-a",
+            title: "A",
+            description: "A",
+            milestone: "M1",
+            fulfills: ["VAL-TW-1"],
+          },
+          {
+            id: "feat-b",
+            title: "B",
+            description: "B",
+            milestone: "M1",
+            files_owned: ["src/shared.ts"],
+            fulfills: ["VAL-TW-2"],
+          },
+        ],
+      },
+      { mode: "tweak", existingRun: runWithCancelled },
+    );
+    assert.equal(requeuedOverlap.valid, false);
+    if (!requeuedOverlap.valid) {
+      assert.match(requeuedOverlap.issues[0]?.message ?? "", /Overlapping files_owned/i);
+    }
+  });
+
+  it("VAL-CONTRACT-002: mergeTweakedMissionContract preserves passed/completed/override/in-progress state, resets modified assertions & unseals affected milestones, merges commands/services/boundaries, blocks sealed-milestone intrusion, and is idempotent", () => {
+    const nowIso = "2026-11-24T16:30:00.000Z";
+    const existingRun: SwarmRunState = {
+      ...createMockRun({
+        title: "Mission Alpha",
+        objective: "Core + Observability",
+        strategy: "Wave 1 -> Wave 2",
+        acceptanceCriteria: "npm test",
+        baseBranch: "main",
+        maxConcurrency: 4,
+        validatorEnabled: true,
+      }),
+      id: "run_merge_canon",
+      commands: [
+        { name: "test", command: "npm test" },
+        { name: "typecheck", command: "npm run typecheck" },
+      ],
+      services: [
+        { name: "db", start: "pg_ctl start", port: 5432 },
+      ],
+      boundaries: ["Never touch legacy-db/"],
+      milestones: [
+        {
+          label: "M0: Prep",
+          status: "done",
+          owner: "scout",
+        },
+        {
+          label: "M1: Foundation",
+          status: "done",
+          owner: "validator",
+          sealed: true,
+          sealedAt: "2026-11-24T12:00:00.000Z",
+        },
+        {
+          label: "M2: External Hold",
+          status: "blocked",
+          owner: "ops",
+        },
+        {
+          label: "M2: API",
+          status: "in_progress",
+          owner: "api-dev",
+        },
+      ],
+      assertions: [
+        {
+          id: "VAL-CORE-001",
+          title: "Auth Token",
+          description: "POST /login returns signed JWT",
+          evidenceRequired: "integration test output",
+          status: "passed",
+          evidence: "tests/auth.test.ts 12/12 passed",
+          verifiedBy: "verifier",
+          verifiedByRole: "validator",
+          overridden: true,
+          overrideJustification: "Verified against local KMS stub",
+          updatedAt: "2026-11-24T11:55:00.000Z",
+        },
+        {
+          id: "VAL-API-001",
+          title: "Metrics Endpoint",
+          description: "GET /metrics returns JSON counters",
+          evidenceRequired: "unit test",
+          status: "passed",
+          evidence: "tests/metrics.test.ts passed",
+          verifiedBy: "verifier",
+          verifiedByRole: "validator",
+          updatedAt: "2026-11-24T12:30:00.000Z",
+        },
+      ],
+      features: [
+        {
+          id: "feat-core",
+          title: "Core Auth",
+          description: "Implement JWT auth",
+          milestone: "M1: Foundation",
+          filesOwned: ["src/auth.ts"],
+          preconditions: ["KMS key available"],
+          expectedBehavior: ["POST /login signs JWT"],
+          verificationSteps: ["npm run test:file -- tests/auth.test.ts"],
+          fulfills: ["VAL-CORE-001"],
+          status: "completed",
+          assignedMember: "core-dev",
+          mergedCommitSha: "abc1234",
+          updatedAt: "2026-11-24T11:50:00.000Z",
+        },
+        {
+          id: "feat-api",
+          title: "Metrics API",
+          description: "Implement /metrics",
+          milestone: "M2: API",
+          dependsOn: ["feat-core"],
+          filesOwned: ["src/metrics.ts"],
+          preconditions: ["Auth middleware ready"],
+          expectedBehavior: ["GET /metrics returns counters"],
+          verificationSteps: ["npm run test:file -- tests/metrics.test.ts"],
+          fulfills: ["VAL-API-001"],
+          status: "in_progress",
+          assignedMember: "api-dev",
+          updatedAt: "2026-11-24T12:15:00.000Z",
+        },
+      ],
+    };
+
+    // 0. Strategy-only tweak (omitting assertions/features/milestones) preserves existing milestones verbatim
+    //    including featureless unsealed M0: Prep and blocked M2: External Hold in exact prior order!
+    const strategyOnly = mergeTweakedMissionContract(existingRun, {}, nowIso);
+    assert.deepEqual(strategyOnly.milestones, existingRun.milestones);
+    assert.deepEqual(strategyOnly.features, existingRun.features);
+    assert.deepEqual(strategyOnly.assertions, existingRun.assertions);
+
+    // 1. Sealed milestone guard throws SwarmProtocolError("INVALID_INPUT")
+    assert.throws(
+      () =>
+        mergeTweakedMissionContract(
+          existingRun,
+          {
+            features: [
+              ...existingRun.features!,
+              {
+                id: "feat-intruder",
+                title: "Intruder",
+                description: "Sneak into sealed M1",
+                milestone: "M1: Foundation",
+                fulfills: [],
+                status: "pending",
+                updatedAt: nowIso,
+              },
+            ],
+          },
+          nowIso,
+        ),
+      (err: unknown) =>
+        err instanceof SwarmProtocolError &&
+        err.code === "INVALID_INPUT" &&
+        /sealed milestone "M1: Foundation"/i.test(err.message),
+    );
+
+    // 2. Canonical merge: preserves completed + in_progress + omitted optional fields (filesOwned/dependsOn/
+    //    preconditions/expectedBehavior/verificationSteps) + unchanged passed/override, resets modified VAL-API-001,
+    //    merges commands/services/boundaries, and preserves prior featureless/blocked & sealed milestones in order!
+    const incoming = {
+      assertions: [
+        {
+          id: "VAL-CORE-001",
+          title: "Auth Token (Retitled)",
+          description: "POST /login returns signed JWT",
+          evidenceRequired: "integration test output",
+          status: "pending" as const,
+          updatedAt: nowIso,
+        },
+        {
+          id: "VAL-API-001",
+          title: "Metrics Endpoint (Prometheus)",
+          description: "GET /metrics returns Prometheus text format",
+          evidenceRequired: "unit test",
+          status: "pending" as const,
+          updatedAt: nowIso,
+        },
+        {
+          id: "VAL-RATE-001",
+          title: "Rate Limit",
+          description: "429 after 10 req/min",
+          status: "pending" as const,
+          updatedAt: nowIso,
+        },
+      ],
+      features: [
+        {
+          // Deliberately omit filesOwned, preconditions, expectedBehavior, verificationSteps on completed feature
+          id: "feat-core",
+          title: "Core Auth",
+          description: "Implement JWT auth",
+          milestone: "M1: Foundation",
+          fulfills: ["VAL-CORE-001"],
+          status: "pending" as const,
+          updatedAt: nowIso,
+        },
+        {
+          // Deliberately omit dependsOn, filesOwned, preconditions, expectedBehavior, verificationSteps on in_progress feature
+          id: "feat-api",
+          title: "Metrics API",
+          description: "Implement Prometheus /metrics",
+          milestone: "M2: API",
+          fulfills: ["VAL-API-001"],
+          status: "pending" as const,
+          updatedAt: nowIso,
+        },
+        {
+          id: "feat-rate",
+          title: "Rate Limiter",
+          description: "Add token bucket limiter",
+          milestone: "M3: Hardening",
+          dependsOn: ["feat-api"],
+          filesOwned: ["src/rate.ts"],
+          fulfills: ["VAL-RATE-001"],
+          status: "pending" as const,
+          updatedAt: nowIso,
+        },
+      ],
+      commands: [
+        { name: "test", command: "npm run test:all" },
+        { name: "lint", command: "npm run lint" },
+      ],
+      services: [
+        { name: "api", start: "node api.js", port: 4100, dependsOn: ["db"] },
+      ],
+      boundaries: ["Never touch legacy-db/", "Keep ports in 4100-4199"],
+    };
+
+    const merged1 = mergeTweakedMissionContract(existingRun, incoming, nowIso);
+
+    const aCore = merged1.assertions?.find((a) => a.id === "VAL-CORE-001");
+    assert.equal(aCore?.status, "passed");
+    assert.equal(aCore?.evidence, "tests/auth.test.ts 12/12 passed");
+    assert.equal(aCore?.verifiedBy, "verifier");
+    assert.equal(aCore?.overridden, true);
+    assert.equal(aCore?.overrideJustification, "Verified against local KMS stub");
+    assert.equal(aCore?.title, "Auth Token (Retitled)");
+
+    const aApi = merged1.assertions?.find((a) => a.id === "VAL-API-001");
+    assert.equal(aApi?.status, "pending");
+    assert.equal(aApi?.evidence, undefined);
+    assert.equal(aApi?.verifiedBy, undefined);
+
+    // Completed & in_progress features preserve omitted optional fields from existingRun!
+    const fCore = merged1.features?.find((f) => f.id === "feat-core");
+    assert.equal(fCore?.status, "completed");
+    assert.equal(fCore?.mergedCommitSha, "abc1234");
+    assert.equal(fCore?.assignedMember, "core-dev");
+    assert.deepEqual(fCore?.filesOwned, ["src/auth.ts"]);
+    assert.deepEqual(fCore?.preconditions, ["KMS key available"]);
+    assert.deepEqual(fCore?.expectedBehavior, ["POST /login signs JWT"]);
+    assert.deepEqual(fCore?.verificationSteps, ["npm run test:file -- tests/auth.test.ts"]);
+
+    const fApi = merged1.features?.find((f) => f.id === "feat-api");
+    assert.equal(fApi?.status, "in_progress");
+    assert.equal(fApi?.assignedMember, "api-dev");
+    assert.deepEqual(fApi?.dependsOn, ["feat-core"]);
+    assert.deepEqual(fApi?.filesOwned, ["src/metrics.ts"]);
+    assert.deepEqual(fApi?.preconditions, ["Auth middleware ready"]);
+
+    assert.deepEqual(merged1.commands, [
+      { name: "test", command: "npm run test:all" },
+      { name: "typecheck", command: "npm run typecheck" },
+      { name: "lint", command: "npm run lint" },
+    ]);
+    assert.deepEqual(
+      merged1.services?.map((s) => s.name),
+      ["db", "api"],
+    );
+    assert.deepEqual(merged1.boundaries, [
+      "Never touch legacy-db/",
+      "Keep ports in 4100-4199",
+    ]);
+
+    // Prior ordering & featureless unsealed/blocked milestones preserved alongside sealed M1 + new M3!
+    assert.deepEqual(
+      merged1.milestones?.map((m) => m.label),
+      ["M0: Prep", "M1: Foundation", "M2: External Hold", "M2: API", "M3: Hardening"],
+    );
+    assert.deepEqual(merged1.milestones?.[0], {
+      label: "M0: Prep",
+      status: "done",
+      owner: "scout",
+    });
+    const m1 = merged1.milestones?.find((m) => m.label === "M1: Foundation");
+    assert.equal(m1?.status, "done");
+    assert.equal(m1?.sealed, true);
+    assert.equal(m1?.sealedAt, "2026-11-24T12:00:00.000Z");
+    assert.equal(m1?.owner, "validator");
+    assert.deepEqual(merged1.milestones?.[2], {
+      label: "M2: External Hold",
+      status: "blocked",
+      owner: "ops",
+    });
+
+    // 3. Explicit incoming milestones preserve explicit ordering & metadata alongside sealed milestones
+    const explicitMsMerged = mergeTweakedMissionContract(
+      existingRun,
+      {
+        milestones: [
+          { label: "M1: Foundation", status: "done" },
+          { label: "M2: API", status: "blocked", owner: "release-lead" },
+          { label: "M4: Signoff", status: "pending", owner: "qa" },
+        ],
+      },
+      nowIso,
+    );
+    assert.deepEqual(
+      explicitMsMerged.milestones?.map((m) => m.label),
+      ["M1: Foundation", "M2: API", "M4: Signoff"],
+    );
+    assert.equal(explicitMsMerged.milestones?.[0]?.sealed, true);
+    assert.equal(explicitMsMerged.milestones?.[1]?.status, "blocked");
+    assert.equal(explicitMsMerged.milestones?.[1]?.owner, "release-lead");
+    assert.deepEqual(explicitMsMerged.milestones?.[2], {
+      label: "M4: Signoff",
+      status: "pending",
+      owner: "qa",
+    });
+
+    // 4. Idempotency: re-applying mergeTweakedMissionContract to its own output yields exact deep equality
+    const merged2 = mergeTweakedMissionContract(existingRun, merged1, nowIso);
+    assert.deepEqual(merged2, merged1);
+
+    // 5. Modifying an assertion inside sealed M1 unseals M1 and moves it to in_progress
+    const unsealed = mergeTweakedMissionContract(
+      existingRun,
+      {
+        assertions: [
+          {
+            id: "VAL-CORE-001",
+            title: "Auth Token",
+            description: "POST /login returns signed JWT with EdDSA",
+            evidenceRequired: "integration test output",
+            status: "pending",
+            updatedAt: nowIso,
+          },
+          {
+            id: "VAL-API-001",
+            title: "Metrics Endpoint",
+            description: "GET /metrics returns JSON counters",
+            evidenceRequired: "unit test",
+            status: "pending",
+            updatedAt: nowIso,
+          },
+        ],
+        features: existingRun.features,
+      },
+      nowIso,
+    );
+    const unsealedM1 = unsealed.milestones?.find(
+      (m) => m.label === "M1: Foundation",
+    );
+    assert.equal(unsealedM1?.sealed, undefined);
+    assert.equal(unsealedM1?.status, "in_progress");
+    assert.equal(unsealedM1?.owner, "validator");
+
+    // 6. Canonical parity regressions:
+    //    (a) failed/cancelled features are requeued to "pending" when incoming status is "pending"
+    //    (b) unchanged "passed" assertion cannot be downgraded by incoming non-pending status (e.g. "failed")
+    //    (c) assertion carry takes UNION of ALL completed features (both omitted carried AND incoming retained)
+    //    (d) contradictory reclaim of a VAL-* already fulfilled by an omitted completed feature is rejected
+    const parityRun: SwarmRunState = {
+      ...existingRun,
+      milestones: [
+        { label: "M1: Done", status: "done" },
+        { label: "M2: Retry", status: "blocked" },
+      ],
+      assertions: [
+        {
+          id: "VAL-D1",
+          title: "Done 1",
+          description: "Done 1 behavior",
+          status: "passed",
+          evidence: "d1 green",
+          verifiedBy: "verifier",
+          verifiedByRole: "validator",
+          updatedAt: "2026-11-24T10:00:00.000Z",
+        },
+        {
+          id: "VAL-D2",
+          title: "Done 2",
+          description: "Done 2 behavior",
+          status: "passed",
+          evidence: "d2 green",
+          verifiedBy: "verifier",
+          verifiedByRole: "validator",
+          updatedAt: "2026-11-24T10:01:00.000Z",
+        },
+        {
+          id: "VAL-D3",
+          title: "Done 3",
+          description: "Done 3 behavior",
+          status: "passed",
+          evidence: "d3 green",
+          verifiedBy: "verifier",
+          verifiedByRole: "validator",
+          updatedAt: "2026-11-24T10:02:00.000Z",
+        },
+        {
+          id: "VAL-RETRY-1",
+          title: "Retry 1",
+          description: "Previously failed",
+          status: "failed",
+          updatedAt: "2026-11-24T10:05:00.000Z",
+        },
+        {
+          id: "VAL-RETRY-2",
+          title: "Retry 2",
+          description: "Previously cancelled",
+          status: "pending",
+          updatedAt: "2026-11-24T10:06:00.000Z",
+        },
+      ],
+      features: [
+        {
+          id: "feat-done-omitted",
+          title: "Completed Omitted",
+          description: "Completed with two VALs",
+          milestone: "M1: Done",
+          fulfills: ["VAL-D1", "VAL-D2"],
+          status: "completed",
+          mergedCommitSha: "111aaaa",
+          updatedAt: "2026-11-24T10:00:00.000Z",
+        },
+        {
+          id: "feat-done-retained",
+          title: "Completed Retained",
+          description: "Completed and included in incoming features",
+          milestone: "M1: Done",
+          fulfills: ["VAL-D3"],
+          status: "completed",
+          mergedCommitSha: "222bbbb",
+          updatedAt: "2026-11-24T10:02:00.000Z",
+        },
+        {
+          id: "feat-failed",
+          title: "Failed Feature",
+          description: "Needs requeue",
+          milestone: "M2: Retry",
+          fulfills: ["VAL-RETRY-1"],
+          status: "failed",
+          updatedAt: "2026-11-24T10:05:00.000Z",
+        },
+        {
+          id: "feat-cancelled",
+          title: "Cancelled Feature",
+          description: "Needs requeue",
+          milestone: "M2: Retry",
+          fulfills: ["VAL-RETRY-2"],
+          status: "cancelled",
+          updatedAt: "2026-11-24T10:06:00.000Z",
+        },
+      ],
+    };
+
+    // (a), (b), (c): Requeue failed/cancelled, carry UNION of VAL-D1/VAL-D2 (omitted) + VAL-D3 (retained),
+    // and refuse to downgrade unchanged passed VAL-D3 even if incoming passes status: "failed"
+    const parityMerged = mergeTweakedMissionContract(
+      parityRun,
+      {
+        assertions: [
+          {
+            id: "VAL-RETRY-1",
+            title: "Retry 1",
+            description: "Previously failed",
+            status: "pending",
+            updatedAt: nowIso,
+          },
+          {
+            id: "VAL-RETRY-2",
+            title: "Retry 2",
+            description: "Previously cancelled",
+            status: "pending",
+            updatedAt: nowIso,
+          },
+        ],
+        features: [
+          {
+            id: "feat-done-retained",
+            title: "Completed Retained",
+            description: "Completed and included in incoming features",
+            milestone: "M1: Done",
+            fulfills: ["VAL-D3"],
+            status: "pending",
+            updatedAt: nowIso,
+          },
+          {
+            id: "feat-failed",
+            title: "Failed Feature",
+            description: "Needs requeue",
+            milestone: "M2: Retry",
+            fulfills: ["VAL-RETRY-1"],
+            status: "pending",
+            updatedAt: nowIso,
+          },
+          {
+            id: "feat-cancelled",
+            title: "Cancelled Feature",
+            description: "Needs requeue",
+            milestone: "M2: Retry",
+            fulfills: ["VAL-RETRY-2"],
+            status: "pending",
+            updatedAt: nowIso,
+          },
+        ],
+      },
+      nowIso,
+    );
+    assert.equal(
+      parityMerged.features?.find((f) => f.id === "feat-failed")?.status,
+      "pending",
+      "failed feature must be requeued to pending on tweak",
+    );
+    assert.equal(
+      parityMerged.features?.find((f) => f.id === "feat-cancelled")?.status,
+      "pending",
+      "cancelled feature must be requeued to pending on tweak",
+    );
+    assert.equal(
+      parityMerged.features?.find((f) => f.id === "feat-done-omitted")?.status,
+      "completed",
+    );
+    // UNION of completed features' assertions carried forward: VAL-D1, VAL-D2 (omitted) AND VAL-D3 (retained)!
+    const carriedValIds = (parityMerged.assertions ?? []).map((a) => a.id);
+    assert.ok(carriedValIds.includes("VAL-D1"), "Must carry VAL-D1 from omitted completed feature");
+    assert.ok(carriedValIds.includes("VAL-D2"), "Must carry VAL-D2 from omitted completed feature");
+    assert.ok(carriedValIds.includes("VAL-D3"), "Must carry VAL-D3 from retained completed feature");
+
+    // (b) Incoming non-pending status (e.g. "failed") cannot downgrade unchanged "passed" assertion
+    const noDowngrade = mergeTweakedMissionContract(
+      parityRun,
+      {
+        assertions: [
+          {
+            id: "VAL-D3",
+            title: "Done 3",
+            description: "Done 3 behavior",
+            status: "failed",
+            evidence: "spurious downgrade",
+            updatedAt: nowIso,
+          },
+        ],
+      },
+      nowIso,
+    );
+    const d3 = noDowngrade.assertions?.find((a) => a.id === "VAL-D3");
+    assert.equal(d3?.status, "passed");
+    assert.equal(d3?.evidence, "d3 green");
+    assert.equal(d3?.verifiedBy, "verifier");
+
+    // (d) Contradictory reclaim of VAL-D1 from omitted completed feature feat-done-omitted is rejected
+    assert.throws(
+      () =>
+        mergeTweakedMissionContract(
+          parityRun,
+          {
+            assertions: [
+              { id: "VAL-D1", title: "Done 1", description: "Done 1 behavior", status: "pending", updatedAt: nowIso },
+            ],
+            features: [
+              {
+                id: "feat-reclaimer",
+                title: "Reclaimer",
+                description: "Tries to steal VAL-D1 from omitted feat-done-omitted",
+                milestone: "M2: Retry",
+                fulfills: ["VAL-D1"],
+                status: "pending",
+                updatedAt: nowIso,
+              },
+            ],
+          },
+          nowIso,
+        ),
+      (err: unknown) =>
+        err instanceof SwarmProtocolError &&
+        err.code === "INVALID_INPUT" &&
+        /cannot reclaim assertion "VAL-D1" already fulfilled by completed feature "feat-done-omitted"/i.test(
+          err.message,
+        ),
+    );
+
+    const validateReclaim = validateProposedSwarmPlan(
+      {
+        ...makeSamplePlanParams(),
+        assertions: [
+          { id: "VAL-D1", title: "Done 1", description: "Done 1 behavior" },
+        ],
+        features: [
+          {
+            id: "feat-reclaimer",
+            title: "Reclaimer",
+            description: "Tries to steal VAL-D1",
+            milestone: "M2: Retry",
+            fulfills: ["VAL-D1"],
+          },
+        ],
+      },
+      { mode: "tweak", existingRun: parityRun, now: nowIso },
+    );
+    assert.equal(validateReclaim.valid, false);
+    if (!validateReclaim.valid) {
+      assert.match(
+        validateReclaim.issues[0]?.message ?? "",
+        /cannot reclaim assertion "VAL-D1"/i,
+      );
+    }
+  });
+
+  it("VAL-DRAFT-001: persists skipContractReview durably on ActiveSwarmDraft and bypasses reviewProposedContract while keeping local validation active", async () => {
+    const harness = new MockPiHarness();
+
+    // 1. Durable persistence & rehydration across compaction + malformed guard
+    const started = startDraft(harness.api, {
+      mode: "swarm",
+      seed: "Fast bugfix",
+      validatorEnabled: true,
+      maxConcurrency: 3,
+      skipContractReview: true,
+    });
+    assert.equal(started.skipContractReview, true);
+    harness.appendCompactionEntry("Compacted during fast draft");
+
+    const ctx = harness.createContext();
+    const rehydrated = rehydrateDraft(ctx);
+    assert.ok(rehydrated);
+    assert.equal(rehydrated.skipContractReview, true);
+
+    const updated = updateDraft(harness.api, rehydrated, {
+      skipContractReview: false,
+    });
+    assert.equal(updated.skipContractReview, false);
+    assert.equal(rehydrateDraft(ctx)?.skipContractReview, false);
+
+    // Explicit skipContractReview: false in startDraft is preserved durably (distinct from omitted undefined)
+    const explicitFalse = startDraft(harness.api, {
+      mode: "swarm",
+      seed: "Explicitly reviewed draft",
+      skipContractReview: false,
+    });
+    assert.equal(explicitFalse.skipContractReview, false);
+    assert.equal(rehydrateDraft(ctx)?.skipContractReview, false);
+
+    const omittedFlag = startDraft(harness.api, {
+      mode: "swarm",
+      seed: "Omitted skip flag",
+    });
+    assert.equal(omittedFlag.skipContractReview, undefined);
+
+    // Reject malformed non-boolean skipContractReview during rehydration
+    harness.api.appendEntry(SWARM_DRAFT_ENTRY, {
+      version: SWARM_DRAFT_VERSION,
+      mode: "swarm",
+      seed: "Bad skip flag",
+      startedAt: new Date().toISOString(),
+      validatorEnabled: true,
+      maxConcurrency: 3,
+      skipContractReview: "yes",
+    });
+    assert.equal(rehydrateDraft(ctx), null);
+
+    // 2. Prompt helpers surface skip_contract_review="true" when enabled
+    const overlay = buildDraftingSystemOverlay({
+      ...started,
+      skipContractReview: true,
+    });
+    assert.match(overlay, /skip_contract_review="true"/);
+    const kickoff = buildDraftingKickoffPrompt("Fast bugfix", "swarm", {
+      skipContractReview: true,
+    });
+    assert.match(kickoff, /skip_contract_review="true"/);
+    const directPrompt = buildDirectPlanPrompt(
+      "Fast bugfix",
+      "main",
+      { maxConcurrency: 3, validatorEnabled: true },
+      { skipContractReview: true },
+    );
+    assert.match(directPrompt, /skip_contract_review="true"/);
+
+    // 3. In propose_swarm_plan: skipContractReview bypasses reviewProposedContract even with validatorEnabled=true,
+    //    while local validation (e.g. overlapping files_owned, unclaimed assertions) STILL rejects before modal!
+    let reviewerCalls = 0;
+    let confirmCalls = 0;
+    let nextModalAction: ProposalDialogOutcome["action"] = "continue";
+    const confirmedPlans: ProposedSwarmPlan[] = [];
+
+    const controller = registerDraftingTools(harness.api, {
+      worktree: createMockWorktree({ currentBranch: "main" }),
+      ui: {
+        askQuestion: async () => ({ cancelled: true, isCustom: false }),
+        askQuestionnaire: async () => ({ cancelled: true, answers: {}, items: [] }),
+        confirmProposal: async (_ctx, plan) => {
+          confirmCalls += 1;
+          return {
+            action: nextModalAction,
+            validatorEnabled: plan.validatorEnabled,
+            maxConcurrency: plan.maxConcurrency,
+          };
+        },
+      },
+      getSettings: () => ({ ...DEFAULT_SWARM_SETTINGS }),
+      onPlanConfirmed: async (plan) => {
+        confirmedPlans.push(plan);
+        return createMockRun(plan);
+      },
+      reviewProposedContract: async () => {
+        reviewerCalls += 1;
+        return {
+          approved: false,
+          summary: "Should NOT be called when skipContractReview=true",
+          findings: [
+            {
+              severity: "blocking",
+              category: "missing_assertion",
+              message: "Unexpected review invocation",
+            },
+          ],
+        };
+      },
+    });
+
+    controller.start({
+      mode: "swarm",
+      seed: "Fast validated launch",
+      validatorEnabled: true,
+      maxConcurrency: 3,
+      skipContractReview: true,
+    });
+
+    const proposeTool = harness.registeredTools.get(PROPOSE_SWARM_PLAN_TOOL);
+
+    // 3a. Local validation STILL blocks invalid plans (overlapping files_owned)
+    const invalidRes = await proposeTool.execute(
+      "tc-fast-invalid",
+      proposeTool.prepareArguments({
+        ...makeSamplePlanParams(),
+        assertions: [
+          { id: "VAL-F-1", title: "A", description: "A" },
+          { id: "VAL-F-2", title: "B", description: "B" },
+        ],
+        features: [
+          {
+            id: "f1",
+            title: "F1",
+            description: "Slice 1",
+            milestone: "M1",
+            files_owned: ["src/core.ts"],
+            fulfills: ["VAL-F-1"],
+          },
+          {
+            id: "f2",
+            title: "F2",
+            description: "Slice 2",
+            milestone: "M1",
+            files_owned: ["src/core.ts"],
+            fulfills: ["VAL-F-2"],
+          },
+        ],
+      }),
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(invalidRes.isError, true);
+    assert.equal(reviewerCalls, 0);
+    assert.equal(confirmCalls, 0);
+    assert.match(invalidRes.content[0].text, /Overlapping files_owned/i);
+
+    // 3b. Valid plan skips reviewProposedContract, preserves skipContractReview across "continue", then confirms cleanly
+    const validArgs = proposeTool.prepareArguments({
+      ...makeSamplePlanParams(),
+      assertions: [
+        { id: "VAL-F-1", title: "Fast Check", description: "Unit tests pass" },
+      ],
+      features: [
+        {
+          id: "f1",
+          title: "Fast Slice",
+          description: "Quick fix",
+          milestone: "M1",
+          files_owned: ["src/core.ts"],
+          fulfills: ["VAL-F-1"],
+        },
+      ],
+    });
+
+    nextModalAction = "continue";
+    const continueRes = await proposeTool.execute(
+      "tc-fast-continue",
+      validArgs,
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(continueRes.isError, undefined);
+    assert.equal(reviewerCalls, 0);
+    assert.equal(confirmCalls, 1);
+    assert.equal(controller.getDraft()?.skipContractReview, true);
+
+    nextModalAction = "confirm";
+    const confirmRes = await proposeTool.execute(
+      "tc-fast-confirm",
+      validArgs,
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(confirmRes.isError, undefined);
+    assert.equal(reviewerCalls, 0);
+    assert.equal(confirmCalls, 2);
+    assert.equal(confirmedPlans.length, 1);
+  });
+
+  it("VAL-DRAFT-002: offers Append in promptExistingDraftConflict/startOrResolveDraft only when incoming seed is non-empty and differs, keeping Resume/Replace/Cancel labels intact", async () => {
+    const harness = new MockPiHarness();
+    let modalDepth = 0;
+    const hooks = {
+      onModalEnter: () => {
+        modalDepth += 1;
+      },
+      onModalExit: () => {
+        modalDepth -= 1;
+      },
+    };
+
+    const existing = startDraft(harness.api, {
+      mode: "swarm",
+      seed: "Build OAuth PKCE login",
+      validatorEnabled: true,
+      maxConcurrency: 4,
+      baseBranch: "main",
+      skipContractReview: true,
+      questionnaireEcho: { storage: "SQLite" },
+    });
+
+    const captureSelectChoices = (
+      pick: (choices: string[]) => string | undefined,
+    ) => {
+      let seenChoices: string[] = [];
+      const ctx = {
+        ...harness.createContext(),
+        ui: {
+          select: async (_title: string, choices: string[]) => {
+            seenChoices = [...choices];
+            return pick(choices);
+          },
+          notify: () => {},
+        },
+      } as unknown as ExtensionToolContext;
+      return { ctx, getChoices: () => seenChoices };
+    };
+
+    // 1. Omitted, empty, whitespace-only, or identical incomingSeed -> 3 choices (no Append), exact legacy labels preserved
+    for (const seedCase of [
+      undefined,
+      "",
+      "   ",
+      "Build OAuth PKCE login",
+      "  Build OAuth PKCE login  ",
+    ]) {
+      const { ctx, getChoices } = captureSelectChoices((c) => c[0]);
+      const action = await promptExistingDraftConflict(
+        ctx,
+        existing,
+        hooks,
+        seedCase,
+      );
+      assert.equal(action, "resume");
+      assert.deepEqual(getChoices(), [
+        "Resume — continue the active draft",
+        "Replace — discard active draft and start fresh",
+        "Cancel — keep current state unchanged",
+      ]);
+      assert.equal(modalDepth, 0);
+    }
+
+    // 2. Non-empty differing incoming seed with OMITTED overrides -> 4 choices including Append,
+    //    exact Resume/Replace/Cancel labels intact, and implicit startOpts defaults do NOT clobber active draft
+    const omittedOverrideCapture = captureSelectChoices((choices) =>
+      choices.find((c) => c.startsWith("Append —")),
+    );
+    const omittedRes = await startOrResolveDraft(
+      harness.api,
+      omittedOverrideCapture.ctx,
+      existing,
+      {
+        mode: "swarm",
+        seed: "Also add brute-force rate limiting",
+      },
+      hooks,
+      {
+        settings: { validatorEnabled: false, maxConcurrency: 2 },
+        defaultBaseBranch: "develop",
+      },
+    );
+
+    assert.equal(modalDepth, 0);
+    assert.equal(omittedOverrideCapture.getChoices().length, 4);
+    assert.equal(
+      omittedOverrideCapture.getChoices()[0],
+      "Resume — continue the active draft",
+    );
+    assert.match(omittedOverrideCapture.getChoices()[1] ?? "", /^Append — /);
+    assert.equal(
+      omittedOverrideCapture.getChoices()[2],
+      "Replace — discard active draft and start fresh",
+    );
+    assert.equal(
+      omittedOverrideCapture.getChoices()[3],
+      "Cancel — keep current state unchanged",
+    );
+
+    assert.equal(omittedRes.action, "appended");
+    assert.ok(omittedRes.draft);
+    assert.equal(
+      omittedRes.draft.seed,
+      "Build OAuth PKCE login\n\nAlso add brute-force rate limiting",
+    );
+    // Preserves existing draft metadata when overrides are omitted (ignores implicit startOpts defaults)
+    assert.equal(omittedRes.draft.validatorEnabled, true);
+    assert.equal(omittedRes.draft.maxConcurrency, 4);
+    assert.equal(omittedRes.draft.baseBranch, "main");
+    assert.equal(omittedRes.draft.skipContractReview, true);
+    assert.deepEqual(omittedRes.draft.questionnaireEcho, { storage: "SQLite" });
+    assert.equal(
+      rehydrateDraft(omittedOverrideCapture.ctx)?.seed,
+      "Build OAuth PKCE login\n\nAlso add brute-force rate limiting",
+    );
+
+    // 3. Non-empty differing incoming seed with EXPLICIT overrides -> applies explicit policy/branch/fast overrides
+    const explicitOverrideCapture = captureSelectChoices((choices) =>
+      choices.find((c) => c.startsWith("Append —")),
+    );
+    const explicitRes = await startOrResolveDraft(
+      harness.api,
+      explicitOverrideCapture.ctx,
+      existing,
+      {
+        mode: "swarm",
+        seed: "Switch target branch and run fast without validator",
+        validatorEnabled: false,
+        maxConcurrency: 2,
+        baseBranch: "release/v2",
+        skipContractReview: false,
+        autoConfirm: true,
+      },
+      hooks,
+    );
+    assert.equal(explicitRes.action, "appended");
+    assert.ok(explicitRes.draft);
+    assert.equal(
+      explicitRes.draft.seed,
+      "Build OAuth PKCE login\n\nSwitch target branch and run fast without validator",
+    );
+    assert.equal(explicitRes.draft.validatorEnabled, false);
+    assert.equal(explicitRes.draft.maxConcurrency, 2);
+    assert.equal(explicitRes.draft.baseBranch, "release/v2");
+    assert.equal(explicitRes.draft.skipContractReview, false);
+    assert.equal(explicitRes.draft.autoConfirm, true);
+    assert.deepEqual(explicitRes.draft.questionnaireEcho, { storage: "SQLite" });
+    const rehydratedExplicit = rehydrateDraft(explicitOverrideCapture.ctx);
+    assert.equal(rehydratedExplicit?.validatorEnabled, false);
+    assert.equal(rehydratedExplicit?.maxConcurrency, 2);
+    assert.equal(rehydratedExplicit?.baseBranch, "release/v2");
+    assert.equal(rehydratedExplicit?.skipContractReview, false);
+    assert.equal(rehydratedExplicit?.autoConfirm, true);
+
+    // 4. DraftStateController.startOrResolve propagates action: "appended", preserves untouched settings
+    //    (ignoring controller's getSettings defaults), and applies explicit overrides when passed
+    const controller = new DraftStateController(
+      harness.api,
+      hooks,
+      () => ({ validatorEnabled: false, maxConcurrency: 1 }),
+    );
+    controller.start(
+      { seed: "Initial seed", validatorEnabled: true, maxConcurrency: 5 },
+      { defaultBaseBranch: "main" },
+    );
+    assert.equal(controller.getDraft()?.baseBranch, "main");
+    const ctrlCapture = captureSelectChoices((choices) =>
+      choices.find((c) => c.startsWith("Append —")),
+    );
+    const ctrlRes = await controller.startOrResolve(
+      ctrlCapture.ctx,
+      { seed: "Second requirement", maxConcurrency: 6 },
+      { defaultBaseBranch: "develop" },
+    );
+    assert.equal(ctrlRes.action, "appended");
+    assert.equal(
+      controller.getDraft()?.seed,
+      "Initial seed\n\nSecond requirement",
+    );
+    assert.equal(controller.getDraft()?.validatorEnabled, true);
+    assert.equal(controller.getDraft()?.maxConcurrency, 6);
+    assert.equal(controller.getDraft()?.baseBranch, "main");
+
+    // 5. Appending onto an empty-seed existing draft uses incoming seed without leading blank lines
+    const emptySeedDraft = startDraft(harness.api, { seed: "" });
+    const emptyAppendCapture = captureSelectChoices((choices) =>
+      choices.find((c) => c.startsWith("Append —")),
+    );
+    const emptyAppendRes = await startOrResolveDraft(
+      harness.api,
+      emptyAppendCapture.ctx,
+      emptySeedDraft,
+      { seed: "First real goal" },
+      hooks,
+    );
+    assert.equal(emptyAppendRes.action, "appended");
+    assert.equal(emptyAppendRes.draft?.seed, "First real goal");
   });
 });

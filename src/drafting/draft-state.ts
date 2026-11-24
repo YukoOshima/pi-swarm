@@ -30,12 +30,15 @@ export interface StartDraftOptions {
   maxConcurrency?: number;
   baseBranch?: string;
   autoConfirm?: boolean;
+  skipContractReview?: boolean;
   questionnaireEcho?: Record<string, string>;
 }
 
 export interface StartDraftExecutionOptions {
   applyToolProfile?: boolean;
   settings?: Partial<Pick<SwarmSettings, "validatorEnabled" | "maxConcurrency">>;
+  /** Implicit auto-detected base branch used only for new/replaced drafts (never clobbers an active draft on Append). */
+  defaultBaseBranch?: string;
 }
 
 export type UpdateDraftPatch = Partial<
@@ -47,10 +50,10 @@ export interface DraftModalHooks {
   onModalExit?: () => void;
 }
 
-export type ExistingDraftAction = "resume" | "replace" | "cancel";
+export type ExistingDraftAction = "resume" | "append" | "replace" | "cancel";
 
 export interface StartOrResumeDraftResult {
-  action: "started" | "resumed" | "replaced" | "cancelled";
+  action: "started" | "resumed" | "appended" | "replaced" | "cancelled";
   draft: SwarmDraftState | null;
 }
 
@@ -168,6 +171,9 @@ function cloneDraft(draft: SwarmDraftState): SwarmDraftState {
   if (typeof draft.autoConfirm === "boolean") {
     cloned.autoConfirm = draft.autoConfirm;
   }
+  if (typeof draft.skipContractReview === "boolean") {
+    cloned.skipContractReview = draft.skipContractReview;
+  }
   if (echo !== undefined) {
     cloned.questionnaireEcho = echo;
   }
@@ -197,6 +203,8 @@ function isSwarmDraftState(value: unknown): value is SwarmDraftState {
     (obj.targetRunId === undefined || typeof obj.targetRunId === "string") &&
     (obj.baseBranch === undefined || typeof obj.baseBranch === "string") &&
     (obj.autoConfirm === undefined || typeof obj.autoConfirm === "boolean") &&
+    (obj.skipContractReview === undefined ||
+      typeof obj.skipContractReview === "boolean") &&
     (obj.questionnaireEcho === undefined ||
       (typeof obj.questionnaireEcho === "object" &&
         obj.questionnaireEcho !== null &&
@@ -288,11 +296,16 @@ export function startDraft(
   if (options.targetRunId?.trim()) {
     draft.targetRunId = options.targetRunId.trim();
   }
-  if (options.baseBranch?.trim()) {
-    draft.baseBranch = options.baseBranch.trim();
+  const resolvedBaseBranch =
+    options.baseBranch?.trim() || opts?.defaultBaseBranch?.trim();
+  if (resolvedBaseBranch) {
+    draft.baseBranch = resolvedBaseBranch;
   }
   if (options.autoConfirm) {
     draft.autoConfirm = true;
+  }
+  if (typeof options.skipContractReview === "boolean") {
+    draft.skipContractReview = options.skipContractReview;
   }
   const echo = cloneEcho(options.questionnaireEcho);
   if (echo) {
@@ -338,6 +351,9 @@ export function updateDraft(
       : {}),
     ...(patch.baseBranch !== undefined ? { baseBranch: patch.baseBranch } : {}),
     ...(patch.autoConfirm !== undefined ? { autoConfirm: patch.autoConfirm } : {}),
+    ...(patch.skipContractReview !== undefined
+      ? { skipContractReview: patch.skipContractReview }
+      : {}),
   };
 
   const cleanedEcho = cloneEcho(mergedEcho);
@@ -387,37 +403,54 @@ export function clearDraft(
 }
 
 // ============================================================================
-// Existing-Draft Conflict Handling (Resume / Replace / Cancel)
+// Existing-Draft Conflict Handling (Resume / Append / Replace / Cancel)
 // ============================================================================
 
 const EXISTING_DRAFT_RESUME_LABEL = "Resume — continue the active draft";
+const EXISTING_DRAFT_APPEND_LABEL =
+  "Append — add new goal details to the active draft";
 const EXISTING_DRAFT_REPLACE_LABEL = "Replace — discard active draft and start fresh";
 const EXISTING_DRAFT_CANCEL_LABEL = "Cancel — keep current state unchanged";
 
 /**
- * Prompts the user with `Resume / Replace / Cancel` when starting a second draft
- * while one is already active. Wraps `ctx.ui.select` in `onModalEnter`/`onModalExit`
- * so global terminal shortcuts never hijack modal keys.
+ * Prompts the user with `Resume / [Append] / Replace / Cancel` when starting a second
+ * draft while one is already active. Offers `Append` only when `incomingSeed` is
+ * non-empty and differs from `existing.seed`. Wraps `ctx.ui.select` in
+ * `onModalEnter`/`onModalExit` so global terminal shortcuts never hijack modal keys.
  */
 export async function promptExistingDraftConflict(
   ctx: ExtensionContext,
   existing: SwarmDraftState,
   hooks?: DraftModalHooks,
+  incomingSeed?: string,
 ): Promise<ExistingDraftAction> {
   if (!ctx.hasUI) {
     return "cancel";
   }
+
+  const trimmedExisting = existing.seed.trim();
+  const trimmedIncoming =
+    typeof incomingSeed === "string" ? incomingSeed.trim() : "";
+  const canAppend =
+    trimmedIncoming.length > 0 && trimmedIncoming !== trimmedExisting;
 
   const seedSnippet =
     existing.seed.length > 60
       ? `${existing.seed.slice(0, 57)}...`
       : existing.seed || "(no seed)";
   const title = `A Swarm draft is already active ("${seedSnippet}"). How do you want to proceed?`;
-  const choices = [
-    EXISTING_DRAFT_RESUME_LABEL,
-    EXISTING_DRAFT_REPLACE_LABEL,
-    EXISTING_DRAFT_CANCEL_LABEL,
-  ];
+  const choices = canAppend
+    ? [
+        EXISTING_DRAFT_RESUME_LABEL,
+        EXISTING_DRAFT_APPEND_LABEL,
+        EXISTING_DRAFT_REPLACE_LABEL,
+        EXISTING_DRAFT_CANCEL_LABEL,
+      ]
+    : [
+        EXISTING_DRAFT_RESUME_LABEL,
+        EXISTING_DRAFT_REPLACE_LABEL,
+        EXISTING_DRAFT_CANCEL_LABEL,
+      ];
 
   let selected: string | undefined;
   hooks?.onModalEnter?.();
@@ -430,6 +463,9 @@ export async function promptExistingDraftConflict(
   if (selected === EXISTING_DRAFT_RESUME_LABEL) {
     return "resume";
   }
+  if (canAppend && selected === EXISTING_DRAFT_APPEND_LABEL) {
+    return "append";
+  }
   if (selected === EXISTING_DRAFT_REPLACE_LABEL) {
     return "replace";
   }
@@ -438,7 +474,7 @@ export async function promptExistingDraftConflict(
 
 /**
  * Starts a new draft or resolves a conflict with an already-active draft via
- * `Resume / Replace / Cancel`.
+ * `Resume / Append / Replace / Cancel`.
  */
 export async function startOrResolveDraft(
   pi: DraftPersistenceAPI,
@@ -449,13 +485,49 @@ export async function startOrResolveDraft(
   startOpts?: StartDraftExecutionOptions,
 ): Promise<StartOrResumeDraftResult> {
   if (isDraftActive(existing)) {
-    const decision = await promptExistingDraftConflict(ctx, existing, hooks);
+    const decision = await promptExistingDraftConflict(
+      ctx,
+      existing,
+      hooks,
+      options.seed,
+    );
     if (decision === "cancel") {
       return { action: "cancelled", draft: cloneDraft(existing) };
     }
     if (decision === "resume") {
       applySwarmToolProfile(pi, "drafting");
       return { action: "resumed", draft: cloneDraft(existing) };
+    }
+    if (decision === "append") {
+      const existingSeed = existing.seed.trim();
+      const incomingSeed = options.seed.trim();
+      const mergedSeed = existingSeed
+        ? `${existingSeed}\n\n${incomingSeed}`
+        : incomingSeed;
+      const patch: UpdateDraftPatch = { seed: mergedSeed };
+      if (options.validatorEnabled !== undefined) {
+        patch.validatorEnabled = options.validatorEnabled;
+      }
+      if (options.maxConcurrency !== undefined) {
+        patch.maxConcurrency = options.maxConcurrency;
+      }
+      if (options.baseBranch !== undefined && options.baseBranch.trim()) {
+        patch.baseBranch = options.baseBranch.trim();
+      }
+      if (options.autoConfirm !== undefined) {
+        patch.autoConfirm = options.autoConfirm;
+      }
+      if (typeof options.skipContractReview === "boolean") {
+        patch.skipContractReview = options.skipContractReview;
+      }
+      if (options.questionnaireEcho !== undefined) {
+        patch.questionnaireEcho = options.questionnaireEcho;
+      }
+      const appended = updateDraft(pi, existing, patch);
+      if (startOpts?.applyToolProfile !== false) {
+        applySwarmToolProfile(pi, "drafting");
+      }
+      return { action: "appended", draft: appended };
     }
     // decision === "replace"
     clearDraft(pi, existing);

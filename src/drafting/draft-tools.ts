@@ -1,3 +1,4 @@
+import path from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
@@ -573,6 +574,24 @@ export interface ValidateProposedSwarmPlanOptions {
   now?: string;
 }
 
+export interface TweakedMissionContractInput {
+  assertions?: MissionAssertion[];
+  features?: MissionFeature[];
+  milestones?: SwarmMilestone[];
+  commands?: MissionCommandEntry[];
+  services?: MissionServiceEntry[];
+  boundaries?: string[];
+}
+
+export interface MergedTweakedMissionContract {
+  assertions?: MissionAssertion[];
+  features?: MissionFeature[];
+  milestones?: SwarmMilestone[];
+  commands?: MissionCommandEntry[];
+  services?: MissionServiceEntry[];
+  boundaries?: string[];
+}
+
 /**
  * Auto-derives ordered `SwarmMilestone[]` in first-seen feature `milestone` order.
  * When `existingMilestones` are supplied (e.g. during `/swarm tweak`), preserves
@@ -627,12 +646,15 @@ export function deriveMilestonesFromFeatures(
     }
 
     const prev = existingByLabel.get(label);
-    const allFulfilledPassed = group.every((f) =>
+    const allFulfilledPassed = activeGroup.every((f) =>
       f.fulfills.every((valId) => {
         const linked = assertionById.get(valId);
         return linked ? linked.status === "passed" : true;
       }),
     );
+    if (status === "done" && !allFulfilledPassed && assertionById.size > 0) {
+      status = "in_progress";
+    }
     const preserveSealed =
       prev?.sealed === true && status === "done" && allFulfilledPassed;
 
@@ -648,6 +670,709 @@ export function deriveMilestonesFromFeatures(
         : {}),
     };
   });
+}
+
+function mergeFeaturePreservingUntouched(
+  prev: MissionFeature | undefined,
+  inc: MissionFeature,
+  overrides: {
+    status: MissionFeature["status"];
+    assignedMember?: string;
+    mergedCommitSha?: string;
+    updatedAt: string;
+  },
+): MissionFeature {
+  const base: Partial<MissionFeature> = prev ? structuredClone(prev) : {};
+  const incomingClone = structuredClone(inc);
+  const definedIncoming = Object.fromEntries(
+    Object.entries(incomingClone).filter(([, value]) => value !== undefined),
+  ) as Partial<MissionFeature>;
+
+  const merged: MissionFeature = {
+    ...(base as MissionFeature),
+    ...definedIncoming,
+    status: overrides.status,
+    updatedAt: overrides.updatedAt,
+  };
+  if (overrides.assignedMember !== undefined) {
+    merged.assignedMember = overrides.assignedMember;
+  } else {
+    delete merged.assignedMember;
+  }
+  if (overrides.mergedCommitSha !== undefined) {
+    merged.mergedCommitSha = overrides.mergedCommitSha;
+  } else {
+    delete merged.mergedCommitSha;
+  }
+  return merged;
+}
+
+function mergeIncomingFeatureWithPrior(
+  prev: MissionFeature | undefined,
+  inc: MissionFeature,
+  effectiveNow: string,
+): MissionFeature {
+  if (prev?.status === "completed") {
+    return mergeFeaturePreservingUntouched(prev, inc, {
+      status: "completed",
+      assignedMember: prev.assignedMember ?? inc.assignedMember,
+      mergedCommitSha: prev.mergedCommitSha ?? inc.mergedCommitSha,
+      updatedAt: prev.updatedAt || inc.updatedAt || effectiveNow,
+    });
+  }
+  if (
+    prev?.status === "in_progress" &&
+    (!inc.status || inc.status === "pending")
+  ) {
+    return mergeFeaturePreservingUntouched(prev, inc, {
+      status: "in_progress",
+      assignedMember: inc.assignedMember ?? prev.assignedMember,
+      mergedCommitSha: inc.mergedCommitSha ?? prev.mergedCommitSha,
+      updatedAt: prev.updatedAt || inc.updatedAt || effectiveNow,
+    });
+  }
+  // Allow failed/cancelled work to be requeued to "pending" on tweak (matches legacy index helper)
+  const nextStatus = inc.status ?? prev?.status ?? "pending";
+  return mergeFeaturePreservingUntouched(prev, inc, {
+    status: nextStatus,
+    assignedMember: inc.assignedMember ?? prev?.assignedMember,
+    mergedCommitSha: inc.mergedCommitSha ?? prev?.mergedCommitSha,
+    updatedAt: inc.updatedAt || effectiveNow,
+  });
+}
+
+function mergeTweakedMilestones(
+  explicitMilestones: readonly SwarmMilestone[] | undefined,
+  features: readonly MissionFeature[] | undefined,
+  assertions: readonly MissionAssertion[] | undefined,
+  priorMilestones: readonly SwarmMilestone[] | undefined,
+  resetAssertionIds: ReadonlySet<string>,
+): SwarmMilestone[] {
+  const hasExplicit = Boolean(explicitMilestones && explicitMilestones.length > 0);
+  const priorByLabel = new Map<string, SwarmMilestone>();
+  for (const pm of priorMilestones ?? []) {
+    const clean = pm.label.trim();
+    if (clean) {
+      priorByLabel.set(clean, pm);
+    }
+  }
+
+  const explicitByLabel = new Map<string, SwarmMilestone>();
+  const orderedLabels: string[] = [];
+  const pushLabel = (rawLabel: string): void => {
+    const clean = rawLabel.trim();
+    if (clean && !orderedLabels.includes(clean)) {
+      orderedLabels.push(clean);
+    }
+  };
+
+  for (const m of explicitMilestones ?? []) {
+    const clean = m.label.trim();
+    if (clean) {
+      explicitByLabel.set(clean, m);
+      pushLabel(clean);
+    }
+  }
+  for (const pm of priorMilestones ?? []) {
+    const clean = pm.label.trim();
+    if (!clean) continue;
+    const stillHasFeatures = (features ?? []).some(
+      (f) => f.milestone.trim() === clean,
+    );
+    if (pm.sealed || stillHasFeatures || !hasExplicit) {
+      pushLabel(clean);
+    }
+  }
+  for (const f of features ?? []) {
+    pushLabel(f.milestone);
+  }
+
+  const assertionMap = new Map<string, MissionAssertion>();
+  for (const a of assertions ?? []) {
+    assertionMap.set(a.id, a);
+  }
+
+  return orderedLabels.map((label): SwarmMilestone => {
+    const exp = explicitByLabel.get(label);
+    const prev = priorByLabel.get(label);
+    const milestoneFeatures = (features ?? []).filter(
+      (f) => f.milestone.trim() === label,
+    );
+    const activeFeatures = milestoneFeatures.filter(
+      (f) => f.status !== "cancelled",
+    );
+
+    const claimedIds = new Set<string>();
+    for (const f of activeFeatures) {
+      for (const aid of f.fulfills ?? []) {
+        claimedIds.add(aid);
+      }
+    }
+    const hadResetAssertion = Array.from(claimedIds).some((aid) =>
+      resetAssertionIds.has(aid),
+    );
+    const allClaimedPassed = Array.from(claimedIds).every((aid) => {
+      const linked = assertionMap.get(aid);
+      return linked ? linked.status === "passed" : true;
+    });
+    const allFeaturesCompleted =
+      activeFeatures.length > 0 &&
+      activeFeatures.every((f) => f.status === "completed");
+    const anyProgress = activeFeatures.some(
+      (f) => f.status === "in_progress" || f.status === "completed",
+    );
+    const owner = exp?.owner ?? prev?.owner;
+
+    if (hadResetAssertion) {
+      return {
+        label,
+        status: "in_progress",
+        ...(owner ? { owner } : {}),
+      };
+    }
+
+    const wasSealed = Boolean(prev?.sealed ?? exp?.sealed);
+    if (
+      wasSealed &&
+      (activeFeatures.length === 0 || (allFeaturesCompleted && allClaimedPassed))
+    ) {
+      const sealedAt = prev?.sealedAt ?? exp?.sealedAt;
+      return {
+        label,
+        status: "done",
+        ...(owner ? { owner } : {}),
+        sealed: true,
+        ...(sealedAt ? { sealedAt } : {}),
+      };
+    }
+
+    let status: SwarmMilestone["status"] =
+      exp?.status ?? prev?.status ?? "pending";
+    if (activeFeatures.length > 0) {
+      if (allFeaturesCompleted && allClaimedPassed) {
+        status = "done";
+      } else if (
+        exp?.status === "blocked" ||
+        activeFeatures.some((f) => f.status === "failed")
+      ) {
+        status = "blocked";
+      } else if (anyProgress || status === "done") {
+        status = "in_progress";
+      } else {
+        status = exp?.status ?? prev?.status ?? "pending";
+      }
+    }
+
+    return {
+      label,
+      status,
+      ...(owner ? { owner } : {}),
+      ...(exp?.sealed === true && !wasSealed ? { sealed: true } : {}),
+      ...(exp?.sealed === true && exp.sealedAt ? { sealedAt: exp.sealedAt } : {}),
+    };
+  });
+}
+
+/**
+ * Canonical shared tweak-merge helper for Mission contracts.
+ *
+ * Used by BOTH `validateProposedSwarmPlan` (pre-modal tweak normalization) and
+ * post-confirmation persistence (`handlePlanConfirmed`) so both stages apply the
+ * exact same merge semantics:
+ * - Blocks adding new features or moving features into `sealed: true` milestones
+ *   (`SwarmProtocolError("INVALID_INPUT", ...)`).
+ * - Preserves `completed` and `in_progress` feature progress (`mergedCommitSha`,
+ *   `assignedMember`, `updatedAt`) and preserves omitted optional fields
+ *   (`filesOwned`, `dependsOn`, `preconditions`, `expectedBehavior`,
+ *   `verificationSteps`) from prior features while carrying forward omitted
+ *   `completed` features whose assertions were not re-claimed.
+ * - Preserves verification metadata (`status`, `evidence`, `verifiedBy`,
+ *   `verifiedByRole`, `overridden`, `overrideJustification`, `updatedAt`) on
+ *   unchanged assertions, and resets modified assertions (`description` or
+ *   `evidenceRequired` changed) back to `"pending"` without stale evidence.
+ * - Merges `commands` and `services` by `name`, unions `boundaries`, and preserves
+ *   untouched prior milestones verbatim when neither milestones, features, nor
+ *   assertions were reset; otherwise reconciles milestones preserving prior
+ *   ordering, featureless/explicit milestones, and sealed status.
+ * - Idempotent when invoked repeatedly with its own merged output.
+ */
+export function mergeTweakedMissionContract(
+  existingRun: Pick<
+    SwarmRunState,
+    | "assertions"
+    | "features"
+    | "milestones"
+    | "commands"
+    | "services"
+    | "boundaries"
+  >,
+  incoming: TweakedMissionContractInput,
+  nowIso?: string,
+): MergedTweakedMissionContract {
+  const effectiveNow = nowIso ?? new Date().toISOString();
+
+  const existingAssertionById = new Map<string, MissionAssertion>();
+  for (const prevA of existingRun.assertions ?? []) {
+    if (prevA && typeof prevA.id === "string" && prevA.id.trim()) {
+      existingAssertionById.set(prevA.id.trim(), prevA);
+    }
+  }
+
+  const existingFeatureById = new Map<string, MissionFeature>();
+  for (const prevF of existingRun.features ?? []) {
+    if (prevF && typeof prevF.id === "string" && prevF.id.trim()) {
+      existingFeatureById.set(prevF.id.trim(), prevF);
+    }
+  }
+
+  const sealedMilestones = new Set<string>();
+  for (const ms of existingRun.milestones ?? []) {
+    if (ms && ms.sealed === true && typeof ms.label === "string" && ms.label.trim()) {
+      sealedMilestones.add(ms.label.trim());
+    }
+  }
+
+  const incomingAssertionIds = new Set<string>(
+    (incoming.assertions ?? [])
+      .map((a) => a.id.trim())
+      .filter(Boolean),
+  );
+
+  // 1. Sealed milestone guard + feature merge (preserving omitted optional fields from prev)
+  let mergedFeatures: MissionFeature[] | undefined;
+  const carriedCompletedFeatures: MissionFeature[] = [];
+  if (incoming.features !== undefined) {
+    for (const inc of incoming.features) {
+      const cleanMilestone = inc.milestone.trim();
+      const prev = existingFeatureById.get(inc.id);
+      if (
+        sealedMilestones.has(cleanMilestone) &&
+        (!prev || prev.milestone.trim() !== cleanMilestone)
+      ) {
+        throw new SwarmProtocolError(
+          "INVALID_INPUT",
+          `Cannot add new feature "${inc.id}" into already sealed milestone "${cleanMilestone}" — add a follow-up milestone instead.`,
+          { featureId: inc.id, milestone: cleanMilestone },
+        );
+      }
+    }
+
+    const incomingFeatureIds = new Set<string>(
+      incoming.features.map((f) => f.id),
+    );
+    const incomingClaimOwner = new Map<string, string>();
+    for (const inc of incoming.features) {
+      for (const valId of inc.fulfills ?? []) {
+        if (!incomingClaimOwner.has(valId)) {
+          incomingClaimOwner.set(valId, inc.id);
+        }
+      }
+    }
+
+    // Carry forward omitted already-completed features; reject contradictory VAL-* reclaims
+    // rather than silently dropping completed history or creating duplicate assertion ownership.
+    for (const prev of existingRun.features ?? []) {
+      if (prev.status === "completed" && !incomingFeatureIds.has(prev.id)) {
+        for (const valId of prev.fulfills ?? []) {
+          const reclaimingFeatureId = incomingClaimOwner.get(valId);
+          if (reclaimingFeatureId) {
+            throw new SwarmProtocolError(
+              "INVALID_INPUT",
+              `Feature "${reclaimingFeatureId}" cannot reclaim assertion "${valId}" already fulfilled by completed feature "${prev.id}" — keep "${prev.id}" in features or define a new assertion ID instead.`,
+              {
+                featureId: reclaimingFeatureId,
+                completedFeatureId: prev.id,
+                assertionId: valId,
+              },
+            );
+          }
+        }
+        carriedCompletedFeatures.push(structuredClone(prev));
+      }
+    }
+
+    const nextFeatures: MissionFeature[] = [];
+    for (const inc of incoming.features) {
+      const prev = existingFeatureById.get(inc.id);
+      nextFeatures.push(mergeIncomingFeatureWithPrior(prev, inc, effectiveNow));
+    }
+
+    mergedFeatures = [...carriedCompletedFeatures, ...nextFeatures];
+  } else if (existingRun.features && existingRun.features.length > 0) {
+    mergedFeatures = structuredClone(existingRun.features);
+  }
+
+  // 2. Assertion merge (preserve metadata when contract unchanged; reset when modified)
+  const resetAssertionIds = new Set<string>();
+  let mergedAssertions: MissionAssertion[] | undefined;
+  if (incoming.assertions !== undefined) {
+    // Carry forward omitted assertions across the UNION of all completed features
+    // (both carried-forward omitted completed features AND incoming retained completed features)
+    const carriedAssertions: MissionAssertion[] = [];
+    const seenCarried = new Set<string>();
+    const effectiveFeatures = mergedFeatures ?? existingRun.features ?? [];
+    for (const feat of effectiveFeatures) {
+      if (feat.status !== "completed") continue;
+      for (const valId of feat.fulfills ?? []) {
+        if (!incomingAssertionIds.has(valId) && !seenCarried.has(valId)) {
+          const prevA = existingAssertionById.get(valId);
+          if (prevA) {
+            seenCarried.add(valId);
+            carriedAssertions.push(structuredClone(prevA));
+          }
+        }
+      }
+    }
+
+    const nextAssertions: MissionAssertion[] = [];
+    for (const incA of incoming.assertions) {
+      const prevA = existingAssertionById.get(incA.id);
+      if (prevA) {
+        const prevDesc = (prevA.description ?? "").trim();
+        const nextDesc = incA.description.trim();
+        const prevEvReq = (prevA.evidenceRequired ?? "").trim();
+        const nextEvReq = (incA.evidenceRequired ?? "").trim();
+        const contractUnchanged = prevDesc === nextDesc && prevEvReq === nextEvReq;
+
+        if (contractUnchanged) {
+          // An unchanged "passed" assertion cannot be downgraded by incoming non-pending status
+          const isPrevPassed = prevA.status === "passed";
+          const mergedStatus = isPrevPassed
+            ? "passed"
+            : incA.status && incA.status !== "pending"
+              ? incA.status
+              : prevA.status;
+          const evidence = isPrevPassed
+            ? prevA.evidence ?? incA.evidence
+            : incA.evidence ?? prevA.evidence;
+          const verifiedBy = isPrevPassed
+            ? prevA.verifiedBy ?? incA.verifiedBy
+            : incA.verifiedBy ?? prevA.verifiedBy;
+          const verifiedByRole = isPrevPassed
+            ? prevA.verifiedByRole ?? incA.verifiedByRole
+            : incA.verifiedByRole ?? prevA.verifiedByRole;
+          const overridden = isPrevPassed
+            ? prevA.overridden !== undefined
+              ? prevA.overridden
+              : incA.overridden
+            : incA.overridden !== undefined
+              ? incA.overridden
+              : prevA.overridden;
+          const overrideJustification = isPrevPassed
+            ? prevA.overrideJustification ?? incA.overrideJustification
+            : incA.overrideJustification ?? prevA.overrideJustification;
+          nextAssertions.push({
+            id: incA.id,
+            title: incA.title,
+            description: nextDesc,
+            ...(incA.evidenceRequired !== undefined
+              ? { evidenceRequired: incA.evidenceRequired }
+              : {}),
+            status: mergedStatus,
+            ...(evidence !== undefined ? { evidence } : {}),
+            ...(verifiedBy !== undefined ? { verifiedBy } : {}),
+            ...(verifiedByRole !== undefined ? { verifiedByRole } : {}),
+            ...(overridden !== undefined ? { overridden } : {}),
+            ...(overrideJustification !== undefined
+              ? { overrideJustification }
+              : {}),
+            updatedAt: prevA.updatedAt || incA.updatedAt || effectiveNow,
+          });
+          continue;
+        }
+
+        // Contract description or evidenceRequired changed -> reset to "pending" & clear stale evidence
+        if (prevA.status !== "pending") {
+          resetAssertionIds.add(incA.id);
+        }
+        nextAssertions.push({
+          id: incA.id,
+          title: incA.title,
+          description: nextDesc,
+          ...(incA.evidenceRequired !== undefined
+            ? { evidenceRequired: incA.evidenceRequired }
+            : {}),
+          status: "pending",
+          updatedAt: effectiveNow,
+        });
+        continue;
+      }
+
+      nextAssertions.push({
+        ...structuredClone(incA),
+        status: incA.status ?? "pending",
+        updatedAt: incA.updatedAt || effectiveNow,
+      });
+    }
+
+    mergedAssertions = [...carriedAssertions, ...nextAssertions];
+  } else if (existingRun.assertions && existingRun.assertions.length > 0) {
+    mergedAssertions = structuredClone(existingRun.assertions);
+  }
+
+  // 3. Commands, Services & Boundaries merge
+  let mergedCommands: MissionCommandEntry[] | undefined;
+  if (incoming.commands !== undefined) {
+    const cmdMap = new Map<string, MissionCommandEntry>();
+    for (const c of existingRun.commands ?? []) {
+      cmdMap.set(c.name, { ...c });
+    }
+    for (const c of incoming.commands) {
+      cmdMap.set(c.name, { ...c });
+    }
+    if (cmdMap.size > 0) {
+      mergedCommands = [...cmdMap.values()];
+    }
+  } else if (existingRun.commands && existingRun.commands.length > 0) {
+    mergedCommands = existingRun.commands.map((c) => ({ ...c }));
+  }
+
+  let mergedServices: MissionServiceEntry[] | undefined;
+  if (incoming.services !== undefined) {
+    const svcMap = new Map<string, MissionServiceEntry>();
+    for (const s of existingRun.services ?? []) {
+      svcMap.set(s.name, structuredClone(s));
+    }
+    for (const s of incoming.services) {
+      svcMap.set(s.name, structuredClone(s));
+    }
+    if (svcMap.size > 0) {
+      mergedServices = [...svcMap.values()];
+    }
+  } else if (existingRun.services && existingRun.services.length > 0) {
+    mergedServices = structuredClone(existingRun.services);
+  }
+
+  let mergedBoundaries: string[] | undefined;
+  if (incoming.boundaries !== undefined) {
+    const seen = new Set<string>();
+    const combined: string[] = [];
+    for (const b of [
+      ...(existingRun.boundaries ?? []),
+      ...incoming.boundaries,
+    ]) {
+      const trimmed = b.trim();
+      if (trimmed && !seen.has(trimmed)) {
+        seen.add(trimmed);
+        combined.push(trimmed);
+      }
+    }
+    if (combined.length > 0) {
+      mergedBoundaries = combined;
+    }
+  } else if (existingRun.boundaries && existingRun.boundaries.length > 0) {
+    mergedBoundaries = [...existingRun.boundaries];
+  }
+
+  // 4. Milestones reconciliation:
+  //    - When neither incoming.milestones, incoming.features, nor resetAssertionIds changed
+  //      (e.g. a strategy-only or commands-only tweak), preserve existingRun.milestones verbatim.
+  //    - Otherwise reconcile while preserving prior ordering, explicit/featureless milestones,
+  //      and sealed metadata (unsealing only milestones whose claimed assertion reset).
+  let mergedMilestones: SwarmMilestone[] | undefined;
+  const shouldReconcileMilestones =
+    incoming.milestones !== undefined ||
+    incoming.features !== undefined ||
+    resetAssertionIds.size > 0;
+  if (shouldReconcileMilestones) {
+    const reconciled = mergeTweakedMilestones(
+      incoming.milestones,
+      mergedFeatures,
+      mergedAssertions,
+      existingRun.milestones,
+      resetAssertionIds,
+    );
+    if (reconciled.length > 0) {
+      mergedMilestones = reconciled;
+    }
+  } else if (existingRun.milestones && existingRun.milestones.length > 0) {
+    mergedMilestones = structuredClone(existingRun.milestones);
+  }
+
+  return {
+    ...(mergedAssertions && mergedAssertions.length > 0
+      ? { assertions: mergedAssertions }
+      : {}),
+    ...(mergedFeatures && mergedFeatures.length > 0
+      ? { features: mergedFeatures }
+      : {}),
+    ...(mergedMilestones && mergedMilestones.length > 0
+      ? { milestones: mergedMilestones }
+      : {}),
+    ...(mergedCommands && mergedCommands.length > 0
+      ? { commands: mergedCommands }
+      : {}),
+    ...(mergedServices && mergedServices.length > 0
+      ? { services: mergedServices }
+      : {}),
+    ...(mergedBoundaries && mergedBoundaries.length > 0
+      ? { boundaries: mergedBoundaries }
+      : {}),
+  };
+}
+
+// ============================================================================
+// Static Local files_owned Overlap Validation Helpers
+// ============================================================================
+
+interface NormalizedOwnedPath {
+  raw: string;
+  /**
+   * Canonical POSIX path after normalizing `/`/`\`, `./`, `..`, trailing `/`,
+   * and trailing `/*` or `/**` directory wildcards (`""` represents repo root).
+   *
+   * Overlap detection is a deterministic literal + POSIX directory-containment
+   * gate (consistent with `engine.ts`'s `ownedPathsOverlap`), without heuristic
+   * glob intersection so disjoint wildcard patterns (e.g. `src/auth-*.ts` vs
+   * `src/ui-*.ts`) never trigger false positives.
+   */
+  normalized: string;
+}
+
+function normalizeOwnedPath(raw: string): NormalizedOwnedPath | null {
+  let p = raw.trim().replace(/\\/g, "/");
+  if (!p) return null;
+
+  p = p.replace(/\/+/g, "/");
+  while (p.startsWith("./")) {
+    p = p.slice(2);
+  }
+  p = p.replace(/^\/+/, "").replace(/\/+$/, "");
+
+  if (p === "" || p === "." || p === "*" || p === "**") {
+    return { raw, normalized: "" };
+  }
+
+  const posixNorm = path.posix
+    .normalize(p)
+    .replace(/^\/+/, "")
+    .replace(/\/+$/, "");
+  if (
+    posixNorm === "" ||
+    posixNorm === "." ||
+    posixNorm === "*" ||
+    posixNorm === "**"
+  ) {
+    return { raw, normalized: "" };
+  }
+
+  let stripped = posixNorm;
+  while (stripped.endsWith("/**") || stripped.endsWith("/*")) {
+    stripped = stripped.replace(/\/\*+$/, "");
+  }
+  if (
+    stripped === "" ||
+    stripped === "." ||
+    stripped === "*" ||
+    stripped === "**"
+  ) {
+    return { raw, normalized: "" };
+  }
+
+  return { raw, normalized: stripped };
+}
+
+function ownedPathEntriesCollide(
+  a: NormalizedOwnedPath,
+  b: NormalizedOwnedPath,
+): boolean {
+  if (a.normalized === "" || b.normalized === "") return true;
+  if (a.normalized === b.normalized) return true;
+  return (
+    a.normalized.startsWith(`${b.normalized}/`) ||
+    b.normalized.startsWith(`${a.normalized}/`)
+  );
+}
+
+function collectFeatureFileOverlapIssues(
+  features: readonly Pick<
+    MissionFeature,
+    "id" | "milestone" | "dependsOn" | "filesOwned" | "status"
+  >[],
+): DraftPlanValidationIssue[] {
+  const issues: DraftPlanValidationIssue[] = [];
+  if (features.length < 2) {
+    return issues;
+  }
+
+  const depsById = new Map<string, readonly string[]>();
+  for (const feat of features) {
+    depsById.set(feat.id, feat.dependsOn ?? []);
+  }
+
+  const ancestorCache = new Map<string, Set<string>>();
+  const getAncestors = (startId: string): Set<string> => {
+    const cached = ancestorCache.get(startId);
+    if (cached) return cached;
+    const visited = new Set<string>();
+    const stack = [...(depsById.get(startId) ?? [])];
+    while (stack.length > 0) {
+      const depId = stack.pop()!;
+      if (depId === startId || visited.has(depId)) continue;
+      visited.add(depId);
+      const nextDeps = depsById.get(depId);
+      if (nextDeps) {
+        for (const nd of nextDeps) {
+          if (!visited.has(nd)) {
+            stack.push(nd);
+          }
+        }
+      }
+    }
+    ancestorCache.set(startId, visited);
+    return visited;
+  };
+
+  // Skip only features whose EFFECTIVE status is terminal (completed/cancelled)
+  const parsedByFeature = features.map((feat) => {
+    const isTerminal =
+      feat.status === "completed" || feat.status === "cancelled";
+    const parsedPaths = isTerminal
+      ? []
+      : (feat.filesOwned ?? [])
+          .map(normalizeOwnedPath)
+          .filter((p): p is NormalizedOwnedPath => p !== null);
+    return { feat, milestone: feat.milestone.trim(), parsedPaths };
+  });
+
+  for (let i = 0; i < parsedByFeature.length; i++) {
+    const a = parsedByFeature[i]!;
+    if (a.parsedPaths.length === 0) continue;
+
+    for (let j = i + 1; j < parsedByFeature.length; j++) {
+      const b = parsedByFeature[j]!;
+      if (b.parsedPaths.length === 0) continue;
+      if (a.milestone !== b.milestone) continue;
+
+      if (
+        getAncestors(a.feat.id).has(b.feat.id) ||
+        getAncestors(b.feat.id).has(a.feat.id)
+      ) {
+        continue;
+      }
+
+      let overlapPair: [string, string] | null = null;
+      for (const pathA of a.parsedPaths) {
+        for (const pathB of b.parsedPaths) {
+          if (ownedPathEntriesCollide(pathA, pathB)) {
+            overlapPair = [pathA.raw, pathB.raw];
+            break;
+          }
+        }
+        if (overlapPair) break;
+      }
+
+      if (overlapPair) {
+        issues.push({
+          code: "INVALID_INPUT",
+          field: "features",
+          message: `Overlapping files_owned between parallel features "${a.feat.id}" ("${overlapPair[0]}") and "${b.feat.id}" ("${overlapPair[1]}") in milestone "${a.milestone}" without depends_on ordering — assign disjoint paths or add depends_on between them.`,
+        });
+      }
+    }
+  }
+
+  return issues;
 }
 
 function collectFeatureDagErrors(
@@ -1765,24 +2490,37 @@ export function validateProposedSwarmPlan(
     }
   }
 
-  // Known completed features from existingRun (supports incremental tweak depends_on references)
+  // Known omitted completed features from existingRun (supports incremental tweak depends_on
+  // references and rejects contradictory VAL-* reclaims without dropping completed history)
   const carriedCompletedIds = new Set<string>();
+  const carriedCompletedOwnerByVal = new Map<string, string>();
   if (existingRun && params.features !== undefined) {
     for (const [prevId, prevFeat] of existingFeatureMap.entries()) {
-      if (
-        prevFeat.status === "completed" &&
-        !seenFeatureIds.has(prevId) &&
-        !prevFeat.fulfills.some((valId) => seenAssertionIds.has(valId))
-      ) {
+      if (prevFeat.status === "completed" && !seenFeatureIds.has(prevId)) {
         carriedCompletedIds.add(prevId);
+        for (const valId of prevFeat.fulfills ?? []) {
+          carriedCompletedOwnerByVal.set(valId, prevId);
+        }
       }
     }
   }
 
-  // Validate depends_on existence & acyclic DAG
+  // Validate depends_on existence, acyclic DAG, and local static files_owned overlaps
+  // against EFFECTIVE merged ownership, dependencies, and status (so tweak inheritance of
+  // omitted filesOwned/dependsOn and cancelled->pending requeues are validated accurately).
   if (incomingFeatures.length > 0) {
+    const effectiveIncomingFeatures: MissionFeature[] = existingRun
+      ? incomingFeatures.map((inc) =>
+          mergeIncomingFeatureWithPrior(
+            existingFeatureMap.get(inc.id),
+            inc,
+            nowIso,
+          ),
+        )
+      : incomingFeatures;
+
     const dagErrors = collectFeatureDagErrors(
-      incomingFeatures,
+      effectiveIncomingFeatures,
       carriedCompletedIds.size > 0 ? carriedCompletedIds : undefined,
     );
     for (const err of dagErrors) {
@@ -1792,13 +2530,33 @@ export function validateProposedSwarmPlan(
         message: err.message,
       });
     }
+
+    const effectiveAllFeatures: MissionFeature[] = existingRun
+      ? [
+          ...Array.from(carriedCompletedIds)
+            .map((id) => existingFeatureMap.get(id))
+            .filter((f): f is MissionFeature => Boolean(f)),
+          ...effectiveIncomingFeatures,
+        ]
+      : effectiveIncomingFeatures;
+
+    const overlapIssues = collectFeatureFileOverlapIssues(effectiveAllFeatures);
+    for (const overlapIssue of overlapIssues) {
+      issues.push(overlapIssue);
+    }
   }
 
   // Validate fulfills references:
   // - Every ID in feature.fulfills[] must match a defined assertion.id in assertions
+  // - Reject contradictory reclaims of assertions already fulfilled by omitted completed features
   // - Reject duplicate fulfills claiming the same VAL-* across multiple features (1-to-1 leaf rule)
   // - If assertions is non-empty, require features to claim 100% of assertions (zero orphan assertions)
   const claimedAssertions = new Map<string, string>();
+  for (const [valId, prevFeatId] of carriedCompletedOwnerByVal.entries()) {
+    if (seenAssertionIds.has(valId)) {
+      claimedAssertions.set(valId, prevFeatId);
+    }
+  }
   for (const feat of incomingFeatures) {
     for (const valId of feat.fulfills) {
       if (!seenAssertionIds.has(valId)) {
@@ -1806,6 +2564,15 @@ export function validateProposedSwarmPlan(
           code: "INVALID_INPUT",
           field: "features",
           message: `Feature "${feat.id}" fulfills unknown assertion "${valId}" — define "${valId}" in assertions first.`,
+        });
+        continue;
+      }
+      const carriedOwner = carriedCompletedOwnerByVal.get(valId);
+      if (carriedOwner) {
+        issues.push({
+          code: "INVALID_INPUT",
+          field: "features",
+          message: `Feature "${feat.id}" cannot reclaim assertion "${valId}" already fulfilled by completed feature "${carriedOwner}" — keep "${carriedOwner}" in features or define a new assertion ID instead.`,
         });
         continue;
       }
@@ -1839,135 +2606,60 @@ export function validateProposedSwarmPlan(
     return { valid: false, issues };
   }
 
-  // Smart normalization & tweak-mode merge onto ProposedSwarmPlan
+  // Smart normalization & canonical tweak-mode merge onto ProposedSwarmPlan
+  const hasExplicitContractInput =
+    params.assertions !== undefined || params.features !== undefined;
+
+  if (existingRun) {
+    const merged = mergeTweakedMissionContract(
+      existingRun,
+      {
+        ...(hasExplicitContractInput
+          ? { assertions: incomingAssertions, features: incomingFeatures }
+          : {}),
+        ...(params.commands !== undefined && normalizedCommands
+          ? { commands: normalizedCommands }
+          : {}),
+        ...(params.services !== undefined && normalizedServices
+          ? { services: normalizedServices }
+          : {}),
+        ...(params.boundaries !== undefined && normalizedBoundaries
+          ? { boundaries: normalizedBoundaries }
+          : {}),
+      },
+      nowIso,
+    );
+
+    return {
+      valid: true,
+      title,
+      objective,
+      strategy,
+      acceptanceCriteria,
+      ...(normalizedMembers.length > 0 ? { initialMembers: normalizedMembers } : {}),
+      ...(merged.assertions ? { assertions: merged.assertions } : {}),
+      ...(merged.features ? { features: merged.features } : {}),
+      ...(merged.milestones ? { milestones: merged.milestones } : {}),
+      ...(merged.commands ? { commands: merged.commands } : {}),
+      ...(merged.services ? { services: merged.services } : {}),
+      ...(merged.boundaries ? { boundaries: merged.boundaries } : {}),
+    };
+  }
+
   let finalAssertions: MissionAssertion[] | undefined;
   let finalFeatures: MissionFeature[] | undefined;
   let finalMilestones: SwarmMilestone[] | undefined;
 
-  const hasExplicitContractInput =
-    params.assertions !== undefined || params.features !== undefined;
-
   if (hasExplicitContractInput) {
-    const mergedAssertions: MissionAssertion[] = [];
-    const mergedFeatures: MissionFeature[] = [];
-
-    // Carry forward already-completed features & their assertions on incremental tweak
-    if (existingRun && carriedCompletedIds.size > 0) {
-      const carriedAssertionIds = new Set<string>();
-      for (const prevId of carriedCompletedIds) {
-        const prevFeat = existingFeatureMap.get(prevId);
-        if (!prevFeat) continue;
-        mergedFeatures.push(structuredClone(prevFeat));
-        for (const valId of prevFeat.fulfills) {
-          if (!seenAssertionIds.has(valId) && !carriedAssertionIds.has(valId)) {
-            const prevAssert = existingAssertionMap.get(valId);
-            if (prevAssert) {
-              carriedAssertionIds.add(valId);
-              mergedAssertions.push(structuredClone(prevAssert));
-            }
-          }
-        }
-      }
+    if (incomingAssertions.length > 0) {
+      finalAssertions = incomingAssertions;
     }
-
-    for (const incA of incomingAssertions) {
-      const prevA = existingAssertionMap.get(incA.id);
-      if (prevA) {
-        const prevDesc = (prevA.description ?? "").trim();
-        const prevEvReq = (prevA.evidenceRequired ?? "").trim();
-        const nextEvReq = (incA.evidenceRequired ?? "").trim();
-        const contractUnchanged =
-          prevDesc === incA.description && prevEvReq === nextEvReq;
-
-        if (contractUnchanged) {
-          mergedAssertions.push({
-            id: incA.id,
-            title: incA.title,
-            description: incA.description,
-            ...(incA.evidenceRequired !== undefined
-              ? { evidenceRequired: incA.evidenceRequired }
-              : {}),
-            status: prevA.status,
-            ...(prevA.evidence !== undefined ? { evidence: prevA.evidence } : {}),
-            ...(prevA.verifiedBy !== undefined
-              ? { verifiedBy: prevA.verifiedBy }
-              : {}),
-            ...(prevA.verifiedByRole !== undefined
-              ? { verifiedByRole: prevA.verifiedByRole }
-              : {}),
-            ...(prevA.overridden !== undefined
-              ? { overridden: prevA.overridden }
-              : {}),
-            ...(prevA.overrideJustification !== undefined
-              ? { overrideJustification: prevA.overrideJustification }
-              : {}),
-            updatedAt: prevA.updatedAt || nowIso,
-          });
-          continue;
-        }
-      }
-      // Brand-new assertion OR description/evidenceRequired changed -> reset to "pending"
-      mergedAssertions.push(incA);
-    }
-
-    for (const incF of incomingFeatures) {
-      const prevF = existingFeatureMap.get(incF.id);
-      if (prevF && prevF.status === "completed") {
-        mergedFeatures.push({
-          ...incF,
-          status: "completed",
-          ...(prevF.assignedMember !== undefined
-            ? { assignedMember: prevF.assignedMember }
-            : {}),
-          ...(prevF.mergedCommitSha !== undefined
-            ? { mergedCommitSha: prevF.mergedCommitSha }
-            : {}),
-          updatedAt: prevF.updatedAt || nowIso,
-        });
-        continue;
-      }
-      if (prevF && prevF.status === "in_progress") {
-        mergedFeatures.push({
-          ...incF,
-          status: "in_progress",
-          ...(prevF.assignedMember !== undefined
-            ? { assignedMember: prevF.assignedMember }
-            : {}),
-          ...(prevF.mergedCommitSha !== undefined
-            ? { mergedCommitSha: prevF.mergedCommitSha }
-            : {}),
-          updatedAt: prevF.updatedAt || nowIso,
-        });
-        continue;
-      }
-      mergedFeatures.push(incF);
-    }
-
-    if (mergedAssertions.length > 0) {
-      finalAssertions = mergedAssertions;
-    }
-    if (mergedFeatures.length > 0) {
-      finalFeatures = mergedFeatures;
+    if (incomingFeatures.length > 0) {
+      finalFeatures = incomingFeatures;
       finalMilestones = deriveMilestonesFromFeatures(
-        mergedFeatures,
-        existingRun?.milestones,
-        mergedAssertions,
-      );
-    }
-  } else if (existingRun) {
-    if (existingRun.assertions && existingRun.assertions.length > 0) {
-      finalAssertions = structuredClone(existingRun.assertions);
-    }
-    if (existingRun.features && existingRun.features.length > 0) {
-      finalFeatures = structuredClone(existingRun.features);
-    }
-    if (existingRun.milestones && existingRun.milestones.length > 0) {
-      finalMilestones = structuredClone(existingRun.milestones);
-    } else if (finalFeatures && finalFeatures.length > 0) {
-      finalMilestones = deriveMilestonesFromFeatures(
-        finalFeatures,
+        incomingFeatures,
         undefined,
-        finalAssertions,
+        incomingAssertions,
       );
     }
   }
@@ -3097,7 +3789,8 @@ export function createProposeSwarmPlanTool(
           : {}),
       };
 
-      // Step 2.5: Pre-Modal Adversarial Contract Reviewer (at most 1 automatic rejection bounce per draft)
+      // Step 2.5: Pre-Modal Adversarial Contract Reviewer (at most 1 automatic rejection bounce per draft;
+      // bypassed cleanly when draft.skipContractReview is true, while Step 1 local validation stays active)
       const draftReviewKey = resolveDraftReviewKey(currentDraft, ctx);
       let attachedContractReview: ContractReviewResult | undefined;
       let attachedReviewPass: number | undefined;
@@ -3105,6 +3798,7 @@ export function createProposeSwarmPlanTool(
         typeof deps.reviewProposedContract === "function" &&
         proposedPlan.assertions &&
         proposedPlan.assertions.length > 0 &&
+        currentDraft?.skipContractReview !== true &&
         currentDraft?.validatorEnabled !== false &&
         proposedPlan.validatorEnabled !== false
       ) {
@@ -3339,6 +4033,9 @@ export function createProposeSwarmPlanTool(
           validatorEnabled: refinedValidatorEnabled,
           maxConcurrency: refinedMaxConcurrency,
           baseBranch,
+          ...(typeof currentDraft?.skipContractReview === "boolean"
+            ? { skipContractReview: currentDraft.skipContractReview }
+            : {}),
           questionnaireEcho: currentDraft?.questionnaireEcho,
         });
       }

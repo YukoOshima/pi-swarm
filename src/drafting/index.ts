@@ -41,6 +41,7 @@ export {
   createSwarmQuestionnaireTool,
   deriveMilestonesFromFeatures,
   InitialMemberProposalSchema,
+  mergeTweakedMissionContract,
   MissionAssertionProposalSchema,
   MissionCommandProposalSchema,
   MissionFeatureProposalSchema,
@@ -54,6 +55,7 @@ export {
   type DraftingDeps,
   type DraftPlanValidationIssue,
   type InitialMemberProposalParams,
+  type MergedTweakedMissionContract,
   type MissionAssertionProposalParams,
   type MissionCommandProposalParams,
   type MissionFeatureProposalParams,
@@ -65,5 +67,6 @@ export {
   type SwarmQuestionnaireToolDetails,
   type SwarmQuestionParams,
   type SwarmQuestionToolDetails,
+  type TweakedMissionContractInput,
   type ValidateProposedSwarmPlanOptions,
 } from "./draft-tools.js";

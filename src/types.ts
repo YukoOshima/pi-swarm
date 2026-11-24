@@ -525,6 +525,7 @@ export interface ActiveSwarmDraft {
   maxConcurrency: number;
   baseBranch?: string;
   autoConfirm?: boolean;
+  skipContractReview?: boolean;
   questionnaireEcho?: Record<string, string>;
   clearedAt?: string;
 }
