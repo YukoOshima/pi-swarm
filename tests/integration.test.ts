@@ -49,6 +49,7 @@ import {
   SWARM_WIDGET_KEY,
 } from "../src/constants.js";
 import {
+  MAX_SPEC_FILE_BYTES,
   SWARM_STATUS_CUSTOM_TYPE,
   SWARM_SUBCOMMANDS,
   type SwarmExtensionOptions,
@@ -56,6 +57,7 @@ import {
   createPiSwarmExtension,
   parseContractReviewOutput,
   parseSwarmCommand,
+  parseSwarmGoalLaunchOptions,
 } from "../src/index.js";
 import { SwarmEngine } from "../src/runtime/index.js";
 import { SwarmStore, WorktreeManager } from "../src/store/index.js";
@@ -3797,6 +3799,9 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     );
 
     // 5. `/swarm tweak` resuming an existing non-tweak "swarm" draft sends a "swarm" prompt (not "tweak")
+    owner.setSelectHandler((_title, choices) =>
+      choices.find((c) => /Start new/i.test(c)) ?? choices[0],
+    );
     await owner.runCommand("swarm", "New feature draft");
     owner.sentUserMessages.length = 0;
     owner.setSelectHandler((_title, choices) =>
@@ -6604,5 +6609,1067 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     } finally {
       SwarmEngine.prototype.completeRun = origCompleteRun;
     }
+  });
+
+  it("21. VAL-CLI-001: parseSwarmCommand preserves exact {kind, rest} & 21 SWARM_SUBCOMMANDS, supports leading -- escape, and routes merge/focus/model prose to goal", async () => {
+    // 1. Exact 21 SWARM_SUBCOMMANDS in exact order
+    assert.deepEqual(
+      SWARM_SUBCOMMANDS.map((c) => c.name),
+      [
+        "direct",
+        "tweak",
+        "status",
+        "board",
+        "graph",
+        "tasks",
+        "ui",
+        "models",
+        "model",
+        "steer",
+        "stop",
+        "merge",
+        "kill",
+        "done",
+        "pause",
+        "resume",
+        "cancel",
+        "teardown",
+        "runs",
+        "focus",
+        "settings",
+        "help",
+      ].filter((x) => x !== "stop"),
+    );
+    assert.equal(SWARM_SUBCOMMANDS.length, 21);
+
+    // 2. Leading `--` escape forces `kind: "goal"` with exact `{ kind, rest }` shape
+    const escStatus = parseSwarmCommand("-- status of auth");
+    assert.deepEqual(escStatus, { kind: "goal", rest: "status of auth" });
+    assert.deepEqual(Object.keys(escStatus).sort(), ["kind", "rest"]);
+    assert.deepEqual(parseSwarmCommand("-- merge author"), {
+      kind: "goal",
+      rest: "merge author",
+    });
+    assert.deepEqual(parseSwarmCommand("-- focus none"), {
+      kind: "goal",
+      rest: "focus none",
+    });
+    assert.deepEqual(parseSwarmCommand("-- model worker default"), {
+      kind: "goal",
+      rest: "model worker default",
+    });
+    assert.deepEqual(parseSwarmCommand("-- direct build app"), {
+      kind: "goal",
+      rest: "direct build app",
+    });
+    assert.deepEqual(parseSwarmCommand("-- --no-validator fix tests"), {
+      kind: "goal",
+      rest: "--no-validator fix tests",
+    });
+    assert.deepEqual(parseSwarmCommand("--"), { kind: "goal", rest: "" });
+
+    // 3. Valid `merge`, `focus`, and `model` subcommand invocations stay intact
+    assert.deepEqual(parseSwarmCommand("merge"), { kind: "merge", rest: "" });
+    assert.deepEqual(parseSwarmCommand("merge author"), {
+      kind: "merge",
+      rest: "author",
+    });
+    assert.deepEqual(parseSwarmCommand("merge @auth-dev"), {
+      kind: "merge",
+      rest: "@auth-dev",
+    });
+
+    assert.deepEqual(parseSwarmCommand("focus"), { kind: "focus", rest: "" });
+    assert.deepEqual(parseSwarmCommand("focus none"), {
+      kind: "focus",
+      rest: "none",
+    });
+    assert.deepEqual(parseSwarmCommand("focus off"), {
+      kind: "focus",
+      rest: "off",
+    });
+    assert.deepEqual(parseSwarmCommand("focus --clear"), {
+      kind: "focus",
+      rest: "--clear",
+    });
+    assert.deepEqual(parseSwarmCommand("focus run_20261124151606_1b44a8"), {
+      kind: "focus",
+      rest: "run_20261124151606_1b44a8",
+    });
+
+    assert.deepEqual(parseSwarmCommand("model"), { kind: "model", rest: "" });
+    assert.deepEqual(parseSwarmCommand("model worker"), {
+      kind: "model",
+      rest: "worker",
+    });
+    assert.deepEqual(parseSwarmCommand("model @validator"), {
+      kind: "model",
+      rest: "@validator",
+    });
+    assert.deepEqual(parseSwarmCommand("model --print"), {
+      kind: "model",
+      rest: "--print",
+    });
+    assert.deepEqual(parseSwarmCommand("model worker default"), {
+      kind: "model",
+      rest: "worker default",
+    });
+    assert.deepEqual(parseSwarmCommand("model worker --clear --global"), {
+      kind: "model",
+      rest: "worker --clear --global",
+    });
+    assert.deepEqual(parseSwarmCommand("model worker gpt-5 --clear --global"), {
+      kind: "model",
+      rest: "worker gpt-5 --clear --global",
+    });
+    assert.deepEqual(parseSwarmCommand("model worker my local high"), {
+      kind: "model",
+      rest: "worker my local high",
+    });
+    assert.deepEqual(
+      parseSwarmCommand("model worker google/gemini-2.5-pro:high --global"),
+      {
+        kind: "model",
+        rest: "worker google/gemini-2.5-pro:high --global",
+      },
+    );
+    assert.deepEqual(
+      parseSwarmCommand("model api-1 openai/gpt-5.2 high --global"),
+      {
+        kind: "model",
+        rest: "api-1 openai/gpt-5.2 high --global",
+      },
+    );
+    assert.deepEqual(
+      parseSwarmCommand("model --global worker anthropic/claude-sonnet-4-5"),
+      {
+        kind: "model",
+        rest: "--global worker anthropic/claude-sonnet-4-5",
+      },
+    );
+
+    // 4. Natural-language prose starting with `merge`, `focus`, or `model` routes to `kind: "goal"`
+    assert.deepEqual(parseSwarmCommand("merge the two reducers into one"), {
+      kind: "goal",
+      rest: "merge the two reducers into one",
+    });
+    assert.deepEqual(parseSwarmCommand("focus on latency regressions in API"), {
+      kind: "goal",
+      rest: "focus on latency regressions in API",
+    });
+    assert.deepEqual(
+      parseSwarmCommand("model the user permissions and roles"),
+      {
+        kind: "goal",
+        rest: "model the user permissions and roles",
+      },
+    );
+    assert.deepEqual(parseSwarmCommand("model user auth flow"), {
+      kind: "goal",
+      rest: "model user auth flow",
+    });
+    assert.deepEqual(parseSwarmCommand("model 3D rendering pipeline"), {
+      kind: "goal",
+      rest: "model 3D rendering pipeline",
+    });
+
+    // 5. End-to-end command routing: `/swarm -- --literal-flag goal` and prose goals enter drafting cleanly
+    const repoDir = await createTempGitRepo("val-cli-001");
+    tempDirs.push(repoDir);
+    const harness = createMockPiHarness(repoDir, { mode: "tui" });
+    createPiSwarmExtension({
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: false,
+      }),
+    })(harness.pi);
+    await harness.emit("session_start", { reason: "startup" });
+
+    await harness.runCommand("swarm", "-- --unknown-flag literal goal");
+    const escKickoff = String(
+      harness.sentUserMessages[harness.sentUserMessages.length - 1]?.content ??
+        "",
+    );
+    assert.match(escKickoff, /--unknown-flag literal goal/);
+    await harness.runCommand("swarm", "cancel");
+
+    harness.sentUserMessages.length = 0;
+    await harness.runCommand("swarm", "merge the two reducers into one");
+    assert.match(
+      String(harness.sentUserMessages[0]?.content ?? ""),
+      /merge the two reducers into one/,
+    );
+    await harness.runCommand("swarm", "cancel");
+
+    harness.sentUserMessages.length = 0;
+    await harness.runCommand("swarm", "focus on latency regressions in API");
+    assert.match(
+      String(harness.sentUserMessages[0]?.content ?? ""),
+      /focus on latency regressions in API/,
+    );
+    await harness.runCommand("swarm", "cancel");
+
+    harness.sentUserMessages.length = 0;
+    await harness.runCommand("swarm", "model the user permissions and roles");
+    assert.match(
+      String(harness.sentUserMessages[0]?.content ?? ""),
+      /model the user permissions and roles/,
+    );
+    await harness.runCommand("swarm", "cancel");
+
+    await harness.emit("session_shutdown", { reason: "quit" });
+  });
+
+  it("22. VAL-CLI-002: parses launch flags, expands --file/@path with size cap, preserves policy on Append, forwards Hub overrides, skips review on --fast, and keeps short flags on resume/kill/done intact", async () => {
+    // 1. Pure parser tests (`parseSwarmGoalLaunchOptions`)
+    assert.deepEqual(
+      parseSwarmGoalLaunchOptions(
+        "--no-validator -c 6 --branch release/v2 --fast --file docs/spec.md Build auth",
+      ),
+      {
+        goal: "Build auth",
+        validatorEnabled: false,
+        maxConcurrency: 6,
+        baseBranch: "release/v2",
+        skipContractReview: true,
+        files: ["docs/spec.md"],
+      },
+    );
+    assert.deepEqual(
+      parseSwarmGoalLaunchOptions(
+        '--validator --concurrency=4 -b dev --no-review --file="docs/my spec.md" -f extra.md Polish UI',
+      ),
+      {
+        goal: "Polish UI",
+        validatorEnabled: true,
+        maxConcurrency: 4,
+        baseBranch: "dev",
+        skipContractReview: true,
+        files: ["docs/my spec.md", "extra.md"],
+      },
+    );
+    // Only leading flags are parsed; trailing flags remain part of literal goal
+    assert.deepEqual(
+      parseSwarmGoalLaunchOptions("Build auth --no-validator --fast"),
+      {
+        goal: "Build auth --no-validator --fast",
+      },
+    );
+    // Bare `--` ends flag parsing and preserves remainder verbatim
+    assert.deepEqual(
+      parseSwarmGoalLaunchOptions("--fast -- --bogus-flag \"quoted text\""),
+      {
+        goal: '--bogus-flag "quoted text"',
+        skipContractReview: true,
+      },
+    );
+    // Legitimate Git branch names per `git check-ref-format --branch` are accepted
+    assert.deepEqual(
+      parseSwarmGoalLaunchOptions("--branch feature./parser Build parser"),
+      {
+        goal: "Build parser",
+        baseBranch: "feature./parser",
+      },
+    );
+    assert.deepEqual(
+      parseSwarmGoalLaunchOptions('--branch "release\u00a0notes" Ship notes'),
+      {
+        goal: "Ship notes",
+        baseBranch: "release\u00a0notes",
+      },
+    );
+    assert.deepEqual(parseSwarmGoalLaunchOptions("--branch @ Ship at-branch"), {
+      goal: "Ship at-branch",
+      baseBranch: "@",
+    });
+    // Validation errors mention `--` as the escape for literal text
+    for (const bad of [
+      "--unknown-flag Build app",
+      "-c",
+      "--concurrency=abc Build",
+      "-c 2.5 Build",
+      "-c 0 Build",
+      "-c 65 Build",
+      "--branch",
+      "--branch HEAD Build",
+      "--branch --fast Build",
+      '--branch "bad branch" hello',
+      "--branch no..good hello",
+      "--branch feat//bad hello",
+      "--branch feat.lock hello",
+      '--branch "unfinished',
+      '--branch="unfinished',
+      "--file",
+      "--file --fast Build",
+      "--file -c 2 foo",
+      "--file -b dev foo",
+      "-f -f spec.md foo",
+      '--file "unfinished',
+    ]) {
+      const parsed = parseSwarmGoalLaunchOptions(bad);
+      assert.ok(parsed.error, `Expected error for "${bad}"`);
+      assert.match(
+        parsed.error!,
+        /--/,
+        `Error for "${bad}" must mention -- escape`,
+      );
+    }
+
+    // 2. End-to-end CLI launch flags, spec files, Append policy preservation, Hub forwarding, and --fast review skip
+    const repoDir = await createTempGitRepo("val-cli-002");
+    tempDirs.push(repoDir);
+    await mkdir(path.join(repoDir, "docs"), { recursive: true });
+    await writeFile(
+      path.join(repoDir, "docs", "spec.md"),
+      "# OAuth2 Spec\nImplement PKCE login flow with refresh tokens.\n",
+      "utf8",
+    );
+    await writeFile(
+      path.join(repoDir, "docs", "huge.md"),
+      "x".repeat(MAX_SPEC_FILE_BYTES + 128),
+      "utf8",
+    );
+
+    const store = new SwarmStore(repoDir);
+    let reviewCalls = 0;
+    const mockTransport: ISwarmTransport = {
+      async spawnMember(request: SpawnMemberRequest) {
+        const tracker = createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async ({ pushAssistantMessage }) => {
+            pushAssistantMessage("Done");
+            return {
+              agentId: request.agentId,
+              name: request.name,
+              role: request.role,
+              outcome: "waiting",
+              summary: "Done",
+              tokens: 50,
+              cost: 0.0005,
+            };
+          },
+        });
+        return tracker.handle;
+      },
+    };
+
+    const host = createMockPiHarness(repoDir, { mode: "tui" });
+    const mockSettings: SwarmSettings = {
+      ...DEFAULT_SWARM_SETTINGS,
+      validatorEnabled: true,
+      maxConcurrency: 4,
+      stallWatchdogEnabled: false,
+    };
+    createPiSwarmExtension({
+      transportFactory: () => mockTransport,
+      settingsLoader: async () => mockSettings,
+      contractReviewer: async () => {
+        reviewCalls += 1;
+        return {
+          approved: false,
+          summary: "Blocking finding",
+          findings: [
+            {
+              severity: "blocking",
+              category: "missing_assertion",
+              message: "Should be skipped on --fast",
+            },
+          ],
+        };
+      },
+    })(host.pi);
+    await host.emit("session_start", { reason: "startup" });
+
+    // (a) Invalid leading flag / malformed branch / missing file / oversized file / FIFO -> clear error, starts nothing
+    host.sentUserMessages.length = 0;
+    await host.runCommand("swarm", "--bogus Build feature");
+    assert.equal(host.sentUserMessages.length, 0);
+    assert.ok(
+      host.notifications.some((n) => /Unknown launch flag.*--/.test(n.message)),
+    );
+
+    await host.runCommand("swarm", '--branch "bad branch" hello');
+    assert.equal(host.sentUserMessages.length, 0);
+    await host.runCommand("swarm", "--branch no..good hello");
+    assert.equal(host.sentUserMessages.length, 0);
+    await host.runCommand("swarm", '--branch "unfinished');
+    assert.equal(host.sentUserMessages.length, 0);
+    await host.runCommand("swarm", "--file -c 2 foo");
+    assert.equal(host.sentUserMessages.length, 0);
+
+    await host.runCommand("swarm", "--file docs/missing.md Build feature");
+    assert.equal(host.sentUserMessages.length, 0);
+    assert.ok(
+      host.notifications.some((n) => /docs\/missing\.md/.test(n.message)),
+    );
+
+    await host.runCommand("swarm", "--file docs/huge.md Build feature");
+    assert.equal(host.sentUserMessages.length, 0);
+    assert.ok(
+      host.notifications.some((n) => /64 KiB/.test(n.message)),
+    );
+
+    // Named pipe / FIFO regression: never blocks on `--file` (errors cleanly) or `@fifo` (remains literal)
+    if (process.platform !== "win32") {
+      const fifoPath = path.join(repoDir, "docs", "pipe.fifo");
+      await execFileAsync("mkfifo", [fifoPath]);
+      host.sentUserMessages.length = 0;
+      await host.runCommand("swarm", "--file docs/pipe.fifo Build feature");
+      assert.equal(host.sentUserMessages.length, 0);
+      assert.ok(
+        host.notifications.some((n) => /not a regular file/i.test(n.message)),
+      );
+
+      await host.runCommand("swarm", "Inspect @docs/pipe.fifo without hanging");
+      assert.equal(host.sentUserMessages.length, 1);
+      assert.match(
+        String(host.sentUserMessages[0]!.content),
+        /@docs\/pipe\.fifo/,
+        "FIFO @mention must remain literal without blocking",
+      );
+      await host.runCommand("swarm", "cancel");
+      host.sentUserMessages.length = 0;
+    }
+
+    // (b) `--no-validator -c 6 -b main --fast --file docs/spec.md` sets explicit overrides + prepends spec file
+    await host.runCommand(
+      "swarm",
+      "--no-validator -c 6 -b main --fast --file docs/spec.md Add audit logs",
+    );
+    assert.equal(host.sentUserMessages.length, 1);
+    const kickoff1 = String(host.sentUserMessages[0]!.content);
+    assert.match(kickoff1, /max_concurrency="6"/);
+    assert.match(kickoff1, /validator_enabled="false"/);
+    assert.match(kickoff1, /skip_contract_review="true"/);
+    assert.match(kickoff1, /Implement PKCE login flow with refresh tokens\./);
+    assert.match(kickoff1, /Add audit logs/);
+
+    // (c) Draft conflict `Append` WITHOUT flags preserves active draft's policy (not overwritten by currentSettings!)
+    host.setSelectHandler((_title, choices) => {
+      const appendChoice = choices.find((c) => /^Append/i.test(c));
+      assert.ok(appendChoice, `Expected Append choice in ${JSON.stringify(choices)}`);
+      return appendChoice;
+    });
+    host.sentUserMessages.length = 0;
+    await host.runCommand("swarm", "Also support key rotation");
+    assert.equal(host.sentUserMessages.length, 1);
+    const kickoffAppended = String(host.sentUserMessages[0]!.content);
+    assert.match(kickoffAppended, /Implement PKCE login flow with refresh tokens\./);
+    assert.match(kickoffAppended, /Also support key rotation/);
+    assert.match(
+      kickoffAppended,
+      /max_concurrency="6"/,
+      "Implicit settings must NOT overwrite draft maxConcurrency on Append",
+    );
+    assert.match(
+      kickoffAppended,
+      /validator_enabled="false"/,
+      "Implicit settings must NOT overwrite draft validatorEnabled on Append",
+    );
+    assert.match(
+      kickoffAppended,
+      /skip_contract_review="true"/,
+      "Implicit defaults must NOT clear skipContractReview on Append",
+    );
+
+    // (d) Draft conflict `Append` WITH explicit `-c 3` updates ONLY maxConcurrency
+    host.sentUserMessages.length = 0;
+    await host.runCommand("swarm", "-c 3 Plus metrics");
+    const kickoffAppended2 = String(host.sentUserMessages[0]!.content);
+    assert.match(kickoffAppended2, /max_concurrency="3"/);
+    assert.match(kickoffAppended2, /validator_enabled="false"/);
+    assert.match(kickoffAppended2, /skip_contract_review="true"/);
+    assert.match(kickoffAppended2, /Plus metrics/);
+    await host.runCommand("swarm", "cancel");
+
+    // (e) Standalone `@<path>` expansion leaves non-file `@tokens`, directories, and emails untouched
+    host.sentUserMessages.length = 0;
+    await host.runCommand(
+      "swarm",
+      "Implement @docs/spec.md with @validator review, check @src and @missing.md, notify dev@example.com",
+    );
+    const atKickoff = String(host.sentUserMessages[0]!.content);
+    assert.match(atKickoff, /Implement PKCE login flow with refresh tokens\./);
+    assert.match(atKickoff, /@validator/);
+    assert.match(atKickoff, /@src/);
+    assert.match(atKickoff, /@missing\.md/);
+    assert.match(atKickoff, /dev@example\.com/);
+    assert.ok(!atKickoff.includes("@docs/spec.md"), "Expanded regular file token should not remain raw");
+    await host.runCommand("swarm", "cancel");
+
+    // (f) `/swarm direct --fast -c 2 --validator` skips adversarial contractReviewer while enforcing local files_owned overlap!
+    host.sentUserMessages.length = 0;
+    await host.runCommand(
+      "swarm",
+      "direct --fast -c 2 --validator Build fast API",
+    );
+    const directPrompt = String(host.sentUserMessages[0]!.content);
+    assert.match(directPrompt, /max_concurrency="2"/);
+    assert.match(directPrompt, /validator_enabled="true"/);
+    assert.match(directPrompt, /skip_contract_review="true"/);
+
+    // Local static `files_owned` overlap still fails even with `--fast`
+    const overlapRes = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Overlap Test",
+      objective: "Test local gate on --fast",
+      strategy: "Parallel workers",
+      acceptance_criteria: "Tests pass",
+      base_branch: "main",
+      assertions: [
+        { id: "VAL-FAST-001", title: "A", description: "Feature A works" },
+        { id: "VAL-FAST-002", title: "B", description: "Feature B works" },
+      ],
+      features: [
+        {
+          id: "feat-a",
+          title: "A",
+          description: "A",
+          milestone: "m1",
+          files_owned: ["src/shared.ts"],
+          fulfills: ["VAL-FAST-001"],
+        },
+        {
+          id: "feat-b",
+          title: "B",
+          description: "B",
+          milestone: "m1",
+          files_owned: ["src/shared.ts"],
+          fulfills: ["VAL-FAST-002"],
+        },
+      ],
+    });
+    assert.equal(overlapRes.isError, true);
+    assert.match(String(overlapRes.content[0].text), /overlap/i);
+
+    // Valid plan confirms immediately without calling contractReviewer (`reviewCalls === 0`)
+    const fastLaunch = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Fast API Launch",
+      objective: "Build fast API",
+      strategy: "Single worker",
+      acceptance_criteria: "Tests pass",
+      base_branch: "main",
+      assertions: [
+        { id: "VAL-FAST-001", title: "API works", description: "Returns 200" },
+      ],
+      features: [
+        {
+          id: "feat-api",
+          title: "API",
+          description: "Implement API",
+          milestone: "m1",
+          files_owned: ["src/api.ts"],
+          fulfills: ["VAL-FAST-001"],
+        },
+      ],
+    });
+    assert.equal(fastLaunch.isError, undefined, JSON.stringify(fastLaunch));
+    assert.equal(reviewCalls, 0, "--fast must bypass adversarial contractReviewer");
+    const fastRunId: string = fastLaunch.details.runId;
+    const fastRun = await store.loadRun(fastRunId);
+    assert.equal(fastRun.maxConcurrency, 2);
+    assert.equal(fastRun.validatorEnabled, true);
+
+    // (g) Verify short flags on `resume -c`, `kill -f`, and `done -f` remain unaffected!
+    await host.executeTool(SWARM_TOOL, {
+      action: "add",
+      name: "short-worker",
+      role: "worker",
+      workspace: "inherit",
+      brief: "Test short flags",
+    });
+    await host.runCommand("swarm", "pause testing resume -c");
+    host.sentUserMessages.length = 0;
+    await host.runCommand("swarm", "resume -c keep going");
+    assert.equal((await store.loadRun(fastRunId)).status, "active");
+    await host.runCommand("swarm", "kill -f short-worker cleanup");
+    assert.equal(
+      (await store.loadRun(fastRunId)).members["short-worker"]?.state,
+      "killed",
+    );
+    await host.runCommand("swarm", "done -f force complete with -f");
+    assert.equal((await store.loadRun(fastRunId)).status, "completed");
+
+    // (h) Hub `draft` and `direct` actions forward explicit `validatorEnabled`/`maxConcurrency` overrides
+    const uiWithCustom = host.ctx.ui as unknown as {
+      custom?: (factory: unknown) => Promise<unknown>;
+    };
+    uiWithCustom.custom = async () => ({
+      kind: "draft",
+      goal: "Hub policy goal",
+      validatorEnabled: false,
+      maxConcurrency: 5,
+    });
+    host.sentUserMessages.length = 0;
+    await host.runCommand("swarm", "");
+    const hubDraftKickoff = String(host.sentUserMessages[0]?.content ?? "");
+    assert.match(hubDraftKickoff, /Hub policy goal/);
+    assert.match(hubDraftKickoff, /validator_enabled="false"/);
+    assert.match(hubDraftKickoff, /max_concurrency="5"/);
+
+    // Hub `direct` with no overrides preserves draft policy on Append
+    uiWithCustom.custom = async () => ({
+      kind: "direct",
+      goal: "Hub appended step",
+    });
+    host.setSelectHandler((_title, choices) =>
+      choices.find((c) => /^Append/i.test(c)) ?? choices[0],
+    );
+    host.sentUserMessages.length = 0;
+    await host.runCommand("swarm", "");
+    const hubDirectPrompt = String(host.sentUserMessages[0]?.content ?? "");
+    assert.match(hubDirectPrompt, /Hub policy goal/);
+    assert.match(hubDirectPrompt, /Hub appended step/);
+    assert.match(hubDirectPrompt, /validator_enabled="false"/);
+    assert.match(hubDirectPrompt, /max_concurrency="5"/);
+    await host.runCommand("swarm", "cancel");
+
+    // (i) `/swarm help` & argument completions cover new launch flags
+    await host.runCommand("swarm", "help");
+    const helpText = String(
+      host.sentMessages[host.sentMessages.length - 1]?.message.content ?? "",
+    );
+    assert.match(helpText, /--no-validator/);
+    assert.match(helpText, /--fast/);
+    assert.match(helpText, /--file/);
+    assert.match(helpText, /@<path>/);
+
+    const swarmCmd = host.commands.get("swarm")!;
+    const flagComps = (await swarmCmd.getArgumentCompletions?.("--f")) as Array<{
+      label: string;
+    }> | null;
+    assert.ok((flagComps ?? []).some((c) => c.label === "--fast"));
+    assert.ok((flagComps ?? []).some((c) => c.label === "--file"));
+    const directFlagComps = (await swarmCmd.getArgumentCompletions?.(
+      "direct --no-",
+    )) as Array<{ value: string; label: string }> | null;
+    assert.ok(
+      (directFlagComps ?? []).some(
+        (c) => c.label === "--no-validator" && c.value === "direct --no-validator",
+      ),
+    );
+    const swarmDirectCmd = host.commands.get("swarm-direct")!;
+    const directCmdComps = (await swarmDirectCmd.getArgumentCompletions?.(
+      "--b",
+    )) as Array<{ label: string }> | null;
+    assert.ok((directCmdComps ?? []).some((c) => c.label === "--branch"));
+
+    await host.emit("session_shutdown", { reason: "quit" });
+  });
+
+  it("23. VAL-CLI-003: prompts on active/paused run for CLI goal/direct launches while bypassing headless, Hub, and legacy menu Start New Swarm", async () => {
+    const repoDir = await createTempGitRepo("val-cli-003");
+    tempDirs.push(repoDir);
+    const store = new SwarmStore(repoDir);
+    const host = createMockPiHarness(repoDir, { mode: "tui" });
+    createPiSwarmExtension({
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: false,
+      }),
+    })(host.pi);
+    await host.emit("session_start", { reason: "startup" });
+
+    // Launch initial active run
+    await host.runCommand("swarm-direct", "Initial active mission");
+    const initPlan = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Active Mission",
+      objective: "Initial active mission",
+      strategy: "Single milestone",
+      acceptance_criteria: "Tests pass",
+      base_branch: "main",
+      assertions: [
+        { id: "VAL-ACT-001", title: "Core", description: "Core works" },
+      ],
+      features: [
+        {
+          id: "feat-core",
+          title: "Core",
+          description: "Core feature",
+          milestone: "m1",
+          fulfills: ["VAL-ACT-001"],
+        },
+      ],
+    });
+    assert.equal(initPlan.isError, undefined, JSON.stringify(initPlan));
+    const activeRunId: string = initPlan.details.runId;
+
+    // 1. Active run + Cancel -> starts nothing
+    const seenPrompts: Array<{ title: string; choices: string[] }> = [];
+    host.setSelectHandler((title, choices) => {
+      seenPrompts.push({ title, choices });
+      return choices.find((c) => /^Cancel/i.test(c));
+    });
+    host.sentUserMessages.length = 0;
+    await host.runCommand("swarm", "Add telemetry dashboard");
+    assert.equal(seenPrompts.length, 1);
+    assert.match(seenPrompts[0]!.title, /Active Mission/);
+    assert.ok(seenPrompts[0]!.choices.some((c) => /Tweak/i.test(c)));
+    assert.ok(seenPrompts[0]!.choices.some((c) => /Start new/i.test(c)));
+    assert.ok(seenPrompts[0]!.choices.some((c) => /Cancel/i.test(c)));
+    assert.equal(host.sentUserMessages.length, 0);
+
+    // 2. Active run + Tweak -> hands goal text to `handleTweakCommand` (`mode="tweak"`)
+    host.setSelectHandler((title, choices) => {
+      seenPrompts.push({ title, choices });
+      return choices.find((c) => /Tweak/i.test(c));
+    });
+    await host.runCommand("swarm", "Add telemetry dashboard");
+    assert.equal(seenPrompts.length, 2);
+    assert.equal(host.sentUserMessages.length, 1);
+    const tweakKickoff = String(host.sentUserMessages[0]!.content);
+    assert.match(tweakKickoff, /mode="tweak"/);
+    assert.match(tweakKickoff, new RegExp(`id="${activeRunId}"`));
+    assert.match(tweakKickoff, /Add telemetry dashboard/);
+    await host.runCommand("swarm", "cancel");
+
+    // 3. Active run + Start new Swarm via `/swarm direct` and `/swarm-direct`
+    host.setSelectHandler((title, choices) => {
+      seenPrompts.push({ title, choices });
+      return choices.find((c) => /Start new/i.test(c));
+    });
+    host.sentUserMessages.length = 0;
+    await host.runCommand("swarm", "direct Separate direct mission");
+    assert.equal(seenPrompts.length, 3);
+    assert.match(
+      String(host.sentUserMessages[0]?.content ?? ""),
+      /<swarm_direct_plan/,
+    );
+    await host.runCommand("swarm", "cancel");
+
+    host.sentUserMessages.length = 0;
+    await host.runCommand("swarm-direct", "Another direct mission");
+    assert.equal(seenPrompts.length, 4);
+    assert.match(
+      String(host.sentUserMessages[0]?.content ?? ""),
+      /Another direct mission/,
+    );
+    await host.runCommand("swarm", "cancel");
+
+    // 4. Paused run also triggers active-run conflict prompt
+    await host.runCommand("swarm", "pause Pausing run");
+    assert.equal((await store.loadRun(activeRunId)).status, "paused");
+    host.setSelectHandler((title, choices) => {
+      seenPrompts.push({ title, choices });
+      return choices.find((c) => /^Cancel/i.test(c));
+    });
+    host.sentUserMessages.length = 0;
+    await host.runCommand("swarm", "Goal while paused");
+    assert.equal(seenPrompts.length, 5);
+    assert.match(seenPrompts[4]!.title, /paused/i);
+    assert.equal(host.sentUserMessages.length, 0);
+
+    // 5. Hub-originated start (`ctx.ui.custom`) during active/paused run does NOT show active-run prompt
+    const promptsBeforeHub = seenPrompts.length;
+    const uiWithCustom = host.ctx.ui as unknown as {
+      custom?: (factory: unknown) => Promise<unknown>;
+    };
+    uiWithCustom.custom = async () => ({
+      kind: "draft",
+      goal: "Hub composed goal",
+    });
+    await host.runCommand("swarm", "");
+    assert.equal(
+      seenPrompts.length,
+      promptsBeforeHub,
+      "Hub-originated draft must NOT open active-run conflict prompt",
+    );
+    assert.match(
+      String(host.sentUserMessages[host.sentUserMessages.length - 1]?.content ?? ""),
+      /Hub composed goal/,
+    );
+    await host.runCommand("swarm", "cancel");
+    delete uiWithCustom.custom;
+
+    // 6. Legacy menu `"Start New Swarm"` (`mode: "rpc"`) does NOT show active-run conflict prompt
+    (host.ctx as { mode: string }).mode = "rpc";
+    let selectCountInLegacy = 0;
+    host.setSelectHandler((_title, choices) => {
+      selectCountInLegacy += 1;
+      return choices.find((c) => /Start New Swarm/i.test(c)) ?? choices[0];
+    });
+    host.setInputHandler(() => "Legacy menu goal");
+    host.sentUserMessages.length = 0;
+    await host.runCommand("swarm", "");
+    assert.equal(
+      selectCountInLegacy,
+      1,
+      "Legacy menu Start New Swarm must NOT trigger a second active-run select prompt",
+    );
+    assert.match(
+      String(host.sentUserMessages[0]?.content ?? ""),
+      /Legacy menu goal/,
+    );
+    await host.runCommand("swarm", "cancel");
+
+    // 7. Headless (`ctx.hasUI = false`) proceeds without prompting
+    (host.ctx as { hasUI: boolean }).hasUI = false;
+    let headlessSelects = 0;
+    host.setSelectHandler((_title, choices) => {
+      headlessSelects += 1;
+      return choices[0];
+    });
+    host.sentUserMessages.length = 0;
+    await host.runCommand("swarm", "Headless CLI goal");
+    assert.equal(headlessSelects, 0);
+    assert.match(
+      String(host.sentUserMessages[0]?.content ?? ""),
+      /Headless CLI goal/,
+    );
+    await host.runCommand("swarm", "cancel");
+
+    await host.emit("session_shutdown", { reason: "quit" });
+  });
+
+  it("24. VAL-CLEANUP-001: src/index.ts uses shared mergeTweakedMissionContract across strategy-only/delta/reset tweaks and single-path reviewProposedContract", async () => {
+    // 1. Source hygiene: removed symbols no longer exist in src/index.ts
+    const indexSrc = await readFile(
+      path.join(process.cwd(), "src", "index.ts"),
+      "utf8",
+    );
+    assert.ok(!indexSrc.includes("mergeTweakedMissionArtifacts"));
+    assert.ok(!indexSrc.includes("reviewAwareQuestionnaireUI"));
+    assert.ok(!indexSrc.includes("draftingReviewHookActive"));
+    assert.ok(!indexSrc.includes("fallbackDraftReviewCounts"));
+
+    const repoDir = await createTempGitRepo("val-cleanup-001");
+    tempDirs.push(repoDir);
+    const store = new SwarmStore(repoDir);
+    let reviewCallCount = 0;
+    let confirmModalCount = 0;
+
+    const host = createMockPiHarness(repoDir, { mode: "tui" });
+    createPiSwarmExtension({
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: false,
+      }),
+      contractReviewer: async () => {
+        reviewCallCount += 1;
+        return {
+          approved: true,
+          summary: "Contract approved cleanly",
+          findings: [],
+        };
+      },
+      questionnaireUI: {
+        askQuestion: async () => ({
+          cancelled: false,
+          answer: "ok",
+          isCustom: false,
+        }),
+        askQuestionnaire: async () => ({
+          cancelled: false,
+          answers: {},
+          items: [],
+        }),
+        confirmProposal: async (_ctx, plan) => {
+          confirmModalCount += 1;
+          return {
+            action: "confirm",
+            validatorEnabled: plan.validatorEnabled,
+            maxConcurrency: plan.maxConcurrency,
+          };
+        },
+      },
+    })(host.pi);
+    await host.emit("session_start", { reason: "startup" });
+
+    // Launch initial run (verifies single-path reviewProposedContract: called exactly once before confirmProposal!)
+    await host.runCommand("swarm", "Build auth & billing");
+    const initRes = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Auth & Billing",
+      objective: "Ship auth and billing",
+      strategy: "M1 auth",
+      acceptance_criteria: "Tests pass",
+      base_branch: "main",
+      assertions: [
+        {
+          id: "VAL-A-001",
+          title: "Auth passes",
+          description: "POST /login returns 200",
+          evidence_required: "auth test output",
+        },
+      ],
+      features: [
+        {
+          id: "feat-a",
+          title: "Auth",
+          description: "Implement auth",
+          milestone: "m1-auth",
+          files_owned: ["src/auth.ts"],
+          fulfills: ["VAL-A-001"],
+        },
+      ],
+      commands: [{ name: "test", command: "npm test" }],
+      boundaries: ["Keep auth isolated"],
+    });
+    assert.equal(initRes.isError, undefined, JSON.stringify(initRes));
+    assert.equal(reviewCallCount, 1, "Single reviewProposedContract path must run exactly once");
+    assert.equal(confirmModalCount, 1);
+    const runId: string = initRes.details.runId;
+
+    // Mark feat-a completed, VAL-A-001 passed (with override metadata), and m1-auth sealed
+    const baseRun = await store.loadRun(runId);
+    await store.updateRun(runId, {
+      features: [
+        {
+          ...baseRun.features![0]!,
+          status: "completed",
+          assignedMember: "auth-dev",
+          mergedCommitSha: "abc12345",
+          updatedAt: "2026-11-24T10:00:00.000Z",
+        },
+      ],
+      assertions: [
+        {
+          ...baseRun.assertions![0]!,
+          status: "passed",
+          evidence: "Auth tests green",
+          verifiedBy: "validator",
+          verifiedByRole: "validator",
+          overridden: true,
+          overrideJustification: "Verified via local harness in sandbox environment.",
+          updatedAt: "2026-11-24T10:00:00.000Z",
+        },
+      ],
+      milestones: [
+        {
+          label: "m1-auth",
+          status: "done",
+          sealed: true,
+          sealedAt: "2026-11-24T10:00:00.000Z",
+        },
+      ],
+    });
+
+    // (a) Strategy-only tweak (omitting assertions/features/milestones): preserves all existing contract artifacts & sealed milestone!
+    await host.runCommand("swarm", "tweak Tighten deployment strategy");
+    const strategyRes = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Auth & Billing",
+      objective: "Ship auth and billing",
+      strategy: "M1 auth (done) -> canary rollout",
+      acceptance_criteria: "Tests pass",
+      base_branch: "main",
+    });
+    assert.equal(strategyRes.isError, undefined, JSON.stringify(strategyRes));
+    const afterStrategy = await store.loadRun(runId);
+    assert.equal(afterStrategy.strategy, "M1 auth (done) -> canary rollout");
+    assert.equal(afterStrategy.features?.length, 1);
+    assert.equal(afterStrategy.features![0]!.status, "completed");
+    assert.equal(afterStrategy.features![0]!.mergedCommitSha, "abc12345");
+    assert.equal(afterStrategy.assertions![0]!.status, "passed");
+    assert.equal(afterStrategy.assertions![0]!.overridden, true);
+    assert.equal(afterStrategy.milestones![0]!.sealed, true);
+    assert.deepEqual(afterStrategy.commands, [{ name: "test", command: "npm test" }]);
+
+    // (b) Delta-features tweak: supplies only new m2-billing feature & VAL-B-001; carries omitted completed feat-a & VAL-A-001!
+    await host.runCommand("swarm", "tweak Add billing milestone");
+    const deltaRes = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Auth & Billing",
+      objective: "Ship auth and billing",
+      strategy: "Add M2 billing after sealed M1 auth",
+      acceptance_criteria: "Tests pass",
+      base_branch: "main",
+      assertions: [
+        {
+          id: "VAL-B-001",
+          title: "Billing works",
+          description: "POST /charge returns 200",
+          evidence_required: "billing test output",
+        },
+      ],
+      features: [
+        {
+          id: "feat-b",
+          title: "Billing",
+          description: "Implement billing",
+          milestone: "m2-billing",
+          files_owned: ["src/billing.ts"],
+          fulfills: ["VAL-B-001"],
+        },
+      ],
+    });
+    assert.equal(deltaRes.isError, undefined, JSON.stringify(deltaRes));
+    const afterDelta = await store.loadRun(runId);
+    assert.deepEqual(
+      afterDelta.features?.map((f) => ({ id: f.id, status: f.status })),
+      [
+        { id: "feat-a", status: "completed" },
+        { id: "feat-b", status: "pending" },
+      ],
+    );
+    assert.deepEqual(
+      afterDelta.assertions?.map((a) => ({ id: a.id, status: a.status })),
+      [
+        { id: "VAL-A-001", status: "passed" },
+        { id: "VAL-B-001", status: "pending" },
+      ],
+    );
+    assert.equal(
+      afterDelta.milestones?.find((m) => m.label === "m1-auth")?.sealed,
+      true,
+    );
+    assert.equal(
+      afterDelta.milestones?.find((m) => m.label === "m2-billing")?.status,
+      "pending",
+    );
+
+    // (c) Tweak resetting a passed assertion: resets VAL-A-001 to pending, clears stale evidence/override, and unseals m1-auth!
+    await host.runCommand("swarm", "tweak Require MFA in login assertion");
+    const resetRes = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Auth & Billing",
+      objective: "Ship MFA auth and billing",
+      strategy: "Re-verify M1 auth with MFA",
+      acceptance_criteria: "Tests pass",
+      base_branch: "main",
+      assertions: [
+        {
+          id: "VAL-A-001",
+          title: "Auth passes with MFA",
+          description: "POST /login requires MFA token and returns 200",
+          evidence_required: "MFA auth test output",
+        },
+        {
+          id: "VAL-B-001",
+          title: "Billing works",
+          description: "POST /charge returns 200",
+          evidence_required: "billing test output",
+        },
+      ],
+      features: [
+        {
+          id: "feat-a",
+          title: "Auth",
+          description: "Implement MFA auth",
+          milestone: "m1-auth",
+          files_owned: ["src/auth.ts"],
+          fulfills: ["VAL-A-001"],
+        },
+        {
+          id: "feat-b",
+          title: "Billing",
+          description: "Implement billing",
+          milestone: "m2-billing",
+          files_owned: ["src/billing.ts"],
+          fulfills: ["VAL-B-001"],
+        },
+      ],
+    });
+    assert.equal(resetRes.isError, undefined, JSON.stringify(resetRes));
+    const afterReset = await store.loadRun(runId);
+    const resetValA = afterReset.assertions?.find((a) => a.id === "VAL-A-001");
+    assert.equal(resetValA?.status, "pending");
+    assert.equal(resetValA?.evidence, undefined);
+    assert.equal(resetValA?.overridden, undefined);
+    assert.equal(resetValA?.overrideJustification, undefined);
+    const m1AfterReset = afterReset.milestones?.find((m) => m.label === "m1-auth");
+    assert.equal(m1AfterReset?.status, "in_progress");
+    assert.notEqual(
+      m1AfterReset?.sealed,
+      true,
+      "Resetting a passed assertion must unseal its milestone in store.updateRun",
+    );
+
+    await host.emit("session_shutdown", { reason: "quit" });
   });
 });
