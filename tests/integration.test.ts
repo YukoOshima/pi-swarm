@@ -6718,6 +6718,14 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       kind: "model",
       rest: "worker --clear --global",
     });
+    assert.deepEqual(parseSwarmCommand("model worker gpt-5 --clear --global"), {
+      kind: "model",
+      rest: "worker gpt-5 --clear --global",
+    });
+    assert.deepEqual(parseSwarmCommand("model worker my local high"), {
+      kind: "model",
+      rest: "worker my local high",
+    });
     assert.deepEqual(
       parseSwarmCommand("model worker google/gemini-2.5-pro:high --global"),
       {
@@ -6866,8 +6874,18 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       "--branch",
       "--branch HEAD Build",
       "--branch --fast Build",
+      '--branch "bad branch" hello',
+      "--branch no..good hello",
+      "--branch feat//bad hello",
+      "--branch feat.lock hello",
+      '--branch "unfinished',
+      '--branch="unfinished',
       "--file",
       "--file --fast Build",
+      "--file -c 2 foo",
+      "--file -b dev foo",
+      "-f -f spec.md foo",
+      '--file "unfinished',
     ]) {
       const parsed = parseSwarmGoalLaunchOptions(bad);
       assert.ok(parsed.error, `Expected error for "${bad}"`);
@@ -6943,13 +6961,22 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     })(host.pi);
     await host.emit("session_start", { reason: "startup" });
 
-    // (a) Invalid leading flag / missing file / oversized file -> clear error, starts nothing
+    // (a) Invalid leading flag / malformed branch / missing file / oversized file / FIFO -> clear error, starts nothing
     host.sentUserMessages.length = 0;
     await host.runCommand("swarm", "--bogus Build feature");
     assert.equal(host.sentUserMessages.length, 0);
     assert.ok(
       host.notifications.some((n) => /Unknown launch flag.*--/.test(n.message)),
     );
+
+    await host.runCommand("swarm", '--branch "bad branch" hello');
+    assert.equal(host.sentUserMessages.length, 0);
+    await host.runCommand("swarm", "--branch no..good hello");
+    assert.equal(host.sentUserMessages.length, 0);
+    await host.runCommand("swarm", '--branch "unfinished');
+    assert.equal(host.sentUserMessages.length, 0);
+    await host.runCommand("swarm", "--file -c 2 foo");
+    assert.equal(host.sentUserMessages.length, 0);
 
     await host.runCommand("swarm", "--file docs/missing.md Build feature");
     assert.equal(host.sentUserMessages.length, 0);
@@ -6962,6 +6989,28 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     assert.ok(
       host.notifications.some((n) => /64 KiB/.test(n.message)),
     );
+
+    // Named pipe / FIFO regression: never blocks on `--file` (errors cleanly) or `@fifo` (remains literal)
+    if (process.platform !== "win32") {
+      const fifoPath = path.join(repoDir, "docs", "pipe.fifo");
+      await execFileAsync("mkfifo", [fifoPath]);
+      host.sentUserMessages.length = 0;
+      await host.runCommand("swarm", "--file docs/pipe.fifo Build feature");
+      assert.equal(host.sentUserMessages.length, 0);
+      assert.ok(
+        host.notifications.some((n) => /not a regular file/i.test(n.message)),
+      );
+
+      await host.runCommand("swarm", "Inspect @docs/pipe.fifo without hanging");
+      assert.equal(host.sentUserMessages.length, 1);
+      assert.match(
+        String(host.sentUserMessages[0]!.content),
+        /@docs\/pipe\.fifo/,
+        "FIFO @mention must remain literal without blocking",
+      );
+      await host.runCommand("swarm", "cancel");
+      host.sentUserMessages.length = 0;
+    }
 
     // (b) `--no-validator -c 6 -b main --fast --file docs/spec.md` sets explicit overrides + prepends spec file
     await host.runCommand(

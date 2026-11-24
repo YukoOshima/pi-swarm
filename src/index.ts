@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { access, open } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { access, open, stat } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
@@ -320,24 +321,41 @@ export interface ParsedSwarmInvocation {
   rest: string;
 }
 
-function isValidModelSubcommandRest(rest: string): boolean {
-  if (!rest) {
-    return true;
-  }
-  const tokens = tokenizeCommandArgs(rest);
+interface ParsedModelCommandShape {
+  explicitScope?: "project" | "global";
+  clearFlag: boolean;
+  words: string[];
+}
+
+function parseModelCommandShape(rawArgs: string): ParsedModelCommandShape {
+  const tokens = tokenizeCommandArgs(rawArgs.trim());
+  let explicitScope: "project" | "global" | undefined;
   let clearFlag = false;
   const words: string[] = [];
   for (const tok of tokens) {
     const lower = tok.toLowerCase();
-    if (lower === "--global" || lower === "-g" || lower === "--project") {
-      continue;
-    }
-    if (lower === "--clear") {
+    if (lower === "--global" || lower === "-g") {
+      explicitScope = "global";
+    } else if (lower === "--project") {
+      explicitScope = "project";
+    } else if (lower === "--clear") {
       clearFlag = true;
-      continue;
+    } else {
+      words.push(tok);
     }
-    words.push(tok);
   }
+  return {
+    ...(explicitScope ? { explicitScope } : {}),
+    clearFlag,
+    words,
+  };
+}
+
+function isValidModelSubcommandRest(rest: string): boolean {
+  if (!rest) {
+    return true;
+  }
+  const { clearFlag, words } = parseModelCommandShape(rest);
   if (words.length === 0) {
     return true;
   }
@@ -353,19 +371,24 @@ function isValidModelSubcommandRest(rest: string): boolean {
   if (!validTarget) {
     return false;
   }
-  if (words.length === 1) {
+  if (words.length === 1 || clearFlag) {
+    // Matches handleModelCommand: single target opens picker/usage, and `--clear`
+    // always sets model=default regardless of any extra positional tokens.
     return true;
   }
-  if (clearFlag) {
+  const rawModelAndThinking = words.slice(1).join(" ").trim();
+  if (!rawModelAndThinking) {
     return false;
   }
-  if (words.length === 2) {
+  if (CLEAR_MODEL_TOKENS.has(rawModelAndThinking.toLowerCase())) {
     return true;
   }
-  if (words.length === 3) {
-    return isThinkingLevel(words[2]!.toLowerCase());
+  const spaceParts = rawModelAndThinking.split(/\s+/).filter(Boolean);
+  if (spaceParts.length >= 2) {
+    const tail = spaceParts[spaceParts.length - 1]!;
+    return isThinkingLevel(tail.toLowerCase());
   }
-  return false;
+  return true;
 }
 
 export function parseSwarmCommand(rawArgs: string): ParsedSwarmInvocation {
@@ -462,6 +485,7 @@ interface ScannedArgToken {
   start: number;
   end: number;
   startsWithQuote: boolean;
+  unterminatedQuote: boolean;
 }
 
 function scanNextArgToken(input: string, fromIndex: number): ScannedArgToken | null {
@@ -505,7 +529,51 @@ function scanNextArgToken(input: string, fromIndex: number): ScannedArgToken | n
     start,
     end: i,
     startsWithQuote,
+    unterminatedQuote: quote !== null,
   };
+}
+
+function isValidGitBranchName(name: string): boolean {
+  if (!name || name === "HEAD" || name === "@") {
+    return false;
+  }
+  if (
+    name.startsWith("-") ||
+    name.startsWith("/") ||
+    name.endsWith("/") ||
+    name.startsWith(".") ||
+    name.endsWith(".")
+  ) {
+    return false;
+  }
+  if (
+    /[\s\x00-\x1f\x7f~^:?*[\\]/.test(name) ||
+    name.includes("..") ||
+    name.includes("//") ||
+    name.includes("@{")
+  ) {
+    return false;
+  }
+  for (const component of name.split("/")) {
+    if (
+      !component ||
+      component.startsWith(".") ||
+      component.endsWith(".") ||
+      component.endsWith(".lock")
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isKnownLaunchFlagToken(rawToken: string): boolean {
+  if (rawToken === "--" || rawToken.startsWith("--")) {
+    return true;
+  }
+  const eqIdx = rawToken.indexOf("=");
+  const flagPart = (eqIdx >= 0 ? rawToken.slice(0, eqIdx) : rawToken).toLowerCase();
+  return flagPart === "-c" || flagPart === "-b" || flagPart === "-f";
 }
 
 /**
@@ -558,10 +626,10 @@ export function parseSwarmGoalLaunchOptions(
     flagLabel: string,
   ): { ok: true; value: string } | { ok: false; error: string } => {
     const trimmedVal = rawVal.trim();
-    if (!trimmedVal || trimmedVal === "HEAD" || trimmedVal.startsWith("-")) {
+    if (!isValidGitBranchName(trimmedVal) || rawVal !== trimmedVal) {
       return {
         ok: false,
-        error: `Invalid ${flagLabel} value "${rawVal}" (must be a branch name other than "HEAD" and not starting with "-").`,
+        error: `Invalid ${flagLabel} value "${rawVal}" (must be a valid Git branch name).`,
       };
     }
     return { ok: true, value: trimmedVal };
@@ -584,6 +652,10 @@ export function parseSwarmGoalLaunchOptions(
 
     if (!tok.value.startsWith("-") || tok.value === "-") {
       break;
+    }
+
+    if (tok.unterminatedQuote) {
+      return makeError("Unterminated quote in launch flag arguments.");
     }
 
     const eqIdx = tok.value.indexOf("=");
@@ -625,6 +697,9 @@ export function parseSwarmGoalLaunchOptions(
         if (!valTok) {
           return makeError(`Missing value after ${flagPart}.`);
         }
+        if (valTok.unterminatedQuote) {
+          return makeError(`Unterminated quote after ${flagPart}.`);
+        }
         rawVal = valTok.value;
         nextPos = valTok.end;
       } else if (!rawVal.trim()) {
@@ -647,6 +722,9 @@ export function parseSwarmGoalLaunchOptions(
         if (!valTok) {
           return makeError(`Missing branch name after ${flagPart}.`);
         }
+        if (valTok.unterminatedQuote) {
+          return makeError(`Unterminated quote after ${flagPart}.`);
+        }
         rawVal = valTok.value;
         nextPos = valTok.end;
       } else if (!rawVal.trim()) {
@@ -666,7 +744,13 @@ export function parseSwarmGoalLaunchOptions(
       let nextPos = tok.end;
       if (rawVal === undefined) {
         const valTok = scanNextArgToken(rawInput, tok.end);
-        if (!valTok || (!valTok.startsWithQuote && valTok.value.startsWith("--"))) {
+        if (!valTok) {
+          return makeError(`Missing file path after ${flagPart}.`);
+        }
+        if (valTok.unterminatedQuote) {
+          return makeError(`Unterminated quote after ${flagPart}.`);
+        }
+        if (!valTok.startsWithQuote && isKnownLaunchFlagToken(valTok.value)) {
           return makeError(`Missing file path after ${flagPart}.`);
         }
         rawVal = valTok.value;
@@ -716,7 +800,16 @@ async function readSpecFileBounded(
   const resolved = path.resolve(cwd, rawPath);
   let fh: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    fh = await open(resolved, "r");
+    // Check regularity before opening so FIFOs/named pipes or special devices never block.
+    const preStat = await stat(resolved);
+    if (!preStat.isFile()) {
+      return {
+        notRegularFile: true,
+        error: `Spec path "${rawPath}" is not a regular file.`,
+      };
+    }
+    const openFlags = fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0);
+    fh = await open(resolved, openFlags);
     const st = await fh.stat();
     if (!st.isFile()) {
       return {
@@ -762,6 +855,7 @@ async function readSpecFileBounded(
       code === "ENOENT" ||
       code === "ENOTDIR" ||
       code === "EISDIR" ||
+      code === "ENXIO" ||
       code === "EINVAL" ||
       code === "ENAMETOOLONG" ||
       code === "ELOOP"
@@ -6529,23 +6623,7 @@ export function createPiSwarmExtension(
     ): Promise<void> {
       const { store, engine } = await ensureBound(ctx);
       await reloadSettings(ctx.cwd);
-      const tokens = tokenizeCommandArgs(rawArgs.trim());
-
-      let explicitScope: "project" | "global" | undefined;
-      let clearFlag = false;
-      const words: string[] = [];
-      for (const tok of tokens) {
-        const lower = tok.toLowerCase();
-        if (lower === "--global" || lower === "-g") {
-          explicitScope = "global";
-        } else if (lower === "--project") {
-          explicitScope = "project";
-        } else if (lower === "--clear") {
-          clearFlag = true;
-        } else {
-          words.push(tok);
-        }
-      }
+      const { explicitScope, clearFlag, words } = parseModelCommandShape(rawArgs);
 
       if (words.length === 0) {
         await handleModelsCommand("", ctx);
