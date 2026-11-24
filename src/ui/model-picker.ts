@@ -1912,6 +1912,13 @@ export class SwarmHubView implements Component, Focusable {
     );
   }
 
+  private getBaseMaxConcurrency(): number {
+    return Math.max(
+      MIN_CONCURRENCY,
+      Math.min(MAX_CONCURRENCY, Math.round(this.state.settings.maxConcurrency || 6)),
+    );
+  }
+
   private getEffectiveValidatorEnabled(): boolean {
     return this.validatorOverride ?? this.state.settings.validatorEnabled;
   }
@@ -1928,12 +1935,14 @@ export class SwarmHubView implements Component, Focusable {
     validatorEnabled?: boolean;
     maxConcurrency?: number;
   } {
+    const effectiveValidator = this.getEffectiveValidatorEnabled();
+    const effectiveConcurrency = this.getEffectiveMaxConcurrency();
     return {
-      ...(this.validatorOverride !== undefined
-        ? { validatorEnabled: this.validatorOverride }
+      ...(effectiveValidator !== this.state.settings.validatorEnabled
+        ? { validatorEnabled: effectiveValidator }
         : {}),
-      ...(this.concurrencyOverride !== undefined
-        ? { maxConcurrency: this.concurrencyOverride }
+      ...(effectiveConcurrency !== this.getBaseMaxConcurrency()
+        ? { maxConcurrency: effectiveConcurrency }
         : {}),
     };
   }
@@ -1946,7 +1955,9 @@ export class SwarmHubView implements Component, Focusable {
       data === "\x1bV" ||
       (allowBareKeys && (ch === "v" || ch === "V"))
     ) {
-      this.validatorOverride = !this.getEffectiveValidatorEnabled();
+      const next = !this.getEffectiveValidatorEnabled();
+      this.validatorOverride =
+        next === this.state.settings.validatorEnabled ? undefined : next;
       this.tui.requestRender();
       return true;
     }
@@ -1957,7 +1968,9 @@ export class SwarmHubView implements Component, Focusable {
       (allowBareKeys && (ch === "+" || ch === "="))
     ) {
       const cur = this.getEffectiveMaxConcurrency();
-      this.concurrencyOverride = Math.min(MAX_CONCURRENCY, cur + 1);
+      const next = Math.min(MAX_CONCURRENCY, cur + 1);
+      this.concurrencyOverride =
+        next === this.getBaseMaxConcurrency() ? undefined : next;
       this.tui.requestRender();
       return true;
     }
@@ -1968,7 +1981,9 @@ export class SwarmHubView implements Component, Focusable {
       (allowBareKeys && (ch === "-" || ch === "_"))
     ) {
       const cur = this.getEffectiveMaxConcurrency();
-      this.concurrencyOverride = Math.max(MIN_CONCURRENCY, cur - 1);
+      const next = Math.max(MIN_CONCURRENCY, cur - 1);
+      this.concurrencyOverride =
+        next === this.getBaseMaxConcurrency() ? undefined : next;
       this.tui.requestRender();
       return true;
     }

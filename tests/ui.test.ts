@@ -6058,22 +6058,24 @@ describe("SwarmHubView quick policy toggles & active-run goal composer (VAL-HUB-
         hubDirect.handleInput(ch);
       }
       hubDirect.handleInput("\x1b\r"); // Alt+Enter -> direct
+      // Lower-bound no-op (1 -> 1) must omit maxConcurrency; only changed validatorEnabled is emitted
       assert.deepEqual(directAction, {
         kind: "direct",
         goal: "Quick direct goal",
         validatorEnabled: true,
-        maxConcurrency: 1,
       });
+      assert.equal("maxConcurrency" in (directAction as object), false);
     } finally {
       hubDirect.dispose();
     }
 
-    // Upper bound clamp at 64
+    // Upper bound clamp no-op at 64 + toggling validator/concurrency back to base omits both fields on draft
     let upperAction: SwarmHubAction | undefined;
     const hubMax = new SwarmHubView(tui, theme, {
       state: {
         settings: {
           ...DEFAULT_SWARM_SETTINGS,
+          validatorEnabled: true,
           maxConcurrency: 64,
         },
       },
@@ -6085,13 +6087,18 @@ describe("SwarmHubView quick policy toggles & active-run goal composer (VAL-HUB-
       },
     });
     try {
-      hubMax.handleInput("\x1b+");
+      hubMax.handleInput("\x1b+"); // boundary no-op at 64
+      hubMax.handleInput("\x1b-"); // 64 -> 63
+      hubMax.handleInput("\x1b+"); // 63 -> 64 (back to base)
+      hubMax.handleInput("\x1bv"); // true -> false
+      hubMax.handleInput("\x1bv"); // false -> true (back to base)
       hubMax.handleInput("\r");
       assert.deepEqual(upperAction, {
         kind: "draft",
         goal: "",
-        maxConcurrency: 64,
       });
+      assert.equal("validatorEnabled" in (upperAction as object), false);
+      assert.equal("maxConcurrency" in (upperAction as object), false);
     } finally {
       hubMax.dispose();
     }
@@ -6212,18 +6219,18 @@ describe("SwarmHubView quick policy toggles & active-run goal composer (VAL-HUB-
       assert.match(composerTyped, /Validator: OFF/);
       assert.match(composerTyped, /Max Concurrency: 5/);
 
-      // Alt+V and Alt++ inside composer update policy before Alt+Enter direct launch
-      hub.handleInput("\x1bv"); // OFF -> ON
-      hub.handleInput("\x1b+"); // 5 -> 6
+      // Alt+V toggles back to baseline true (must be omitted), Alt++ raises 5 -> 6 (differs from baseline 4)
+      hub.handleInput("\x1bv"); // OFF -> ON (matches baseline true)
+      hub.handleInput("\x1b+"); // 5 -> 6 (differs from baseline 4)
       hub.handleInput("\x1b\r"); // Alt+Enter -> direct
       assert.deepEqual(actions, [
         {
           kind: "direct",
           goal: "fix v2 + cache - stale",
-          validatorEnabled: true,
           maxConcurrency: 6,
         },
       ]);
+      assert.equal("validatorEnabled" in (actions[0] as object), false);
       assert.equal(tuiHandle.getHardwareCursor(), false);
     } finally {
       hub.dispose();
