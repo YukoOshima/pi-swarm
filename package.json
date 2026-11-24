@@ -1,7 +1,7 @@
 {
   "name": "pi-swarm",
-  "version": "0.7.0",
-  "description": "Dynamic Antigravity Swarm multi-agent orchestration for Pi with pi-goal-x upfront Q&A planning, 3-role Orchestrator/Worker/Validator models, Droid Mission-style Model Picker & cross-session Resume, shared Message Board & channels, warm persistent sessions with context forking, hot model switching, and optional isolated Git worktrees.",
+  "version": "0.8.0",
+  "description": "Dynamic Mission Goal Engine & Antigravity Swarm multi-agent orchestration for Pi with VAL-* validation contracts, dynamic feature queues & sealed milestones, structured handoff tech-debt gates, Sisyphus auto-continuation, 3-role Orchestrator/Worker/Validator models, Droid Mission-style Model Picker & cross-session Resume, shared Message Board, warm persistent sessions, and isolated Git worktrees.",
   "type": "module",
   "license": "MIT",
   "keywords": [

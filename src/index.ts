@@ -111,6 +111,7 @@ import {
   type ModelPickerSettingsState,
   type ModelPickerTab,
   type ModelSaveScope,
+  type SwarmOverlayGraphView,
   type SwarmOverlayTab,
   type SwarmWidgetOptions,
   type SwarmWidgetState,
@@ -5093,6 +5094,7 @@ export function createPiSwarmExtension(
       const arg = rawArg.trim();
       const lower = arg.toLowerCase();
       let initialTab: SwarmOverlayTab | undefined;
+      let initialGraphView: SwarmOverlayGraphView | undefined;
       let initialMemberName: string | undefined;
       let initialChannel: string | undefined;
 
@@ -5105,6 +5107,7 @@ export function createPiSwarmExtension(
           lower === "features"
         ) {
           initialTab = "graph";
+          initialGraphView = "contract";
         } else if (arg.startsWith("#") && arg.length > 1) {
           initialTab = "board";
           initialChannel = arg.slice(1).toLowerCase();
@@ -5166,6 +5169,7 @@ export function createPiSwarmExtension(
         onModalExit,
         initialScope: getPreferredSaveScope(),
         ...(initialTab ? { initialTab } : {}),
+        ...(initialGraphView ? { initialGraphView } : {}),
         ...(initialMemberName ? { initialMemberName } : {}),
         ...(initialChannel ? { initialChannel } : {}),
         hostModel: formatHostModelId(ctx.model),

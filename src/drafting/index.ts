@@ -31,12 +31,17 @@ export {
 } from "./draft-prompts.js";
 
 export {
+  assertFeatureDependencyDag,
   buildRoleModelsFromSettings,
   createDraftingTools,
   createProposeSwarmPlanTool,
   createSwarmQuestionTool,
   createSwarmQuestionnaireTool,
+  deriveMilestonesFromFeatures,
   InitialMemberProposalSchema,
+  MissionAssertionProposalSchema,
+  MissionCommandProposalSchema,
+  MissionFeatureProposalSchema,
   ProposeSwarmPlanParamsSchema,
   registerDraftingTools,
   SwarmQuestionnaireItemSchema,
@@ -46,10 +51,14 @@ export {
   type DraftingDeps,
   type DraftPlanValidationIssue,
   type InitialMemberProposalParams,
+  type MissionAssertionProposalParams,
+  type MissionCommandProposalParams,
+  type MissionFeatureProposalParams,
   type ProposeSwarmPlanParams,
   type ProposeSwarmPlanToolDetails,
   type SwarmQuestionnaireParams,
   type SwarmQuestionnaireToolDetails,
   type SwarmQuestionParams,
   type SwarmQuestionToolDetails,
+  type ValidateProposedSwarmPlanOptions,
 } from "./draft-tools.js";

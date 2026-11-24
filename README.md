@@ -1,11 +1,20 @@
-# 🐝 pi-swarm (`v0.7.0`)
+# 🐝 pi-swarm (`v0.8.0`)
 
-**`pi-swarm`** is a **Dynamic Antigravity Swarm** multi-agent orchestration extension for [Pi](https://github.com/earendil-works/pi) (`v1.5.2+`, verified on `v1.6.0`).
-面向 [Pi](https://github.com/earendil-works/pi) (`v1.5.2+`，已验证 `v1.6.0`) 的**动态蜂群（Dynamic Antigravity Swarm）多 Agent 协作与编排扩展**。
+**`pi-swarm`** is a **Dynamic Mission Goal Engine & Antigravity Swarm** multi-agent orchestration extension for [Pi](https://github.com/earendil-works/pi) (`v1.5.2+`, verified on `v1.6.0`).
+面向 [Pi](https://github.com/earendil-works/pi) (`v1.5.2+`，已验证 `v1.6.0`) 的**动态目标契约引擎与蜂群（Dynamic Mission Goal Engine & Antigravity Swarm）多 Agent 协作与编排扩展**。
 
-Instead of locking work into a rigid upfront DAG, `pi-swarm` v0.7.0 pairs **`pi-goal-x`-style upfront clarification** and **Droid Mission-style Model & Effort Configuration + Cross-Session Mission Resume** (`/swarm resume`) with **Antigravity-Swarm-grade dynamic orchestration**: unified floating Mission Hub (`/swarm` with `🔄 Resume Mission`), searchable provider-grouped Model Picker (`/swarm models`, `Ctrl+Shift+M`, `Alt+M`), automatic live role propagation (`Running agents switch on their next turn; Inherit applies only to new agents`), non-blocking `swarm_wait`, disk-persisted member sessions (`SessionManager.create`/`open`), hot model switching, Smart LLM Monitor (`@monitor`), and true isolated `git clone` for `workspace:"branch"`.
+Instead of locking work into a rigid upfront DAG or letting agents drift off objective, `pi-swarm` v0.8.0 unites **Mission-Level TDD (`VAL-*` Validation Contracts + Dynamic Feature Queues)**, **Sisyphus Anti-Premature-Stop Auto-Continuation**, and **Droid Mission-style Model & Effort Configuration + Cross-Session Mission Resume** (`/swarm resume`) with **Antigravity-Swarm-grade dynamic orchestration**: unified floating Mission Hub (`/swarm` with `🔄 Resume Mission`), live `swarm{action:"mission"}` mid-flight scope steering, sealed milestone guards, structured tech-debt handoffs, searchable provider-grouped Model Picker (`/swarm models`, `Ctrl+Shift+M`, `Alt+M`), non-blocking `swarm_wait`, disk-persisted member sessions (`SessionManager.create`/`open`), hot model switching, Smart LLM Monitor (`@monitor`), and isolated Git worktrees / clones.
 
-### 🆕 v0.7.0 — Pi 1.6.0 Polish, Floating Overlays & Live Telemetry / Pi 1.6.0 适配、悬浮面板与实时遥测
+### 🆕 v0.8.0 — Dynamic Mission Goal Engine / 动态目标契约引擎
+
+- **Mission-Level TDD & `VAL-*` Validation Contract / 任务级 TDD 与验证契约 (`validation-contract.md` · `validation-state.json`)**: `propose_swarm_plan` defines testable `VAL-<AREA>-<NNN>` behavioral assertions with required evidence alongside ordered vertical `features` (`features.json`), `commands`, and `boundaries` (`mission.md`). Pre-modal gates enforce 100% `fulfills` assertion coverage, 1-to-1 leaf ownership, and 3-color DFS cycle detection across `depends_on`.
+- **Living Dynamic Mid-Run Scope (`swarm{action:"mission"}`) & Smart `/swarm tweak` / 运行中动态演进**: Mutate features, assertions, commands/boundaries, milestones, and handoff items mid-flight via `swarm{action:"mission"}` (`status`, `set_manifest`, `upsert_assertions`, `upsert_features`, `update_feature`, `verify_assertion`, `seal_milestone`, `resolve_handoff`). `/swarm tweak` smartly preserves `"passed"` assertions + evidence and `"completed"` features + `mergedCommitSha` while resetting modified assertions to `"pending"`.
+- **Independent Verification, Auto-Injected Milestone Review & Sealed Milestones / 独立验证、自动里程碑审查与封印防篡改**: Workers and `@monitor` cannot mark `VAL-*` assertions `"passed"` (`PERMISSION_DENIED`); when `validatorEnabled: true`, only `role:"validator"` (or human / explicit `force: true`) can certify `"passed"` with concrete `evidence`. Merging the final feature of a milestone auto-posts `[milestone-review]` to wake the Orchestrator/Validator, and milestones auto-seal (`[S]`) once every feature is `"completed"` and every fulfilled `VAL-*` is `"passed"`, blocking scope creep or silent status regressions unless an assertion fails.
+- **Structured Handoff Tech-Debt Gate & Hard Completion Gates / 结构化交接债闸门与完成硬门槛**: Workers attach structured `discovered_issues`, `incomplete_work`, `salient_summary`, `what_was_implemented`, `verification_run`, and `critical_context` directly on `post_message`, creating open `MissionHandoffItem` entries on the run. `swarm{action:"done"}` enforces 5 hard gates: zero working members, zero unmerged isolated commits, 100% non-cancelled features `"completed"`, 100% `VAL-*` assertions `"passed"` & claimed, and zero unresolved handoffs (`resolve_handoff` requires either a `tracked_feature_id` or a substantive `>=20`-char `dismissed` justification).
+- **Sisyphus `agent_settled` Auto-Continuation & `[NEEDS_HUMAN]` Escape Hatch / 西西弗斯防早停自动续跑**: If the Orchestrator ends a turn with plain text while structured Goal items remain unfinished (and no member is working and `swarm_wait` is not armed), `pi-swarm` injects a `🎯 Pi Swarm Goal Checkpoint` follow-up turn automatically—complete with a `[NEEDS_HUMAN]` escape hatch and a 2-stagnant-turn / 12-continuation no-progress circuit breaker (reset on user input, `/swarm resume`, or `/swarm tweak`).
+- **Live Goal UI, Contract Inspector & Droid Proposal Card / 实时目标进度面板与契约检查器**: Above-editor dashboard (`Alt+W`), `/swarm status` (`/swarm contract` · `/swarm mission` · `/swarm goal`), Mission Control pipeline strip, `/swarm tasks contract` (`[v]` toggle on Graph tab), scrollable `propose_swarm_plan` modal (`[`/`]`/`PgUp`/`PgDn`), and the Rich Mission Complete Card surface live `Features X/Y`, `VAL A/B`, `[S]` sealed milestones, and `!N debt` cleanly at both `100x30` and `72x20`.
+
+### v0.7.0 — Pi 1.6.0 Polish, Floating Overlays & Live Telemetry / Pi 1.6.0 适配、悬浮面板与实时遥测
 
 - **Native Pi 1.6.0 UX & Markdown Rendering / 原生 Markdown 渲染与命令补全**: `/swarm status`, `/swarm board`, `/swarm help`, and `/swarm models --print` render via native Pi `Markdown` + `Box` with `keyHint` styling; exact subcommand completions submit on a single `Enter` (no double-Enter trap); `setWorkingMessage`/`setTitle` track active swarm progress and pre-swarm host models are automatically restored on `done`/`cancel`.
 - **Floating Hub & Model Picker Overlays / 悬浮 Hub 与模型选择器**: `/swarm` (Hub) and `/swarm models` open as centered floating overlays with terminal-aware height capping, 1-cell safe box glyphs, `* Current / Host` model pinning, and `Esc`-clears-search behavior.
@@ -205,11 +214,11 @@ Only **`/swarm`** and **`/swarm-direct`** are registered on Pi.
 | `/swarm <goal>` | Interactive `pi-goal-x` drafting (`orchestratorModel` → Q&A → plan confirm → Dynamic Swarm) | Yes |
 | `/swarm` (bare) | Open **Swarm Mission Hub** in TUI (`🔄 Resume Mission` when unfinished, Goal composer, `Alt+M` / `Ctrl+M` inline Mission Models picker, previous runs & quick actions) | No (until launched) |
 | `/swarm direct <goal>` <br> `/swarm-direct <goal>` | Fast-path: skip Q&A (`autoConfirm: true`), propose plan and launch Dynamic Swarm immediately | Yes |
-| `/swarm tweak [guidance]` | Revise the focused active/paused Swarm plan, strategy, or spawn additional members interactively | Yes |
-| `/swarm status` | Zero-turn dashboard: 3-role models, channels, roster table, recent board & events | **No** |
+| `/swarm tweak [guidance]` | Revise the focused active/paused Mission plan, `VAL-*` contract, features, or spawn additional members (preserves passed `VAL-*` & completed features) | Yes |
+| `/swarm status` <br> `/swarm contract` · `/swarm mission` · `/swarm goal` | Zero-turn dashboard: Mission Features, `VAL-*` Validation Contract, open handoffs, commands/boundaries, 3-role models, roster & recent board | **No** |
 | `/swarm board [limit] [--channel <ch>] [--search <q>]` | Zero-turn shared `#seq` Message Board feed with optional channel & substring filters | **No** |
 | `/swarm graph` | Zero-turn ASCII/Unicode Spawn Tree & Peer `@mention` / `#channel` Interaction Graph | **No** |
-| `/swarm tasks [tab\|member\|#ch]` <br> `/swarm ui [tab\|member\|#ch]` | Open the live 4-tab Mission Control Overlay (**Board** / **Members** / **Graph** / **Search**; `[M]` models, `[P]` pause/resume, `[?]` help) | **No** |
+| `/swarm tasks [tab\|contract\|member\|#ch]` <br> `/swarm ui [tab\|contract\|member\|#ch]` | Open the live 4-tab Mission Control Overlay (**Board** / **Members** / **Graph** / **Search**; `/swarm tasks contract` or `[v]` opens **Mission Contract & Features** inspector) | **No** |
 | `/swarm models [role\|--print]` | Open interactive Mission Model Picker (`Orchestrator`/`Worker`/`Validator`/`Fallbacks`), or `--print` Markdown overview | **No** |
 | `/swarm model <target> <model[:thinking]\|default> [thinking] [--global]` | Set role default (propagates to live role-tracking members) OR switch live `@member` | **No** |
 | `/swarm steer <member> <message>` | Steer a working member mid-turn or wake a parked member with new user direction | **No** |
@@ -241,11 +250,12 @@ Only **`/swarm`** and **`/swarm-direct`** are registered on Pi.
 - **`↑` / `↓`** (plus **`j` / `k`** on Board / Graph / Search tabs): Navigate messages or scroll (on Members tab, **`↑` / `↓`** navigates and **`k`** kills the selected member)
 - **Board Tab `[1]`**: **`Enter`** open full scrollable `#seq` post reader (**`↑`/`↓`/`j`/`k`/`PgUp`/`PgDn`** scroll, **`Enter`/`Esc`** back) · **`p`** post a board message (`@mention` / `@#channel`) · **`c`** cycle channel filter (`*` / `#main` / custom channels)
 - **Members Tab `[2]`**: **`w`** wake/message selected member · **`m`** open interactive Member Model & Effort Picker (supports queued turn-end switch on `working` members, keeps 100% history) · **`x`** human-stop member · **`k`** kill member (opens inline **`[y/Enter]`** confirm / **`[f]`** force dirty toggle / **`[n/Esc]`** cancel) · **`g`** merge `share`/`branch` worktree · **`l`** toggle full `brief` + `logTail` view (**`[`/`]`/`PgUp`/`PgDn`** scroll) · **`d`** toggle member details vs scrollable Git diff summary (**`[`/`]`/`PgUp`/`PgDn`** scroll)
-- **Graph Tab `[3]`**: Live Spawn Tree (with `fork:@from` / `✓merged` badges) & Peer `@mention` / `#channel` Interaction Graph (`buildSwarmGraphLines`)
+- **Graph Tab `[3]`**: **`v`** toggles between Live Spawn Tree & Peer `@mention` Interaction Graph and the scrollable **Mission Contract & Features** inspector (`Milestones` with `[S]` sealed badges, ordered `Features`, `VAL-*` assertions + `evidence`, open tech-debt handoffs, `Commands & Boundaries`)
 - **Search Tab `[4]`**: Live IME substring search across every `#seq` message on the board (**`Enter`** opens full scrollable post reader after finishing query)
 - **`Esc` / `q`**: Close overlay cleanly (unsubscribes engine listener & restores terminal cursor)
 
 ### Plan Confirmation Modal (`propose_swarm_plan`)
+- **`[` / `]` / `PgUp` / `PgDn`**: Scroll full Mission Contract (`VAL-*` assertions), Feature Queue (`fulfills` & `depends_on`), and Commands & Boundaries preview
 - **`m`**: Open inline **Mission Model Picker** to adjust `O` / `W` / `V` / `Fallbacks` before launching
 - **`c`**: Attach optional launch guidance / comment
 - **`v`**: Toggle Independent Validator Policy (`ON` / `OFF`)
@@ -266,10 +276,14 @@ Only **`/swarm`** and **`/swarm-direct`** are registered on Pi.
 │   └── swarm/
 │       ├── .locks/                       # Per-run atomic lockfiles with stale-PID recovery
 │       ├── runs/<run-id>/
-│       │   ├── state.json                # Authoritative v2 run, members, channels & roleModels snapshot
+│       │   ├── state.json                # Authoritative v2 run, members, features, assertions & handoffs snapshot
+│       │   ├── mission.md                # Materialized Mission objective, boundaries & canonical commands
+│       │   ├── validation-contract.md    # Materialized human-readable VAL-* behavioral contract & evidence status
+│       │   ├── validation-state.json     # Machine-readable VAL-* verification state & milestone seal status
+│       │   ├── features.json             # Machine-readable ordered Feature queue, DAG deps & fulfills claims
 │       │   ├── ROSTER.md                 # Auto-rendered human-readable Markdown roster & channel table
 │       │   ├── board.jsonl               # Append-only shared #seq Message Board (LF-only JSONL)
-│       │   ├── events.jsonl              # Append-only audit event ledger (21 event types)
+│       │   ├── events.jsonl              # Append-only audit event ledger
 │       │   └── sessions/                 # Disk-persisted per-member SessionManager JSONL transcripts
 │       └── worktrees/<run-id>/
 │           └── wt-<member>/              # Isolated Git worktree for share/branch members

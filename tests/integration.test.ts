@@ -5428,6 +5428,42 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       3,
     );
 
+    // `/swarm tasks contract` opens Mission Control overlay directly on the Mission Contract & Features inspector
+    let contractOverlayRendered = "";
+    const origCustom = (host.ctx.ui as any).custom;
+    (host.ctx.ui as any).custom = async (factory: any) => {
+      return new Promise((resolve) => {
+        const comp = factory(
+          {
+            terminal: { rows: 30, columns: 100 },
+            requestRender() {},
+            getShowHardwareCursor: () => false,
+            setShowHardwareCursor() {},
+          },
+          {
+            fg: (_c: string, t: string) => t,
+            bg: (_c: string, t: string) => t,
+            bold: (t: string) => t,
+          },
+          {},
+          resolve,
+        );
+        comp.focused = true;
+        void (async () => {
+          await new Promise((r) => setTimeout(r, 20));
+          contractOverlayRendered = stripTerminalSequences(comp.render(100).join("\n"));
+          comp.handleInput?.("q");
+        })();
+      });
+    };
+    try {
+      await host.runCommand("swarm", "tasks contract");
+    } finally {
+      (host.ctx.ui as any).custom = origCustom;
+    }
+    assert.match(contractOverlayRendered, /VAL-AUTH-001/);
+    assert.match(contractOverlayRendered, /feat-ratelimit/);
+
     // 5. Complete all features, pass all VAL-* assertions, seal both milestones, resolve handoff, and verify Rich Mission Complete Card!
     await store.updateRun(runId, {
       features: tweakedRun.features!.map((f) => ({
