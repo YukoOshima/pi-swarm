@@ -5018,6 +5018,9 @@ export class SwarmEngine implements ISwarmEngine {
             summary,
           };
         }
+
+        default:
+          throw new SwarmProtocolError("INVALID_INPUT", `Unsupported mission_op: ${String(op)}`);
       }
     });
   }

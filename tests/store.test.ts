@@ -14,7 +14,9 @@ import path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { promisify } from "node:util";
 import {
+  ALL_SWARM_EXTENSION_TOOLS,
   ASSERTION_STATUSES,
+  DEFAULT_LIBRARY_TOPICS,
   DRAFTING_TOOLS,
   FEATURE_STATUSES,
   HANDOFF_ITEM_TYPES,
@@ -23,10 +25,12 @@ import {
   SWARM_CORE_TOOLS,
   SWARM_DIR,
   SWARM_FEATURES_FILE,
+  SWARM_LIBRARY_DIR,
   SWARM_MISSION_FILE,
   SWARM_MISSION_OPS,
   SWARM_PATHS,
   SWARM_RUNS_DIR,
+  SWARM_SERVICES_FILE,
   SWARM_SETTINGS_FILE,
   SWARM_STATE_FILE,
   SWARM_VALIDATION_CONTRACT_FILE,
@@ -35,13 +39,15 @@ import {
 import { SwarmBoard, filterMentions, parseMentions } from "../src/store/board.js";
 import { SwarmStore } from "../src/store/swarm-store.js";
 import { WorktreeManager } from "../src/store/worktree.js";
-import type {
-  MissionAssertion,
-  MissionAuditRecord,
-  MissionCommandEntry,
-  MissionFeature,
-  MissionHandoffItem,
-  SwarmMilestone,
+import {
+  isSwarmProtocolError,
+  type MissionAssertion,
+  type MissionAuditRecord,
+  type MissionCommandEntry,
+  type MissionFeature,
+  type MissionHandoffItem,
+  type MissionServiceEntry,
+  type SwarmMilestone,
 } from "../src/types.js";
 
 const execFileAsync = promisify(execFile);
@@ -530,6 +536,7 @@ async function exists(filePath: string): Promise<boolean> {
 
 describe("SwarmStore v0.8.0 Dynamic Mission Goal Engine persistence & artifacts", () => {
   it("exports mission constants and keeps core/drafting tool counts invariant", () => {
+    assert.equal(ALL_SWARM_EXTENSION_TOOLS.length, 7);
     assert.equal(SWARM_CORE_TOOLS.length, 4);
     assert.equal(DRAFTING_TOOLS.length, 3);
     assert.ok(SWARM_ACTIONS.includes("mission"));
@@ -538,10 +545,14 @@ describe("SwarmStore v0.8.0 Dynamic Mission Goal Engine persistence & artifacts"
       "upsert_assertions",
       "remove_assertion",
       "verify_assertion",
+      "override_assertion",
       "upsert_features",
       "update_feature",
+      "dispatch_ready",
       "resolve_handoff",
       "set_manifest",
+      "read_library",
+      "write_library",
     ]);
     assert.deepEqual(ASSERTION_STATUSES, ["pending", "passed", "failed", "blocked"]);
     assert.deepEqual(FEATURE_STATUSES, [
@@ -557,10 +568,17 @@ describe("SwarmStore v0.8.0 Dynamic Mission Goal Engine persistence & artifacts"
       "critical_context",
     ]);
     assert.deepEqual(HANDOFF_RESOLUTIONS, ["open", "tracked", "dismissed"]);
+    assert.deepEqual(DEFAULT_LIBRARY_TOPICS, [
+      "architecture",
+      "environment",
+      "testing",
+    ]);
     assert.equal(SWARM_PATHS.missionFile, SWARM_MISSION_FILE);
     assert.equal(SWARM_PATHS.validationContractFile, SWARM_VALIDATION_CONTRACT_FILE);
     assert.equal(SWARM_PATHS.validationStateFile, SWARM_VALIDATION_STATE_FILE);
     assert.equal(SWARM_PATHS.featuresFile, SWARM_FEATURES_FILE);
+    assert.equal(SWARM_PATHS.servicesFile, SWARM_SERVICES_FILE);
+    assert.equal(SWARM_PATHS.libraryDir, SWARM_LIBRARY_DIR);
   });
 
   it("round-trips mission fields, sealed milestones, and legacy/malformed state.json safely", async () => {
@@ -1153,5 +1171,447 @@ describe("BoardMessage structured worker handoff fields", () => {
     });
     assert.equal(byIssue.messages.length, 1);
     assert.equal(byIssue.messages[0].seq, handoffMsg.seq);
+  });
+});
+
+describe("SwarmStore & WorktreeManager v0.9.0 services, overrides, library & worktree dependency bootstrap", () => {
+  it("(a) persists services & overridden assertions and materializes services.json, mission.md, validation-contract.md, and validation-state.json", async () => {
+    const root = await makeTempDir("pi-swarm-v090-services-overrides-");
+    const store = new SwarmStore(root);
+    const ts = "2026-11-24T07:30:00.000Z";
+
+    const services: MissionServiceEntry[] = [
+      {
+        name: "postgres",
+        start: "docker compose up -d postgres",
+        stop: "docker compose stop postgres",
+        healthcheck: "pg_isready -h localhost -p 5432",
+        port: 5432,
+      },
+      {
+        name: "api",
+        start: "npm run dev:api",
+        stop: "pkill -f dev:api",
+        healthcheck: "curl -sf http://localhost:4000/health",
+        port: 4000,
+        dependsOn: ["postgres"],
+      },
+    ];
+
+    const assertions: MissionAssertion[] = [
+      {
+        id: "VAL-SVC-001",
+        title: "External webhook callback delivery",
+        description: "Third-party Stripe sandbox callback reaches local tunnel.",
+        evidenceRequired: "Live webhook signature log",
+        status: "passed",
+        evidence: "Verified unit signature check; external sandbox tunnel unavailable offline",
+        verifiedBy: "human",
+        verifiedByRole: "human",
+        overridden: true,
+        overrideJustification:
+          "Offline CI environment lacks external Stripe webhook tunnel; signature verification tested locally.",
+        updatedAt: ts,
+      },
+      {
+        id: "VAL-SVC-002",
+        title: "API healthcheck endpoint",
+        description: "GET /health returns 200 OK.",
+        status: "passed",
+        evidence: "curl -sf http://localhost:4000/health -> 200",
+        verifiedBy: "validator-1",
+        verifiedByRole: "validator",
+        updatedAt: ts,
+      },
+    ];
+
+    const created = await store.createRun({
+      id: "run-v090-svc",
+      title: "Services & Override Mission",
+      objective: "Verify v0.9.0 services manifest and assertion override persistence",
+      baseBranch: "main",
+      ownerSessionId: "sess-v090",
+      services,
+      assertions,
+    });
+
+    assert.deepEqual(created.services, services);
+    assert.deepEqual(created.assertions, assertions);
+
+    // Reload from a fresh SwarmStore instance to verify disk persistence
+    const reloadStore = new SwarmStore(root);
+    const loaded = await reloadStore.loadRun("run-v090-svc");
+    assert.deepEqual(loaded.services, services);
+    assert.deepEqual(loaded.assertions, assertions);
+
+    const runDir = store.getRunDir("run-v090-svc");
+    const servicesPath = path.join(runDir, SWARM_SERVICES_FILE);
+    const missionPath = path.join(runDir, SWARM_MISSION_FILE);
+    const contractPath = path.join(runDir, SWARM_VALIDATION_CONTRACT_FILE);
+    const valStatePath = path.join(runDir, SWARM_VALIDATION_STATE_FILE);
+
+    assert.equal(await exists(servicesPath), true);
+    const servicesJson = JSON.parse(await readFile(servicesPath, "utf8")) as {
+      services: MissionServiceEntry[];
+    };
+    assert.deepEqual(servicesJson, { services });
+
+    const missionMd = await readFile(missionPath, "utf8");
+    assert.match(missionMd, /## Services & Ports/);
+    assert.match(missionMd, /\*\*postgres\*\* \(port 5432\)/);
+    assert.match(
+      missionMd,
+      /\*\*api\*\* \(port 4000\).*start: `npm run dev:api`.*dependsOn: `postgres`/,
+    );
+
+    const contractMd = await readFile(contractPath, "utf8");
+    assert.match(contractMd, /1 \[OVERRIDE\]/);
+    assert.match(
+      contractMd,
+      /### VAL-SVC-001: External webhook callback delivery \[OVERRIDE\]/,
+    );
+    assert.match(contractMd, /- \*\*Status:\*\* \[x\] `PASSED` `\[OVERRIDE\]`/);
+    assert.match(
+      contractMd,
+      /- \*\*Override Justification:\*\* Offline CI environment lacks external Stripe webhook tunnel/,
+    );
+    // Non-overridden assertion does NOT render [OVERRIDE]
+    assert.match(contractMd, /### VAL-SVC-002: API healthcheck endpoint\n/);
+
+    const valState = JSON.parse(await readFile(valStatePath, "utf8")) as {
+      assertions: Record<string, Record<string, unknown>>;
+    };
+    assert.equal(valState.assertions["VAL-SVC-001"].overridden, true);
+    assert.match(
+      String(valState.assertions["VAL-SVC-001"].overrideJustification),
+      /Offline CI environment/,
+    );
+    assert.equal("overridden" in valState.assertions["VAL-SVC-002"], false);
+
+    // Diff-caching: unrelated board message on warm store does NOT rewrite services.json or mission.md
+    const svcStat1 = await lstat(servicesPath);
+    const missionStat1 = await lstat(missionPath);
+    await store.postBoardMessage("run-v090-svc", {
+      from: "orchestrator",
+      fromRole: "orchestrator",
+      text: "Services up and running",
+    });
+    const svcStat2 = await lstat(servicesPath);
+    const missionStat2 = await lstat(missionPath);
+    assert.equal(svcStat2.ino, svcStat1.ino);
+    assert.equal(missionStat2.ino, missionStat1.ino);
+
+    // Clearing services via null removes services.json and resets mission.md Services & Ports to (none)
+    await store.updateRun("run-v090-svc", { services: null });
+    assert.equal(await exists(servicesPath), false);
+    const clearedLoaded = await new SwarmStore(root).loadRun("run-v090-svc");
+    assert.equal(clearedLoaded.services, undefined);
+    const clearedMissionMd = await readFile(missionPath, "utf8");
+    assert.match(clearedMissionMd, /## Services & Ports\n\n\(none\)/);
+
+    // Malformed services & override fields in raw state.json normalize safely
+    const malformedDir = path.join(root, SWARM_DIR, SWARM_RUNS_DIR, "run-malformed-v090");
+    await mkdir(malformedDir, { recursive: true });
+    await writeFile(
+      path.join(malformedDir, SWARM_STATE_FILE),
+      `${JSON.stringify(
+        {
+          version: 2,
+          id: "run-malformed-v090",
+          title: "Malformed v0.9.0",
+          objective: "Normalize malformed services & overrides",
+          strategy: "",
+          acceptanceCriteria: "",
+          baseBranch: "main",
+          ownerSessionId: "sess-m",
+          ownerPid: 1,
+          status: "active",
+          services: [
+            { name: "  redis  ", start: "  redis-server  ", port: 6379.8, dependsOn: ["  ", "db"] },
+            { name: "__proto__", start: "bad" },
+            { name: "bad-port", start: "run", port: 99999 },
+            { name: "", start: "nope" },
+          ],
+          assertions: [
+            {
+              id: "VAL-1",
+              title: "Check",
+              description: "Desc",
+              status: "passed",
+              overridden: "not-boolean",
+              overrideJustification: "   ",
+              updatedAt: ts,
+            },
+          ],
+          maxConcurrency: 4,
+          validatorEnabled: true,
+          keepWorkersWarm: true,
+          roleModels: {},
+          revision: 1,
+          members: {},
+          memberOrder: [],
+          channels: {},
+          boardHead: 0,
+          createdAt: ts,
+          updatedAt: ts,
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    const normalizedMalformed = await new SwarmStore(root).loadRun("run-malformed-v090");
+    assert.deepEqual(normalizedMalformed.services, [
+      { name: "redis", start: "redis-server", port: 6379, dependsOn: ["db"] },
+      { name: "bad-port", start: "run" },
+    ]);
+    assert.equal(normalizedMalformed.assertions?.[0].overridden, undefined);
+    assert.equal(normalizedMalformed.assertions?.[0].overrideJustification, undefined);
+  });
+
+  it("(b) initializes library/ starter topics, supports overwrite/append writes, reads, listing, and rejects path traversal", async () => {
+    const root = await makeTempDir("pi-swarm-v090-library-");
+    const store = new SwarmStore(root);
+
+    await store.createRun({
+      id: "run-v090-lib",
+      title: "Shared Library Run",
+      objective: "Verify .pi/swarm/runs/<runId>/library/*.md operations",
+      baseBranch: "main",
+      ownerSessionId: "sess-lib",
+    });
+
+    const libDir = path.join(store.getRunDir("run-v090-lib"), SWARM_LIBRARY_DIR);
+    assert.equal(await exists(path.join(libDir, "architecture.md")), true);
+    assert.equal(await exists(path.join(libDir, "environment.md")), true);
+    assert.equal(await exists(path.join(libDir, "testing.md")), true);
+
+    const initialTopics = await store.listLibraryTopics("run-v090-lib");
+    assert.deepEqual(
+      initialTopics.map((t) => t.topic),
+      ["architecture", "environment", "testing"],
+    );
+    for (const item of initialTopics) {
+      assert.ok(item.bytes > 0);
+      assert.equal(item.path, path.join(libDir, `${item.topic}.md`));
+    }
+
+    const archStarter = await store.readLibraryTopic("run-v090-lib", "architecture");
+    assert.match(archStarter ?? "", /^# Architecture/);
+
+    // Missing valid topic returns null
+    assert.equal(await store.readLibraryTopic("run-v090-lib", "nonexistent-topic"), null);
+
+    // Overwrite existing starter topic
+    const overwritten = await store.writeLibraryTopic(
+      "run-v090-lib",
+      "architecture",
+      "# Architecture\n\n- Store uses per-run file locks",
+    );
+    assert.equal(overwritten.topic, "architecture");
+    assert.equal(
+      overwritten.content,
+      "# Architecture\n\n- Store uses per-run file locks",
+    );
+    assert.equal(
+      await store.readLibraryTopic("run-v090-lib", "architecture"),
+      "# Architecture\n\n- Store uses per-run file locks",
+    );
+
+    // Append to existing topic (auto-inserts newline separator when prior content has no trailing \n)
+    const appended = await store.writeLibraryTopic(
+      "run-v090-lib",
+      "architecture",
+      "- Worktrees share gitignored node_modules\n",
+      { append: true, actor: "worker-1" },
+    );
+    assert.equal(
+      appended.content,
+      "# Architecture\n\n- Store uses per-run file locks\n- Worktrees share gitignored node_modules\n",
+    );
+    assert.equal(
+      await store.readLibraryTopic("run-v090-lib", "architecture"),
+      appended.content,
+    );
+
+    // Create brand-new custom topic with uppercase/underscore/hyphen characters
+    const custom = await store.writeLibraryTopic(
+      "run-v090-lib",
+      "API_Conventions-v2",
+      "Use snake_case for tool params.\n",
+    );
+    assert.equal(custom.topic, "api_conventions-v2");
+    assert.equal(
+      await store.readLibraryTopic("run-v090-lib", "API_Conventions-v2"),
+      "Use snake_case for tool params.\n",
+    );
+
+    const updatedTopics = await store.listLibraryTopics("run-v090-lib");
+    assert.deepEqual(
+      updatedTopics.map((t) => t.topic),
+      ["api_conventions-v2", "architecture", "environment", "testing"],
+    );
+
+    // Reject path traversal, slashes, leading hyphens, dots, prototype keys, and overlong slugs
+    const invalidTopics = [
+      "",
+      "   ",
+      "..",
+      "../state",
+      "../../etc/passwd",
+      "nested/topic",
+      "nested\\topic",
+      ".hidden",
+      "architecture.md",
+      "-leading-dash",
+      "_leading-underscore",
+      "__proto__",
+      "constructor",
+      "a".repeat(49),
+    ];
+    for (const badTopic of invalidTopics) {
+      await assert.rejects(
+        () => store.readLibraryTopic("run-v090-lib", badTopic),
+        (err) => isSwarmProtocolError(err) && err.code === "INVALID_INPUT",
+        `Expected readLibraryTopic to reject ${JSON.stringify(badTopic)}`,
+      );
+      await assert.rejects(
+        () => store.writeLibraryTopic("run-v090-lib", badTopic, "nope"),
+        (err) => isSwarmProtocolError(err) && err.code === "INVALID_INPUT",
+        `Expected writeLibraryTopic to reject ${JSON.stringify(badTopic)}`,
+      );
+    }
+  });
+
+  it("(c) bootstraps git-ignored node_modules/.venv symlinks cleanly in share worktrees without dirtying git status and preserves repoRoot on removeWorktree", async () => {
+    // 1. Repo where node_modules/ (with trailing slash!) and .venv are git-ignored
+    const ignoredRepo = await makeTempDir("pi-swarm-v090-wt-ignored-");
+    await initPlainRepo(ignoredRepo);
+    await writeFile(
+      path.join(ignoredRepo, ".gitignore"),
+      "node_modules/\n.venv\n",
+      "utf8",
+    );
+    await git(ignoredRepo, ["add", ".gitignore"]);
+    await git(ignoredRepo, [
+      "-c",
+      "user.name=Test User",
+      "-c",
+      "user.email=test@example.com",
+      "commit",
+      "-m",
+      "chore: ignore node_modules/ and .venv",
+    ]);
+
+    // Populate real dependency files in repoRoot/node_modules and repoRoot/.venv
+    const pkgSentinel = path.join(
+      ignoredRepo,
+      "node_modules",
+      "sample-pkg",
+      "index.js",
+    );
+    const venvSentinel = path.join(ignoredRepo, ".venv", "pyvenv.cfg");
+    await mkdir(path.dirname(pkgSentinel), { recursive: true });
+    await writeFile(pkgSentinel, "export const ok = 42;\n", "utf8");
+    await mkdir(path.dirname(venvSentinel), { recursive: true });
+    await writeFile(venvSentinel, "home = /usr/bin\n", "utf8");
+
+    const wtMgr = new WorktreeManager(ignoredRepo);
+    await wtMgr.ensureRepoReady("main");
+
+    const wtPath = path.join(
+      ignoredRepo,
+      SWARM_DIR,
+      "worktrees",
+      "run-v090",
+      "wt-worker",
+    );
+    const created = await wtMgr.createWorktree({
+      branch: "swarm/run-v090/worker",
+      baseBranch: "main",
+      worktreePath: wtPath,
+      mode: "share",
+    });
+
+    assert.deepEqual(created.bootstrappedLinks, ["node_modules", ".venv"]);
+
+    const wtNodeModulesStat = await lstat(path.join(wtPath, "node_modules"));
+    const wtVenvStat = await lstat(path.join(wtPath, ".venv"));
+    assert.equal(wtNodeModulesStat.isSymbolicLink(), true);
+    assert.equal(wtVenvStat.isSymbolicLink(), true);
+    assert.equal(
+      await readFile(
+        path.join(wtPath, "node_modules", "sample-pkg", "index.js"),
+        "utf8",
+      ),
+      "export const ok = 42;\n",
+    );
+
+    // Worktree AND base repo MUST remain 100% clean in git status!
+    assert.equal(await wtMgr.isWorktreeDirty(wtPath), false);
+    assert.equal(
+      await git(wtPath, ["status", "--porcelain", "--untracked-files=all"]),
+      "",
+    );
+    assert.equal(await wtMgr.isWorktreeDirty(ignoredRepo), false);
+
+    // Removing worktree (normal) leaves repoRoot/node_modules and .venv 100% intact!
+    await wtMgr.removeWorktree(wtPath);
+    assert.equal(await exists(wtPath), false);
+    assert.equal(await readFile(pkgSentinel, "utf8"), "export const ok = 42;\n");
+    assert.equal(await readFile(venvSentinel, "utf8"), "home = /usr/bin\n");
+
+    // Force-removing a dirty worktree ALSO leaves repoRoot/node_modules 100% intact!
+    const wtForcePath = path.join(
+      ignoredRepo,
+      SWARM_DIR,
+      "worktrees",
+      "run-v090",
+      "wt-force",
+    );
+    await wtMgr.createWorktree({
+      branch: "swarm/run-v090/force",
+      baseBranch: "main",
+      worktreePath: wtForcePath,
+      mode: "share",
+    });
+    await writeFile(path.join(wtForcePath, "uncommitted.txt"), "wip\n", "utf8");
+    assert.equal(await wtMgr.isWorktreeDirty(wtForcePath), true);
+    await wtMgr.removeWorktree(wtForcePath, { force: true });
+    assert.equal(await exists(wtForcePath), false);
+    assert.equal(await readFile(pkgSentinel, "utf8"), "export const ok = 42;\n");
+    assert.equal(await readFile(venvSentinel, "utf8"), "home = /usr/bin\n");
+
+    // 2. Repo where node_modules is NOT git-ignored: MUST NOT symlink!
+    const unignoredRepo = await makeTempDir("pi-swarm-v090-wt-unignored-");
+    await initPlainRepo(unignoredRepo);
+    await mkdir(path.join(unignoredRepo, "node_modules", "pkg"), {
+      recursive: true,
+    });
+    await writeFile(
+      path.join(unignoredRepo, "node_modules", "pkg", "index.js"),
+      "1\n",
+      "utf8",
+    );
+
+    const unignoredMgr = new WorktreeManager(unignoredRepo);
+    await unignoredMgr.ensureRepoReady("main");
+    const wtUnignoredPath = path.join(
+      unignoredRepo,
+      SWARM_DIR,
+      "worktrees",
+      "run-unignored",
+      "wt-worker",
+    );
+    const unignoredRes = await unignoredMgr.createWorktree({
+      branch: "swarm/run-unignored/worker",
+      baseBranch: "main",
+      worktreePath: wtUnignoredPath,
+      mode: "share",
+    });
+
+    assert.deepEqual(unignoredRes.bootstrappedLinks, []);
+    assert.equal(await exists(path.join(wtUnignoredPath, "node_modules")), false);
+    assert.equal(await unignoredMgr.isWorktreeDirty(wtUnignoredPath), false);
   });
 });

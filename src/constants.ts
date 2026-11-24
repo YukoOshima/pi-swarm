@@ -60,10 +60,14 @@ export const SWARM_MISSION_OPS = [
   "upsert_assertions",
   "remove_assertion",
   "verify_assertion",
+  "override_assertion",
   "upsert_features",
   "update_feature",
+  "dispatch_ready",
   "resolve_handoff",
   "set_manifest",
+  "read_library",
+  "write_library",
 ] as const;
 
 /** Validation contract assertion lifecycle statuses. */
@@ -177,6 +181,13 @@ export const SWARM_MISSION_FILE = "mission.md" as const;
 export const SWARM_VALIDATION_CONTRACT_FILE = "validation-contract.md" as const;
 export const SWARM_VALIDATION_STATE_FILE = "validation-state.json" as const;
 export const SWARM_FEATURES_FILE = "features.json" as const;
+export const SWARM_SERVICES_FILE = "services.json" as const;
+export const SWARM_LIBRARY_DIR = "library" as const;
+export const DEFAULT_LIBRARY_TOPICS = [
+  "architecture",
+  "environment",
+  "testing",
+] as const;
 export const SWARM_STATE_FILE = "state.json" as const;
 export const SWARM_BOARD_FILE = "board.jsonl" as const;
 export const SWARM_EVENTS_FILE = "events.jsonl" as const;
@@ -193,6 +204,8 @@ export const SWARM_PATHS = Object.freeze({
   validationContractFile: SWARM_VALIDATION_CONTRACT_FILE,
   validationStateFile: SWARM_VALIDATION_STATE_FILE,
   featuresFile: SWARM_FEATURES_FILE,
+  servicesFile: SWARM_SERVICES_FILE,
+  libraryDir: SWARM_LIBRARY_DIR,
   stateFile: SWARM_STATE_FILE,
   boardFile: SWARM_BOARD_FILE,
   eventsFile: SWARM_EVENTS_FILE,

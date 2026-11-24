@@ -313,6 +313,8 @@ export interface MissionAssertion {
   evidence?: string;
   verifiedBy?: string;
   verifiedByRole?: CallerRole;
+  overridden?: boolean;
+  overrideJustification?: string;
   updatedAt: string;
 }
 
@@ -325,6 +327,8 @@ export interface MissionAssertionInput {
   evidence?: string;
   verifiedBy?: string;
   verifiedByRole?: CallerRole;
+  overridden?: boolean;
+  overrideJustification?: string;
   updatedAt?: string;
 }
 
@@ -394,6 +398,39 @@ export interface MissionCommandEntry {
   command: string;
 }
 
+export interface MissionServiceEntry {
+  name: string;
+  start: string;
+  stop?: string;
+  healthcheck?: string;
+  port?: number;
+  dependsOn?: string[];
+}
+
+export interface MissionLibraryTopic {
+  topic: string;
+  content: string;
+  updatedAt: string;
+}
+
+export interface ContractReviewFinding {
+  severity: "blocking" | "warning";
+  category:
+    | "missing_assertion"
+    | "ambiguous_criteria"
+    | "invalid_command"
+    | "file_collision"
+    | "other";
+  message: string;
+  suggestion?: string;
+}
+
+export interface ContractReviewResult {
+  approved: boolean;
+  summary: string;
+  findings: ContractReviewFinding[];
+}
+
 export interface MissionAuditRecord {
   verdict: "approved" | "disapproved";
   summary: string;
@@ -426,6 +463,7 @@ export interface SwarmRunState {
   features?: MissionFeature[];
   handoffItems?: MissionHandoffItem[];
   commands?: MissionCommandEntry[];
+  services?: MissionServiceEntry[];
   boundaries?: string[];
   lastAudit?: MissionAuditRecord;
   maxConcurrency: number;
@@ -468,6 +506,7 @@ export interface ProposedSwarmPlan {
   features?: MissionFeature[];
   handoffItems?: MissionHandoffItem[];
   commands?: MissionCommandEntry[];
+  services?: MissionServiceEntry[];
   boundaries?: string[];
   lastAudit?: MissionAuditRecord;
   roleModels?: SwarmRoleModels;
@@ -634,6 +673,7 @@ export interface CreateRunInput {
   features?: MissionFeature[];
   handoffItems?: MissionHandoffItem[];
   commands?: MissionCommandEntry[];
+  services?: MissionServiceEntry[];
   boundaries?: string[];
   lastAudit?: MissionAuditRecord;
 }
@@ -673,6 +713,7 @@ export interface RunUpdateInput {
   features?: MissionFeature[] | null;
   handoffItems?: MissionHandoffItem[] | null;
   commands?: MissionCommandEntry[] | null;
+  services?: MissionServiceEntry[] | null;
   boundaries?: string[] | null;
   lastAudit?: MissionAuditRecord | null;
   completionSummary?: string;
@@ -793,6 +834,16 @@ export interface ISwarmStore {
   getRunDir(runId: string): string;
   getMemberSessionDir?(runId: string): string;
   getWorktreePath(runId: string, memberName: string): string;
+  readLibraryTopic?(runId: string, topic: string): Promise<string | null>;
+  writeLibraryTopic?(
+    runId: string,
+    topic: string,
+    content: string,
+    options?: { append?: boolean; actor?: string },
+  ): Promise<{ topic: string; path: string; content: string }>;
+  listLibraryTopics?(
+    runId: string,
+  ): Promise<Array<{ topic: string; path: string; bytes: number }>>;
   /**
    * Live-session ownership check helper: allows teardown only by owning session
    * or when the owning PID is no longer alive.
@@ -819,6 +870,7 @@ export interface CreateWorktreeResult {
   branch: string;
   worktreePath: string;
   baseSha: string;
+  bootstrappedLinks?: string[];
 }
 
 export interface BaseBranchCleanCheck {
@@ -1071,9 +1123,15 @@ export interface ManageMissionInput {
   trackedFeatureId?: string;
   justification?: string;
   commands?: MissionCommandEntry[];
+  services?: MissionServiceEntry[];
   boundaries?: string[];
   milestones?: SwarmMilestone[];
   lastAudit?: MissionAuditRecord | null;
+  libraryTopic?: string;
+  libraryContent?: string;
+  libraryAppend?: boolean;
+  maxDispatch?: number;
+  hostContext?: ExtensionContext;
   force?: boolean;
   callerName?: string;
   callerRole?: CallerRole;
@@ -1086,8 +1144,14 @@ export interface ManageMissionResult {
   handoffItems?: MissionHandoffItem[];
   milestones?: SwarmMilestone[];
   commands?: MissionCommandEntry[];
+  services?: MissionServiceEntry[];
   boundaries?: string[];
   lastAudit?: MissionAuditRecord;
+  dispatchedFeatures?: string[];
+  spawnedMembers?: string[];
+  libraryTopic?: string;
+  libraryContent?: string;
+  libraryTopics?: string[];
   summary: string;
 }
 

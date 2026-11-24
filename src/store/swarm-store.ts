@@ -17,6 +17,7 @@ import {
   ASSERTION_STATUSES,
   CHANNEL_NAME_PATTERN,
   DEFAULT_CHANNEL,
+  DEFAULT_LIBRARY_TOPICS,
   DEFAULT_SWARM_SETTINGS,
   FEATURE_STATUSES,
   HANDOFF_ITEM_TYPES,
@@ -28,11 +29,13 @@ import {
   SWARM_DIR,
   SWARM_EVENTS_FILE,
   SWARM_FEATURES_FILE,
+  SWARM_LIBRARY_DIR,
   SWARM_LOCKS_DIR,
   SWARM_LOG_TAIL_LIMIT,
   SWARM_MISSION_FILE,
   SWARM_ROSTER_FILE,
   SWARM_RUNS_DIR,
+  SWARM_SERVICES_FILE,
   SWARM_SESSIONS_DIR,
   SWARM_STATE_FILE,
   SWARM_STATE_VERSION,
@@ -58,6 +61,7 @@ import {
   type MissionCommandEntry,
   type MissionFeature,
   type MissionHandoffItem,
+  type MissionServiceEntry,
   type PostBoardMessageInput,
   type ReadBoardOptions,
   type ReadBoardResult,
@@ -85,6 +89,15 @@ import { SWARM_SETTINGS_BOUNDS } from "./settings.js";
 // ============================================================================
 
 const SAFE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const LIBRARY_TOPIC_PATTERN = /^[a-z0-9][a-z0-9-_]{0,47}$/i;
+
+const DEFAULT_LIBRARY_STARTER_CONTENT: Readonly<
+  Record<(typeof DEFAULT_LIBRARY_TOPICS)[number], string>
+> = Object.freeze({
+  architecture: "# Architecture\n\n",
+  environment: "# Environment\n\n",
+  testing: "# Testing\n\n",
+});
 
 const RESERVED_MEMBER_NAME_SET: ReadonlySet<string> = new Set<string>(
   RESERVED_MEMBER_NAMES,
@@ -228,6 +241,34 @@ export function validateChannelName(name: string): string {
     );
   }
   return name;
+}
+
+/** Validate a Mission Library topic slug strictly against `/^[a-z0-9][a-z0-9-_]{0,47}$/i`. */
+export function validateLibraryTopic(topic: string): string {
+  if (typeof topic !== "string") {
+    throw new SwarmProtocolError(
+      "INVALID_INPUT",
+      `Invalid library topic: ${JSON.stringify(topic)}`,
+      { topic },
+    );
+  }
+  const trimmed = topic.trim();
+  if (
+    trimmed.length === 0 ||
+    topic.includes("..") ||
+    topic.includes("/") ||
+    topic.includes("\\") ||
+    topic.includes("\0") ||
+    !LIBRARY_TOPIC_PATTERN.test(trimmed) ||
+    isPrototypeKey(trimmed)
+  ) {
+    throw new SwarmProtocolError(
+      "INVALID_INPUT",
+      `Invalid library topic ${JSON.stringify(topic)}: must match ${LIBRARY_TOPIC_PATTERN.source} without path separators or "..".`,
+      { topic },
+    );
+  }
+  return trimmed.toLowerCase();
 }
 
 /** Derive a deterministic git branch name (`swarm/<run-short>/<memberName>`) for isolated worktrees. */
@@ -571,6 +612,13 @@ function normalizeAssertions(
       VALID_CALLER_ROLES.has(candidate.verifiedByRole as CallerRole)
         ? (candidate.verifiedByRole as CallerRole)
         : undefined;
+    const overridden =
+      typeof candidate.overridden === "boolean"
+        ? candidate.overridden
+        : undefined;
+    const overrideJustification = normalizeOptionalNonEmptyString(
+      candidate.overrideJustification,
+    );
     const updatedAt =
       normalizeOptionalNonEmptyString(candidate.updatedAt) ?? fallbackTimestamp;
 
@@ -583,6 +631,8 @@ function normalizeAssertions(
       ...(evidence !== undefined ? { evidence } : {}),
       ...(verifiedBy !== undefined ? { verifiedBy } : {}),
       ...(verifiedByRole !== undefined ? { verifiedByRole } : {}),
+      ...(overridden !== undefined ? { overridden } : {}),
+      ...(overrideJustification !== undefined ? { overrideJustification } : {}),
       updatedAt,
     });
   }
@@ -740,6 +790,44 @@ function normalizeCommands(raw: unknown): MissionCommandEntry[] | undefined {
   return normalized;
 }
 
+function normalizeServices(raw: unknown): MissionServiceEntry[] | undefined {
+  if (!Array.isArray(raw)) {
+    return undefined;
+  }
+  const normalized: MissionServiceEntry[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      continue;
+    }
+    const candidate = item as Record<string, unknown>;
+    const name = normalizeOptionalNonEmptyString(candidate.name);
+    const start = normalizeOptionalNonEmptyString(candidate.start);
+    if (!name || isPrototypeKey(name) || !start) {
+      continue;
+    }
+    const stop = normalizeOptionalNonEmptyString(candidate.stop);
+    const healthcheck = normalizeOptionalNonEmptyString(candidate.healthcheck);
+    const rawPort = candidate.port;
+    const port =
+      typeof rawPort === "number" &&
+      Number.isFinite(rawPort) &&
+      Math.floor(rawPort) >= 1 &&
+      Math.floor(rawPort) <= 65535
+        ? Math.floor(rawPort)
+        : undefined;
+    const dependsOn = normalizeOptionalStringArray(candidate.dependsOn);
+    normalized.push({
+      name,
+      start,
+      ...(stop !== undefined ? { stop } : {}),
+      ...(healthcheck !== undefined ? { healthcheck } : {}),
+      ...(port !== undefined ? { port } : {}),
+      ...(dependsOn !== undefined ? { dependsOn } : {}),
+    });
+  }
+  return normalized;
+}
+
 function normalizeBoundaries(raw: unknown): string[] | undefined {
   return normalizeOptionalStringArray(raw);
 }
@@ -889,6 +977,14 @@ function backfillRunState(state: SwarmRunState): SwarmRunState {
       state.commands = normalizedCommands;
     } else {
       delete state.commands;
+    }
+  }
+  if (raw.services !== undefined) {
+    const normalizedServices = normalizeServices(raw.services);
+    if (normalizedServices !== undefined) {
+      state.services = normalizedServices;
+    } else {
+      delete state.services;
     }
   }
   if (raw.boundaries !== undefined) {
@@ -1048,6 +1144,7 @@ interface RunStateCacheEntry {
   lastValidationContractBody?: string;
   lastValidationStateBody?: string;
   lastFeaturesBody?: string;
+  lastServicesBody?: string;
 }
 
 export interface SwarmStoreOptions {
@@ -1111,6 +1208,22 @@ export class SwarmStore implements ISwarmStore {
     return assertWithinRoot(
       this.projectRoot,
       path.join(this.getRunDir(safeRunId), SWARM_SESSIONS_DIR),
+    );
+  }
+
+  getLibraryDir(runId: string): string {
+    const safeRunId = validateSafeIdentifier(runId, "runId");
+    return assertWithinRoot(
+      this.projectRoot,
+      path.join(this.getRunDir(safeRunId), SWARM_LIBRARY_DIR),
+    );
+  }
+
+  private getLibraryTopicPath(runId: string, topic: string): string {
+    const safeTopic = validateLibraryTopic(topic);
+    return assertWithinRoot(
+      this.projectRoot,
+      path.join(this.getLibraryDir(runId), `${safeTopic}.md`),
     );
   }
 
@@ -1614,6 +1727,10 @@ export class SwarmStore implements ISwarmStore {
       this.projectRoot,
       path.join(runDir, SWARM_FEATURES_FILE),
     );
+    const servicesJsonPath = assertWithinRoot(
+      this.projectRoot,
+      path.join(runDir, SWARM_SERVICES_FILE),
+    );
 
     const json = `${JSON.stringify(state, null, 2)}\n`;
     const rosterBody = this.renderRosterMarkdown(state);
@@ -1629,6 +1746,10 @@ export class SwarmStore implements ISwarmStore {
         : undefined;
     const featuresBody =
       state.features !== undefined ? this.renderFeaturesJson(state) : undefined;
+    const servicesBody =
+      state.services !== undefined && state.services.length > 0
+        ? this.renderServicesJson(state)
+        : undefined;
 
     const cached = this.stateCache.get(state.id);
     const shouldWriteRoster =
@@ -1647,6 +1768,9 @@ export class SwarmStore implements ISwarmStore {
     const shouldWriteFeatures =
       featuresBody !== undefined &&
       (!cached?.lastFeaturesBody || featuresBody !== cached.lastFeaturesBody);
+    const shouldWriteServices =
+      servicesBody !== undefined &&
+      (!cached?.lastServicesBody || servicesBody !== cached.lastServicesBody);
 
     const shouldRemoveValidationArtifacts =
       state.assertions === undefined &&
@@ -1657,6 +1781,11 @@ export class SwarmStore implements ISwarmStore {
       state.features === undefined &&
       (cached?.state.features !== undefined ||
         cached?.lastFeaturesBody !== undefined);
+    const shouldRemoveServicesArtifact =
+      servicesBody === undefined &&
+      ((cached?.state.services !== undefined &&
+        cached.state.services.length > 0) ||
+        cached?.lastServicesBody !== undefined);
 
     await assertLeafNotSymlink(statePath);
     if (shouldWriteRoster) {
@@ -1673,6 +1802,9 @@ export class SwarmStore implements ISwarmStore {
     }
     if (shouldWriteFeatures || shouldRemoveFeaturesArtifact) {
       await assertLeafNotSymlink(featuresJsonPath);
+    }
+    if (shouldWriteServices || shouldRemoveServicesArtifact) {
+      await assertLeafNotSymlink(servicesJsonPath);
     }
 
     const [stateStat] = await Promise.all([
@@ -1692,6 +1824,9 @@ export class SwarmStore implements ISwarmStore {
       ...(shouldWriteFeatures && featuresBody !== undefined
         ? [writeTmpAndRename(featuresJsonPath, featuresBody)]
         : []),
+      ...(shouldWriteServices && servicesBody !== undefined
+        ? [writeTmpAndRename(servicesJsonPath, servicesBody)]
+        : []),
       ...(shouldRemoveValidationArtifacts
         ? [
             unlink(validationContractPath).catch(() => {}),
@@ -1700,6 +1835,9 @@ export class SwarmStore implements ISwarmStore {
         : []),
       ...(shouldRemoveFeaturesArtifact
         ? [unlink(featuresJsonPath).catch(() => {})]
+        : []),
+      ...(shouldRemoveServicesArtifact
+        ? [unlink(servicesJsonPath).catch(() => {})]
         : []),
     ]);
 
@@ -1720,6 +1858,7 @@ export class SwarmStore implements ISwarmStore {
         ? { lastValidationStateBody: validationStateBody }
         : {}),
       ...(featuresBody !== undefined ? { lastFeaturesBody: featuresBody } : {}),
+      ...(servicesBody !== undefined ? { lastServicesBody: servicesBody } : {}),
     });
     return structuredClone(cachedState);
   }
@@ -1834,6 +1973,7 @@ export class SwarmStore implements ISwarmStore {
         now,
       );
       const initialCommands = normalizeCommands(input.commands);
+      const initialServices = normalizeServices(input.services);
       const initialBoundaries = normalizeBoundaries(input.boundaries);
       const initialAudit = normalizeLastAudit(input.lastAudit, now);
       const state: SwarmRunState = {
@@ -1859,6 +1999,7 @@ export class SwarmStore implements ISwarmStore {
           ? { handoffItems: initialHandoffItems }
           : {}),
         ...(initialCommands !== undefined ? { commands: initialCommands } : {}),
+        ...(initialServices !== undefined ? { services: initialServices } : {}),
         ...(initialBoundaries !== undefined
           ? { boundaries: initialBoundaries }
           : {}),
@@ -1879,6 +2020,7 @@ export class SwarmStore implements ISwarmStore {
       };
 
       const saved = await this.persistStateUnlocked(state);
+      await this.ensureLibraryInitializedUnlocked(runId);
 
       await appendLedgerEvent(this.getEventsPath(runId), {
         runId,
@@ -2124,6 +2266,16 @@ export class SwarmStore implements ISwarmStore {
           state.commands = normalizedCommands;
         } else {
           delete state.commands;
+        }
+      }
+      if (patch.services === null) {
+        delete state.services;
+      } else if (patch.services !== undefined) {
+        const normalizedServices = normalizeServices(patch.services);
+        if (normalizedServices !== undefined) {
+          state.services = normalizedServices;
+        } else {
+          delete state.services;
         }
       }
       if (patch.boundaries === null) {
@@ -3026,6 +3178,159 @@ export class SwarmStore implements ISwarmStore {
   }
 
   // --------------------------------------------------------------------------
+  // Shared Mission Knowledge Library (.pi/swarm/runs/<runId>/library/*.md)
+  // --------------------------------------------------------------------------
+
+  private async ensureLibraryInitializedUnlocked(runId: string): Promise<string> {
+    const libraryDir = this.getLibraryDir(runId);
+    await assertNoSymlinksWithin(this.projectRoot, libraryDir);
+    await mkdir(libraryDir, { recursive: true });
+    await assertNoSymlinksWithin(this.projectRoot, libraryDir);
+
+    await Promise.all(
+      DEFAULT_LIBRARY_TOPICS.map(async (topic) => {
+        const filePath = path.join(libraryDir, `${topic}.md`);
+        await assertLeafNotSymlink(filePath);
+        const starter = DEFAULT_LIBRARY_STARTER_CONTENT[topic];
+        try {
+          await writeFile(filePath, starter, { encoding: "utf8", flag: "wx" });
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") {
+            throw err;
+          }
+        }
+      }),
+    );
+    return libraryDir;
+  }
+
+  async readLibraryTopic(runId: string, topic: string): Promise<string | null> {
+    const safeRunId = validateSafeIdentifier(runId, "runId");
+    const safeTopic = validateLibraryTopic(topic);
+    await this.readStateUnlocked(safeRunId);
+    const topicPath = this.getLibraryTopicPath(safeRunId, safeTopic);
+    await assertNoSymlinksWithin(this.projectRoot, topicPath);
+    try {
+      return await readFile(topicPath, "utf8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+        return null;
+      }
+      throw err;
+    }
+  }
+
+  async writeLibraryTopic(
+    runId: string,
+    topic: string,
+    content: string,
+    options?: { append?: boolean; actor?: string },
+  ): Promise<{ topic: string; path: string; content: string }> {
+    const safeRunId = validateSafeIdentifier(runId, "runId");
+    const safeTopic = validateLibraryTopic(topic);
+    if (typeof content !== "string") {
+      throw new SwarmProtocolError(
+        "INVALID_INPUT",
+        `Library content for topic "${safeTopic}" must be a string.`,
+        { runId: safeRunId, topic: safeTopic },
+      );
+    }
+
+    return this.withRunLock(safeRunId, async () => {
+      await this.readStateUnlocked(safeRunId);
+      await this.ensureLibraryInitializedUnlocked(safeRunId);
+      const topicPath = this.getLibraryTopicPath(safeRunId, safeTopic);
+      await assertNoSymlinksWithin(this.projectRoot, topicPath);
+      await assertLeafNotSymlink(topicPath);
+
+      let nextContent = content;
+      if (options?.append) {
+        let existing = "";
+        try {
+          existing = await readFile(topicPath, "utf8");
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+            throw err;
+          }
+        }
+        if (existing.length === 0) {
+          nextContent = content;
+        } else if (
+          existing.endsWith("\n") ||
+          content.startsWith("\n") ||
+          content.length === 0
+        ) {
+          nextContent = `${existing}${content}`;
+        } else {
+          nextContent = `${existing}\n${content}`;
+        }
+      }
+
+      await writeTmpAndRename(topicPath, nextContent);
+      return {
+        topic: safeTopic,
+        path: topicPath,
+        content: nextContent,
+      };
+    });
+  }
+
+  async listLibraryTopics(
+    runId: string,
+  ): Promise<Array<{ topic: string; path: string; bytes: number }>> {
+    const safeRunId = validateSafeIdentifier(runId, "runId");
+    await this.readStateUnlocked(safeRunId);
+    const libraryDir = this.getLibraryDir(safeRunId);
+    await assertNoSymlinksWithin(this.projectRoot, libraryDir);
+
+    let entries: string[];
+    try {
+      entries = await readdir(libraryDir);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+        return [];
+      }
+      throw err;
+    }
+
+    const results: Array<{ topic: string; path: string; bytes: number }> = [];
+    const seen = new Set<string>();
+    for (const entry of entries) {
+      if (!entry.toLowerCase().endsWith(".md")) {
+        continue;
+      }
+      const rawTopic = entry.slice(0, -3);
+      if (!LIBRARY_TOPIC_PATTERN.test(rawTopic) || isPrototypeKey(rawTopic)) {
+        continue;
+      }
+      const normalizedTopic = rawTopic.toLowerCase();
+      if (seen.has(normalizedTopic)) {
+        continue;
+      }
+      const fullPath = assertWithinRoot(
+        this.projectRoot,
+        path.join(libraryDir, entry),
+      );
+      try {
+        const st = await lstat(fullPath);
+        if (!st.isSymbolicLink() && st.isFile()) {
+          seen.add(normalizedTopic);
+          results.push({
+            topic: normalizedTopic,
+            path: fullPath,
+            bytes: st.size,
+          });
+        }
+      } catch {
+        // Ignore concurrently removed files.
+      }
+    }
+
+    results.sort((a, b) => a.topic.localeCompare(b.topic));
+    return results;
+  }
+
+  // --------------------------------------------------------------------------
   // ROSTER.md Auto-Generation
   // --------------------------------------------------------------------------
 
@@ -3170,6 +3475,34 @@ export class SwarmStore implements ISwarmStore {
       lines.push("(none)");
     }
 
+    lines.push("", "## Services & Ports", "");
+    if (state.services && state.services.length > 0) {
+      for (const svc of state.services) {
+        const portPart = svc.port !== undefined ? ` (port ${svc.port})` : "";
+        const details: string[] = [
+          `start: \`${svc.start.replace(/`/g, "\\`")}\``,
+        ];
+        if (svc.stop) {
+          details.push(`stop: \`${svc.stop.replace(/`/g, "\\`")}\``);
+        }
+        if (svc.healthcheck) {
+          details.push(
+            `healthcheck: \`${svc.healthcheck.replace(/`/g, "\\`")}\``,
+          );
+        }
+        if (svc.dependsOn && svc.dependsOn.length > 0) {
+          details.push(
+            `dependsOn: ${svc.dependsOn.map((d) => `\`${escapeMarkdownCell(d)}\``).join(", ")}`,
+          );
+        }
+        lines.push(
+          `- **${escapeMarkdownCell(svc.name)}**${portPart} — ${details.join(" | ")}`,
+        );
+      }
+    } else {
+      lines.push("(none)");
+    }
+
     lines.push("", "## Mission Boundaries", "");
     if (state.boundaries && state.boundaries.length > 0) {
       for (const boundary of state.boundaries) {
@@ -3226,18 +3559,23 @@ export class SwarmStore implements ISwarmStore {
     let pending = 0;
     let failed = 0;
     let blocked = 0;
+    let overriddenCount = 0;
     for (const a of assertions) {
       if (a.status === "passed") passed += 1;
       else if (a.status === "failed") failed += 1;
       else if (a.status === "blocked") blocked += 1;
       else pending += 1;
+      if (a.overridden) overriddenCount += 1;
     }
+
+    const overrideSummarySuffix =
+      overriddenCount > 0 ? ` (${overriddenCount} [OVERRIDE])` : "";
 
     const lines: string[] = [
       `# Validation Contract — ${escapeMarkdownCell(state.title || state.id)}`,
       "",
       `- **Run ID:** \`${state.id}\``,
-      `- **Summary:** ${passed}/${assertions.length} passed, ${pending} pending, ${failed} failed, ${blocked} blocked`,
+      `- **Summary:** ${passed}/${assertions.length} passed, ${pending} pending, ${failed} failed, ${blocked} blocked${overrideSummarySuffix}`,
       "",
     ];
 
@@ -3256,6 +3594,8 @@ export class SwarmStore implements ISwarmStore {
               ? "-"
               : " ";
       const badge = a.status.toUpperCase();
+      const overrideBadge = a.overridden ? " `[OVERRIDE]`" : "";
+      const headerOverrideSuffix = a.overridden ? " [OVERRIDE]" : "";
       const safeId = a.id.replace(/\r?\n/g, " ").trim();
       const safeTitle = a.title.replace(/\r?\n/g, " ").trim();
       const verifiedByText = a.verifiedBy
@@ -3265,16 +3605,20 @@ export class SwarmStore implements ISwarmStore {
         : "(unverified)";
 
       lines.push(
-        `### ${safeId}: ${safeTitle}`,
+        `### ${safeId}: ${safeTitle}${headerOverrideSuffix}`,
         "",
-        `- **Status:** [${checkbox}] \`${badge}\``,
+        `- **Status:** [${checkbox}] \`${badge}\`${overrideBadge}`,
         `- **Behavioral Description:** ${a.description || "(none)"}`,
         `- **Required Evidence:** ${a.evidenceRequired || "(not specified)"}`,
         `- **Collected Evidence:** ${a.evidence || "(none)"}`,
         `- **Verified By:** ${verifiedByText}`,
-        `- **Updated At:** ${a.updatedAt}`,
-        "",
       );
+      if (a.overridden || a.overrideJustification !== undefined) {
+        lines.push(
+          `- **Override Justification:** ${a.overrideJustification || "(none)"}`,
+        );
+      }
+      lines.push(`- **Updated At:** ${a.updatedAt}`, "");
     }
 
     return lines.join("\n");
@@ -3288,6 +3632,8 @@ export class SwarmStore implements ISwarmStore {
         evidence?: string;
         verifiedBy?: string;
         verifiedByRole?: CallerRole;
+        overridden?: boolean;
+        overrideJustification?: string;
         updatedAt: string;
       }
     > = {};
@@ -3302,6 +3648,10 @@ export class SwarmStore implements ISwarmStore {
         ...(a.verifiedByRole !== undefined
           ? { verifiedByRole: a.verifiedByRole }
           : {}),
+        ...(a.overridden !== undefined ? { overridden: a.overridden } : {}),
+        ...(a.overrideJustification !== undefined
+          ? { overrideJustification: a.overrideJustification }
+          : {}),
         updatedAt: a.updatedAt,
       };
     }
@@ -3310,5 +3660,9 @@ export class SwarmStore implements ISwarmStore {
 
   renderFeaturesJson(state: SwarmRunState): string {
     return `${JSON.stringify({ features: state.features ?? [] }, null, 2)}\n`;
+  }
+
+  renderServicesJson(state: SwarmRunState): string {
+    return `${JSON.stringify({ services: state.services ?? [] }, null, 2)}\n`;
   }
 }

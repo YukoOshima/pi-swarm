@@ -1,5 +1,18 @@
 import { execFile } from "node:child_process";
-import { access, lstat, mkdir, readdir, readFile, realpath, rm, rmdir, writeFile } from "node:fs/promises";
+import {
+  access,
+  lstat,
+  mkdir,
+  readdir,
+  readFile,
+  realpath,
+  rm,
+  rmdir,
+  stat,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import {
@@ -29,6 +42,7 @@ const DEFAULT_MAX_BUFFER = 16 * 1024 * 1024;
 const RM_RETRY_CODES = new Set(["ENOTEMPTY", "EBUSY", "EPERM", "EACCES"]);
 const UNMERGED_STATUS_CODES = new Set(["DD", "AU", "UD", "UA", "DU", "AA", "UU"]);
 const SWARM_PROJECT_SETTINGS_REL_PATH = `.pi/${SWARM_SETTINGS_FILE}`;
+const BOOTSTRAP_DEPENDENCY_DIRS = ["node_modules", ".venv"] as const;
 
 export interface WorktreeManagerOptions {
   gitTimeoutMs?: number;
@@ -403,6 +417,133 @@ export class WorktreeManager implements IWorktreeManager {
     await writeFile(excludePath, `${existing}${addition}`, "utf8");
   }
 
+  private async ensureRootSymlinkExcluded(
+    worktreePath: string,
+    dirName: string,
+  ): Promise<void> {
+    const commonDirRes = await this.runGit(["rev-parse", "--git-common-dir"], {
+      cwd: worktreePath,
+    });
+    const gitCommonDir = path.resolve(
+      worktreePath,
+      commonDirRes.stdout.trim(),
+    );
+    const excludePath = path.join(gitCommonDir, "info", "exclude");
+    await mkdir(path.dirname(excludePath), { recursive: true });
+
+    let existing = "";
+    try {
+      existing = await readFile(excludePath, "utf8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+        throw err;
+      }
+    }
+
+    const anchoredPattern = `/${dirName}`;
+    const lines = new Set(existing.split(/\r?\n/).map((line) => line.trim()));
+    if (lines.has(anchoredPattern) || lines.has(dirName)) {
+      return;
+    }
+
+    const prefix =
+      existing.length === 0
+        ? ""
+        : existing.endsWith("\n")
+          ? ""
+          : "\n";
+    await writeFile(excludePath, `${existing}${prefix}${anchoredPattern}\n`, "utf8");
+  }
+
+  private async bootstrapDependencyLinks(
+    worktreePath: string,
+  ): Promise<string[]> {
+    const bootstrappedLinks: string[] = [];
+    const topRes = await this.runGit(["rev-parse", "--show-toplevel"], {
+      allowFailure: true,
+    });
+    const effectiveRepoRoot =
+      topRes.ok && topRes.stdout.trim()
+        ? path.resolve(topRes.stdout.trim())
+        : this.repoRoot;
+
+    for (const dir of BOOTSTRAP_DEPENDENCY_DIRS) {
+      try {
+        const sourcePath = path.join(effectiveRepoRoot, dir);
+        const targetPath = path.join(worktreePath, dir);
+
+        const srcStat = await stat(sourcePath).catch(() => null);
+        if (!srcStat || !srcStat.isDirectory()) {
+          continue;
+        }
+
+        let targetExists = false;
+        try {
+          await lstat(targetPath);
+          targetExists = true;
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+            continue;
+          }
+        }
+        if (targetExists) {
+          continue;
+        }
+
+        const ignoreRes = await this.runGit(["check-ignore", "-q", dir], {
+          cwd: effectiveRepoRoot,
+          allowFailure: true,
+        });
+        if (!ignoreRes.ok) {
+          continue;
+        }
+
+        await symlink(sourcePath, targetPath, "dir");
+
+        // Trailing-slash .gitignore entries (e.g. `node_modules/`) match directories
+        // in repoRoot (`S_IFDIR`) but not symlinks in the worktree (`S_IFLNK`).
+        // Ensure `/<dir>` is excluded in git info/exclude when needed so git status stays 100% clean.
+        let wtIgnoreRes = await this.runGit(["check-ignore", "-q", dir], {
+          cwd: worktreePath,
+          allowFailure: true,
+        });
+        if (!wtIgnoreRes.ok) {
+          await this.ensureRootSymlinkExcluded(worktreePath, dir).catch(
+            () => {},
+          );
+          wtIgnoreRes = await this.runGit(["check-ignore", "-q", dir], {
+            cwd: worktreePath,
+            allowFailure: true,
+          });
+        }
+        if (!wtIgnoreRes.ok) {
+          await unlink(targetPath).catch(() => {});
+          continue;
+        }
+
+        bootstrappedLinks.push(dir);
+      } catch {
+        // Best-effort bootstrap: never fail worktree creation on symlink/fs errors.
+      }
+    }
+
+    return bootstrappedLinks;
+  }
+
+  private async unlinkBootstrappedSymlinks(worktreePath: string): Promise<void> {
+    for (const dir of BOOTSTRAP_DEPENDENCY_DIRS) {
+      const candidatePath = path.join(worktreePath, dir);
+      try {
+        const st = await lstat(candidatePath);
+        if (st.isSymbolicLink()) {
+          await unlink(candidatePath);
+        }
+      } catch {
+        // Missing or inaccessible — ignore.
+      }
+    }
+  }
+
   async ensureRepoReady(preferredBaseBranch?: string): Promise<RepoReadyResult> {
     const trimmedPreferred = preferredBaseBranch?.trim();
     if (trimmedPreferred === "HEAD") {
@@ -678,10 +819,13 @@ export class WorktreeManager implements IWorktreeManager {
             if (realWorktree === realTop) {
               const currentBranch = await this.getCurrentBranch(resolvedWorktree);
               if (currentBranch === options.branch) {
+                const bootstrappedLinks =
+                  await this.bootstrapDependencyLinks(resolvedWorktree);
                 return {
                   branch: options.branch,
                   worktreePath: resolvedWorktree,
                   baseSha,
+                  bootstrappedLinks,
                 };
               }
               throw new SwarmProtocolError(
@@ -720,10 +864,14 @@ export class WorktreeManager implements IWorktreeManager {
       ]);
     }
 
+    const bootstrappedLinks =
+      await this.bootstrapDependencyLinks(resolvedWorktree);
+
     return {
       branch: options.branch,
       worktreePath: resolvedWorktree,
       baseSha,
+      bootstrappedLinks,
     };
   }
 
@@ -818,6 +966,8 @@ export class WorktreeManager implements IWorktreeManager {
     }
 
     this.identityOverrideCache.delete(resolvedWorktree);
+
+    await this.unlinkBootstrappedSymlinks(resolvedWorktree);
 
     if (await this.isIsolatedClone(resolvedWorktree)) {
       await removeDirectoryWithRetry(resolvedWorktree);
