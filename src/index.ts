@@ -534,7 +534,7 @@ function scanNextArgToken(input: string, fromIndex: number): ScannedArgToken | n
 }
 
 function isValidGitBranchName(name: string): boolean {
-  if (!name || name === "HEAD" || name === "@") {
+  if (!name || name === "HEAD") {
     return false;
   }
   if (
@@ -547,7 +547,7 @@ function isValidGitBranchName(name: string): boolean {
     return false;
   }
   if (
-    /[\s\x00-\x1f\x7f~^:?*[\\]/.test(name) ||
+    /[\x00-\x20\x7f~^:?*[\\]/.test(name) ||
     name.includes("..") ||
     name.includes("//") ||
     name.includes("@{")
@@ -558,7 +558,6 @@ function isValidGitBranchName(name: string): boolean {
     if (
       !component ||
       component.startsWith(".") ||
-      component.endsWith(".") ||
       component.endsWith(".lock")
     ) {
       return false;
@@ -625,14 +624,13 @@ export function parseSwarmGoalLaunchOptions(
     rawVal: string,
     flagLabel: string,
   ): { ok: true; value: string } | { ok: false; error: string } => {
-    const trimmedVal = rawVal.trim();
-    if (!isValidGitBranchName(trimmedVal) || rawVal !== trimmedVal) {
+    if (!isValidGitBranchName(rawVal)) {
       return {
         ok: false,
         error: `Invalid ${flagLabel} value "${rawVal}" (must be a valid Git branch name).`,
       };
     }
-    return { ok: true, value: trimmedVal };
+    return { ok: true, value: rawVal };
   };
 
   while (pos < rawInput.length) {
@@ -727,7 +725,7 @@ export function parseSwarmGoalLaunchOptions(
         }
         rawVal = valTok.value;
         nextPos = valTok.end;
-      } else if (!rawVal.trim()) {
+      } else if (rawVal.length === 0) {
         return makeError(`Missing branch name after ${flagPart}=.`);
       }
       const checked = parseBranchValue(rawVal, flagPart);

@@ -6863,6 +6863,25 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
         skipContractReview: true,
       },
     );
+    // Legitimate Git branch names per `git check-ref-format --branch` are accepted
+    assert.deepEqual(
+      parseSwarmGoalLaunchOptions("--branch feature./parser Build parser"),
+      {
+        goal: "Build parser",
+        baseBranch: "feature./parser",
+      },
+    );
+    assert.deepEqual(
+      parseSwarmGoalLaunchOptions('--branch "release\u00a0notes" Ship notes'),
+      {
+        goal: "Ship notes",
+        baseBranch: "release\u00a0notes",
+      },
+    );
+    assert.deepEqual(parseSwarmGoalLaunchOptions("--branch @ Ship at-branch"), {
+      goal: "Ship at-branch",
+      baseBranch: "@",
+    });
     // Validation errors mention `--` as the escape for literal text
     for (const bad of [
       "--unknown-flag Build app",
