@@ -32,10 +32,12 @@ import {
   SWARM_EVENTS_FILE,
   SWARM_FEATURES_FILE,
   SWARM_FOCUS_ENTRY,
+  SWARM_LIBRARY_DIR,
   SWARM_MISSION_FILE,
   SWARM_QUESTIONNAIRE_TOOL,
   SWARM_ROSTER_FILE,
   SWARM_RUNS_DIR,
+  SWARM_SERVICES_FILE,
   SWARM_SETTINGS_FILE,
   SWARM_STATE_FILE,
   SWARM_STATUS_KEY,
@@ -49,14 +51,18 @@ import {
 import {
   SWARM_STATUS_CUSTOM_TYPE,
   SWARM_SUBCOMMANDS,
+  type SwarmExtensionOptions,
   buildLaunchKickoffPrompt,
   createPiSwarmExtension,
+  parseContractReviewOutput,
   parseSwarmCommand,
 } from "../src/index.js";
 import { SwarmEngine } from "../src/runtime/index.js";
 import { SwarmStore, WorktreeManager } from "../src/store/index.js";
 import {
   type AgentTurnResult,
+  type CompleteRunOptions,
+  type ContractReviewResult,
   type IQuestionnaireUI,
   type ISwarmEngine,
   type ISwarmTransport,
@@ -64,6 +70,7 @@ import {
   type ManageMissionInput,
   type MissionAssertion,
   type MissionFeature,
+  type MissionServiceEntry,
   type ModelSwitchResult,
   type PersistentAgentHandle,
   type ProposedSwarmPlan,
@@ -5945,6 +5952,657 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       } else {
         delete engineProto.manageMission;
       }
+    }
+  });
+
+  it("20. v0.9.0: Adversarial Contract Reviewer pre-confirmation bounce & live ephemeral validator session, services persistence & tweak merge, /swarm done --force human CLI vs callerRole:'human', Rich Mission Complete Card [OVERRIDE] & library metadata, and 21-subcommand invariant", async () => {
+    const repoDir = await createTempGitRepo("v090-host-lifecycle");
+    tempDirs.push(repoDir);
+    const store = new SwarmStore(repoDir);
+
+    // ------------------------------------------------------------------------
+    // (4) Exact 21-item SWARM_SUBCOMMANDS order, ["swarm", "swarm-direct"] commands & 7/4/3 tool counts
+    // ------------------------------------------------------------------------
+    assert.equal(ALL_SWARM_EXTENSION_TOOLS.length, 7);
+    assert.equal(SWARM_CORE_TOOLS.length, 4);
+    assert.equal(DRAFTING_TOOLS.length, 3);
+    assert.equal(SWARM_SUBCOMMANDS.length, 21);
+    assert.deepEqual(
+      SWARM_SUBCOMMANDS.map((c) => c.name),
+      [
+        "direct",
+        "tweak",
+        "status",
+        "board",
+        "graph",
+        "tasks",
+        "ui",
+        "models",
+        "model",
+        "steer",
+        "merge",
+        "kill",
+        "done",
+        "pause",
+        "resume",
+        "cancel",
+        "teardown",
+        "runs",
+        "focus",
+        "settings",
+        "help",
+      ],
+    );
+
+    // Verify structured verdict parser (`<approved/>` vs `<gaps_found>...</gaps_found>`)
+    assert.deepEqual(parseContractReviewOutput("<approved/>"), {
+      approved: true,
+      summary: "Adversarial contract review passed with no blocking gaps.",
+      findings: [],
+    });
+    const parsedGaps = parseContractReviewOutput(
+      `<gaps_found>{"approved":false,"summary":"Missing 429 rate-limit assertion","findings":[{"severity":"blocking","category":"missing_assertion","message":"Objective requires 429 rate limiting but no VAL-* assertion covers it.","suggestion":"Add VAL-API-002 covering 429 Too Many Requests."}]}</gaps_found>`,
+    );
+    assert.ok(parsedGaps);
+    assert.equal(parsedGaps.approved, false);
+    assert.equal(parsedGaps.findings.length, 1);
+    assert.equal(parsedGaps.findings[0]!.severity, "blocking");
+    assert.equal(parsedGaps.findings[0]!.category, "missing_assertion");
+
+    // ------------------------------------------------------------------------
+    // (1a) `SwarmExtensionOptions.contractReviewer` pre-confirmation adversarial review + `services` persistence & `tweak` merge
+    // ------------------------------------------------------------------------
+    const reviewCalls: Array<{ title: string; assertionIds: string[] }> = [];
+    let confirmModalCalls = 0;
+    let nextServicesOverlay: MissionServiceEntry[] | undefined = [
+      {
+        name: "api",
+        start: "npm run start:api",
+        stop: "pkill -f start:api",
+        healthcheck: "curl -sf http://127.0.0.1:4110/health",
+        port: 4110,
+      },
+    ];
+
+    const mockTransport: ISwarmTransport = {
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        const tracker = createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async () => ({
+            agentId: request.agentId,
+            name: request.name,
+            role: request.role,
+            outcome: "waiting",
+            summary: `${request.name} ready`,
+            tokens: 250,
+            cost: 0.0025,
+          }),
+        });
+        return tracker.handle;
+      },
+    };
+
+    const mockUI: IQuestionnaireUI = {
+      async askQuestion() {
+        return { cancelled: false, answer: "Confirmed", isCustom: false };
+      },
+      async askQuestionnaire() {
+        return { cancelled: false, answers: {}, items: [] };
+      },
+      async confirmProposal(_ctx, plan) {
+        confirmModalCalls += 1;
+        if (!plan.services && nextServicesOverlay) {
+          plan.services = nextServicesOverlay;
+        }
+        return {
+          action: "confirm",
+          validatorEnabled: plan.validatorEnabled,
+          maxConcurrency: plan.maxConcurrency,
+        };
+      },
+    };
+
+    const extOptions: SwarmExtensionOptions = {
+      transportFactory: () => mockTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        validatorModel: "openai/gpt-5.2",
+        validatorThinkingLevel: "high",
+        stallWatchdogEnabled: false,
+      }),
+      questionnaireUI: mockUI,
+      contractReviewer: async (plan): Promise<ContractReviewResult | undefined> => {
+        reviewCalls.push({
+          title: plan.title,
+          assertionIds: (plan.assertions ?? []).map((a) => a.id),
+        });
+        // Pass 1: reject missing VAL-SVC-002 healthcheck assertion!
+        if (reviewCalls.length === 1) {
+          return {
+            approved: false,
+            summary: "Missing healthcheck validation assertion for API service.",
+            findings: [
+              {
+                severity: "blocking",
+                category: "missing_assertion",
+                message: "API service on port 4110 has no VAL-* assertion verifying /health.",
+                suggestion: "Add VAL-SVC-002 claimed by feat-healthcheck.",
+              },
+            ],
+          };
+        }
+        return {
+          approved: true,
+          summary: "All VAL-* assertions, commands, and service ports verified.",
+          findings: [],
+        };
+      },
+    };
+
+    const completeRunCalls: CompleteRunOptions[] = [];
+    const origCompleteRun = SwarmEngine.prototype.completeRun;
+    SwarmEngine.prototype.completeRun = async function (
+      this: SwarmEngine,
+      options: CompleteRunOptions,
+    ) {
+      completeRunCalls.push({ ...options });
+      return origCompleteRun.call(this, options);
+    };
+
+    try {
+      const host = createMockPiHarness(repoDir, {
+        mode: "tui",
+        sessionId: "sess-v090-host",
+      });
+      createPiSwarmExtension(extOptions)(host.pi);
+      await host.emit("session_start", { reason: "startup" });
+
+      // Verify exact registered top-level commands ["swarm", "swarm-direct"] and `/swarm done --force` completion
+      assert.deepEqual(Array.from(host.commands.keys()).sort(), [
+        "swarm",
+        "swarm-direct",
+      ]);
+      const swarmCmdDef = host.commands.get("swarm")!;
+      const doneCompletions = (await swarmCmdDef.getArgumentCompletions?.(
+        "done --f",
+      )) as Array<{ label: string; value: string }> | null;
+      assert.ok(
+        doneCompletions?.some((item) => item.label === "--force"),
+        "Expected `/swarm done` autocomplete to suggest --force",
+      );
+
+      // Start interactive `/swarm` draft
+      await host.runCommand("swarm", "Build API service with healthcheck and worker queue");
+      host.setIdle(false);
+
+      // Pass 1: `contractReviewer` rejects missing VAL-SVC-002 BEFORE opening confirmation modal!
+      const pass1Res = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+        title: "API & Worker Service Mission",
+        objective: "Ship API server on :4110 with verified /health endpoint",
+        strategy: "M1 API core -> M2 health verification",
+        acceptance_criteria: "API responds 200 on /health and passes integration tests",
+        base_branch: "main",
+        assertions: [
+          {
+            id: "VAL-SVC-001",
+            title: "API starts cleanly on port 4110",
+            description: "API binds 127.0.0.1:4110 without error.",
+            evidence_required: "Startup log + curl check",
+          },
+        ],
+        features: [
+          {
+            id: "feat-api",
+            title: "Implement API server",
+            description: "HTTP API server on port 4110",
+            milestone: "m1-api",
+            files_owned: ["src/api.ts"],
+            fulfills: ["VAL-SVC-001"],
+          },
+        ],
+        commands: [{ name: "test", command: "npm test" }],
+        services: nextServicesOverlay,
+        boundaries: ["Use ports 4100-4199 only"],
+      });
+
+      assert.equal(pass1Res.isError, undefined, "Pass-1 review bounce must be non-fatal refinement");
+      assert.equal(reviewCalls.length, 1);
+      assert.equal(
+        confirmModalCalls,
+        0,
+        "Blocking adversarial review on Pass 1 must NOT open user confirmation modal",
+      );
+      assert.equal((await store.listRuns()).length, 0, "No run persisted during Pass-1 bounce");
+      assert.ok(
+        host.pi.getActiveTools().includes(PROPOSE_SWARM_PLAN_TOOL),
+        "Draft must remain active after Pass-1 adversarial review bounce",
+      );
+      assert.match(String(pass1Res.content[0].text), /\[BLOCKING\]/i);
+      assert.match(String(pass1Res.content[0].text), /VAL-SVC-002/);
+      assert.ok(
+        host.workingMessageHistory.includes(
+          "🐝 Adversarial Contract Review (checking VAL-* coverage & commands)…",
+        ),
+        "Expected TUI working message during adversarial contract review",
+      );
+
+      // Pass 2: Orchestrator adds VAL-SVC-002 + feat-healthcheck -> `contractReviewer` approves -> modal confirms -> `services` persisted!
+      const pass2Res = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+        title: "API & Worker Service Mission",
+        objective: "Ship API server on :4110 with verified /health endpoint",
+        strategy: "M1 API core -> M2 health verification",
+        acceptance_criteria: "API responds 200 on /health and passes integration tests",
+        base_branch: "main",
+        assertions: [
+          {
+            id: "VAL-SVC-001",
+            title: "API starts cleanly on port 4110",
+            description: "API binds 127.0.0.1:4110 without error.",
+            evidence_required: "Startup log + curl check",
+          },
+          {
+            id: "VAL-SVC-002",
+            title: "GET /health returns 200 JSON status",
+            description: "Health endpoint returns { ok: true }.",
+            evidence_required: "curl -sf http://127.0.0.1:4110/health output",
+          },
+        ],
+        features: [
+          {
+            id: "feat-api",
+            title: "Implement API server",
+            description: "HTTP API server on port 4110",
+            milestone: "m1-api",
+            files_owned: ["src/api.ts"],
+            fulfills: ["VAL-SVC-001"],
+          },
+          {
+            id: "feat-healthcheck",
+            title: "Implement /health endpoint",
+            description: "Expose GET /health returning { ok: true }",
+            milestone: "m1-api",
+            depends_on: ["feat-api"],
+            files_owned: ["src/health.ts"],
+            fulfills: ["VAL-SVC-002"],
+          },
+        ],
+        commands: [{ name: "test", command: "npm test" }],
+        services: nextServicesOverlay,
+        boundaries: ["Use ports 4100-4199 only"],
+      });
+
+      assert.equal(pass2Res.isError, undefined, JSON.stringify(pass2Res));
+      assert.equal(reviewCalls.length, 2);
+      assert.equal(confirmModalCalls, 1);
+      const runId: string = pass2Res.details.runId;
+      assert.ok(runId);
+
+      const createdRun = await store.loadRun(runId);
+      assert.equal(createdRun.services?.length, 1);
+      assert.equal(createdRun.services?.[0]?.name, "api");
+      assert.equal(createdRun.services?.[0]?.port, 4110);
+      assert.equal(
+        await pathExists(
+          path.join(repoDir, SWARM_DIR, SWARM_RUNS_DIR, runId, SWARM_SERVICES_FILE),
+        ),
+        true,
+        "Expected materialized services.json on disk",
+      );
+
+      // Flush launch kickoff and verify `- **Services:**` is summarized in `buildLaunchKickoffPrompt`
+      host.setIdle(true);
+      await host.emit("agent_settled", { aborted: false });
+      const launchKickoff = host.sentMessages
+        .filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE)
+        .pop()!;
+      const launchKickoffText = String(launchKickoff.message.content);
+      assert.match(launchKickoffText, /\*\*Services:\*\*.*`api` \(:4110\)/);
+      assert.match(
+        buildLaunchKickoffPrompt(createdRun, []),
+        /\*\*Services:\*\*.*`api` \(:4110\): `npm run start:api`/,
+      );
+
+      // `/swarm tweak` merges new `services` cleanly while preserving existing `api` service!
+      await host.runCommand("swarm", "tweak Add background metrics worker service on :4111");
+      nextServicesOverlay = [
+        {
+          name: "metrics-worker",
+          start: "npm run start:metrics",
+          healthcheck: "curl -sf http://127.0.0.1:4111/ready",
+          port: 4111,
+          dependsOn: ["api"],
+        },
+      ];
+      host.setIdle(false);
+      const tweakRes = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+        title: "API & Metrics Service Mission",
+        objective: "Ship API server (:4110) and metrics worker (:4111)",
+        strategy: "M1 API + health -> M2 metrics worker",
+        acceptance_criteria: "Both services healthy",
+        base_branch: "main",
+        assertions: [
+          {
+            id: "VAL-SVC-001",
+            title: "API starts cleanly on port 4110",
+            description: "API binds 127.0.0.1:4110 without error.",
+            evidence_required: "Startup log + curl check",
+          },
+          {
+            id: "VAL-SVC-002",
+            title: "GET /health returns 200 JSON status",
+            description: "Health endpoint returns { ok: true }.",
+            evidence_required: "curl -sf http://127.0.0.1:4110/health output",
+          },
+        ],
+        features: [
+          {
+            id: "feat-api",
+            title: "Implement API server",
+            description: "HTTP API server on port 4110",
+            milestone: "m1-api",
+            files_owned: ["src/api.ts"],
+            fulfills: ["VAL-SVC-001"],
+          },
+          {
+            id: "feat-healthcheck",
+            title: "Implement /health endpoint",
+            description: "Expose GET /health returning { ok: true }",
+            milestone: "m1-api",
+            depends_on: ["feat-api"],
+            files_owned: ["src/health.ts"],
+            fulfills: ["VAL-SVC-002"],
+          },
+        ],
+        commands: [{ name: "test", command: "npm test" }],
+        services: nextServicesOverlay,
+        boundaries: ["Use ports 4100-4199 only"],
+      });
+      assert.equal(tweakRes.isError, undefined, JSON.stringify(tweakRes));
+
+      const tweakedRun = await store.loadRun(runId);
+      assert.deepEqual(
+        tweakedRun.services?.map((s) => ({ name: s.name, port: s.port })),
+        [
+          { name: "api", port: 4110 },
+          { name: "metrics-worker", port: 4111 },
+        ],
+        "Expected /swarm tweak to preserve existing api service and merge metrics-worker",
+      );
+
+      // ----------------------------------------------------------------------
+      // (2) & (3) Shared Library topics, Audited `[OVERRIDE]` assertion, `/swarm done` vs `/swarm done --force` (`callerRole: "human"`), and Rich Mission Complete Card
+      // ----------------------------------------------------------------------
+      await store.writeLibraryTopic(
+        runId,
+        "architecture",
+        "# Service Ports\n- api: 4110\n- metrics-worker: 4111\n",
+        { actor: "orchestrator" },
+      );
+      await store.writeLibraryTopic(
+        runId,
+        "testing",
+        "# Integration Checks\nRun `npm test` against isolated ports.\n",
+        { actor: "validator" },
+      );
+
+      // Mark feat-api completed + VAL-SVC-001 passed via audited OVERRIDE while leaving feat-healthcheck / VAL-SVC-002 pending!
+      await store.updateRun(runId, {
+        features: [
+          {
+            ...tweakedRun.features![0]!,
+            status: "completed",
+            assignedMember: "api-worker",
+            mergedCommitSha: "aabbccdd1122",
+            updatedAt: "2026-11-24T12:10:00.000Z",
+          },
+          tweakedRun.features![1]!,
+        ],
+        assertions: [
+          {
+            ...tweakedRun.assertions![0]!,
+            status: "passed",
+            overridden: true,
+            overrideJustification:
+              "Sandbox container blocks privileged TCP bind check; verified via in-memory socket harness.",
+            evidence:
+              "[OVERRIDE] Sandbox container blocks privileged TCP bind check; verified via in-memory socket harness.",
+            verifiedBy: "orchestrator",
+            verifiedByRole: "orchestrator",
+            updatedAt: "2026-11-24T12:10:00.000Z",
+          },
+          tweakedRun.assertions![1]!,
+        ],
+      });
+      await host.runCommand("swarm", `focus ${runId}`);
+
+      // Bare `/swarm done` (without `--force`) warns & blocks cleanly while Goal Gates remain unfinished!
+      await host.runCommand("swarm", "done Attempt premature close without force");
+      assert.equal(
+        (await store.loadRun(runId)).status,
+        "active",
+        "Bare /swarm done without --force must NOT close unfinished Mission",
+      );
+      const blockedDoneMsg = host.sentMessages
+        .filter(
+          (m) =>
+            m.message.customType === SWARM_STATUS_CUSTOM_TYPE &&
+            (m.message.details as { blockedByGoalGates?: boolean } | undefined)
+              ?.blockedByGoalGates === true,
+        )
+        .pop();
+      assert.ok(blockedDoneMsg, "Expected Goal Gate warning on bare /swarm done");
+      assert.match(String(blockedDoneMsg.message.content), /\/swarm done --force/);
+
+      // Human CLI `/swarm done --force <summary>` passes `callerRole: "human"` and force-closes cleanly!
+      completeRunCalls.length = 0;
+      await host.runCommand(
+        "swarm",
+        "done --force Human emergency release cut with audited override",
+      );
+      assert.equal(completeRunCalls.length, 1);
+      assert.equal(completeRunCalls[0]!.callerRole, "human");
+      assert.equal(completeRunCalls[0]!.actor, "human");
+      assert.equal(
+        completeRunCalls[0]!.summary,
+        "Human emergency release cut with audited override",
+        "--force flag must be stripped cleanly from completion summary",
+      );
+      assert.equal((await store.loadRun(runId)).status, "completed");
+
+      // Verify Rich Mission Complete Card surfaces `[OVERRIDE]` audited assertions count + warning note, `Services` count, and `.pi/swarm/runs/<runId>/library/`!
+      const cardMsg = host.sentMessages
+        .filter(
+          (m) =>
+            m.message.customType === SWARM_STATUS_CUSTOM_TYPE &&
+            (m.message.details as { runId?: string; missionCompleteCard?: boolean } | undefined)
+              ?.runId === runId &&
+            (m.message.details as { missionCompleteCard?: boolean } | undefined)
+              ?.missionCompleteCard === true,
+        )
+        .pop()!;
+      assert.ok(cardMsg, "Expected Rich Mission Complete Card after /swarm done --force");
+      const cardText = String(cardMsg.message.content);
+      assert.match(cardText, /1 overridden/);
+      assert.match(cardText, /\[OVERRIDE\]/);
+      assert.match(cardText, /Audited Overrides:.*1 overridden/);
+      assert.match(cardText, /Sandbox container blocks privileged TCP bind check/);
+      assert.match(cardText, /\*\*Services:\*\* 2 configured.*`api` \(:4110\).*`metrics-worker` \(:4111\)/);
+      assert.match(
+        cardText,
+        new RegExp(
+          `\\*\\*Shared Library:\\*\\* \`\\.pi/swarm/runs/${runId}/${SWARM_LIBRARY_DIR}/\` \\(2 topic\\(s\\): \`architecture\\.md\`, \`testing\\.md\`\\)`,
+        ),
+      );
+
+      const cardDetails = cardMsg.message.details as Record<string, unknown>;
+      assert.equal(cardDetails.assertionsPassed, 1);
+      assert.equal(cardDetails.assertionsOverridden, 1);
+      assert.equal(cardDetails.assertionsTotal, 2);
+      assert.equal(cardDetails.servicesCount, 2);
+      assert.deepEqual(cardDetails.libraryTopics, ["architecture", "testing"]);
+      assert.equal(
+        cardDetails.libraryPath,
+        `${SWARM_DIR}/${SWARM_RUNS_DIR}/${runId}/${SWARM_LIBRARY_DIR}/`,
+      );
+
+      await host.emit("session_shutdown", { reason: "quit" });
+
+      // ----------------------------------------------------------------------
+      // (1b) Live Ephemeral Read-Only `transport.spawnMember` Adversarial Review (`hasLivePiModelRuntime` -> `validatorModel` -> killed in `finally`, zero store footprint)
+      // ----------------------------------------------------------------------
+      const spawnedReviewRequests: SpawnMemberRequest[] = [];
+      let reviewerKilledCount = 0;
+      const liveSimRuntime = {
+        ...createMockModelRuntime(),
+        stream: () => {
+          throw new Error("Mock transport intercepts before network stream");
+        },
+      } as unknown as ModelRuntime;
+
+      const liveReviewTransport: ISwarmTransport = {
+        async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+          if (request.runId === "draft-contract-review") {
+            spawnedReviewRequests.push(request);
+            const isFirst = spawnedReviewRequests.length === 1;
+            const tracker = createMockPersistentMemberHandle({
+              request,
+              runInitialTurn: async ({ pushAssistantMessage }) => {
+                const verdict = isFirst
+                  ? `<gaps_found>{"approved":false,"summary":"Non-existent lint:missing script","findings":[{"severity":"blocking","category":"invalid_command","message":"Command lint:missing does not exist in package.json.","suggestion":"Use npm test instead."}]}</gaps_found>`
+                  : `<approved/>`;
+                pushAssistantMessage(verdict);
+                return {
+                  agentId: request.agentId,
+                  name: request.name,
+                  role: request.role,
+                  outcome: "stopped",
+                  summary: verdict,
+                  tokens: 180,
+                  cost: 0.0018,
+                };
+              },
+            });
+            const origKill = tracker.handle.kill.bind(tracker.handle);
+            tracker.handle.kill = async (reason?: string) => {
+              reviewerKilledCount += 1;
+              return origKill(reason);
+            };
+            return tracker.handle;
+          }
+          return mockTransport.spawnMember(request);
+        },
+      };
+
+      const liveHost = createMockPiHarness(repoDir, {
+        mode: "tui",
+        sessionId: "sess-v090-live-review",
+        modelRuntime: liveSimRuntime,
+      });
+      createPiSwarmExtension({
+        transportFactory: () => liveReviewTransport,
+        settingsLoader: async () => ({
+          ...DEFAULT_SWARM_SETTINGS,
+          validatorModel: "openai/gpt-5.2",
+          validatorThinkingLevel: "high",
+          stallWatchdogEnabled: false,
+        }),
+        questionnaireUI: {
+          async askQuestion() {
+            return { cancelled: false, isCustom: false };
+          },
+          async askQuestionnaire() {
+            return { cancelled: false, answers: {}, items: [] };
+          },
+          async confirmProposal(_c, plan) {
+            return {
+              action: "confirm",
+              validatorEnabled: plan.validatorEnabled,
+              maxConcurrency: plan.maxConcurrency,
+            };
+          },
+        },
+      })(liveHost.pi);
+      await liveHost.emit("session_start", { reason: "startup" });
+
+      const runsBeforeLiveReview = (await store.listRuns()).length;
+      await liveHost.runCommand("swarm", "Verify live ephemeral adversarial reviewer");
+      liveHost.setIdle(false);
+
+      const livePass1 = await liveHost.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+        title: "Live Ephemeral Reviewer Check",
+        objective: "Verify package.json script checks",
+        strategy: "Single milestone",
+        acceptance_criteria: "Tests pass",
+        base_branch: "main",
+        assertions: [
+          {
+            id: "VAL-CMD-001",
+            title: "Tests pass cleanly",
+            description: "Test command exits 0",
+          },
+        ],
+        features: [
+          {
+            id: "feat-cmd",
+            title: "Run check",
+            description: "Verify script",
+            milestone: "m1",
+            fulfills: ["VAL-CMD-001"],
+          },
+        ],
+        commands: [{ name: "lint", command: "npm run lint:missing" }],
+      });
+
+      assert.equal(spawnedReviewRequests.length, 1);
+      assert.equal(spawnedReviewRequests[0]!.role, "validator");
+      assert.equal(spawnedReviewRequests[0]!.workspace, "inherit");
+      assert.equal(spawnedReviewRequests[0]!.keepWarm, false);
+      assert.equal(spawnedReviewRequests[0]!.modelOverride, "openai/gpt-5.2");
+      assert.equal(spawnedReviewRequests[0]!.thinkingLevel, "high");
+      assert.equal(
+        reviewerKilledCount,
+        1,
+        "Ephemeral adversarial reviewer handle must be killed/disposed immediately in finally",
+      );
+      assert.equal(
+        (await store.listRuns()).length,
+        runsBeforeLiveReview,
+        "Ephemeral adversarial reviewer must leave zero footprint in SwarmStore",
+      );
+      assert.match(String(livePass1.content[0].text), /invalid_command/);
+
+      const livePass2 = await liveHost.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+        title: "Live Ephemeral Reviewer Check",
+        objective: "Verify package.json script checks",
+        strategy: "Single milestone",
+        acceptance_criteria: "Tests pass",
+        base_branch: "main",
+        assertions: [
+          {
+            id: "VAL-CMD-001",
+            title: "Tests pass cleanly",
+            description: "Test command exits 0",
+          },
+        ],
+        features: [
+          {
+            id: "feat-cmd",
+            title: "Run check",
+            description: "Verify script",
+            milestone: "m1",
+            fulfills: ["VAL-CMD-001"],
+          },
+        ],
+        commands: [{ name: "test", command: "npm test" }],
+      });
+      assert.equal(livePass2.isError, undefined, JSON.stringify(livePass2));
+      assert.equal(spawnedReviewRequests.length, 2);
+      assert.equal(reviewerKilledCount, 2);
+      assert.ok(livePass2.details.runId);
+
+      await liveHost.emit("session_shutdown", { reason: "quit" });
+    } finally {
+      SwarmEngine.prototype.completeRun = origCompleteRun;
     }
   });
 });
