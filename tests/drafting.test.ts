@@ -59,13 +59,18 @@ import {
 } from "../src/drafting/index.js";
 import {
   assertFeatureDependencyDag,
+  assertProposedSwarmPlan,
+  assertServiceManifest,
   deriveMilestonesFromFeatures,
   MissionAssertionProposalSchema,
   MissionCommandProposalSchema,
   MissionFeatureProposalSchema,
+  MissionServiceProposalSchema,
+  type ProposeSwarmPlanInput,
 } from "../src/drafting/draft-tools.js";
 import {
   SwarmProtocolError,
+  type ContractReviewResult,
   type IQuestionnaireUI,
   type ISwarmStore,
   type IWorktreeManager,
@@ -246,8 +251,8 @@ function createMockRun(plan: ProposedSwarmPlan): SwarmRunState {
 }
 
 function makeSamplePlanParams(
-  overrides?: Partial<ProposeSwarmPlanParams>,
-): ProposeSwarmPlanParams {
+  overrides?: Partial<ProposeSwarmPlanInput>,
+): ProposeSwarmPlanInput {
   return {
     title: "OAuth & Audit Rollout",
     objective: "Implement OAuth2 PKCE login and structured security audit logging.",
@@ -4309,5 +4314,788 @@ describe("v0.8.0 Mission-Level TDD planning, 100% fulfills & DAG gates, tweak me
         `${name} must not contain case-insensitive 'tower'`,
       );
     }
+  });
+});
+
+// ============================================================================
+// 12. v0.9.0 Mandatory Schema Contract, Services Manifest & Adversarial Review
+// ============================================================================
+
+describe("v0.9.0 mandatory contract schema, services manifest & adversarial contract review", () => {
+  it("requires assertions and features (minItems: 1) in ProposeSwarmPlanParamsSchema while preserving legacy JS omission and rejecting empty [] arrays with INVALID_INPUT", async () => {
+    const requiredFields = (ProposeSwarmPlanParamsSchema as { required?: string[] })
+      .required ?? [];
+    assert.ok(
+      requiredFields.includes("assertions"),
+      "ProposeSwarmPlanParamsSchema.required must include 'assertions'",
+    );
+    assert.ok(
+      requiredFields.includes("features"),
+      "ProposeSwarmPlanParamsSchema.required must include 'features'",
+    );
+
+    const assertionsProp = ProposeSwarmPlanParamsSchema.properties
+      .assertions as unknown as Record<string, unknown>;
+    const featuresProp = ProposeSwarmPlanParamsSchema.properties
+      .features as unknown as Record<string, unknown>;
+    assert.equal(assertionsProp.minItems, 1);
+    assert.equal(featuresProp.minItems, 1);
+
+    // Legacy JS direct call omitting both assertions & features still succeeds cleanly
+    const legacyPlan = assertProposedSwarmPlan(
+      makeSamplePlanParams({ assertions: undefined, features: undefined }),
+    );
+    assert.equal(legacyPlan.valid, true);
+    assert.equal(legacyPlan.assertions, undefined);
+    assert.equal(legacyPlan.features, undefined);
+
+    // Empty [] arrays throw genuine SwarmProtocolError("INVALID_INPUT", ...)
+    assert.throws(
+      () =>
+        assertProposedSwarmPlan(
+          makeSamplePlanParams({
+            assertions: [],
+            features: [
+              {
+                id: "feat-1",
+                title: "Feature 1",
+                description: "Valid feature",
+                milestone: "M1",
+              },
+            ],
+          }),
+        ),
+      (err: unknown) =>
+        err instanceof SwarmProtocolError &&
+        err.code === "INVALID_INPUT" &&
+        /assertions.*at least 1/i.test(err.message),
+    );
+
+    assert.throws(
+      () =>
+        assertProposedSwarmPlan(
+          makeSamplePlanParams({
+            assertions: [
+              {
+                id: "VAL-1",
+                title: "Assertion 1",
+                description: "Testable assertion",
+              },
+            ],
+            features: [],
+          }),
+        ),
+      (err: unknown) =>
+        err instanceof SwarmProtocolError &&
+        err.code === "INVALID_INPUT" &&
+        /features.*at least 1/i.test(err.message),
+    );
+
+    assert.throws(
+      () =>
+        assertProposedSwarmPlan(
+          makeSamplePlanParams({ assertions: [], features: [] }),
+        ),
+      (err: unknown) =>
+        err instanceof SwarmProtocolError && err.code === "INVALID_INPUT",
+    );
+
+    // Tool execute rejects empty [] arrays before opening confirmation modal
+    const harness = new MockPiHarness();
+    let confirmCalls = 0;
+    const controller = registerDraftingTools(harness.api, {
+      worktree: createMockWorktree(),
+      ui: {
+        askQuestion: async () => ({ cancelled: true, isCustom: false }),
+        askQuestionnaire: async () => ({ cancelled: true, answers: {}, items: [] }),
+        confirmProposal: async () => {
+          confirmCalls += 1;
+          return { action: "confirm", validatorEnabled: true, maxConcurrency: 3 };
+        },
+      },
+      getSettings: () => ({ ...DEFAULT_SWARM_SETTINGS }),
+      onPlanConfirmed: async (plan) => createMockRun(plan),
+    });
+    controller.start({ seed: "Empty array guard" });
+
+    const proposeTool = harness.registeredTools.get(PROPOSE_SWARM_PLAN_TOOL);
+    const ctx = harness.createContext();
+
+    const emptyBothRes = await proposeTool.execute(
+      "tc-empty-arrays",
+      proposeTool.prepareArguments({
+        ...makeSamplePlanParams(),
+        assertions: [],
+        features: [],
+      }),
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(emptyBothRes.isError, true);
+    assert.equal(confirmCalls, 0);
+    assert.equal(
+      (emptyBothRes.details as ProposeSwarmPlanToolDetails).errorCode,
+      "INVALID_INPUT",
+    );
+    assert.match(emptyBothRes.content[0].text, /\[SwarmProtocolError:INVALID_INPUT\]/);
+
+    // Legacy JS tool execute omitting assertions & features succeeds
+    const legacyExecRes = await proposeTool.execute(
+      "tc-legacy-ok",
+      proposeTool.prepareArguments(makeSamplePlanParams()),
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(legacyExecRes.isError, undefined);
+    assert.equal(confirmCalls, 1);
+  });
+
+  it("normalizes services manifest, merges in tweak mode, renders in renderCall & transcript summary, and rejects duplicate ports & service depends_on cycles", async () => {
+    const portProp = MissionServiceProposalSchema.properties
+      .port as unknown as Record<string, unknown>;
+    assert.equal(portProp.type, "integer");
+    assert.equal(portProp.minimum, 1);
+    assert.equal(portProp.maximum, 65535);
+
+    // Direct helper throws SwarmProtocolError("INVALID_INPUT") on duplicate ports & DAG cycles
+    assert.throws(
+      () =>
+        assertServiceManifest([
+          { name: "api", port: 4100 },
+          { name: "web", port: 4100 },
+        ]),
+      (err: unknown) =>
+        err instanceof SwarmProtocolError &&
+        err.code === "INVALID_INPUT" &&
+        /Duplicate service port 4100/i.test(err.message),
+    );
+
+    assert.throws(
+      () =>
+        assertServiceManifest([
+          { name: "api", port: 4100, dependsOn: ["worker"] },
+          { name: "worker", port: 4101, dependsOn: ["api"] },
+        ]),
+      (err: unknown) =>
+        err instanceof SwarmProtocolError &&
+        err.code === "INVALID_INPUT" &&
+        /api -> worker -> api/.test(err.message),
+    );
+
+    assert.throws(
+      () =>
+        assertServiceManifest([
+          { name: "api", port: 4100, dependsOn: ["missing-db"] },
+        ]),
+      (err: unknown) =>
+        err instanceof SwarmProtocolError &&
+        err.code === "INVALID_INPUT" &&
+        /unknown service "missing-db"/i.test(err.message),
+    );
+
+    const harness = new MockPiHarness();
+    let confirmCalls = 0;
+    const confirmedPlans: ProposedSwarmPlan[] = [];
+
+    const existingRun: SwarmRunState = {
+      ...createMockRun({
+        title: "Services Tweak Base",
+        objective: "Run DB + API",
+        strategy: "Wave 1 -> Wave 2",
+        acceptanceCriteria: "npm test",
+        baseBranch: "main",
+        maxConcurrency: 4,
+        validatorEnabled: true,
+      }),
+      id: "run_svc_tweak",
+      services: [
+        {
+          name: "postgres",
+          start: "pg_ctl -D .pg start -o '-p 5439'",
+          stop: "pg_ctl -D .pg stop",
+          healthcheck: "pg_isready -p 5439",
+          port: 5439,
+        },
+      ],
+      assertions: [
+        {
+          id: "VAL-DB-001",
+          title: "DB Ready",
+          description: "Postgres responds on 5439",
+          status: "passed",
+          overridden: true,
+          overrideJustification:
+            "Verified against local embedded Postgres fixture in CI environment.",
+          evidence: "[OVERRIDE] Verified against local embedded Postgres fixture.",
+          updatedAt: "2026-11-24T08:00:00.000Z",
+        },
+      ],
+      features: [
+        {
+          id: "db-bootstrap",
+          title: "DB Bootstrap",
+          description: "Configure embedded DB",
+          milestone: "M1",
+          fulfills: ["VAL-DB-001"],
+          status: "completed",
+          mergedCommitSha: "deadbeef1234",
+          updatedAt: "2026-11-24T08:00:00.000Z",
+        },
+      ],
+    };
+
+    const mockStore = {
+      loadRun: async (id: string) => {
+        if (id === existingRun.id) return structuredClone(existingRun);
+        throw new SwarmProtocolError("NOT_FOUND", `Run ${id} not found`);
+      },
+    } as unknown as ISwarmStore;
+
+    const controller = registerDraftingTools(harness.api, {
+      store: mockStore,
+      worktree: createMockWorktree(),
+      ui: {
+        askQuestion: async () => ({ cancelled: true, isCustom: false }),
+        askQuestionnaire: async () => ({ cancelled: true, answers: {}, items: [] }),
+        confirmProposal: async (_ctx, plan) => {
+          confirmCalls += 1;
+          return {
+            action: "confirm",
+            validatorEnabled: plan.validatorEnabled,
+            maxConcurrency: plan.maxConcurrency,
+          };
+        },
+      },
+      getSettings: () => ({ ...DEFAULT_SWARM_SETTINGS }),
+      onPlanConfirmed: async (plan) => {
+        confirmedPlans.push(plan);
+        return createMockRun(plan);
+      },
+    });
+
+    controller.start({ mode: "swarm", seed: "Service stack" });
+    const proposeTool = harness.registeredTools.get(PROPOSE_SWARM_PLAN_TOOL);
+    const ctx = harness.createContext();
+
+    // 1. Reject duplicate service ports before modal
+    const dupPortRes = await proposeTool.execute(
+      "tc-dup-port",
+      proposeTool.prepareArguments({
+        ...makeSamplePlanParams(),
+        assertions: [{ id: "VAL-SVC-001", title: "API", description: "Serves HTTP" }],
+        features: [
+          {
+            id: "api-server",
+            title: "API Server",
+            description: "Start HTTP server",
+            milestone: "M1",
+            fulfills: ["VAL-SVC-001"],
+          },
+        ],
+        services: [
+          { name: "api", start: "npm run start:api -- --port 4200", port: 4200 },
+          { name: "admin", start: "npm run start:admin -- --port 4200", port: 4200 },
+        ],
+      }),
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(dupPortRes.isError, true);
+    assert.equal(confirmCalls, 0);
+    assert.match(dupPortRes.content[0].text, /Duplicate service port 4200/i);
+
+    // 2. Reject service depends_on cycle before modal
+    const svcCycleRes = await proposeTool.execute(
+      "tc-svc-cycle",
+      proposeTool.prepareArguments({
+        ...makeSamplePlanParams(),
+        assertions: [{ id: "VAL-SVC-001", title: "API", description: "Serves HTTP" }],
+        features: [
+          {
+            id: "api-server",
+            title: "API Server",
+            description: "Start HTTP server",
+            milestone: "M1",
+            fulfills: ["VAL-SVC-001"],
+          },
+        ],
+        services: [
+          { name: "gateway", start: "node gateway.js", port: 4201, depends_on: ["auth"] },
+          { name: "auth", start: "node auth.js", port: 4202, depends_on: ["gateway"] },
+        ],
+      }),
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(svcCycleRes.isError, true);
+    assert.equal(confirmCalls, 0);
+    assert.match(svcCycleRes.content[0].text, /gateway -> auth -> gateway/);
+
+    // 3. Valid services normalization + collapsed & expanded renderCall + transcript summary
+    const validSvcArgs = proposeTool.prepareArguments({
+      ...makeSamplePlanParams({ initial_members: undefined }),
+      commands: [
+        { name: "init", command: "npm run generate:types" },
+        { name: "test", command: "npm test" },
+      ],
+      services: [
+        {
+          name: " redis ",
+          start: " redis-server --port 6389 ",
+          stop: " redis-cli -p 6389 shutdown ",
+          healthcheck: " redis-cli -p 6389 ping ",
+          port: 6389,
+        },
+        {
+          name: " api ",
+          start: " PORT=4300 node server.js ",
+          healthcheck: " curl -sf http://127.0.0.1:4300/healthz ",
+          port: 4300,
+          depends_on: [" redis "],
+        },
+      ],
+      assertions: [
+        {
+          id: "VAL-SVC-001",
+          title: "API Healthz",
+          description: "GET /healthz returns 200 OK with Redis connected",
+          evidence_required: "curl -sf http://127.0.0.1:4300/healthz",
+        },
+      ],
+      features: [
+        {
+          id: "api-health",
+          title: "API Health Endpoint",
+          description: "Implement /healthz with Redis ping",
+          milestone: "M1: Core Services",
+          files_owned: ["src/server.ts"],
+          fulfills: ["VAL-SVC-001"],
+        },
+      ],
+    });
+
+    const theme = createMockTheme();
+    const collapsedSvc = proposeTool
+      .renderCall(validSvcArgs, theme, { expanded: false } as any)
+      .render(180)
+      .join("\n");
+    assert.match(
+      collapsedSvc,
+      /1 feature · 1 VAL assertion · 1 milestone · 2 services \(:6389, :4300\)/,
+    );
+
+    const expandedSvc = proposeTool
+      .renderCall(validSvcArgs, theme, { expanded: true } as any)
+      .render(180)
+      .join("\n");
+    assert.match(expandedSvc, /\*\*Services & Ports:\*\*/);
+    assert.match(expandedSvc, /\*\*redis\*\* \(`:6389`\)/);
+    assert.match(expandedSvc, /\*\*api\*\* \(`:4300`\).*dependsOn: `redis`/);
+
+    const okSvcRes = await proposeTool.execute(
+      "tc-svc-ok",
+      validSvcArgs,
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(okSvcRes.isError, undefined);
+    assert.equal(confirmCalls, 1);
+    assert.deepEqual(confirmedPlans[0]?.services, [
+      {
+        name: "redis",
+        start: "redis-server --port 6389",
+        stop: "redis-cli -p 6389 shutdown",
+        healthcheck: "redis-cli -p 6389 ping",
+        port: 6389,
+      },
+      {
+        name: "api",
+        start: "PORT=4300 node server.js",
+        healthcheck: "curl -sf http://127.0.0.1:4300/healthz",
+        port: 4300,
+        dependsOn: ["redis"],
+      },
+    ]);
+
+    // 4. Tweak mode merges existingRun.services (and rejects port collision against carried-over service) + preserves overridden assertion metadata
+    controller.start({
+      mode: "tweak",
+      targetRunId: existingRun.id,
+      seed: "Add HTTP API on top of existing postgres",
+    });
+
+    const tweakPortCollision = await proposeTool.execute(
+      "tc-tweak-svc-port-clash",
+      proposeTool.prepareArguments({
+        ...makeSamplePlanParams(),
+        assertions: [
+          {
+            id: "VAL-DB-001",
+            title: "DB Ready",
+            description: "Postgres responds on 5439",
+          },
+        ],
+        features: [
+          {
+            id: "db-bootstrap",
+            title: "DB Bootstrap",
+            description: "Configure embedded DB",
+            milestone: "M1",
+            fulfills: ["VAL-DB-001"],
+          },
+        ],
+        services: [{ name: "api", start: "node api.js", port: 5439 }],
+      }),
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(tweakPortCollision.isError, true);
+    assert.match(tweakPortCollision.content[0].text, /Duplicate service port 5439/i);
+
+    const tweakMergeOk = await proposeTool.execute(
+      "tc-tweak-svc-merge-ok",
+      proposeTool.prepareArguments({
+        ...makeSamplePlanParams(),
+        assertions: [
+          {
+            id: "VAL-DB-001",
+            title: "DB Ready",
+            description: "Postgres responds on 5439",
+          },
+          {
+            id: "VAL-API-001",
+            title: "API Ready",
+            description: "API responds on 4400",
+          },
+        ],
+        features: [
+          {
+            id: "db-bootstrap",
+            title: "DB Bootstrap",
+            description: "Configure embedded DB",
+            milestone: "M1",
+            fulfills: ["VAL-DB-001"],
+          },
+          {
+            id: "api-layer",
+            title: "API Layer",
+            description: "Add HTTP server depending on postgres",
+            milestone: "M2",
+            depends_on: ["db-bootstrap"],
+            fulfills: ["VAL-API-001"],
+          },
+        ],
+        services: [
+          {
+            name: "api",
+            start: "PORT=4400 node api.js",
+            port: 4400,
+            depends_on: ["postgres"],
+          },
+        ],
+      }),
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(tweakMergeOk.isError, undefined);
+    const mergedTweakPlan = confirmedPlans[1]!;
+    assert.equal(mergedTweakPlan.services?.length, 2);
+    assert.equal(mergedTweakPlan.services?.[0]?.name, "postgres");
+    assert.equal(mergedTweakPlan.services?.[1]?.name, "api");
+    assert.deepEqual(mergedTweakPlan.services?.[1]?.dependsOn, ["postgres"]);
+    const preservedDbAssert = mergedTweakPlan.assertions?.find(
+      (a) => a.id === "VAL-DB-001",
+    );
+    assert.equal(preservedDbAssert?.overridden, true);
+    assert.match(
+      preservedDbAssert?.overrideJustification ?? "",
+      /embedded Postgres fixture/,
+    );
+  });
+
+  it("bounces blocking reviewProposedContract findings on Pass 1 (skipping modal & keeping draft active) and proceeds cleanly to confirmation on Pass 2", async () => {
+    const harness = new MockPiHarness();
+    let confirmCalls = 0;
+    let reviewerCalls = 0;
+    const confirmedPlans: ProposedSwarmPlan[] = [];
+    let reviewerImpl: (plan: ProposedSwarmPlan) => Promise<ContractReviewResult | undefined> =
+      async () => ({
+        approved: false,
+        summary: "Missing rate-limit assertion and speculative npx command.",
+        findings: [
+          {
+            severity: "blocking",
+            category: "missing_assertion",
+            message: "Objective requires brute-force protection, but no VAL-RATE-* assertion exists.",
+            suggestion: "Add VAL-RATE-001 asserting 429 response after 5 failed attempts.",
+          },
+          {
+            severity: "warning",
+            category: "invalid_command",
+            message: "Prefer npm test over ad-hoc runner flags.",
+          },
+        ],
+      });
+
+    const controller = registerDraftingTools(harness.api, {
+      worktree: createMockWorktree({ currentBranch: "main" }),
+      ui: {
+        askQuestion: async () => ({ cancelled: true, isCustom: false }),
+        askQuestionnaire: async () => ({ cancelled: true, answers: {}, items: [] }),
+        confirmProposal: async (_ctx, plan) => {
+          confirmCalls += 1;
+          return {
+            action: "confirm",
+            validatorEnabled: plan.validatorEnabled,
+            maxConcurrency: plan.maxConcurrency,
+          };
+        },
+      },
+      getSettings: () => ({ ...DEFAULT_SWARM_SETTINGS }),
+      onPlanConfirmed: async (plan) => {
+        confirmedPlans.push(plan);
+        return createMockRun(plan);
+      },
+      reviewProposedContract: async (plan) => {
+        reviewerCalls += 1;
+        return reviewerImpl(plan);
+      },
+    });
+
+    controller.start({
+      mode: "swarm",
+      seed: "Add login + brute-force rate limiter",
+      validatorEnabled: true,
+      maxConcurrency: 4,
+    });
+
+    const proposeTool = harness.registeredTools.get(PROPOSE_SWARM_PLAN_TOOL);
+    const ctx = harness.createContext();
+    const theme = createMockTheme();
+
+    // Pass 1: reviewer rejects -> skips confirmProposal, keeps draft active, returns structured findings
+    const pass1Res = await proposeTool.execute(
+      "tc-review-pass1",
+      proposeTool.prepareArguments({
+        ...makeSamplePlanParams(),
+        assertions: [
+          {
+            id: "VAL-AUTH-001",
+            title: "Login Token",
+            description: "Valid credentials return signed JWT",
+          },
+        ],
+        features: [
+          {
+            id: "login-jwt",
+            title: "JWT Login",
+            description: "Implement POST /login",
+            milestone: "M1",
+            fulfills: ["VAL-AUTH-001"],
+          },
+        ],
+      }),
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    assert.equal(pass1Res.isError, undefined);
+    assert.equal(reviewerCalls, 1);
+    assert.equal(confirmCalls, 0);
+    assert.equal(confirmedPlans.length, 0);
+    assert.equal(controller.isActive(), true);
+
+    const pass1Details = pass1Res.details as ProposeSwarmPlanToolDetails;
+    assert.equal(pass1Details.status, "contract_review_changes_requested");
+    assert.equal(pass1Details.outcome, "contract_review_changes_requested");
+    assert.equal(pass1Details.reviewPass, 1);
+    assert.match(pass1Res.content[0].text, /contract_review_changes_requested/);
+    assert.match(pass1Res.content[0].text, /\[BLOCKING\] \(missing_assertion\)/);
+    assert.match(pass1Res.content[0].text, /VAL-RATE-001/);
+    assert.match(pass1Res.content[0].text, /\[WARNING\] \(invalid_command\)/);
+
+    // Verify renderResult formats contract_review_changes_requested cleanly in collapsed & expanded modes
+    const collapsedBounce = proposeTool
+      .renderResult(pass1Res, { expanded: false } as any, theme, {} as any)
+      .render(160)
+      .join("\n");
+    assert.match(collapsedBounce, /\[CONTRACT REVIEW\]/);
+    assert.match(collapsedBounce, /2 findings/);
+
+    const expandedBounce = proposeTool
+      .renderResult(pass1Res, { expanded: true } as any, theme, {} as any)
+      .render(160)
+      .join("\n");
+    assert.match(expandedBounce, /\[CONTRACT REVIEW · CHANGES REQUESTED\]/);
+    assert.match(expandedBounce, /VAL-RATE-001/);
+
+    // Pass 2 (even if reviewer is still picky and returns approved: false!):
+    // Max 1 automatic bounce per draft -> attaches remaining notes to plan summary & proceeds to confirmProposal!
+    const pass2Res = await proposeTool.execute(
+      "tc-review-pass2",
+      proposeTool.prepareArguments({
+        ...makeSamplePlanParams(),
+        assertions: [
+          {
+            id: "VAL-AUTH-001",
+            title: "Login Token",
+            description: "Valid credentials return signed JWT",
+          },
+          {
+            id: "VAL-RATE-001",
+            title: "Brute-Force Rate Limit",
+            description: "Returns 429 after 5 failed login attempts",
+          },
+        ],
+        features: [
+          {
+            id: "login-jwt",
+            title: "JWT Login",
+            description: "Implement POST /login",
+            milestone: "M1",
+            fulfills: ["VAL-AUTH-001"],
+          },
+          {
+            id: "rate-limiter",
+            title: "Login Rate Limiter",
+            description: "Enforce 5-attempt window",
+            milestone: "M1",
+            fulfills: ["VAL-RATE-001"],
+          },
+        ],
+      }),
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    assert.equal(pass2Res.isError, undefined);
+    assert.equal(reviewerCalls, 2);
+    assert.equal(confirmCalls, 1);
+    assert.equal(confirmedPlans.length, 1);
+    assert.equal(
+      (pass2Res.details as ProposeSwarmPlanToolDetails).outcome,
+      "confirmed",
+    );
+    assert.match(
+      confirmedPlans[0]?.feedback ?? "",
+      /Adversarial Contract Review \(Pass 2\)/,
+    );
+    assert.match(pass2Res.content[0].text, /Adversarial Contract Review \(Pass 2\)/);
+
+    // Also verify validatorEnabled: false skips reviewProposedContract entirely
+    controller.start({
+      mode: "swarm",
+      seed: "Fast unvalidated draft",
+      validatorEnabled: false,
+      maxConcurrency: 2,
+    });
+    const prevReviewerCalls = reviewerCalls;
+    const noValRes = await proposeTool.execute(
+      "tc-review-disabled",
+      proposeTool.prepareArguments({
+        ...makeSamplePlanParams({ validator_enabled: false }),
+        assertions: [{ id: "VAL-FAST-001", title: "Fast", description: "Check" }],
+        features: [
+          {
+            id: "fast-feat",
+            title: "Fast Feat",
+            description: "Quick slice",
+            milestone: "M1",
+            fulfills: ["VAL-FAST-001"],
+          },
+        ],
+      }),
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(noValRes.isError, undefined);
+    assert.equal(reviewerCalls, prevReviewerCalls);
+
+    // Verify upgraded v0.9.0 prompts include MANDATORY assertions/features, "init", services, Adversarial Contract Review & dispatch_ready
+    const kickoff = buildDraftingKickoffPrompt("Build fullstack app", "swarm");
+    const overlay = buildDraftingSystemOverlay({
+      version: 2,
+      mode: "swarm",
+      seed: "Build fullstack app",
+      startedAt: new Date().toISOString(),
+      validatorEnabled: true,
+      maxConcurrency: 4,
+    });
+    const direct = buildDirectPlanPrompt("Build fullstack app", "main", {
+      maxConcurrency: 4,
+      validatorEnabled: true,
+    });
+    for (const [name, promptText] of [
+      ["kickoff", kickoff],
+      ["overlay", overlay],
+      ["direct", direct],
+    ] as const) {
+      assert.match(promptText, /MANDATORY/, `${name} must emphasize MANDATORY contract`);
+      assert.match(promptText, /services/, `${name} must mention services manifest`);
+      assert.match(promptText, /init/, `${name} must mention optional init setup command`);
+      assert.match(
+        promptText,
+        /Adversarial Contract Review/,
+        `${name} must mention Adversarial Contract Review`,
+      );
+      assert.match(
+        promptText,
+        /dispatch_ready/,
+        `${name} must mention mission_op:"dispatch_ready"`,
+      );
+    }
+  });
+
+  it("maintains zero Type.Union, Type.Record, anyOf, oneOf, replaceControlCharacters, and tower across v0.9.0 MissionServiceProposalSchema and sources", () => {
+    const forbiddenKeys: string[] = [];
+    const visitSchema = (node: unknown, path: string): void => {
+      if (!node || typeof node !== "object") {
+        return;
+      }
+      if (Array.isArray(node)) {
+        for (let i = 0; i < node.length; i++) {
+          visitSchema(node[i], `${path}[${i}]`);
+        }
+        return;
+      }
+      for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+        if (k === "anyOf" || k === "oneOf") {
+          forbiddenKeys.push(`${path}.${k}`);
+        }
+        visitSchema(v, `${path}.${k}`);
+      }
+    };
+
+    visitSchema(MissionServiceProposalSchema, "MissionServiceProposalSchema");
+    visitSchema(ProposeSwarmPlanParamsSchema, "ProposeSwarmPlanParamsSchema");
+    assert.deepEqual(forbiddenKeys, []);
+
+    const draftToolsSource = readFileSync(
+      fileURLToPath(new URL("../src/drafting/draft-tools.ts", import.meta.url)),
+      "utf8",
+    );
+    const draftPromptsSource = readFileSync(
+      fileURLToPath(new URL("../src/drafting/draft-prompts.ts", import.meta.url)),
+      "utf8",
+    );
+
+    assert.equal(/\bType\.Union\b/.test(draftToolsSource), false);
+    assert.equal(/\bType\.Record\b/.test(draftToolsSource), false);
+    assert.equal(/\banyOf\b/.test(draftToolsSource), false);
+    assert.equal(/\boneOf\b/.test(draftToolsSource), false);
+    assert.equal(/replaceControlCharacters/.test(draftToolsSource), false);
+    assert.equal(/replaceControlCharacters/.test(draftPromptsSource), false);
+    assert.equal(/tower/i.test(draftToolsSource), false);
+    assert.equal(/tower/i.test(draftPromptsSource), false);
   });
 });

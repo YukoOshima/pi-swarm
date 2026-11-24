@@ -200,10 +200,10 @@ export function buildDraftingKickoffPrompt(
   lines.push("");
   lines.push("How the Dynamic Antigravity Swarm executes once approved:");
   lines.push(
-    `- **Orchestrator (you):** Dynamically coordinates the run over the shared **Message Board** using the 4 core tools (\`${SWARM_TOOL}\`, \`${POST_MESSAGE_TOOL}\`, \`${READ_BOARD_TOOL}\`, \`${SWARM_WAIT_TOOL}\`) — spawning/naming workers and validators wave-by-wave on demand, updating the live contract via \`swarm{action:"mission"}\`, organizing \`#channels\`, hot-switching models on waiting members, merging clean worktrees, killing finished helpers, and completing the run.`,
+    `   - **Orchestrator (you):** Dynamically coordinates the run over the shared **Message Board** using the 4 core tools (\`${SWARM_TOOL}\`, \`${POST_MESSAGE_TOOL}\`, \`${READ_BOARD_TOOL}\`, \`${SWARM_WAIT_TOOL}\`) — spawning/naming workers and validators wave-by-wave on demand, auto-dispatching ready parallel features into fresh isolated \`share\` worktrees via \`swarm{action:"mission", mission_op:"dispatch_ready"}\`, updating the live contract via \`swarm{action:"mission"}\`, organizing \`#channels\`, hot-switching models on waiting members, merging clean worktrees, killing finished helpers, and completing the run.`,
   );
   lines.push(
-    "- **Workers:** Warm persistent sessions that collaborate on the shared `#seq` Message Board with `@mention` wakeups, optional context forking (`fork`), and flexible workspaces (`inherit` for read-only scouts/researchers, `share` or `branch` for isolated Git worktree edits). Workers can also spawn their own helpers when a slice splits naturally.",
+    "- **Workers:** Warm persistent sessions that collaborate on the shared `#seq` Message Board with `@mention` wakeups, optional context forking (`fork`), and flexible workspaces (`inherit` for read-only scouts/researchers, `share` or `branch` for isolated Git worktree edits with automatic `node_modules`/`.venv` symlink bootstrap + optional `init` command). Workers can also spawn their own helpers when a slice splits naturally.",
   );
   lines.push(
     "- **Validators:** Independent read-only verifiers (`validator` role) spawned on demand to audit peer worktrees/diffs, verify `VAL-*` contract assertions with concrete evidence, and report issues directly via `@mention` on the board without mutating code.",
@@ -213,7 +213,7 @@ export function buildDraftingKickoffPrompt(
     "1. **No Mutations Yet:** DO NOT start editing, writing, or implementing code yet. Do not run mutating shell commands or create git branches/worktrees.",
   );
   lines.push(
-    "2. **Operational Reconnaissance FIRST:** Run fast read-only repository recon (`read`, `grep`, `find`, `ls` on `package.json`, `tsconfig*`, build/lint/test configs, key entrypoints, and target modules/tests) FIRST to discover exact **already-installed** `commands` (`test`, `typecheck`, `build`, `lint`) and `boundaries` (reserved ports, off-limits directories/services) — never invent speculative `npx -y` downloads.",
+    "2. **Operational Reconnaissance FIRST:** Run fast read-only repository recon (`read`, `grep`, `find`, `ls` on `package.json`, `tsconfig*`, build/lint/test configs, key entrypoints, and target modules/tests) FIRST to discover exact **already-installed** `commands` (`test`, `typecheck`, `build`, `lint`, plus optional idempotent `init` if isolated worktrees require setup beyond automatic `node_modules`/`.venv` symlinks), `services` (background/dev services with explicit unique ports in `start`/`stop`/`healthcheck` + `port` and acyclic `depends_on`), and `boundaries` (reserved ports, off-limits directories/services) — never invent speculative `npx -y` downloads.",
   );
   lines.push(
     "3. **Requirement Echo & Lean Upfront Clarification (事前澄清 — `pi-goal-x` style):**",
@@ -231,36 +231,36 @@ export function buildDraftingKickoffPrompt(
     "   - **Never interrogate the user on obvious details** or facts you can inspect directly in the repository.",
   );
   lines.push(
-    "4. **Mission-Level TDD (`assertions` -> `features`) & Right-Sizing:**",
+    "4. **Mission-Level TDD (`assertions` -> `features` are MANDATORY) & Right-Sizing:**",
   );
   lines.push(
-    "   - **Contract First (`VAL-<AREA>-<NNN>`):** Define concrete, testable behavioral `assertions` (`id` like `VAL-AUTH-001`, `title`, `description`, `evidence_required`) FIRST.",
+    "   - **Mandatory Contract First (`VAL-<AREA>-<NNN>`):** `assertions` (`minItems: 1`) and `features` (`minItems: 1`) are **MANDATORY** in `propose_swarm_plan`! Define concrete, testable behavioral `assertions` (`id` like `VAL-AUTH-001`, `title`, `description`, `evidence_required`) FIRST, covering happy paths and critical edge cases.",
   );
   lines.push(
-    "   - **Ordered Milestones & Parallel Features:** Decompose vertical `milestones` and `features` (`id`, `title`, `description`, `milestone`, `depends_on`, `files_owned`, `preconditions`, `expected_behavior`, `verification_steps`, `fulfills`) where `depends_on` forms an acyclic DAG and `files_owned` assigns disjoint paths so independent features in the same milestone can run concurrently in parallel `share` worktrees! Every assertion in `assertions` MUST be claimed by a single feature's `fulfills[]` (**100% `fulfills` coverage**, 1-to-1 leaf rule, zero orphan assertions).",
+    "   - **Ordered Milestones & Parallel Features:** Decompose vertical `milestones` and `features` (`id`, `title`, `description`, `milestone`, `depends_on`, `files_owned`, `preconditions`, `expected_behavior`, `verification_steps`, `fulfills`) where `depends_on` forms an acyclic DAG and `files_owned` assigns disjoint paths so independent features in the same milestone can run concurrently in parallel `share` worktrees (and be auto-dispatched via `swarm{action:\"mission\", mission_op:\"dispatch_ready\"}`)! Every assertion in `assertions` MUST be claimed by a single feature's `fulfills[]` (**100% `fulfills` coverage**, 1-to-1 leaf rule, zero orphan assertions).",
   );
   lines.push(
     "   - **Right-Size the Swarm:** **1–2 workers** for small, localized, or single-module tasks (do not over-spawn); **Disjoint parallel `share` authors + independent `validator`** for multi-module work (spawn the read-only `validator` on demand once workers commit/post `[done]` — e.g. 1 `validator` auditing peer branches/worktrees per 2–4 parallel authors — rather than waking an idle validator before any code exists).",
   );
   lines.push(
-    `5. **Flexible Dynamic Swarm Plan & Living Dynamic Workflow:** Once clear, call \`${PROPOSE_SWARM_PLAN_TOOL}\` with:`,
+    `5. **Flexible Dynamic Swarm Plan, Adversarial Contract Review & Living Dynamic Workflow:** Once clear, call \`${PROPOSE_SWARM_PLAN_TOOL}\` with:`,
   );
   lines.push("   - `title`: short, clear human-readable title for this swarm.");
   lines.push("   - `objective`: crisp statement echoing every user requirement the swarm must accomplish.");
   lines.push(
-    "   - `strategy`: **wave-by-wave execution with disjoint file/directory ownership boundaries** (assign non-overlapping files/directories per parallel `share`/`branch` worker so zero two-worker collisions occur on the same file, plus `@mention` -> `validator` review and merge gates on the shared Message Board). Keep wave transitions adaptive on the live board — this is NOT a rigid pre-locked file-level DAG: `features`, `assertions`, `milestones`, and workers are **dynamically extensible mid-mission** via `swarm{action:\"mission\"}` and `swarm{action:\"add\"}`!",
+    "   - `strategy`: **wave-by-wave execution with disjoint file/directory ownership boundaries** (assign non-overlapping files/directories per parallel `share`/`branch` worker so zero two-worker collisions occur on the same file, plus `@mention` -> `validator` review and merge gates on the shared Message Board). Keep wave transitions adaptive on the live board — this is NOT a rigid pre-locked file-level DAG: `features`, `assertions`, `milestones`, and workers are **dynamically extensible mid-mission** via `swarm{action:\"mission\"}` (including `swarm{action:\"mission\", mission_op:\"dispatch_ready\"}`) and `swarm{action:\"add\"}`!",
   );
   lines.push(
     '   - `acceptance_criteria`: concrete, testable definition of "what done looks like" listing **exact runnable verification commands** using **already-installed** repo scripts discovered during recon (`npm test`, `npm run typecheck`, `node --test`, build checks — explicitly avoid speculative `npx -y` network package downloads) and behavioral invariants.',
   );
   lines.push(
-    "   - `commands` & `boundaries`: single-source-of-truth command manifest (`test`, `typecheck`, `build`, `lint`) from `package.json`/configs plus mission boundaries (port ranges, off-limits dirs/services).",
+    '   - `commands`, `services` & `boundaries`: single-source-of-truth command manifest (`test`, `typecheck`, `build`, `lint`, plus optional `"init"` setup command if isolated worktrees need setup beyond `node_modules`/`.venv` auto-symlinks), optional `services` manifest (`name`, `start`, `stop`, `healthcheck`, unique `port`, acyclic `depends_on` with explicit ports in `start`/`stop`/`healthcheck`), and mission boundaries (port ranges, off-limits dirs/services).',
   );
   lines.push(
-    "   - `assertions` & `features`: `VAL-<AREA>-<NNN>` validation contract assertions + milestone-ordered features claiming 100% of `assertions` via 1-to-1 `fulfills` (in `tweak` mode, never add new features into an already `sealed` milestone — append a new milestone instead).",
+    "   - **MANDATORY** `assertions` & `features`: `VAL-<AREA>-<NNN>` validation contract assertions (`minItems: 1`) + milestone-ordered features (`minItems: 1`) claiming 100% of `assertions` via 1-to-1 `fulfills` (in `tweak` mode, never add new features into an already `sealed` milestone — append a new milestone instead). Note: `propose_swarm_plan` runs an automated **Adversarial Contract Review** checking for missing edge-case assertions, file-ownership collisions, and speculative commands — if it requests refinements, address every `[BLOCKING]` finding and call `propose_swarm_plan` again.",
   );
   lines.push(
-    `   - \`initial_members\` (optional): populate with **wave-1 workers only** by default — e.g. read-only scout (\`workspace: "inherit"\`) or disjoint parallel workers (\`workspace: "share"\` / \`"branch"\`). Spawn an independent \`validator\` on demand once a worker commits/posts \`[done]\` (only include a \`validator\` initially when reviewing already-existing code). Keep each \`brief\` concise with exclusive file ownership and **already-installed** repo verification scripts (no speculative \`npx -y\` downloads). Each name must match \`${MEMBER_NAME_PATTERN.source}\`, be unique, and avoid reserved names (${RESERVED_MEMBER_NAMES.join(", ")}). Leave omitted/empty to spawn wave 1 dynamically after launch.`,
+    `   - \`initial_members\` (optional): populate with **wave-1 workers only** by default — e.g. read-only scout (\`workspace: "inherit"\`) or disjoint parallel workers (\`workspace: "share"\` / \`"branch"\`). Spawn an independent \`validator\` on demand once a worker commits/posts \`[done]\` (only include a \`validator\` initially when reviewing already-existing code). Keep each \`brief\` concise with exclusive file ownership and **already-installed** repo verification scripts (no speculative \`npx -y\` downloads). Each name must match \`${MEMBER_NAME_PATTERN.source}\`, be unique, and avoid reserved names (${RESERVED_MEMBER_NAMES.join(", ")}). Leave omitted/empty to spawn wave 1 dynamically after launch (or via \`swarm{action:"mission", mission_op:"dispatch_ready"}\`).`,
   );
   lines.push(
     `6. Do NOT dump the full plan in prose before calling \`${PROPOSE_SWARM_PLAN_TOOL}\` — the expandable proposal card and confirmation modal already display the full formatted plan.`,
@@ -279,7 +279,7 @@ export function buildDraftingSystemOverlay(draft: ActiveSwarmDraft): string {
   const autoConfirmAttr = draft.autoConfirm ? ' auto_confirm="true"' : "";
   const lines: string[] = [
     `<swarm_drafting_active mode="${escapeXml(draft.mode)}" base_branch="${escapeXml(draft.baseBranch ?? "auto")}" max_concurrency="${draft.maxConcurrency}" validator_enabled="${draft.validatorEnabled ? "true" : "false"}"${autoConfirmAttr}>`,
-    `Active \`pi-swarm\` draft for a **Dynamic Antigravity Swarm** (Orchestrator dynamically spawns/steers warm Workers & read-only Validators on the shared \`#seq\` Message Board with \`@mention\` wakeups). Rules: (1) Operational Recon FIRST — run fast read-only recon (\`ls\`, \`find\`, \`grep\`, \`read\` key entrypoints/\`package.json\`/configs) FIRST to discover **already-installed** \`commands\` (\`test\`, \`typecheck\`, \`build\`, \`lint\`) and \`boundaries\` (never invent speculative \`npx -y\` network downloads; do NOT edit files or implement code yet); (2) Requirement Echo & Lean Clarification — capture every user requirement, ask **0 questions** when clear, or **at most 1–3 high-leverage trade-off questions** for real ambiguities via \`${SWARM_QUESTIONNAIRE_TOOL}\` (or \`${SWARM_QUESTION_TOOL}\`) with the best option placed first and prefixed \`(Recommended)\` — never interrogate on obvious details; (3) Mission-Level TDD & Right-Sizing — define testable \`VAL-<AREA>-<NNN>\` \`assertions\` with \`evidence_required\` FIRST, then decompose ordered vertical \`milestones\` and \`features\` (\`depends_on\` DAG + disjoint \`files_owned\` for parallel \`share\` worktrees + 100% 1-to-1 \`fulfills\` coverage), right-sizing to 1–2 workers for small/single-module tasks or disjoint parallel \`share\` authors + independent \`validator\` spawned on demand once workers commit/post \`[done]\`; (4) Living Dynamic Workflow — finalize via \`${PROPOSE_SWARM_PLAN_TOOL}\` with \`title\`, \`objective\`, \`strategy\` specifying **wave-by-wave execution with disjoint file/directory ownership boundaries** (zero same-file collisions; not a rigid pre-locked file-level DAG — \`features\`, \`assertions\`, \`milestones\`, and workers remain dynamically extensible mid-mission via \`swarm{action:"mission"}\` and \`swarm{action:"add"}\`), \`acceptance_criteria\` listing **exact runnable verification commands** using **already-installed** repo scripts, \`commands\`, \`boundaries\`, \`assertions\`, \`features\`, and optional valid \`initial_members\` populated with **wave-1 workers only** by default (concise briefs; only include a \`validator\` initially when reviewing already-existing code); (5) Do not repeat the full plan in prose before calling \`${PROPOSE_SWARM_PLAN_TOOL}\`.`,
+    `Active \`pi-swarm\` draft for a **Dynamic Antigravity Swarm** (Orchestrator dynamically spawns/steers warm Workers & read-only Validators on the shared \`#seq\` Message Board with \`@mention\` wakeups). Rules: (1) Operational Recon FIRST — run fast read-only recon (\`ls\`, \`find\`, \`grep\`, \`read\` key entrypoints/\`package.json\`/configs) FIRST to discover **already-installed** \`commands\` (\`test\`, \`typecheck\`, \`build\`, \`lint\`, plus optional \`"init"\` setup command if worktrees need setup beyond \`node_modules\`/\`.venv\` auto-symlinks), \`services\` (explicit unique ports in \`start\`/\`stop\`/\`healthcheck\` + \`port\` and acyclic \`depends_on\`), and \`boundaries\` (never invent speculative \`npx -y\` network downloads; do NOT edit files or implement code yet); (2) Requirement Echo & Lean Clarification — capture every user requirement, ask **0 questions** when clear, or **at most 1–3 high-leverage trade-off questions** for real ambiguities via \`${SWARM_QUESTIONNAIRE_TOOL}\` (or \`${SWARM_QUESTION_TOOL}\`) with the best option placed first and prefixed \`(Recommended)\` — never interrogate on obvious details; (3) Mission-Level TDD (**MANDATORY** \`assertions\` & \`features\`) & Right-Sizing — \`assertions\` (\`VAL-<AREA>-<NNN>\`, \`minItems: 1\`) and \`features\` (\`fulfills\`, \`minItems: 1\`) are **MANDATORY** in \`${PROPOSE_SWARM_PLAN_TOOL}\`: define testable \`VAL-<AREA>-<NNN>\` \`assertions\` with \`evidence_required\` FIRST, then decompose ordered vertical \`milestones\` and \`features\` (\`depends_on\` DAG + disjoint \`files_owned\` for parallel \`share\` worktrees + 100% 1-to-1 \`fulfills\` coverage), right-sizing to 1–2 workers for small/single-module tasks or disjoint parallel \`share\` authors + independent \`validator\` spawned on demand once workers commit/post \`[done]\`; (4) Adversarial Contract Review & Living Dynamic Workflow — finalize via \`${PROPOSE_SWARM_PLAN_TOOL}\` (which runs an automated **Adversarial Contract Review** for missing edge-case assertions, file-ownership collisions, and speculative commands) with \`title\`, \`objective\`, \`strategy\` specifying **wave-by-wave execution with disjoint file/directory ownership boundaries** (zero same-file collisions; not a rigid pre-locked file-level DAG — \`features\`, \`assertions\`, \`milestones\`, and workers remain dynamically extensible mid-mission via \`swarm{action:"mission"}\`, \`swarm{action:"mission", mission_op:"dispatch_ready"}\` auto-dispatching ready parallel features into fresh \`share\` worktrees, and \`swarm{action:"add"}\`), \`acceptance_criteria\` listing **exact runnable verification commands** using **already-installed** repo scripts, \`commands\`, \`services\`, \`boundaries\`, **MANDATORY** \`assertions\` & \`features\`, and optional valid \`initial_members\` populated with **wave-1 workers only** by default (concise briefs; only include a \`validator\` initially when reviewing already-existing code); (5) Do not repeat the full plan in prose before calling \`${PROPOSE_SWARM_PLAN_TOOL}\`.`,
   ];
 
   if (draft.seed.trim()) {
@@ -321,15 +321,15 @@ export function buildDirectPlanPrompt(
     "<instructions>",
     "Fast-path `pi-swarm` launch (`/swarm direct`) as the **Orchestrator** (`autoConfirm: true`):",
     `1. Skip interactive Q&A — do NOT call \`${SWARM_QUESTION_TOOL}\` or \`${SWARM_QUESTIONNAIRE_TOOL}\`, while still echoing every goal requirement faithfully.`,
-    "2. Operational Recon FIRST — run fast targeted read-only recon (`ls`, `find`, `grep`, `read` key entrypoints/`package.json`/configs) FIRST to discover exact **already-installed** `commands` (`test`, `typecheck`, `build`, `lint`) and `boundaries` (ports, off-limits dirs) — never invent speculative `npx -y` downloads and do NOT edit or implement code directly.",
-    "3. Mission-Level TDD & Right-Sizing — define testable `VAL-<AREA>-<NNN>` behavioral `assertions` with required evidence FIRST, then decompose ordered vertical `milestones` and `features` (acyclic `depends_on` + disjoint `files_owned` so independent features in the same milestone run in parallel `share` worktrees, with 100% 1-to-1 `fulfills` coverage). Right-size the swarm (1–2 workers for small/single-module tasks; disjoint parallel `share` authors + independent `validator` spawned on demand once workers commit/post `[done]` for multi-module work).",
-    `4. Immediately call \`${PROPOSE_SWARM_PLAN_TOOL}\` with a Contract-First **Flexible Dynamic Swarm Plan** (not a rigid pre-locked file-level DAG — \`features\`, \`assertions\`, \`milestones\`, and workers remain **dynamically extensible mid-mission** via \`swarm{action:"mission"}\` and \`swarm{action:"add"}\`):`,
+    "2. Operational Recon FIRST — run fast targeted read-only recon (`ls`, `find`, `grep`, `read` key entrypoints/`package.json`/configs) FIRST to discover exact **already-installed** `commands` (`test`, `typecheck`, `build`, `lint`, plus optional `\"init\"` setup command if isolated worktrees need setup beyond `node_modules`/`.venv` auto-symlinks), `services` (explicit unique ports in `start`/`stop`/`healthcheck` + `port` and acyclic `depends_on`), and `boundaries` (ports, off-limits dirs) — never invent speculative `npx -y` downloads and do NOT edit or implement code directly.",
+    "3. Mission-Level TDD (**MANDATORY** `assertions` & `features`) & Right-Sizing — `assertions` (`VAL-<AREA>-<NNN>`, `minItems: 1`) and `features` (`fulfills`, `minItems: 1`) are **MANDATORY** in `propose_swarm_plan`: define testable `VAL-<AREA>-<NNN>` behavioral `assertions` with required evidence FIRST, then decompose ordered vertical `milestones` and `features` (acyclic `depends_on` + disjoint `files_owned` so independent features in the same milestone run in parallel `share` worktrees and can be auto-dispatched via `swarm{action:\"mission\", mission_op:\"dispatch_ready\"}`, with 100% 1-to-1 `fulfills` coverage). Right-size the swarm (1–2 workers for small/single-module tasks; disjoint parallel `share` authors + independent `validator` spawned on demand once workers commit/post `[done]` for multi-module work).",
+    `4. Immediately call \`${PROPOSE_SWARM_PLAN_TOOL}\` with a Contract-First **Flexible Dynamic Swarm Plan** (not a rigid pre-locked file-level DAG — \`features\`, \`assertions\`, \`milestones\`, and workers remain **dynamically extensible mid-mission** via \`swarm{action:"mission"}\`, \`swarm{action:"mission", mission_op:"dispatch_ready"}\`, and \`swarm{action:"add"}\`):`,
     baseBranchRule,
     "   - `strategy`: **wave-by-wave execution with disjoint file/directory ownership boundaries** (zero two-worker collisions on the same file) plus board review/merge gates.",
     "   - `acceptance_criteria`: **exact runnable verification commands** using **already-installed** repo scripts discovered during recon (`npm test`, `npm run typecheck`, `node --test`, build checks — explicitly avoid speculative `npx -y` network package downloads) plus behavioral invariants.",
-    "   - `commands`, `boundaries`, `assertions` (`VAL-*`), and `features` (with `milestone`, `depends_on`, `files_owned`, and 100% `fulfills` coverage).",
+    "   - `commands` (including optional `\"init\"`), `services` (unique `port`, `start`/`stop`/`healthcheck`, `depends_on`), `boundaries`, and **MANDATORY** `assertions` (`VAL-*`) and `features` (with `milestone`, `depends_on`, `files_owned`, and 100% `fulfills` coverage).",
     `   - Provide \`title\`, \`objective\`, and optional right-sized \`initial_members\` with **wave-1 workers only** by default (spawn \`validator\` on demand once a worker commits/posts \`[done]\`; only include a \`validator\` initially when reviewing already-existing code). Keep each \`brief\` concise with exclusive file ownership and already-installed repo verification scripts; use unique lowercase names matching \`${MEMBER_NAME_PATTERN.source}\`, avoiding ${RESERVED_MEMBER_NAMES.join(", ")}.`,
-    `5. Because this draft runs with \`autoConfirm: true\`, calling \`${PROPOSE_SWARM_PLAN_TOOL}\` validates and launches the Dynamic Swarm immediately without a confirmation modal. Do NOT dump the full plan in prose beforehand.`,
+    `5. Because this draft runs with \`autoConfirm: true\`, calling \`${PROPOSE_SWARM_PLAN_TOOL}\` runs pre-launch validation + automated **Adversarial Contract Review** (checking for missing edge-case assertions, file-ownership collisions, and speculative commands) and launches the Dynamic Swarm immediately without a confirmation modal once approved. Do NOT dump the full plan in prose beforehand.`,
     "</instructions>",
     "</swarm_direct_plan>",
   ];
@@ -443,8 +443,9 @@ export function formatProposalTranscriptSummary(plan: ProposedSwarmPlan): string
   );
 
   const commands = plan.commands ?? [];
+  const services = plan.services ?? [];
   const boundaries = plan.boundaries ?? [];
-  if (commands.length > 0 || boundaries.length > 0) {
+  if (commands.length > 0 || services.length > 0 || boundaries.length > 0) {
     lines.push("", "### Commands & Boundaries");
     if (commands.length > 0) {
       lines.push("", "**Commands:**");
@@ -452,6 +453,28 @@ export function formatProposalTranscriptSummary(plan: ProposedSwarmPlan): string
         const name = formatInlineBacktick(cmd.name || "cmd");
         const command = formatInlineBacktick(cmd.command || "");
         lines.push(`- \`${name}\`: \`${command}\``);
+      }
+    }
+    if (services.length > 0) {
+      lines.push("", "**Services & Ports:**");
+      for (const svc of services) {
+        const svcName = escapeTableCell(svc.name || "service");
+        const portPart = svc.port !== undefined ? ` (\`:${svc.port}\`)` : "";
+        const details: string[] = [
+          `start: \`${formatInlineBacktick(svc.start || "")}\``,
+        ];
+        if (svc.stop) {
+          details.push(`stop: \`${formatInlineBacktick(svc.stop)}\``);
+        }
+        if (svc.healthcheck) {
+          details.push(`healthcheck: \`${formatInlineBacktick(svc.healthcheck)}\``);
+        }
+        if (svc.dependsOn && svc.dependsOn.length > 0) {
+          details.push(
+            `dependsOn: ${svc.dependsOn.map((d) => `\`${formatInlineBacktick(d)}\``).join(", ")}`,
+          );
+        }
+        lines.push(`- **${svcName}**${portPart} — ${details.join(" | ")}`);
       }
     }
     if (boundaries.length > 0) {
