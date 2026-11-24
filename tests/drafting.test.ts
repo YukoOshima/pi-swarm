@@ -5271,6 +5271,193 @@ describe("drafting-contract-hardening: VAL-CONTRACT-001, VAL-CONTRACT-002, VAL-D
     assert.equal(confirmCalls, 0);
     assert.equal((execRes.details as ProposeSwarmPlanToolDetails).errorCode, "INVALID_INPUT");
     assert.match(execRes.content[0].text, /Overlapping files_owned/i);
+
+    // 5. Tweak-mode effective merged ownership/deps/status validation:
+    const tweakBaseRun: SwarmRunState = {
+      ...createMockRun({
+        title: "Tweak Overlap Base",
+        objective: "Test effective merged validation",
+        strategy: "Wave 1",
+        acceptanceCriteria: "npm test",
+        baseBranch: "main",
+        maxConcurrency: 4,
+        validatorEnabled: true,
+      }),
+      assertions: [
+        { id: "VAL-TW-1", title: "A", description: "A", status: "pending", updatedAt: "2026-11-24T10:00:00.000Z" },
+        { id: "VAL-TW-2", title: "B", description: "B", status: "pending", updatedAt: "2026-11-24T10:00:00.000Z" },
+      ],
+      features: [
+        {
+          id: "feat-a",
+          title: "A",
+          description: "A",
+          milestone: "M1",
+          filesOwned: ["src/shared.ts"],
+          fulfills: ["VAL-TW-1"],
+          status: "in_progress",
+          updatedAt: "2026-11-24T10:00:00.000Z",
+        },
+        {
+          id: "feat-b",
+          title: "B",
+          description: "B",
+          milestone: "M1",
+          filesOwned: ["src/other.ts"],
+          fulfills: ["VAL-TW-2"],
+          status: "pending",
+          updatedAt: "2026-11-24T10:00:00.000Z",
+        },
+      ],
+    };
+
+    // 5a. Existing in_progress feat-a owns src/shared.ts; tweak omits files_owned on feat-a + gives src/shared.ts to feat-b -> REJECTED!
+    const inheritedOverlap = validateProposedSwarmPlan(
+      {
+        ...makeSamplePlanParams(),
+        assertions: [
+          { id: "VAL-TW-1", title: "A", description: "A" },
+          { id: "VAL-TW-2", title: "B", description: "B" },
+        ],
+        features: [
+          {
+            id: "feat-a",
+            title: "A",
+            description: "A",
+            milestone: "M1",
+            fulfills: ["VAL-TW-1"],
+          },
+          {
+            id: "feat-b",
+            title: "B",
+            description: "B",
+            milestone: "M1",
+            files_owned: ["src/shared.ts"],
+            fulfills: ["VAL-TW-2"],
+          },
+        ],
+      },
+      { mode: "tweak", existingRun: tweakBaseRun },
+    );
+    assert.equal(inheritedOverlap.valid, false);
+    if (!inheritedOverlap.valid) {
+      assert.match(inheritedOverlap.issues[0]?.message ?? "", /Overlapping files_owned/i);
+    }
+
+    // 5b. Existing feat-a dependsOn feat-b; tweak gives both src/shared.ts while omitting depends_on on feat-a -> ACCEPTED (inherits dependsOn)!
+    const runWithDep: SwarmRunState = {
+      ...tweakBaseRun,
+      features: [
+        { ...tweakBaseRun.features![0]!, dependsOn: ["feat-b"], status: "pending" },
+        tweakBaseRun.features![1]!,
+      ],
+    };
+    const inheritedOrder = validateProposedSwarmPlan(
+      {
+        ...makeSamplePlanParams(),
+        assertions: [
+          { id: "VAL-TW-1", title: "A", description: "A" },
+          { id: "VAL-TW-2", title: "B", description: "B" },
+        ],
+        features: [
+          {
+            id: "feat-a",
+            title: "A",
+            description: "A",
+            milestone: "M1",
+            files_owned: ["src/shared.ts"],
+            fulfills: ["VAL-TW-1"],
+          },
+          {
+            id: "feat-b",
+            title: "B",
+            description: "B",
+            milestone: "M1",
+            files_owned: ["src/shared.ts"],
+            fulfills: ["VAL-TW-2"],
+          },
+        ],
+      },
+      { mode: "tweak", existingRun: runWithDep },
+    );
+    assert.equal(
+      inheritedOrder.valid,
+      true,
+      `Inherited dependsOn must prevent false overlap rejection: ${inheritedOrder.valid ? "" : JSON.stringify(inheritedOrder.issues)}`,
+    );
+
+    // 5c. Existing feat-a dependsOn feat-b; tweak omits feat-a.depends_on and adds feat-b.depends_on: ["feat-a"] -> REJECTED (inherited cycle)!
+    const inheritedCycle = validateProposedSwarmPlan(
+      {
+        ...makeSamplePlanParams(),
+        assertions: [
+          { id: "VAL-TW-1", title: "A", description: "A" },
+          { id: "VAL-TW-2", title: "B", description: "B" },
+        ],
+        features: [
+          {
+            id: "feat-a",
+            title: "A",
+            description: "A",
+            milestone: "M1",
+            fulfills: ["VAL-TW-1"],
+          },
+          {
+            id: "feat-b",
+            title: "B",
+            description: "B",
+            milestone: "M1",
+            depends_on: ["feat-a"],
+            fulfills: ["VAL-TW-2"],
+          },
+        ],
+      },
+      { mode: "tweak", existingRun: runWithDep },
+    );
+    assert.equal(inheritedCycle.valid, false);
+    if (!inheritedCycle.valid) {
+      assert.match(inheritedCycle.issues[0]?.message ?? "", /Dependency cycle/i);
+    }
+
+    // 5d. Existing cancelled feat-a owns src/shared.ts; tweak requeues feat-a (now live "pending") alongside feat-b owning src/shared.ts -> REJECTED!
+    const runWithCancelled: SwarmRunState = {
+      ...tweakBaseRun,
+      features: [
+        { ...tweakBaseRun.features![0]!, status: "cancelled" },
+        tweakBaseRun.features![1]!,
+      ],
+    };
+    const requeuedOverlap = validateProposedSwarmPlan(
+      {
+        ...makeSamplePlanParams(),
+        assertions: [
+          { id: "VAL-TW-1", title: "A", description: "A" },
+          { id: "VAL-TW-2", title: "B", description: "B" },
+        ],
+        features: [
+          {
+            id: "feat-a",
+            title: "A",
+            description: "A",
+            milestone: "M1",
+            fulfills: ["VAL-TW-1"],
+          },
+          {
+            id: "feat-b",
+            title: "B",
+            description: "B",
+            milestone: "M1",
+            files_owned: ["src/shared.ts"],
+            fulfills: ["VAL-TW-2"],
+          },
+        ],
+      },
+      { mode: "tweak", existingRun: runWithCancelled },
+    );
+    assert.equal(requeuedOverlap.valid, false);
+    if (!requeuedOverlap.valid) {
+      assert.match(requeuedOverlap.issues[0]?.message ?? "", /Overlapping files_owned/i);
+    }
   });
 
   it("VAL-CONTRACT-002: mergeTweakedMissionContract preserves passed/completed/override/in-progress state, resets modified assertions & unseals affected milestones, merges commands/services/boundaries, blocks sealed-milestone intrusion, and is idempotent", () => {

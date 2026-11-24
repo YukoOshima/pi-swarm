@@ -707,6 +707,40 @@ function mergeFeaturePreservingUntouched(
   return merged;
 }
 
+function mergeIncomingFeatureWithPrior(
+  prev: MissionFeature | undefined,
+  inc: MissionFeature,
+  effectiveNow: string,
+): MissionFeature {
+  if (prev?.status === "completed") {
+    return mergeFeaturePreservingUntouched(prev, inc, {
+      status: "completed",
+      assignedMember: prev.assignedMember ?? inc.assignedMember,
+      mergedCommitSha: prev.mergedCommitSha ?? inc.mergedCommitSha,
+      updatedAt: prev.updatedAt || inc.updatedAt || effectiveNow,
+    });
+  }
+  if (
+    prev?.status === "in_progress" &&
+    (!inc.status || inc.status === "pending")
+  ) {
+    return mergeFeaturePreservingUntouched(prev, inc, {
+      status: "in_progress",
+      assignedMember: inc.assignedMember ?? prev.assignedMember,
+      mergedCommitSha: inc.mergedCommitSha ?? prev.mergedCommitSha,
+      updatedAt: prev.updatedAt || inc.updatedAt || effectiveNow,
+    });
+  }
+  // Allow failed/cancelled work to be requeued to "pending" on tweak (matches legacy index helper)
+  const nextStatus = inc.status ?? prev?.status ?? "pending";
+  return mergeFeaturePreservingUntouched(prev, inc, {
+    status: nextStatus,
+    assignedMember: inc.assignedMember ?? prev?.assignedMember,
+    mergedCommitSha: inc.mergedCommitSha ?? prev?.mergedCommitSha,
+    updatedAt: inc.updatedAt || effectiveNow,
+  });
+}
+
 function mergeTweakedMilestones(
   explicitMilestones: readonly SwarmMilestone[] | undefined,
   features: readonly MissionFeature[] | undefined,
@@ -960,39 +994,7 @@ export function mergeTweakedMissionContract(
     const nextFeatures: MissionFeature[] = [];
     for (const inc of incoming.features) {
       const prev = existingFeatureById.get(inc.id);
-      if (prev?.status === "completed") {
-        nextFeatures.push(
-          mergeFeaturePreservingUntouched(prev, inc, {
-            status: "completed",
-            assignedMember: prev.assignedMember ?? inc.assignedMember,
-            mergedCommitSha: prev.mergedCommitSha ?? inc.mergedCommitSha,
-            updatedAt: prev.updatedAt || inc.updatedAt || effectiveNow,
-          }),
-        );
-      } else if (
-        prev?.status === "in_progress" &&
-        (!inc.status || inc.status === "pending")
-      ) {
-        nextFeatures.push(
-          mergeFeaturePreservingUntouched(prev, inc, {
-            status: "in_progress",
-            assignedMember: inc.assignedMember ?? prev.assignedMember,
-            mergedCommitSha: inc.mergedCommitSha ?? prev.mergedCommitSha,
-            updatedAt: prev.updatedAt || inc.updatedAt || effectiveNow,
-          }),
-        );
-      } else {
-        // Allow failed/cancelled work to be requeued to "pending" on tweak (matches legacy index helper)
-        const nextStatus = inc.status ?? prev?.status ?? "pending";
-        nextFeatures.push(
-          mergeFeaturePreservingUntouched(prev, inc, {
-            status: nextStatus,
-            assignedMember: inc.assignedMember ?? prev?.assignedMember,
-            mergedCommitSha: inc.mergedCommitSha ?? prev?.mergedCommitSha,
-            updatedAt: inc.updatedAt || effectiveNow,
-          }),
-        );
-      }
+      nextFeatures.push(mergeIncomingFeatureWithPrior(prev, inc, effectiveNow));
     }
 
     mergedFeatures = [...carriedCompletedFeatures, ...nextFeatures];
@@ -1285,9 +1287,8 @@ function ownedPathEntriesCollide(
 function collectFeatureFileOverlapIssues(
   features: readonly Pick<
     MissionFeature,
-    "id" | "milestone" | "dependsOn" | "filesOwned"
+    "id" | "milestone" | "dependsOn" | "filesOwned" | "status"
   >[],
-  existingFeatureMap?: ReadonlyMap<string, MissionFeature>,
 ): DraftPlanValidationIssue[] {
   const issues: DraftPlanValidationIssue[] = [];
   if (features.length < 2) {
@@ -1295,11 +1296,6 @@ function collectFeatureFileOverlapIssues(
   }
 
   const depsById = new Map<string, readonly string[]>();
-  if (existingFeatureMap) {
-    for (const [id, feat] of existingFeatureMap.entries()) {
-      depsById.set(id, feat.dependsOn ?? []);
-    }
-  }
   for (const feat of features) {
     depsById.set(feat.id, feat.dependsOn ?? []);
   }
@@ -1327,11 +1323,11 @@ function collectFeatureFileOverlapIssues(
     return visited;
   };
 
+  // Skip only features whose EFFECTIVE status is terminal (completed/cancelled)
   const parsedByFeature = features.map((feat) => {
-    const prev = existingFeatureMap?.get(feat.id);
-    const isFinished =
-      prev?.status === "completed" || prev?.status === "cancelled";
-    const parsedPaths = isFinished
+    const isTerminal =
+      feat.status === "completed" || feat.status === "cancelled";
+    const parsedPaths = isTerminal
       ? []
       : (feat.filesOwned ?? [])
           .map(normalizeOwnedPath)
@@ -2510,9 +2506,21 @@ export function validateProposedSwarmPlan(
   }
 
   // Validate depends_on existence, acyclic DAG, and local static files_owned overlaps
+  // against EFFECTIVE merged ownership, dependencies, and status (so tweak inheritance of
+  // omitted filesOwned/dependsOn and cancelled->pending requeues are validated accurately).
   if (incomingFeatures.length > 0) {
+    const effectiveIncomingFeatures: MissionFeature[] = existingRun
+      ? incomingFeatures.map((inc) =>
+          mergeIncomingFeatureWithPrior(
+            existingFeatureMap.get(inc.id),
+            inc,
+            nowIso,
+          ),
+        )
+      : incomingFeatures;
+
     const dagErrors = collectFeatureDagErrors(
-      incomingFeatures,
+      effectiveIncomingFeatures,
       carriedCompletedIds.size > 0 ? carriedCompletedIds : undefined,
     );
     for (const err of dagErrors) {
@@ -2523,10 +2531,16 @@ export function validateProposedSwarmPlan(
       });
     }
 
-    const overlapIssues = collectFeatureFileOverlapIssues(
-      incomingFeatures,
-      existingRun ? existingFeatureMap : undefined,
-    );
+    const effectiveAllFeatures: MissionFeature[] = existingRun
+      ? [
+          ...Array.from(carriedCompletedIds)
+            .map((id) => existingFeatureMap.get(id))
+            .filter((f): f is MissionFeature => Boolean(f)),
+          ...effectiveIncomingFeatures,
+        ]
+      : effectiveIncomingFeatures;
+
+    const overlapIssues = collectFeatureFileOverlapIssues(effectiveAllFeatures);
     for (const overlapIssue of overlapIssues) {
       issues.push(overlapIssue);
     }
