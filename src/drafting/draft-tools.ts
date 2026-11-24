@@ -23,6 +23,7 @@ import {
   SwarmProtocolError,
   isSwarmProtocolError,
   type ConfirmProposalOptions,
+  type ContractReviewResult,
   type InitialMemberProposal,
   type IQuestionnaireUI,
   type ISwarmStore,
@@ -30,6 +31,7 @@ import {
   type MissionAssertion,
   type MissionCommandEntry,
   type MissionFeature,
+  type MissionServiceEntry,
   type ProposalDialogOutcome,
   type ProposedSwarmPlan,
   type QuestionAnswer,
@@ -72,6 +74,12 @@ export interface DraftingDeps {
     ctx: ExtensionContext,
     plan: ProposedSwarmPlan,
   ) => Partial<ConfirmProposalOptions>;
+  /** Optional pre-modal adversarial contract reviewer (at most 1 automatic blocking bounce per draft). */
+  reviewProposedContract?: (
+    plan: ProposedSwarmPlan,
+    ctx: ExtensionContext,
+    signal?: AbortSignal,
+  ) => Promise<ContractReviewResult | undefined>;
 }
 
 export interface DraftPlanValidationIssue {
@@ -98,11 +106,20 @@ export interface SwarmQuestionnaireToolDetails {
 }
 
 export interface ProposeSwarmPlanToolDetails {
-  outcome: "confirmed" | "continue" | "cancelled" | "validation_error" | "error";
+  outcome:
+    | "confirmed"
+    | "continue"
+    | "cancelled"
+    | "contract_review_changes_requested"
+    | "validation_error"
+    | "error";
+  status?: "contract_review_changes_requested";
   runId?: string;
   plan?: ProposedSwarmPlan;
   autoConfirmed?: boolean;
   feedback?: string;
+  contractReview?: ContractReviewResult;
+  reviewPass?: number;
   errors?: DraftPlanValidationIssue[];
   errorCode?: SwarmErrorCode | string;
   errorMessage?: string;
@@ -289,12 +306,48 @@ export const MissionFeatureProposalSchema = Type.Object({
 export const MissionCommandProposalSchema = Type.Object({
   name: Type.String({
     description:
-      'Canonical command slot name (e.g. "test", "typecheck", "build", "lint").',
+      'Canonical command slot name (e.g. "test", "typecheck", "build", "lint", or optional "init" setup command for isolated worktrees).',
   }),
   command: Type.String({
     description:
       "Exact runnable command discovered from package.json/repo config using already-installed tools (avoid speculative npx -y downloads).",
   }),
+});
+
+export const MissionServiceProposalSchema = Type.Object({
+  name: Type.String({
+    description:
+      'Unique service identifier (e.g. "api", "web", "worker-queue").',
+  }),
+  start: Type.String({
+    description:
+      "Exact runnable start command with explicit port flag/env using already-installed repo tools (avoid speculative npx -y downloads).",
+  }),
+  stop: Type.Optional(
+    Type.String({
+      description: "Optional command to cleanly stop this service.",
+    }),
+  ),
+  healthcheck: Type.Optional(
+    Type.String({
+      description:
+        "Optional healthcheck command or URL probe verifying service readiness on its assigned port.",
+    }),
+  ),
+  port: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      maximum: 65535,
+      description:
+        "Optional explicit TCP port (1–65535) reserved exclusively by this service (must be unique across all services).",
+    }),
+  ),
+  depends_on: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        "Optional upstream service names that must start before this service (must form an acyclic DAG).",
+    }),
+  ),
 });
 
 export const ProposeSwarmPlanParamsSchema = Type.Object({
@@ -337,22 +390,26 @@ export const ProposeSwarmPlanParamsSchema = Type.Object({
         "Optional wave-1 workers only by default (1–2 workers for small/single-module tasks; disjoint parallel 'share' workers for multi-module work). Spawn an independent 'validator' on demand once a worker commits/posts '[done]' (only include a validator initially when reviewing already-existing code). Keep briefs concise and grounded in already-installed repo verification scripts (no speculative 'npx -y' downloads). Leave omitted/empty to spawn dynamically after launch.",
     }),
   ),
-  assertions: Type.Optional(
-    Type.Array(MissionAssertionProposalSchema, {
-      description:
-        "Optional contract-first validation assertions (e.g. VAL-AUTH-001) defining concrete testable behaviors and required evidence. When provided, features must claim 100% of assertions via fulfills.",
-    }),
-  ),
-  features: Type.Optional(
-    Type.Array(MissionFeatureProposalSchema, {
-      description:
-        "Optional ordered vertical features grouped by milestone with acyclic depends_on, disjoint files_owned for parallel share worktrees, and 1-to-1 fulfills coverage of assertions.",
-    }),
-  ),
+  assertions: Type.Array(MissionAssertionProposalSchema, {
+    minItems: 1,
+    description:
+      "Mandatory contract-first validation assertions (e.g. VAL-AUTH-001) defining concrete testable behaviors and required evidence (minItems: 1). Features must claim 100% of assertions via fulfills.",
+  }),
+  features: Type.Array(MissionFeatureProposalSchema, {
+    minItems: 1,
+    description:
+      "Mandatory ordered vertical features grouped by milestone with acyclic depends_on, disjoint files_owned for parallel share worktrees, and 1-to-1 fulfills coverage of assertions (minItems: 1).",
+  }),
   commands: Type.Optional(
     Type.Array(MissionCommandProposalSchema, {
       description:
-        "Optional canonical command manifest (test, typecheck, build, lint) discovered from package.json and repo configs.",
+        'Optional canonical command manifest ("test", "typecheck", "build", "lint", plus optional idempotent "init" worktree setup command) discovered from package.json and repo configs.',
+    }),
+  ),
+  services: Type.Optional(
+    Type.Array(MissionServiceProposalSchema, {
+      description:
+        "Optional service manifest defining local background/dev services with explicit unique ports, start/stop/healthcheck commands, and acyclic depends_on ordering.",
     }),
   ),
   boundaries: Type.Optional(
@@ -369,7 +426,15 @@ export type InitialMemberProposalParams = Static<typeof InitialMemberProposalSch
 export type MissionAssertionProposalParams = Static<typeof MissionAssertionProposalSchema>;
 export type MissionFeatureProposalParams = Static<typeof MissionFeatureProposalSchema>;
 export type MissionCommandProposalParams = Static<typeof MissionCommandProposalSchema>;
+export type MissionServiceProposalParams = Static<typeof MissionServiceProposalSchema>;
 export type ProposeSwarmPlanParams = Static<typeof ProposeSwarmPlanParamsSchema>;
+export type ProposeSwarmPlanInput = Omit<
+  ProposeSwarmPlanParams,
+  "assertions" | "features"
+> & {
+  assertions?: ProposeSwarmPlanParams["assertions"];
+  features?: ProposeSwarmPlanParams["features"];
+};
 
 // ============================================================================
 // Normalization, Role Models & Pre-Modal Validation Helpers
@@ -680,6 +745,148 @@ export function assertFeatureDependencyDag(
   }
 }
 
+function collectServiceDagErrors(
+  services: readonly Pick<MissionServiceEntry, "name" | "dependsOn">[],
+): SwarmProtocolError[] {
+  const errors: SwarmProtocolError[] = [];
+  const serviceByName = new Map<
+    string,
+    Pick<MissionServiceEntry, "name" | "dependsOn">
+  >();
+  for (const svc of services) {
+    serviceByName.set(svc.name, svc);
+  }
+
+  for (const svc of services) {
+    for (const depName of svc.dependsOn ?? []) {
+      if (depName === svc.name) {
+        errors.push(
+          new SwarmProtocolError(
+            "INVALID_INPUT",
+            `Service "${svc.name}" cannot depend on itself (self-cycle in depends_on: ${svc.name} -> ${svc.name}).`,
+            { serviceName: svc.name, dependsOn: depName },
+          ),
+        );
+      } else if (!serviceByName.has(depName)) {
+        errors.push(
+          new SwarmProtocolError(
+            "INVALID_INPUT",
+            `Service "${svc.name}" depends_on unknown service "${depName}".`,
+            { serviceName: svc.name, dependsOn: depName },
+          ),
+        );
+      }
+    }
+  }
+
+  // 3-color DFS (0 = unvisited, 1 = visiting, 2 = visited) for service cycle detection
+  const visitState = new Map<string, 0 | 1 | 2>();
+  const pathStack: string[] = [];
+  const reportedCycles = new Set<string>();
+
+  const dfs = (nodeName: string): void => {
+    visitState.set(nodeName, 1);
+    pathStack.push(nodeName);
+
+    const node = serviceByName.get(nodeName);
+    for (const depName of node?.dependsOn ?? []) {
+      if (depName === nodeName || !serviceByName.has(depName)) {
+        continue;
+      }
+      const depState = visitState.get(depName) ?? 0;
+      if (depState === 1) {
+        const cycleStart = pathStack.indexOf(depName);
+        const cycleSlice =
+          cycleStart >= 0
+            ? [...pathStack.slice(cycleStart), depName]
+            : [nodeName, depName];
+        const cycleKey = cycleSlice.join("->");
+        if (!reportedCycles.has(cycleKey)) {
+          reportedCycles.add(cycleKey);
+          errors.push(
+            new SwarmProtocolError(
+              "INVALID_INPUT",
+              `Dependency cycle detected in services.depends_on: ${cycleSlice.join(" -> ")}. Services must form an acyclic DAG.`,
+              { cycle: cycleSlice },
+            ),
+          );
+        }
+      } else if (depState === 0) {
+        dfs(depName);
+      }
+    }
+
+    pathStack.pop();
+    visitState.set(nodeName, 2);
+  };
+
+  for (const svc of services) {
+    if ((visitState.get(svc.name) ?? 0) === 0) {
+      dfs(svc.name);
+    }
+  }
+
+  return errors;
+}
+
+/**
+ * Validates that `services` have unique ports and form a valid acyclic `dependsOn` DAG,
+ * throwing `SwarmProtocolError("INVALID_INPUT", ...)` on duplicate ports, unknown references,
+ * or dependency cycles.
+ */
+export function assertServiceManifest(
+  services: readonly Pick<MissionServiceEntry, "name" | "port" | "dependsOn">[],
+): void {
+  const seenNames = new Set<string>();
+  const seenPorts = new Map<number, string>();
+  for (const svc of services) {
+    const cleanName = typeof svc.name === "string" ? svc.name.trim() : "";
+    if (!cleanName || isPrototypeKey(cleanName)) {
+      throw new SwarmProtocolError(
+        "INVALID_INPUT",
+        "Every service entry must have a valid non-empty name.",
+      );
+    }
+    if (seenNames.has(cleanName)) {
+      throw new SwarmProtocolError(
+        "INVALID_INPUT",
+        `Duplicate service name "${cleanName}" — every service must have a unique name.`,
+        { serviceName: cleanName },
+      );
+    }
+    seenNames.add(cleanName);
+
+    if (svc.port !== undefined) {
+      if (
+        typeof svc.port !== "number" ||
+        !Number.isInteger(svc.port) ||
+        svc.port < 1 ||
+        svc.port > 65535
+      ) {
+        throw new SwarmProtocolError(
+          "INVALID_INPUT",
+          `Service "${cleanName}" port must be an integer between 1 and 65535.`,
+          { serviceName: cleanName, port: svc.port },
+        );
+      }
+      const prevOwner = seenPorts.get(svc.port);
+      if (prevOwner) {
+        throw new SwarmProtocolError(
+          "INVALID_INPUT",
+          `Duplicate service port ${svc.port} across services "${prevOwner}" and "${cleanName}" — each service must use a unique port.`,
+          { port: svc.port, services: [prevOwner, cleanName] },
+        );
+      }
+      seenPorts.set(svc.port, cleanName);
+    }
+  }
+
+  const dagErrors = collectServiceDagErrors(services);
+  if (dagErrors.length > 0) {
+    throw dagErrors[0]!;
+  }
+}
+
 function normalizeValidatedStringList(
   raw: unknown,
   field: string,
@@ -749,7 +956,7 @@ function normalizeValidatedStringList(
  * existing progress + sealed milestone protection during `/swarm tweak`.
  */
 export function validateProposedSwarmPlan(
-  params: ProposeSwarmPlanParams,
+  params: ProposeSwarmPlanInput,
   options?: ValidateProposedSwarmPlanOptions,
 ):
   | {
@@ -763,6 +970,7 @@ export function validateProposedSwarmPlan(
       features?: MissionFeature[];
       milestones?: SwarmMilestone[];
       commands?: MissionCommandEntry[];
+      services?: MissionServiceEntry[];
       boundaries?: string[];
     }
   | {
@@ -1013,6 +1221,204 @@ export function validateProposedSwarmPlan(
     normalizedCommands = existingRun.commands.map((c) => ({ ...c }));
   }
 
+  // --------------------------------------------------------------------------
+  // Services & Ports Validation + Tweak Merge
+  // --------------------------------------------------------------------------
+  let normalizedServices: MissionServiceEntry[] | undefined;
+  if (params.services !== undefined) {
+    if (!Array.isArray(params.services)) {
+      issues.push({
+        code: "INVALID_INPUT",
+        field: "services",
+        message:
+          "Plan services must be an array of { name, start, stop?, healthcheck?, port?, depends_on? } objects.",
+      });
+    } else {
+      const incomingServices: MissionServiceEntry[] = [];
+      const seenServiceNames = new Set<string>();
+      const seenServicePorts = new Map<number, string>();
+
+      for (let i = 0; i < params.services.length; i++) {
+        const rawSvc = params.services[i];
+        if (!rawSvc || typeof rawSvc !== "object" || Array.isArray(rawSvc)) {
+          issues.push({
+            code: "INVALID_INPUT",
+            field: "services",
+            message: `Service entry #${i + 1} must be an object with non-empty name and start command.`,
+          });
+          continue;
+        }
+        const svcName =
+          typeof rawSvc.name === "string" ? rawSvc.name.trim() : "";
+        const svcTag = svcName || `#${i + 1}`;
+        let nameOk = false;
+        if (!svcName) {
+          issues.push({
+            code: "INVALID_INPUT",
+            field: "services",
+            message: `Service entry #${i + 1} must have a non-empty name.`,
+          });
+        } else if (isPrototypeKey(svcName)) {
+          issues.push({
+            code: "INVALID_INPUT",
+            field: "services",
+            message: `Service name "${svcName}" is forbidden (prototype key).`,
+          });
+        } else if (seenServiceNames.has(svcName)) {
+          issues.push({
+            code: "INVALID_INPUT",
+            field: "services",
+            message: `Duplicate service name "${svcName}" — every service must have a unique name.`,
+          });
+        } else {
+          seenServiceNames.add(svcName);
+          nameOk = true;
+        }
+
+        const svcStart =
+          typeof rawSvc.start === "string" ? rawSvc.start.trim() : "";
+        if (!svcStart) {
+          issues.push({
+            code: "INVALID_INPUT",
+            field: "services",
+            message: `Service "${svcTag}" must have a non-empty start command.`,
+          });
+        }
+
+        let svcStop: string | undefined;
+        if (rawSvc.stop !== undefined) {
+          if (typeof rawSvc.stop !== "string") {
+            issues.push({
+              code: "INVALID_INPUT",
+              field: "services",
+              message: `Service "${svcTag}" stop command must be a string.`,
+            });
+          } else if (rawSvc.stop.trim()) {
+            svcStop = rawSvc.stop.trim();
+          }
+        }
+
+        let svcHealthcheck: string | undefined;
+        if (rawSvc.healthcheck !== undefined) {
+          if (typeof rawSvc.healthcheck !== "string") {
+            issues.push({
+              code: "INVALID_INPUT",
+              field: "services",
+              message: `Service "${svcTag}" healthcheck must be a string.`,
+            });
+          } else if (rawSvc.healthcheck.trim()) {
+            svcHealthcheck = rawSvc.healthcheck.trim();
+          }
+        }
+
+        let svcPort: number | undefined;
+        if (rawSvc.port !== undefined) {
+          if (
+            typeof rawSvc.port !== "number" ||
+            !Number.isInteger(rawSvc.port) ||
+            rawSvc.port < 1 ||
+            rawSvc.port > 65535
+          ) {
+            issues.push({
+              code: "INVALID_INPUT",
+              field: "services",
+              message: `Service "${svcTag}" port must be an integer between 1 and 65535.`,
+            });
+          } else {
+            const prevPortOwner = seenServicePorts.get(rawSvc.port);
+            if (prevPortOwner) {
+              const dupPortErr = new SwarmProtocolError(
+                "INVALID_INPUT",
+                `Duplicate service port ${rawSvc.port} across services "${prevPortOwner}" and "${svcTag}" — each service must use a unique port.`,
+                { port: rawSvc.port, services: [prevPortOwner, svcTag] },
+              );
+              issues.push({
+                code: dupPortErr.code,
+                field: "services",
+                message: dupPortErr.message,
+              });
+            } else {
+              seenServicePorts.set(rawSvc.port, svcTag);
+              svcPort = rawSvc.port;
+            }
+          }
+        }
+
+        const svcDependsOn = normalizeValidatedStringList(
+          rawSvc.depends_on,
+          "depends_on",
+          `Service "${svcTag}"`,
+          issues,
+          { rejectEmptyItems: true, dedupe: true },
+        );
+
+        if (nameOk && svcStart) {
+          incomingServices.push({
+            name: svcName,
+            start: svcStart,
+            ...(svcStop !== undefined ? { stop: svcStop } : {}),
+            ...(svcHealthcheck !== undefined
+              ? { healthcheck: svcHealthcheck }
+              : {}),
+            ...(svcPort !== undefined ? { port: svcPort } : {}),
+            ...(svcDependsOn && svcDependsOn.length > 0
+              ? { dependsOn: svcDependsOn }
+              : {}),
+          });
+        }
+      }
+
+      // Merge with existingRun.services in tweak mode (by service name) before port/DAG cross-check
+      let effectiveServices: MissionServiceEntry[] = incomingServices;
+      if (existingRun?.services && existingRun.services.length > 0) {
+        const svcMap = new Map<string, MissionServiceEntry>();
+        for (const prevSvc of existingRun.services) {
+          svcMap.set(prevSvc.name, structuredClone(prevSvc));
+        }
+        for (const incSvc of incomingServices) {
+          svcMap.set(incSvc.name, incSvc);
+        }
+        effectiveServices = [...svcMap.values()];
+
+        const mergedPorts = new Map<number, string>();
+        for (const svc of effectiveServices) {
+          if (svc.port !== undefined) {
+            const prevOwner = mergedPorts.get(svc.port);
+            if (prevOwner && !seenServicePorts.has(svc.port)) {
+              issues.push({
+                code: "INVALID_INPUT",
+                field: "services",
+                message: `Duplicate service port ${svc.port} across services "${prevOwner}" and "${svc.name}" — each service must use a unique port.`,
+              });
+            } else if (prevOwner && seenServiceNames.has(svc.name) && !seenServiceNames.has(prevOwner)) {
+              issues.push({
+                code: "INVALID_INPUT",
+                field: "services",
+                message: `Duplicate service port ${svc.port} across existing service "${prevOwner}" and "${svc.name}" — each service must use a unique port.`,
+              });
+            } else {
+              mergedPorts.set(svc.port, svc.name);
+            }
+          }
+        }
+      }
+
+      if (effectiveServices.length > 0) {
+        const svcDagErrors = collectServiceDagErrors(effectiveServices);
+        for (const err of svcDagErrors) {
+          issues.push({
+            code: err.code,
+            field: "services",
+            message: err.message,
+          });
+        }
+        normalizedServices = effectiveServices;
+      }
+    }
+  } else if (existingRun?.services && existingRun.services.length > 0) {
+    normalizedServices = structuredClone(existingRun.services);
+  }
+
   let normalizedBoundaries: string[] | undefined;
   if (params.boundaries !== undefined) {
     if (!Array.isArray(params.boundaries)) {
@@ -1048,7 +1454,50 @@ export function validateProposedSwarmPlan(
 
   // --------------------------------------------------------------------------
   // Mission-Level TDD Validation (assertions & features) + Dynamic Tweak Merge
+  // Legacy JS unit tests omitting BOTH assertions === undefined && features === undefined
+  // remain compatible; empty [] arrays or half-omitted contracts are strictly rejected!
   // --------------------------------------------------------------------------
+  if (Array.isArray(params.assertions) && params.assertions.length === 0) {
+    const err = new SwarmProtocolError(
+      "INVALID_INPUT",
+      "Plan assertions must include at least 1 validation assertion (minItems: 1).",
+      { field: "assertions" },
+    );
+    issues.push({
+      code: err.code,
+      field: "assertions",
+      message: err.message,
+    });
+  }
+  if (Array.isArray(params.features) && params.features.length === 0) {
+    const err = new SwarmProtocolError(
+      "INVALID_INPUT",
+      "Plan features must include at least 1 feature (minItems: 1).",
+      { field: "features" },
+    );
+    issues.push({
+      code: err.code,
+      field: "features",
+      message: err.message,
+    });
+  }
+  if (params.assertions === undefined && params.features !== undefined) {
+    issues.push({
+      code: "INVALID_INPUT",
+      field: "assertions",
+      message:
+        "Plan assertions must include at least 1 validation assertion (minItems: 1) when features are provided.",
+    });
+  }
+  if (params.assertions !== undefined && params.features === undefined) {
+    issues.push({
+      code: "INVALID_INPUT",
+      field: "features",
+      message:
+        "Plan features must include at least 1 feature (minItems: 1) claiming all assertions via fulfills.",
+    });
+  }
+
   const incomingAssertions: MissionAssertion[] = [];
   const seenAssertionIds = new Set<string>();
   if (params.assertions !== undefined) {
@@ -1446,6 +1895,12 @@ export function validateProposedSwarmPlan(
             ...(prevA.verifiedByRole !== undefined
               ? { verifiedByRole: prevA.verifiedByRole }
               : {}),
+            ...(prevA.overridden !== undefined
+              ? { overridden: prevA.overridden }
+              : {}),
+            ...(prevA.overrideJustification !== undefined
+              ? { overrideJustification: prevA.overrideJustification }
+              : {}),
             updatedAt: prevA.updatedAt || nowIso,
           });
           continue;
@@ -1530,8 +1985,31 @@ export function validateProposedSwarmPlan(
       ? { milestones: finalMilestones }
       : {}),
     ...(normalizedCommands ? { commands: normalizedCommands } : {}),
+    ...(normalizedServices ? { services: normalizedServices } : {}),
     ...(normalizedBoundaries ? { boundaries: normalizedBoundaries } : {}),
   };
+}
+
+/**
+ * Validates `params` via `validateProposedSwarmPlan` and throws a genuine
+ * `SwarmProtocolError(issue.code, issue.message)` when any validation gate fails
+ * (including empty `assertions: []`, empty `features: []`, duplicate service ports,
+ * or dependency cycles).
+ */
+export function assertProposedSwarmPlan(
+  params: ProposeSwarmPlanInput,
+  options?: ValidateProposedSwarmPlanOptions,
+): Extract<ReturnType<typeof validateProposedSwarmPlan>, { valid: true }> {
+  const result = validateProposedSwarmPlan(params, options);
+  if (!result.valid) {
+    const first = result.issues[0]!;
+    throw new SwarmProtocolError(
+      first.code,
+      first.message,
+      first.field ? { field: first.field } : undefined,
+    );
+  }
+  return result;
 }
 
 async function resolveBaseBranch(
@@ -2310,19 +2788,110 @@ export function createSwarmQuestionnaireTool(
 // Tool 3: propose_swarm_plan
 // ============================================================================
 
+function formatContractReviewRefinementRequest(
+  plan: ProposedSwarmPlan,
+  review: ContractReviewResult,
+  passNumber: number,
+): string {
+  const summaryLine =
+    review.summary?.trim() ||
+    "Adversarial Contract Review identified blocking gaps in the proposed mission contract.";
+  const lines: string[] = [
+    `status: contract_review_changes_requested (pass ${passNumber})`,
+    "",
+    "### Adversarial Contract Review — Refinements Requested",
+    "",
+    summaryLine,
+    "",
+    "**Findings:**",
+  ];
+
+  if (!Array.isArray(review.findings) || review.findings.length === 0) {
+    lines.push(`- [BLOCKING] (other) ${summaryLine}`);
+  } else {
+    for (const f of review.findings) {
+      const sevTag = f.severity === "blocking" ? "[BLOCKING]" : "[WARNING]";
+      const catTag = f.category || "other";
+      const msg = f.message?.trim() || "(unspecified finding)";
+      const suggestionLine = f.suggestion?.trim()
+        ? `\n  Suggestion: ${f.suggestion.trim()}`
+        : "";
+      lines.push(`- ${sevTag} (${catTag}) ${msg}${suggestionLine}`);
+    }
+  }
+
+  lines.push(
+    "",
+    "---",
+    `Draft remains active for "${plan.title}" — do NOT ask the user to confirm yet. Address every [BLOCKING] finding above (add the missing \`VAL-*\` assertions, fix \`features\`/\`fulfills\`/disjoint \`files_owned\`, and verify \`commands\`/\`services\`) and call \`${PROPOSE_SWARM_PLAN_TOOL}\` again.`,
+  );
+
+  return lines.join("\n");
+}
+
+function formatRemainingContractReviewNote(
+  review: ContractReviewResult,
+  passNumber: number,
+): string | undefined {
+  const findings = Array.isArray(review.findings) ? review.findings : [];
+  const hasNotes =
+    findings.length > 0 || passNumber >= 2 || !review.approved;
+  if (!hasNotes) {
+    return undefined;
+  }
+
+  const summary = review.summary?.trim() || "";
+  const findingItems = findings
+    .map((f) => {
+      const sev = f.severity === "blocking" ? "[BLOCKING]" : "[WARNING]";
+      const cat = f.category || "other";
+      const msg = f.message?.trim() || "";
+      const sug = f.suggestion?.trim() ? ` (Suggestion: ${f.suggestion.trim()})` : "";
+      return `${sev} (${cat}) ${msg}${sug}`.trim();
+    })
+    .filter(Boolean);
+
+  if (!summary && findingItems.length === 0) {
+    return undefined;
+  }
+
+  const passTag = passNumber >= 2 ? ` (Pass ${passNumber})` : "";
+  const bodyParts: string[] = [];
+  if (summary) {
+    bodyParts.push(summary);
+  }
+  if (findingItems.length > 0) {
+    bodyParts.push(findingItems.join("; "));
+  }
+  return `Adversarial Contract Review${passTag}: ${bodyParts.join(" — ")}`;
+}
+
 export function createProposeSwarmPlanTool(
   deps: DraftingDeps,
   draftController: DraftStateController,
 ) {
+  const reviewPassCounts = new Map<string, number>();
+
+  const resolveDraftReviewKey = (
+    draft: SwarmDraftState | null,
+    ctx: ExtensionContext,
+  ): string => {
+    const sessionId = ctx?.sessionManager?.getSessionId?.() || "default-session";
+    if (draft?.startedAt) {
+      return `${sessionId}::${draft.mode}::${draft.startedAt}`;
+    }
+    return `${sessionId}::ephemeral`;
+  };
+
   return defineTool({
     name: PROPOSE_SWARM_PLAN_TOOL,
     label: "Swarm Plan",
     description:
-      "Validate a Contract-First Dynamic Swarm Plan (including optional VAL-* assertions, milestone features with 100% fulfills coverage, commands, and boundaries), render a compact expandable summary card, and ask the user to Confirm, Continue refining, or Cancel.",
+      "Validate a Contract-First Dynamic Swarm Plan (mandatory VAL-* assertions and milestone features with 100% fulfills coverage, plus commands, services, and boundaries), run Adversarial Contract Review, render a compact expandable summary card, and ask the user to Confirm, Continue refining, or Cancel.",
     promptSnippet:
-      "Validate and present a Contract-First Dynamic Swarm Plan (title, objective, strategy, acceptance criteria, VAL-* assertions, milestone features, commands, boundaries, optional initial members) for user confirmation before launching.",
+      "Validate and present a Contract-First Dynamic Swarm Plan (title, objective, strategy, acceptance criteria, mandatory VAL-* assertions & milestone features, commands, services, boundaries, optional initial members) for user confirmation before launching.",
     promptGuidelines: [
-      `Call \`${PROPOSE_SWARM_PLAN_TOOL}\` once requirements are clear with wave-by-wave disjoint file/directory ownership in \`strategy\`, exact runnable verification commands using already-installed repo scripts (no speculative \`npx -y\` downloads) in \`acceptance_criteria\` and \`commands\`, testable \`VAL-<AREA>-<NNN>\` \`assertions\` paired with ordered \`features\` (100% \`fulfills\` coverage + acyclic \`depends_on\` + disjoint \`files_owned\`), and wave-1 workers only in \`initial_members\` (spawn \`validator\` on demand once workers commit/post \`[done]\`); do NOT duplicate the full plan in prose beforehand because the expandable proposal card and confirmation modal present it automatically.`,
+      `Call \`${PROPOSE_SWARM_PLAN_TOOL}\` once requirements are clear with wave-by-wave disjoint file/directory ownership in \`strategy\`, exact runnable verification commands using already-installed repo scripts (no speculative \`npx -y\` downloads) in \`acceptance_criteria\` and \`commands\` (including optional \`"init"\` worktree setup), optional \`services\` with unique \`port\`s and acyclic \`depends_on\`, **mandatory** testable \`VAL-<AREA>-<NNN>\` \`assertions\` (\`minItems: 1\`) paired with ordered \`features\` (\`minItems: 1\`, 100% \`fulfills\` coverage + acyclic \`depends_on\` + disjoint \`files_owned\`), and wave-1 workers only in \`initial_members\` (spawn \`validator\` on demand once workers commit/post \`[done]\`); do NOT duplicate the full plan in prose beforehand because the expandable proposal card and confirmation modal present it automatically.`,
     ],
     exposure: "model-only",
     defaultActive: false,
@@ -2423,9 +2992,31 @@ export function createProposeSwarmPlanTool(
         });
       }
 
+      if (Array.isArray(obj.services)) {
+        prepared.services = obj.services.map((item) => {
+          if (!item || typeof item !== "object" || Array.isArray(item)) {
+            return item;
+          }
+          const s = item as Record<string, unknown>;
+          const depsList =
+            s.depends_on !== undefined
+              ? s.depends_on
+              : Array.isArray(s.dependsOn)
+                ? s.dependsOn
+                : undefined;
+          return {
+            ...s,
+            name: typeof s.name === "string" ? s.name : "",
+            start: typeof s.start === "string" ? s.start : "",
+            ...(depsList !== undefined ? { depends_on: depsList } : {}),
+          };
+        });
+      }
+
       return prepared as ProposeSwarmPlanParams;
     },
-    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+    async execute(_toolCallId, rawParams, signal, _onUpdate, ctx) {
+      const params = rawParams as ProposeSwarmPlanInput;
       const currentDraft = ensureDraftSynced(draftController, ctx);
       const settings = deps.getSettings();
 
@@ -2443,7 +3034,7 @@ export function createProposeSwarmPlanTool(
         }
       }
 
-      // Step 1: Pre-modal validation (required fields, initial_members, VAL-* assertions, features DAG & fulfills, sealed milestones)
+      // Step 1: Pre-modal validation (required fields, initial_members, VAL-* assertions, features DAG & fulfills, services ports/DAG, sealed milestones)
       const validation = validateProposedSwarmPlan(params, {
         mode: currentDraft?.mode,
         existingRun,
@@ -2496,6 +3087,7 @@ export function createProposeSwarmPlanTool(
         ...(validation.features ? { features: validation.features } : {}),
         ...(validation.milestones ? { milestones: validation.milestones } : {}),
         ...(validation.commands ? { commands: validation.commands } : {}),
+        ...(validation.services ? { services: validation.services } : {}),
         ...(validation.boundaries ? { boundaries: validation.boundaries } : {}),
         ...(existingRun?.handoffItems && existingRun.handoffItems.length > 0
           ? { handoffItems: structuredClone(existingRun.handoffItems) }
@@ -2504,6 +3096,69 @@ export function createProposeSwarmPlanTool(
           ? { lastAudit: structuredClone(existingRun.lastAudit) }
           : {}),
       };
+
+      // Step 2.5: Pre-Modal Adversarial Contract Reviewer (at most 1 automatic rejection bounce per draft)
+      const draftReviewKey = resolveDraftReviewKey(currentDraft, ctx);
+      let attachedContractReview: ContractReviewResult | undefined;
+      let attachedReviewPass: number | undefined;
+      if (
+        typeof deps.reviewProposedContract === "function" &&
+        proposedPlan.assertions &&
+        proposedPlan.assertions.length > 0 &&
+        currentDraft?.validatorEnabled !== false &&
+        proposedPlan.validatorEnabled !== false
+      ) {
+        const currentPass = (reviewPassCounts.get(draftReviewKey) ?? 0) + 1;
+        reviewPassCounts.set(draftReviewKey, currentPass);
+        attachedReviewPass = currentPass;
+
+        let review: ContractReviewResult | undefined;
+        try {
+          review = await deps.reviewProposedContract(proposedPlan, ctx, signal);
+        } catch {
+          review = undefined;
+        }
+
+        if (review) {
+          attachedContractReview = review;
+          const findings = Array.isArray(review.findings) ? review.findings : [];
+          const hasBlockingFinding =
+            !review.approved ||
+            findings.some((f) => f && f.severity === "blocking");
+
+          if (hasBlockingFinding && currentPass === 1) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: formatContractReviewRefinementRequest(
+                    proposedPlan,
+                    review,
+                    currentPass,
+                  ),
+                },
+              ],
+              details: {
+                outcome: "contract_review_changes_requested",
+                status: "contract_review_changes_requested",
+                plan: proposedPlan,
+                contractReview: review,
+                reviewPass: currentPass,
+              } satisfies ProposeSwarmPlanToolDetails,
+            };
+          }
+
+          const reviewNote = formatRemainingContractReviewNote(
+            review,
+            currentPass,
+          );
+          if (reviewNote) {
+            proposedPlan.feedback = proposedPlan.feedback
+              ? `${proposedPlan.feedback} | ${reviewNote}`
+              : reviewNote;
+          }
+        }
+      }
 
       // Step 3: Show confirmation modal (or auto-confirm for `/swarm direct`)
       const autoConfirm = Boolean(currentDraft?.autoConfirm);
@@ -2528,13 +3183,17 @@ export function createProposeSwarmPlanTool(
       // Step 4: Execute user's decision
       if (outcome.action === "confirm") {
         const launchComment = outcome.feedback?.trim();
+        const combinedFeedback =
+          launchComment && proposedPlan.feedback
+            ? `${launchComment} | ${proposedPlan.feedback}`
+            : launchComment || proposedPlan.feedback;
         const finalPlan: ProposedSwarmPlan = {
           ...proposedPlan,
           strategy: launchComment
             ? `${proposedPlan.strategy}\n\nUser launch guidance: ${launchComment}`
             : proposedPlan.strategy,
           ...(outcome.roleModels ? { roleModels: outcome.roleModels } : {}),
-          ...(launchComment ? { feedback: launchComment } : {}),
+          ...(combinedFeedback ? { feedback: combinedFeedback } : {}),
           validatorEnabled: outcome.validatorEnabled,
           maxConcurrency: sanitizePositiveInt(
             outcome.maxConcurrency,
@@ -2581,6 +3240,7 @@ export function createProposeSwarmPlanTool(
         }
 
         // Clear draft and swap tool profile to `"running"` (the 4 core Swarm tools)
+        reviewPassCounts.delete(draftReviewKey);
         draftController.clear("running");
         deps.onDraftChanged?.(null, ctx);
 
@@ -2605,12 +3265,19 @@ export function createProposeSwarmPlanTool(
             runId: run.id,
             plan: finalPlan,
             autoConfirmed: autoConfirm,
+            ...(attachedContractReview
+              ? {
+                  contractReview: attachedContractReview,
+                  reviewPass: attachedReviewPass,
+                }
+              : {}),
           } satisfies ProposeSwarmPlanToolDetails,
           terminate: true,
         };
       }
 
       if (outcome.action === "cancel") {
+        reviewPassCounts.delete(draftReviewKey);
         draftController.clear(
           deps.onDraftChanged
             ? undefined
@@ -2632,6 +3299,12 @@ export function createProposeSwarmPlanTool(
           details: {
             outcome: "cancelled",
             plan: proposedPlan,
+            ...(attachedContractReview
+              ? {
+                  contractReview: attachedContractReview,
+                  reviewPass: attachedReviewPass,
+                }
+              : {}),
           } satisfies ProposeSwarmPlanToolDetails,
           terminate: true,
         };
@@ -2689,10 +3362,17 @@ export function createProposeSwarmPlanTool(
           ...(outcome.feedback?.trim()
             ? { feedback: outcome.feedback.trim() }
             : {}),
+          ...(attachedContractReview
+            ? {
+                contractReview: attachedContractReview,
+                reviewPass: attachedReviewPass,
+              }
+            : {}),
         } satisfies ProposeSwarmPlanToolDetails,
       };
     },
-    renderCall(args: ProposeSwarmPlanParams, theme: Theme, context) {
+    renderCall(rawArgs: ProposeSwarmPlanParams, theme: Theme, context) {
+      const args = rawArgs as ProposeSwarmPlanInput | undefined;
       const isExpanded = Boolean(context?.expanded);
       const isPartial = Boolean(context?.isPartial);
       const settings = deps.getSettings();
@@ -2815,6 +3495,39 @@ export function createProposeSwarmPlanTool(
         }))
         .filter((c) => Boolean(c.name && c.command));
 
+      const rawServices = Array.isArray(args?.services) ? args.services : [];
+      const previewServices: MissionServiceEntry[] = rawServices
+        .filter((item): item is MissionServiceProposalParams =>
+          Boolean(item && typeof item === "object" && !Array.isArray(item)),
+        )
+        .map((s) => {
+          const name = typeof s.name === "string" ? s.name.trim() : "";
+          const start = typeof s.start === "string" ? s.start.trim() : "";
+          const stop =
+            typeof s.stop === "string" && s.stop.trim() ? s.stop.trim() : undefined;
+          const healthcheck =
+            typeof s.healthcheck === "string" && s.healthcheck.trim()
+              ? s.healthcheck.trim()
+              : undefined;
+          const port =
+            typeof s.port === "number" &&
+            Number.isInteger(s.port) &&
+            s.port >= 1 &&
+            s.port <= 65535
+              ? s.port
+              : undefined;
+          const dependsOn = toCleanStringArray(s.depends_on);
+          return {
+            name,
+            start,
+            ...(stop !== undefined ? { stop } : {}),
+            ...(healthcheck !== undefined ? { healthcheck } : {}),
+            ...(port !== undefined ? { port } : {}),
+            ...(dependsOn.length > 0 ? { dependsOn } : {}),
+          };
+        })
+        .filter((s) => Boolean(s.name && s.start));
+
       const previewBoundaries = toCleanStringArray(args?.boundaries);
 
       const draftBranch =
@@ -2849,6 +3562,7 @@ export function createProposeSwarmPlanTool(
         ...(previewFeatures.length > 0 ? { features: previewFeatures } : {}),
         ...(previewMilestones.length > 0 ? { milestones: previewMilestones } : {}),
         ...(previewCommands.length > 0 ? { commands: previewCommands } : {}),
+        ...(previewServices.length > 0 ? { services: previewServices } : {}),
         ...(previewBoundaries.length > 0 ? { boundaries: previewBoundaries } : {}),
       };
 
@@ -2897,6 +3611,16 @@ export function createProposeSwarmPlanTool(
         if (previewMilestones.length > 0) {
           contractParts.push(
             `${previewMilestones.length} ${previewMilestones.length === 1 ? "milestone" : "milestones"}`,
+          );
+        }
+        if (previewServices.length > 0) {
+          const portTags = previewServices
+            .filter((s) => s.port !== undefined)
+            .map((s) => `:${s.port}`);
+          const portSuffix =
+            portTags.length > 0 ? ` (${portTags.join(", ")})` : "";
+          contractParts.push(
+            `${previewServices.length} ${previewServices.length === 1 ? "service" : "services"}${portSuffix}`,
           );
         }
         if (contractParts.length === 0) {
@@ -2992,11 +3716,38 @@ export function createProposeSwarmPlanTool(
             ? ` ${formatRoleModelsPillBar(details.plan.roleModels, theme)}`
             : "";
           statusHeader = `${theme.fg("warning", "✎ [REFINING]")}${pills}\n`;
+        } else if (
+          details?.outcome === "contract_review_changes_requested" ||
+          details?.status === "contract_review_changes_requested"
+        ) {
+          statusHeader = `${theme.fg("warning", "⚠ [CONTRACT REVIEW · CHANGES REQUESTED]")}\n`;
         } else if (details?.outcome === "cancelled") {
           statusHeader = `${theme.fg("muted", "✕ [CANCELLED]")}\n`;
         }
         return new Text(
           `${statusHeader}${theme.fg("toolOutput", body)}`,
+          0,
+          0,
+        );
+      }
+
+      if (
+        details?.outcome === "contract_review_changes_requested" ||
+        details?.status === "contract_review_changes_requested"
+      ) {
+        const findingCount = details.contractReview?.findings?.length ?? 0;
+        const countTag =
+          findingCount > 0
+            ? ` (${findingCount} ${findingCount === 1 ? "finding" : "findings"})`
+            : "";
+        const expandHint = ` ${formatExpandHint(context, theme)}`;
+        const summaryLine = formatInlineSnippet(
+          details.contractReview?.summary ||
+            "Adversarial Contract Review requested plan refinements.",
+          96,
+        );
+        return new Text(
+          `${theme.fg("warning", "⚠ [CONTRACT REVIEW]")}${theme.fg("toolOutput", `${countTag} ${summaryLine}`)}${expandHint}`,
           0,
           0,
         );
