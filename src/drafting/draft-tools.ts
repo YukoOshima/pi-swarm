@@ -672,6 +672,173 @@ export function deriveMilestonesFromFeatures(
   });
 }
 
+function mergeFeaturePreservingUntouched(
+  prev: MissionFeature | undefined,
+  inc: MissionFeature,
+  overrides: {
+    status: MissionFeature["status"];
+    assignedMember?: string;
+    mergedCommitSha?: string;
+    updatedAt: string;
+  },
+): MissionFeature {
+  const base: Partial<MissionFeature> = prev ? structuredClone(prev) : {};
+  const incomingClone = structuredClone(inc);
+  const definedIncoming = Object.fromEntries(
+    Object.entries(incomingClone).filter(([, value]) => value !== undefined),
+  ) as Partial<MissionFeature>;
+
+  const merged: MissionFeature = {
+    ...(base as MissionFeature),
+    ...definedIncoming,
+    status: overrides.status,
+    updatedAt: overrides.updatedAt,
+  };
+  if (overrides.assignedMember !== undefined) {
+    merged.assignedMember = overrides.assignedMember;
+  } else {
+    delete merged.assignedMember;
+  }
+  if (overrides.mergedCommitSha !== undefined) {
+    merged.mergedCommitSha = overrides.mergedCommitSha;
+  } else {
+    delete merged.mergedCommitSha;
+  }
+  return merged;
+}
+
+function mergeTweakedMilestones(
+  explicitMilestones: readonly SwarmMilestone[] | undefined,
+  features: readonly MissionFeature[] | undefined,
+  assertions: readonly MissionAssertion[] | undefined,
+  priorMilestones: readonly SwarmMilestone[] | undefined,
+  resetAssertionIds: ReadonlySet<string>,
+): SwarmMilestone[] {
+  const hasExplicit = Boolean(explicitMilestones && explicitMilestones.length > 0);
+  const priorByLabel = new Map<string, SwarmMilestone>();
+  for (const pm of priorMilestones ?? []) {
+    const clean = pm.label.trim();
+    if (clean) {
+      priorByLabel.set(clean, pm);
+    }
+  }
+
+  const explicitByLabel = new Map<string, SwarmMilestone>();
+  const orderedLabels: string[] = [];
+  const pushLabel = (rawLabel: string): void => {
+    const clean = rawLabel.trim();
+    if (clean && !orderedLabels.includes(clean)) {
+      orderedLabels.push(clean);
+    }
+  };
+
+  for (const m of explicitMilestones ?? []) {
+    const clean = m.label.trim();
+    if (clean) {
+      explicitByLabel.set(clean, m);
+      pushLabel(clean);
+    }
+  }
+  for (const pm of priorMilestones ?? []) {
+    const clean = pm.label.trim();
+    if (!clean) continue;
+    const stillHasFeatures = (features ?? []).some(
+      (f) => f.milestone.trim() === clean,
+    );
+    if (pm.sealed || stillHasFeatures || !hasExplicit) {
+      pushLabel(clean);
+    }
+  }
+  for (const f of features ?? []) {
+    pushLabel(f.milestone);
+  }
+
+  const assertionMap = new Map<string, MissionAssertion>();
+  for (const a of assertions ?? []) {
+    assertionMap.set(a.id, a);
+  }
+
+  return orderedLabels.map((label): SwarmMilestone => {
+    const exp = explicitByLabel.get(label);
+    const prev = priorByLabel.get(label);
+    const milestoneFeatures = (features ?? []).filter(
+      (f) => f.milestone.trim() === label,
+    );
+    const activeFeatures = milestoneFeatures.filter(
+      (f) => f.status !== "cancelled",
+    );
+
+    const claimedIds = new Set<string>();
+    for (const f of activeFeatures) {
+      for (const aid of f.fulfills ?? []) {
+        claimedIds.add(aid);
+      }
+    }
+    const hadResetAssertion = Array.from(claimedIds).some((aid) =>
+      resetAssertionIds.has(aid),
+    );
+    const allClaimedPassed = Array.from(claimedIds).every((aid) => {
+      const linked = assertionMap.get(aid);
+      return linked ? linked.status === "passed" : true;
+    });
+    const allFeaturesCompleted =
+      activeFeatures.length > 0 &&
+      activeFeatures.every((f) => f.status === "completed");
+    const anyProgress = activeFeatures.some(
+      (f) => f.status === "in_progress" || f.status === "completed",
+    );
+    const owner = exp?.owner ?? prev?.owner;
+
+    if (hadResetAssertion) {
+      return {
+        label,
+        status: "in_progress",
+        ...(owner ? { owner } : {}),
+      };
+    }
+
+    const wasSealed = Boolean(prev?.sealed ?? exp?.sealed);
+    if (
+      wasSealed &&
+      (activeFeatures.length === 0 || (allFeaturesCompleted && allClaimedPassed))
+    ) {
+      const sealedAt = prev?.sealedAt ?? exp?.sealedAt;
+      return {
+        label,
+        status: "done",
+        ...(owner ? { owner } : {}),
+        sealed: true,
+        ...(sealedAt ? { sealedAt } : {}),
+      };
+    }
+
+    let status: SwarmMilestone["status"] =
+      exp?.status ?? prev?.status ?? "pending";
+    if (activeFeatures.length > 0) {
+      if (allFeaturesCompleted && allClaimedPassed) {
+        status = "done";
+      } else if (
+        exp?.status === "blocked" ||
+        activeFeatures.some((f) => f.status === "failed")
+      ) {
+        status = "blocked";
+      } else if (anyProgress || status === "done") {
+        status = "in_progress";
+      } else {
+        status = exp?.status ?? prev?.status ?? "pending";
+      }
+    }
+
+    return {
+      label,
+      status,
+      ...(owner ? { owner } : {}),
+      ...(exp?.sealed === true && !wasSealed ? { sealed: true } : {}),
+      ...(exp?.sealed === true && exp.sealedAt ? { sealedAt: exp.sealedAt } : {}),
+    };
+  });
+}
+
 /**
  * Canonical shared tweak-merge helper for Mission contracts.
  *
@@ -681,15 +848,18 @@ export function deriveMilestonesFromFeatures(
  * - Blocks adding new features or moving features into `sealed: true` milestones
  *   (`SwarmProtocolError("INVALID_INPUT", ...)`).
  * - Preserves `completed` and `in_progress` feature progress (`mergedCommitSha`,
- *   `assignedMember`, `updatedAt`) and carries forward omitted `completed` features
- *   whose assertions were not re-claimed.
+ *   `assignedMember`, `updatedAt`) and preserves omitted optional fields
+ *   (`filesOwned`, `dependsOn`, `preconditions`, `expectedBehavior`,
+ *   `verificationSteps`) from prior features while carrying forward omitted
+ *   `completed` features whose assertions were not re-claimed.
  * - Preserves verification metadata (`status`, `evidence`, `verifiedBy`,
  *   `verifiedByRole`, `overridden`, `overrideJustification`, `updatedAt`) on
  *   unchanged assertions, and resets modified assertions (`description` or
  *   `evidenceRequired` changed) back to `"pending"` without stale evidence.
- * - Merges `commands` and `services` by `name`, unions `boundaries`, and derives
- *   milestones while keeping untouched sealed milestones sealed and unsealing any
- *   milestone whose assertion was reset.
+ * - Merges `commands` and `services` by `name`, unions `boundaries`, and preserves
+ *   untouched prior milestones verbatim when neither milestones, features, nor
+ *   assertions were reset; otherwise reconciles milestones preserving prior
+ *   ordering, featureless/explicit milestones, and sealed status.
  * - Idempotent when invoked repeatedly with its own merged output.
  */
 export function mergeTweakedMissionContract(
@@ -734,7 +904,7 @@ export function mergeTweakedMissionContract(
       .filter(Boolean),
   );
 
-  // 1. Sealed milestone guard + feature merge
+  // 1. Sealed milestone guard + feature merge (preserving omitted optional fields from prev)
   let mergedFeatures: MissionFeature[] | undefined;
   const carriedCompletedFeatures: MissionFeature[] = [];
   if (incoming.features !== undefined) {
@@ -770,42 +940,39 @@ export function mergeTweakedMissionContract(
     for (const inc of incoming.features) {
       const prev = existingFeatureById.get(inc.id);
       if (prev?.status === "completed") {
-        const mergedCommitSha = prev.mergedCommitSha ?? inc.mergedCommitSha;
-        const assignedMember = prev.assignedMember ?? inc.assignedMember;
-        nextFeatures.push({
-          ...structuredClone(inc),
-          status: "completed",
-          ...(assignedMember !== undefined ? { assignedMember } : {}),
-          ...(mergedCommitSha !== undefined ? { mergedCommitSha } : {}),
-          updatedAt: prev.updatedAt || inc.updatedAt || effectiveNow,
-        });
+        nextFeatures.push(
+          mergeFeaturePreservingUntouched(prev, inc, {
+            status: "completed",
+            assignedMember: prev.assignedMember ?? inc.assignedMember,
+            mergedCommitSha: prev.mergedCommitSha ?? inc.mergedCommitSha,
+            updatedAt: prev.updatedAt || inc.updatedAt || effectiveNow,
+          }),
+        );
       } else if (
         prev?.status === "in_progress" &&
         (!inc.status || inc.status === "pending")
       ) {
-        const assignedMember = inc.assignedMember ?? prev.assignedMember;
-        const mergedCommitSha = inc.mergedCommitSha ?? prev.mergedCommitSha;
-        nextFeatures.push({
-          ...structuredClone(inc),
-          status: "in_progress",
-          ...(assignedMember !== undefined ? { assignedMember } : {}),
-          ...(mergedCommitSha !== undefined ? { mergedCommitSha } : {}),
-          updatedAt: prev.updatedAt || inc.updatedAt || effectiveNow,
-        });
+        nextFeatures.push(
+          mergeFeaturePreservingUntouched(prev, inc, {
+            status: "in_progress",
+            assignedMember: inc.assignedMember ?? prev.assignedMember,
+            mergedCommitSha: inc.mergedCommitSha ?? prev.mergedCommitSha,
+            updatedAt: prev.updatedAt || inc.updatedAt || effectiveNow,
+          }),
+        );
       } else {
         const nextStatus =
           inc.status && inc.status !== "pending"
             ? inc.status
             : prev?.status ?? inc.status ?? "pending";
-        const assignedMember = inc.assignedMember ?? prev?.assignedMember;
-        const mergedCommitSha = inc.mergedCommitSha ?? prev?.mergedCommitSha;
-        nextFeatures.push({
-          ...structuredClone(inc),
-          status: nextStatus,
-          ...(assignedMember !== undefined ? { assignedMember } : {}),
-          ...(mergedCommitSha !== undefined ? { mergedCommitSha } : {}),
-          updatedAt: inc.updatedAt || effectiveNow,
-        });
+        nextFeatures.push(
+          mergeFeaturePreservingUntouched(prev, inc, {
+            status: nextStatus,
+            assignedMember: inc.assignedMember ?? prev?.assignedMember,
+            mergedCommitSha: inc.mergedCommitSha ?? prev?.mergedCommitSha,
+            updatedAt: inc.updatedAt || effectiveNow,
+          }),
+        );
       }
     }
 
@@ -815,6 +982,7 @@ export function mergeTweakedMissionContract(
   }
 
   // 2. Assertion merge (preserve metadata when contract unchanged; reset when modified)
+  const resetAssertionIds = new Set<string>();
   let mergedAssertions: MissionAssertion[] | undefined;
   if (incoming.assertions !== undefined) {
     const carriedAssertions: MissionAssertion[] = [];
@@ -878,6 +1046,9 @@ export function mergeTweakedMissionContract(
         }
 
         // Contract description or evidenceRequired changed -> reset to "pending" & clear stale evidence
+        if (prevA.status !== "pending") {
+          resetAssertionIds.add(incA.id);
+        }
         nextAssertions.push({
           id: incA.id,
           title: incA.title,
@@ -957,48 +1128,27 @@ export function mergeTweakedMissionContract(
     mergedBoundaries = [...existingRun.boundaries];
   }
 
-  // 4. Milestones derivation (preserve prior sealed metadata, unseal on reset assertion)
+  // 4. Milestones reconciliation:
+  //    - When neither incoming.milestones, incoming.features, nor resetAssertionIds changed
+  //      (e.g. a strategy-only or commands-only tweak), preserve existingRun.milestones verbatim.
+  //    - Otherwise reconcile while preserving prior ordering, explicit/featureless milestones,
+  //      and sealed metadata (unsealing only milestones whose claimed assertion reset).
   let mergedMilestones: SwarmMilestone[] | undefined;
-  if (mergedFeatures && mergedFeatures.length > 0) {
-    // Combine prior milestone metadata (existingRun takes precedence for sealed/sealedAt; incoming may supply owner)
-    const combinedPriorMilestones: SwarmMilestone[] = [];
-    const seenPriorLabels = new Set<string>();
-    for (const prev of existingRun.milestones ?? []) {
-      const label = prev.label.trim();
-      if (!label || seenPriorLabels.has(label)) continue;
-      seenPriorLabels.add(label);
-      const incMatch = (incoming.milestones ?? []).find(
-        (m) => m.label.trim() === label,
-      );
-      combinedPriorMilestones.push({
-        ...prev,
-        ...(incMatch?.owner ?? prev.owner
-          ? { owner: incMatch?.owner ?? prev.owner }
-          : {}),
-      });
-    }
-    for (const incMs of incoming.milestones ?? []) {
-      const label = incMs.label.trim();
-      if (!label || seenPriorLabels.has(label)) continue;
-      seenPriorLabels.add(label);
-      combinedPriorMilestones.push({ ...incMs });
-    }
-
-    const derived = deriveMilestonesFromFeatures(
+  const shouldReconcileMilestones =
+    incoming.milestones !== undefined ||
+    incoming.features !== undefined ||
+    resetAssertionIds.size > 0;
+  if (shouldReconcileMilestones) {
+    const reconciled = mergeTweakedMilestones(
+      incoming.milestones,
       mergedFeatures,
-      combinedPriorMilestones,
       mergedAssertions,
+      existingRun.milestones,
+      resetAssertionIds,
     );
-    const derivedLabels = new Set(derived.map((m) => m.label));
-    const orphanedSealed = (existingRun.milestones ?? [])
-      .filter((m) => m.sealed === true && !derivedLabels.has(m.label.trim()))
-      .map((m) => ({ ...m }));
-    const finalMs = [...orphanedSealed, ...derived];
-    if (finalMs.length > 0) {
-      mergedMilestones = finalMs;
+    if (reconciled.length > 0) {
+      mergedMilestones = reconciled;
     }
-  } else if (incoming.milestones && incoming.milestones.length > 0) {
-    mergedMilestones = structuredClone(incoming.milestones);
   } else if (existingRun.milestones && existingRun.milestones.length > 0) {
     mergedMilestones = structuredClone(existingRun.milestones);
   }
@@ -1029,24 +1179,23 @@ export function mergeTweakedMissionContract(
 // Static Local files_owned Overlap Validation Helpers
 // ============================================================================
 
-interface ParsedOwnedPath {
+interface NormalizedOwnedPath {
   raw: string;
+  /**
+   * Canonical POSIX path after normalizing `/`/`\`, `./`, `..`, trailing `/`,
+   * and trailing `/*` or `/**` directory wildcards (`""` represents repo root).
+   *
+   * Overlap detection is a deterministic literal + POSIX directory-containment
+   * gate (consistent with `engine.ts`'s `ownedPathsOverlap`), without heuristic
+   * glob intersection so disjoint wildcard patterns (e.g. `src/auth-*.ts` vs
+   * `src/ui-*.ts`) never trigger false positives.
+   */
   normalized: string;
-  hasGlob: boolean;
-  explicitDir: boolean;
 }
 
-function parseOwnedPath(raw: string): ParsedOwnedPath | null {
+function normalizeOwnedPath(raw: string): NormalizedOwnedPath | null {
   let p = raw.trim().replace(/\\/g, "/");
   if (!p) return null;
-
-  const hadTrailingDirHint =
-    p.endsWith("/") ||
-    /\/\*+$/.test(p) ||
-    p === "." ||
-    p === "./" ||
-    p === "*" ||
-    p === "**";
 
   p = p.replace(/\/+/g, "/");
   while (p.startsWith("./")) {
@@ -1055,7 +1204,7 @@ function parseOwnedPath(raw: string): ParsedOwnedPath | null {
   p = p.replace(/^\/+/, "").replace(/\/+$/, "");
 
   if (p === "" || p === "." || p === "*" || p === "**") {
-    return { raw, normalized: "", hasGlob: false, explicitDir: true };
+    return { raw, normalized: "" };
   }
 
   const posixNorm = path.posix
@@ -1068,13 +1217,11 @@ function parseOwnedPath(raw: string): ParsedOwnedPath | null {
     posixNorm === "*" ||
     posixNorm === "**"
   ) {
-    return { raw, normalized: "", hasGlob: false, explicitDir: true };
+    return { raw, normalized: "" };
   }
 
   let stripped = posixNorm;
-  let strippedTrailingWildcard = false;
   while (stripped.endsWith("/**") || stripped.endsWith("/*")) {
-    strippedTrailingWildcard = true;
     stripped = stripped.replace(/\/\*+$/, "");
   }
   if (
@@ -1083,133 +1230,22 @@ function parseOwnedPath(raw: string): ParsedOwnedPath | null {
     stripped === "*" ||
     stripped === "**"
   ) {
-    return { raw, normalized: "", hasGlob: false, explicitDir: true };
+    return { raw, normalized: "" };
   }
 
-  return {
-    raw,
-    normalized: stripped,
-    hasGlob: /[*?]/.test(stripped),
-    explicitDir: hadTrailingDirHint || strippedTrailingWildcard,
-  };
+  return { raw, normalized: stripped };
 }
 
-function escapeRegExpChar(ch: string): string {
-  return ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
-}
-
-function globToRegExp(glob: string): RegExp {
-  let pattern = "^";
-  let i = 0;
-  while (i < glob.length) {
-    if (glob[i] === "*" && glob[i + 1] === "*") {
-      if (glob[i + 2] === "/") {
-        pattern += "(?:.*/)?";
-        i += 3;
-      } else {
-        pattern += ".*";
-        i += 2;
-      }
-    } else if (glob[i] === "*") {
-      pattern += "[^/]*";
-      i += 1;
-    } else if (glob[i] === "?") {
-      pattern += "[^/]";
-      i += 1;
-    } else {
-      pattern += escapeRegExpChar(glob[i]!);
-      i += 1;
-    }
-  }
-  pattern += "$";
-  return new RegExp(pattern);
-}
-
-function staticDirPrefix(glob: string): string {
-  const parts = glob.split("/");
-  const prefix: string[] = [];
-  for (const part of parts) {
-    if (/[*?]/.test(part)) {
-      break;
-    }
-    prefix.push(part);
-  }
-  return prefix.join("/");
-}
-
-function concretePathsOverlap(a: string, b: string): boolean {
-  if (a === "" || b === "") return true;
-  if (a === b) return true;
-  return a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
-}
-
-function literalTrailingSuffix(glob: string): string {
-  const base = glob.split("/").pop() ?? glob;
-  const lastWild = Math.max(base.lastIndexOf("*"), base.lastIndexOf("?"));
-  if (lastWild < 0) return base;
-  return base.slice(lastWild + 1);
-}
-
-function globAndConcreteOverlap(
-  globPath: ParsedOwnedPath,
-  concretePath: ParsedOwnedPath,
+function ownedPathEntriesCollide(
+  a: NormalizedOwnedPath,
+  b: NormalizedOwnedPath,
 ): boolean {
-  const c = concretePath.normalized;
-  if (c === "") return true;
-
-  if (globToRegExp(globPath.normalized).test(c)) {
-    return true;
-  }
-
-  const globPrefix = staticDirPrefix(globPath.normalized);
-  if (globPrefix === c || globPrefix.startsWith(`${c}/`)) {
-    return true;
-  }
-
-  const looksLikeDirectory =
-    concretePath.explicitDir || !path.posix.basename(c).includes(".");
-  if (
-    looksLikeDirectory &&
-    globPath.normalized.includes("**") &&
-    (globPrefix === "" || c.startsWith(`${globPrefix}/`))
-  ) {
-    return true;
-  }
-
-  return false;
-}
-
-function parsedOwnedPathsOverlap(
-  a: ParsedOwnedPath,
-  b: ParsedOwnedPath,
-): boolean {
-  if (!a.hasGlob && !b.hasGlob) {
-    return concretePathsOverlap(a.normalized, b.normalized);
-  }
-  if (a.hasGlob && !b.hasGlob) {
-    return globAndConcreteOverlap(a, b);
-  }
-  if (!a.hasGlob && b.hasGlob) {
-    return globAndConcreteOverlap(b, a);
-  }
-
+  if (a.normalized === "" || b.normalized === "") return true;
   if (a.normalized === b.normalized) return true;
-  const prefA = staticDirPrefix(a.normalized);
-  const prefB = staticDirPrefix(b.normalized);
-  if (!concretePathsOverlap(prefA, prefB)) {
-    return false;
-  }
-  const aRec = a.normalized.includes("**");
-  const bRec = b.normalized.includes("**");
-  if (!aRec && !bRec && prefA !== prefB) {
-    return false;
-  }
-  const sufA = literalTrailingSuffix(a.normalized);
-  const sufB = literalTrailingSuffix(b.normalized);
-  if (sufA && sufB && !sufA.endsWith(sufB) && !sufB.endsWith(sufA)) {
-    return false;
-  }
-  return true;
+  return (
+    a.normalized.startsWith(`${b.normalized}/`) ||
+    b.normalized.startsWith(`${a.normalized}/`)
+  );
 }
 
 function collectFeatureFileOverlapIssues(
@@ -1264,8 +1300,8 @@ function collectFeatureFileOverlapIssues(
     const parsedPaths = isFinished
       ? []
       : (feat.filesOwned ?? [])
-          .map(parseOwnedPath)
-          .filter((p): p is ParsedOwnedPath => p !== null);
+          .map(normalizeOwnedPath)
+          .filter((p): p is NormalizedOwnedPath => p !== null);
     return { feat, milestone: feat.milestone.trim(), parsedPaths };
   });
 
@@ -1288,7 +1324,7 @@ function collectFeatureFileOverlapIssues(
       let overlapPair: [string, string] | null = null;
       for (const pathA of a.parsedPaths) {
         for (const pathB of b.parsedPaths) {
-          if (parsedOwnedPathsOverlap(pathA, pathB)) {
+          if (ownedPathEntriesCollide(pathA, pathB)) {
             overlapPair = [pathA.raw, pathB.raw];
             break;
           }
@@ -3933,7 +3969,9 @@ export function createProposeSwarmPlanTool(
           validatorEnabled: refinedValidatorEnabled,
           maxConcurrency: refinedMaxConcurrency,
           baseBranch,
-          ...(currentDraft?.skipContractReview ? { skipContractReview: true } : {}),
+          ...(typeof currentDraft?.skipContractReview === "boolean"
+            ? { skipContractReview: currentDraft.skipContractReview }
+            : {}),
           questionnaireEcho: currentDraft?.questionnaireEcho,
         });
       }

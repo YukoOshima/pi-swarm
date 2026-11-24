@@ -37,6 +37,8 @@ export interface StartDraftOptions {
 export interface StartDraftExecutionOptions {
   applyToolProfile?: boolean;
   settings?: Partial<Pick<SwarmSettings, "validatorEnabled" | "maxConcurrency">>;
+  /** Implicit auto-detected base branch used only for new/replaced drafts (never clobbers an active draft on Append). */
+  defaultBaseBranch?: string;
 }
 
 export type UpdateDraftPatch = Partial<
@@ -294,14 +296,16 @@ export function startDraft(
   if (options.targetRunId?.trim()) {
     draft.targetRunId = options.targetRunId.trim();
   }
-  if (options.baseBranch?.trim()) {
-    draft.baseBranch = options.baseBranch.trim();
+  const resolvedBaseBranch =
+    options.baseBranch?.trim() || opts?.defaultBaseBranch?.trim();
+  if (resolvedBaseBranch) {
+    draft.baseBranch = resolvedBaseBranch;
   }
   if (options.autoConfirm) {
     draft.autoConfirm = true;
   }
-  if (options.skipContractReview) {
-    draft.skipContractReview = true;
+  if (typeof options.skipContractReview === "boolean") {
+    draft.skipContractReview = options.skipContractReview;
   }
   const echo = cloneEcho(options.questionnaireEcho);
   if (echo) {
@@ -500,8 +504,29 @@ export async function startOrResolveDraft(
       const mergedSeed = existingSeed
         ? `${existingSeed}\n\n${incomingSeed}`
         : incomingSeed;
-      const appended = updateDraft(pi, existing, { seed: mergedSeed });
-      applySwarmToolProfile(pi, "drafting");
+      const patch: UpdateDraftPatch = { seed: mergedSeed };
+      if (options.validatorEnabled !== undefined) {
+        patch.validatorEnabled = options.validatorEnabled;
+      }
+      if (options.maxConcurrency !== undefined) {
+        patch.maxConcurrency = options.maxConcurrency;
+      }
+      if (options.baseBranch !== undefined && options.baseBranch.trim()) {
+        patch.baseBranch = options.baseBranch.trim();
+      }
+      if (options.autoConfirm !== undefined) {
+        patch.autoConfirm = options.autoConfirm;
+      }
+      if (typeof options.skipContractReview === "boolean") {
+        patch.skipContractReview = options.skipContractReview;
+      }
+      if (options.questionnaireEcho !== undefined) {
+        patch.questionnaireEcho = options.questionnaireEcho;
+      }
+      const appended = updateDraft(pi, existing, patch);
+      if (startOpts?.applyToolProfile !== false) {
+        applySwarmToolProfile(pi, "drafting");
+      }
       return { action: "appended", draft: appended };
     }
     // decision === "replace"

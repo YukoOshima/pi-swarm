@@ -5150,8 +5150,8 @@ describe("drafting-contract-hardening: VAL-CONTRACT-001, VAL-CONTRACT-002, VAL-D
       ["trailing slash directory and file", ["src/drafting/"], ["src/drafting/draft-state.ts"]],
       ["wildcard dir /* and file", ["src/drafting/*"], ["src/drafting/draft-tools.ts"]],
       ["recursive dir /** and nested file", ["src/drafting/**"], ["src/drafting/sub/helper.ts"]],
-      ["extension glob *.ts and matching file", ["src/drafting/*.ts"], ["src/drafting/draft-tools.ts"]],
-      ["recursive glob **/*.ts and matching file", ["src/**/*.ts"], ["src/drafting/draft-tools.ts"]],
+      ["identical wildcard path", ["src/drafting/*.ts"], ["src/drafting/*.ts"]],
+      ["directory enclosing wildcard path", ["src/drafting/"], ["src/drafting/*.ts"]],
       ["repo root . and any file", ["."], ["src/index.ts"]],
     ];
 
@@ -5177,8 +5177,8 @@ describe("drafting-contract-hardening: VAL-CONTRACT-001, VAL-CONTRACT-002, VAL-D
       ["disjoint sibling directory prefix (src/draft vs src/drafting/x.ts)", ["src/draft"], ["src/drafting/draft-tools.ts"]],
       ["disjoint files in same dir", ["src/drafting/draft-state.ts"], ["src/drafting/draft-tools.ts"]],
       ["disjoint filename suffix (src/a.ts vs src/a.ts.bak)", ["src/a.ts"], ["src/a.ts.bak"]],
-      ["disjoint glob extension (*.ts vs README.md)", ["src/drafting/*.ts"], ["src/drafting/README.md"]],
-      ["disjoint globs (*.ts vs *.md)", ["src/drafting/*.ts"], ["src/drafting/*.md"]],
+      ["disjoint prefix wildcards (src/auth-*.ts vs src/ui-*.ts)", ["src/auth-*.ts"], ["src/ui-*.ts"]],
+      ["disjoint extension wildcards (*.ts vs *.md)", ["src/drafting/*.ts"], ["src/drafting/*.md"]],
       ["direct depends_on ordering in same milestone", ["src/shared.ts"], ["src/shared.ts"], { dependsOnB: ["feat-a"] }],
       ["different milestones without depends_on", ["src/shared.ts"], ["src/shared.ts"], { milestoneB: "M2: Follow-up" }],
     ];
@@ -5296,11 +5296,21 @@ describe("drafting-contract-hardening: VAL-CONTRACT-001, VAL-CONTRACT-002, VAL-D
       boundaries: ["Never touch legacy-db/"],
       milestones: [
         {
+          label: "M0: Prep",
+          status: "done",
+          owner: "scout",
+        },
+        {
           label: "M1: Foundation",
           status: "done",
           owner: "validator",
           sealed: true,
           sealedAt: "2026-11-24T12:00:00.000Z",
+        },
+        {
+          label: "M2: External Hold",
+          status: "blocked",
+          owner: "ops",
         },
         {
           label: "M2: API",
@@ -5341,6 +5351,9 @@ describe("drafting-contract-hardening: VAL-CONTRACT-001, VAL-CONTRACT-002, VAL-D
           description: "Implement JWT auth",
           milestone: "M1: Foundation",
           filesOwned: ["src/auth.ts"],
+          preconditions: ["KMS key available"],
+          expectedBehavior: ["POST /login signs JWT"],
+          verificationSteps: ["npm run test:file -- tests/auth.test.ts"],
           fulfills: ["VAL-CORE-001"],
           status: "completed",
           assignedMember: "core-dev",
@@ -5354,6 +5367,9 @@ describe("drafting-contract-hardening: VAL-CONTRACT-001, VAL-CONTRACT-002, VAL-D
           milestone: "M2: API",
           dependsOn: ["feat-core"],
           filesOwned: ["src/metrics.ts"],
+          preconditions: ["Auth middleware ready"],
+          expectedBehavior: ["GET /metrics returns counters"],
+          verificationSteps: ["npm run test:file -- tests/metrics.test.ts"],
           fulfills: ["VAL-API-001"],
           status: "in_progress",
           assignedMember: "api-dev",
@@ -5361,6 +5377,13 @@ describe("drafting-contract-hardening: VAL-CONTRACT-001, VAL-CONTRACT-002, VAL-D
         },
       ],
     };
+
+    // 0. Strategy-only tweak (omitting assertions/features/milestones) preserves existing milestones verbatim
+    //    including featureless unsealed M0: Prep and blocked M2: External Hold in exact prior order!
+    const strategyOnly = mergeTweakedMissionContract(existingRun, {}, nowIso);
+    assert.deepEqual(strategyOnly.milestones, existingRun.milestones);
+    assert.deepEqual(strategyOnly.features, existingRun.features);
+    assert.deepEqual(strategyOnly.assertions, existingRun.assertions);
 
     // 1. Sealed milestone guard throws SwarmProtocolError("INVALID_INPUT")
     assert.throws(
@@ -5389,8 +5412,9 @@ describe("drafting-contract-hardening: VAL-CONTRACT-001, VAL-CONTRACT-002, VAL-D
         /sealed milestone "M1: Foundation"/i.test(err.message),
     );
 
-    // 2. Canonical merge: preserves completed + in_progress + unchanged passed/override,
-    // resets modified VAL-API-001, merges commands/services/boundaries, preserves sealed M1!
+    // 2. Canonical merge: preserves completed + in_progress + omitted optional fields (filesOwned/dependsOn/
+    //    preconditions/expectedBehavior/verificationSteps) + unchanged passed/override, resets modified VAL-API-001,
+    //    merges commands/services/boundaries, and preserves prior featureless/blocked & sealed milestones in order!
     const incoming = {
       assertions: [
         {
@@ -5419,22 +5443,21 @@ describe("drafting-contract-hardening: VAL-CONTRACT-001, VAL-CONTRACT-002, VAL-D
       ],
       features: [
         {
+          // Deliberately omit filesOwned, preconditions, expectedBehavior, verificationSteps on completed feature
           id: "feat-core",
           title: "Core Auth",
           description: "Implement JWT auth",
           milestone: "M1: Foundation",
-          filesOwned: ["src/auth.ts"],
           fulfills: ["VAL-CORE-001"],
           status: "pending" as const,
           updatedAt: nowIso,
         },
         {
+          // Deliberately omit dependsOn, filesOwned, preconditions, expectedBehavior, verificationSteps on in_progress feature
           id: "feat-api",
           title: "Metrics API",
           description: "Implement Prometheus /metrics",
           milestone: "M2: API",
-          dependsOn: ["feat-core"],
-          filesOwned: ["src/metrics.ts"],
           fulfills: ["VAL-API-001"],
           status: "pending" as const,
           updatedAt: nowIso,
@@ -5476,14 +5499,22 @@ describe("drafting-contract-hardening: VAL-CONTRACT-001, VAL-CONTRACT-002, VAL-D
     assert.equal(aApi?.evidence, undefined);
     assert.equal(aApi?.verifiedBy, undefined);
 
+    // Completed & in_progress features preserve omitted optional fields from existingRun!
     const fCore = merged1.features?.find((f) => f.id === "feat-core");
     assert.equal(fCore?.status, "completed");
     assert.equal(fCore?.mergedCommitSha, "abc1234");
     assert.equal(fCore?.assignedMember, "core-dev");
+    assert.deepEqual(fCore?.filesOwned, ["src/auth.ts"]);
+    assert.deepEqual(fCore?.preconditions, ["KMS key available"]);
+    assert.deepEqual(fCore?.expectedBehavior, ["POST /login signs JWT"]);
+    assert.deepEqual(fCore?.verificationSteps, ["npm run test:file -- tests/auth.test.ts"]);
 
     const fApi = merged1.features?.find((f) => f.id === "feat-api");
     assert.equal(fApi?.status, "in_progress");
     assert.equal(fApi?.assignedMember, "api-dev");
+    assert.deepEqual(fApi?.dependsOn, ["feat-core"]);
+    assert.deepEqual(fApi?.filesOwned, ["src/metrics.ts"]);
+    assert.deepEqual(fApi?.preconditions, ["Auth middleware ready"]);
 
     assert.deepEqual(merged1.commands, [
       { name: "test", command: "npm run test:all" },
@@ -5499,17 +5530,57 @@ describe("drafting-contract-hardening: VAL-CONTRACT-001, VAL-CONTRACT-002, VAL-D
       "Keep ports in 4100-4199",
     ]);
 
+    // Prior ordering & featureless unsealed/blocked milestones preserved alongside sealed M1 + new M3!
+    assert.deepEqual(
+      merged1.milestones?.map((m) => m.label),
+      ["M0: Prep", "M1: Foundation", "M2: External Hold", "M2: API", "M3: Hardening"],
+    );
+    assert.deepEqual(merged1.milestones?.[0], {
+      label: "M0: Prep",
+      status: "done",
+      owner: "scout",
+    });
     const m1 = merged1.milestones?.find((m) => m.label === "M1: Foundation");
     assert.equal(m1?.status, "done");
     assert.equal(m1?.sealed, true);
     assert.equal(m1?.sealedAt, "2026-11-24T12:00:00.000Z");
     assert.equal(m1?.owner, "validator");
+    assert.deepEqual(merged1.milestones?.[2], {
+      label: "M2: External Hold",
+      status: "blocked",
+      owner: "ops",
+    });
 
-    // 3. Idempotency: re-applying mergeTweakedMissionContract to its own output yields exact deep equality
+    // 3. Explicit incoming milestones preserve explicit ordering & metadata alongside sealed milestones
+    const explicitMsMerged = mergeTweakedMissionContract(
+      existingRun,
+      {
+        milestones: [
+          { label: "M1: Foundation", status: "done" },
+          { label: "M2: API", status: "blocked", owner: "release-lead" },
+          { label: "M4: Signoff", status: "pending", owner: "qa" },
+        ],
+      },
+      nowIso,
+    );
+    assert.deepEqual(
+      explicitMsMerged.milestones?.map((m) => m.label),
+      ["M1: Foundation", "M2: API", "M4: Signoff"],
+    );
+    assert.equal(explicitMsMerged.milestones?.[0]?.sealed, true);
+    assert.equal(explicitMsMerged.milestones?.[1]?.status, "blocked");
+    assert.equal(explicitMsMerged.milestones?.[1]?.owner, "release-lead");
+    assert.deepEqual(explicitMsMerged.milestones?.[2], {
+      label: "M4: Signoff",
+      status: "pending",
+      owner: "qa",
+    });
+
+    // 4. Idempotency: re-applying mergeTweakedMissionContract to its own output yields exact deep equality
     const merged2 = mergeTweakedMissionContract(existingRun, merged1, nowIso);
     assert.deepEqual(merged2, merged1);
 
-    // 4. Modifying an assertion inside sealed M1 unseals M1 and moves it to in_progress
+    // 5. Modifying an assertion inside sealed M1 unseals M1 and moves it to in_progress
     const unsealed = mergeTweakedMissionContract(
       existingRun,
       {
@@ -5567,6 +5638,21 @@ describe("drafting-contract-hardening: VAL-CONTRACT-001, VAL-CONTRACT-002, VAL-D
     });
     assert.equal(updated.skipContractReview, false);
     assert.equal(rehydrateDraft(ctx)?.skipContractReview, false);
+
+    // Explicit skipContractReview: false in startDraft is preserved durably (distinct from omitted undefined)
+    const explicitFalse = startDraft(harness.api, {
+      mode: "swarm",
+      seed: "Explicitly reviewed draft",
+      skipContractReview: false,
+    });
+    assert.equal(explicitFalse.skipContractReview, false);
+    assert.equal(rehydrateDraft(ctx)?.skipContractReview, false);
+
+    const omittedFlag = startDraft(harness.api, {
+      mode: "swarm",
+      seed: "Omitted skip flag",
+    });
+    assert.equal(omittedFlag.skipContractReview, undefined);
 
     // Reject malformed non-boolean skipContractReview during rehydration
     harness.api.appendEntry(SWARM_DRAFT_ENTRY, {
@@ -5795,71 +5881,127 @@ describe("drafting-contract-hardening: VAL-CONTRACT-001, VAL-CONTRACT-002, VAL-D
       assert.equal(modalDepth, 0);
     }
 
-    // 2. Non-empty differing incoming seed -> 4 choices including Append, exact Resume/Replace/Cancel labels intact
-    const appendCapture = captureSelectChoices((choices) =>
+    // 2. Non-empty differing incoming seed with OMITTED overrides -> 4 choices including Append,
+    //    exact Resume/Replace/Cancel labels intact, and implicit startOpts defaults do NOT clobber active draft
+    const omittedOverrideCapture = captureSelectChoices((choices) =>
       choices.find((c) => c.startsWith("Append —")),
     );
-    const appendRes = await startOrResolveDraft(
+    const omittedRes = await startOrResolveDraft(
       harness.api,
-      appendCapture.ctx,
+      omittedOverrideCapture.ctx,
       existing,
       {
         mode: "swarm",
         seed: "Also add brute-force rate limiting",
-        validatorEnabled: false,
-        maxConcurrency: 2,
       },
       hooks,
+      {
+        settings: { validatorEnabled: false, maxConcurrency: 2 },
+        defaultBaseBranch: "develop",
+      },
     );
 
     assert.equal(modalDepth, 0);
-    assert.equal(appendCapture.getChoices().length, 4);
+    assert.equal(omittedOverrideCapture.getChoices().length, 4);
     assert.equal(
-      appendCapture.getChoices()[0],
+      omittedOverrideCapture.getChoices()[0],
       "Resume — continue the active draft",
     );
-    assert.match(appendCapture.getChoices()[1] ?? "", /^Append — /);
+    assert.match(omittedOverrideCapture.getChoices()[1] ?? "", /^Append — /);
     assert.equal(
-      appendCapture.getChoices()[2],
+      omittedOverrideCapture.getChoices()[2],
       "Replace — discard active draft and start fresh",
     );
     assert.equal(
-      appendCapture.getChoices()[3],
+      omittedOverrideCapture.getChoices()[3],
       "Cancel — keep current state unchanged",
     );
 
-    assert.equal(appendRes.action, "appended");
-    assert.ok(appendRes.draft);
+    assert.equal(omittedRes.action, "appended");
+    assert.ok(omittedRes.draft);
     assert.equal(
-      appendRes.draft.seed,
+      omittedRes.draft.seed,
       "Build OAuth PKCE login\n\nAlso add brute-force rate limiting",
     );
-    // Preserves existing draft metadata durably
-    assert.equal(appendRes.draft.validatorEnabled, true);
-    assert.equal(appendRes.draft.maxConcurrency, 4);
-    assert.equal(appendRes.draft.skipContractReview, true);
-    assert.deepEqual(appendRes.draft.questionnaireEcho, { storage: "SQLite" });
+    // Preserves existing draft metadata when overrides are omitted (ignores implicit startOpts defaults)
+    assert.equal(omittedRes.draft.validatorEnabled, true);
+    assert.equal(omittedRes.draft.maxConcurrency, 4);
+    assert.equal(omittedRes.draft.baseBranch, "main");
+    assert.equal(omittedRes.draft.skipContractReview, true);
+    assert.deepEqual(omittedRes.draft.questionnaireEcho, { storage: "SQLite" });
     assert.equal(
-      rehydrateDraft(appendCapture.ctx)?.seed,
+      rehydrateDraft(omittedOverrideCapture.ctx)?.seed,
       "Build OAuth PKCE login\n\nAlso add brute-force rate limiting",
     );
 
-    // 3. DraftStateController.startOrResolve propagates action: "appended" and updates cached draft
-    const controller = new DraftStateController(harness.api, hooks);
-    controller.start({ seed: "Initial seed", maxConcurrency: 3 });
+    // 3. Non-empty differing incoming seed with EXPLICIT overrides -> applies explicit policy/branch/fast overrides
+    const explicitOverrideCapture = captureSelectChoices((choices) =>
+      choices.find((c) => c.startsWith("Append —")),
+    );
+    const explicitRes = await startOrResolveDraft(
+      harness.api,
+      explicitOverrideCapture.ctx,
+      existing,
+      {
+        mode: "swarm",
+        seed: "Switch target branch and run fast without validator",
+        validatorEnabled: false,
+        maxConcurrency: 2,
+        baseBranch: "release/v2",
+        skipContractReview: false,
+        autoConfirm: true,
+      },
+      hooks,
+    );
+    assert.equal(explicitRes.action, "appended");
+    assert.ok(explicitRes.draft);
+    assert.equal(
+      explicitRes.draft.seed,
+      "Build OAuth PKCE login\n\nSwitch target branch and run fast without validator",
+    );
+    assert.equal(explicitRes.draft.validatorEnabled, false);
+    assert.equal(explicitRes.draft.maxConcurrency, 2);
+    assert.equal(explicitRes.draft.baseBranch, "release/v2");
+    assert.equal(explicitRes.draft.skipContractReview, false);
+    assert.equal(explicitRes.draft.autoConfirm, true);
+    assert.deepEqual(explicitRes.draft.questionnaireEcho, { storage: "SQLite" });
+    const rehydratedExplicit = rehydrateDraft(explicitOverrideCapture.ctx);
+    assert.equal(rehydratedExplicit?.validatorEnabled, false);
+    assert.equal(rehydratedExplicit?.maxConcurrency, 2);
+    assert.equal(rehydratedExplicit?.baseBranch, "release/v2");
+    assert.equal(rehydratedExplicit?.skipContractReview, false);
+    assert.equal(rehydratedExplicit?.autoConfirm, true);
+
+    // 4. DraftStateController.startOrResolve propagates action: "appended", preserves untouched settings
+    //    (ignoring controller's getSettings defaults), and applies explicit overrides when passed
+    const controller = new DraftStateController(
+      harness.api,
+      hooks,
+      () => ({ validatorEnabled: false, maxConcurrency: 1 }),
+    );
+    controller.start(
+      { seed: "Initial seed", validatorEnabled: true, maxConcurrency: 5 },
+      { defaultBaseBranch: "main" },
+    );
+    assert.equal(controller.getDraft()?.baseBranch, "main");
     const ctrlCapture = captureSelectChoices((choices) =>
       choices.find((c) => c.startsWith("Append —")),
     );
-    const ctrlRes = await controller.startOrResolve(ctrlCapture.ctx, {
-      seed: "Second requirement",
-    });
+    const ctrlRes = await controller.startOrResolve(
+      ctrlCapture.ctx,
+      { seed: "Second requirement", maxConcurrency: 6 },
+      { defaultBaseBranch: "develop" },
+    );
     assert.equal(ctrlRes.action, "appended");
     assert.equal(
       controller.getDraft()?.seed,
       "Initial seed\n\nSecond requirement",
     );
+    assert.equal(controller.getDraft()?.validatorEnabled, true);
+    assert.equal(controller.getDraft()?.maxConcurrency, 6);
+    assert.equal(controller.getDraft()?.baseBranch, "main");
 
-    // 4. Appending onto an empty-seed existing draft uses incoming seed without leading blank lines
+    // 5. Appending onto an empty-seed existing draft uses incoming seed without leading blank lines
     const emptySeedDraft = startDraft(harness.api, { seed: "" });
     const emptyAppendCapture = captureSelectChoices((choices) =>
       choices.find((c) => c.startsWith("Append —")),
