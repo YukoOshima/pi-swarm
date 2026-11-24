@@ -85,6 +85,11 @@ import {
   type ISwarmStore,
   type ISwarmTransport,
   type IWorktreeManager,
+  type ManageMissionInput,
+  type MissionAssertion,
+  type MissionCommandEntry,
+  type MissionFeature,
+  type MissionHandoffItem,
   type ProposedSwarmPlan,
   type RoleModelOrigin,
   type RunSummary,
@@ -92,6 +97,7 @@ import {
   type SwarmEngineEvent,
   type SwarmFocusEntry,
   type SwarmMemberRecord,
+  type SwarmMilestone,
   type SwarmModelRole,
   type SwarmRunState,
   type SwarmRunStatus,
@@ -212,10 +218,13 @@ const SINGLE_WORD_SUBCOMMANDS = new Set([
   "help",
 ]);
 
-const SINGLE_WORD_ALIASES = new Map<string, "runs" | "settings">([
+const SINGLE_WORD_ALIASES = new Map<string, "runs" | "settings" | "status">([
   ["ls", "runs"],
   ["list", "runs"],
   ["config", "settings"],
+  ["mission", "status"],
+  ["contract", "status"],
+  ["goal", "status"],
 ]);
 
 const ARG_SUBCOMMANDS = new Set([
@@ -863,7 +872,349 @@ function createDelegatingProxy<T extends object>(getTarget: () => T): T {
   });
 }
 
-function buildRunKickoffMessage(
+function derivePlanMilestones(
+  explicitMilestones: readonly SwarmMilestone[] | undefined,
+  features: readonly MissionFeature[] | undefined,
+  assertions: readonly MissionAssertion[] | undefined,
+  priorMilestones?: readonly SwarmMilestone[],
+  resetAssertionIds?: ReadonlySet<string>,
+): SwarmMilestone[] | undefined {
+  const hasExplicit = Boolean(explicitMilestones && explicitMilestones.length > 0);
+  const hasFeatures = Boolean(features && features.length > 0);
+  const hasPrior = Boolean(priorMilestones && priorMilestones.length > 0);
+  if (!hasExplicit && !hasFeatures && !hasPrior) {
+    return explicitMilestones ? [...explicitMilestones] : undefined;
+  }
+
+  const priorByLabel = new Map<string, SwarmMilestone>();
+  for (const pm of priorMilestones ?? []) {
+    if (pm.label.trim()) {
+      priorByLabel.set(pm.label.trim(), pm);
+    }
+  }
+  const explicitByLabel = new Map<string, SwarmMilestone>();
+  const orderedLabels: string[] = [];
+  const pushLabel = (rawLabel: string): void => {
+    const clean = rawLabel.trim();
+    if (clean && !orderedLabels.includes(clean)) {
+      orderedLabels.push(clean);
+    }
+  };
+
+  for (const m of explicitMilestones ?? []) {
+    const clean = m.label.trim();
+    if (clean) {
+      explicitByLabel.set(clean, m);
+      pushLabel(clean);
+    }
+  }
+  for (const pm of priorMilestones ?? []) {
+    const clean = pm.label.trim();
+    if (!clean) continue;
+    const stillHasFeatures = (features ?? []).some((f) => f.milestone.trim() === clean);
+    if (pm.sealed || stillHasFeatures || !hasExplicit) {
+      pushLabel(clean);
+    }
+  }
+  for (const f of features ?? []) {
+    pushLabel(f.milestone);
+  }
+
+  const assertionMap = new Map<string, MissionAssertion>();
+  for (const a of assertions ?? []) {
+    assertionMap.set(a.id, a);
+  }
+
+  return orderedLabels.map((label): SwarmMilestone => {
+    const exp = explicitByLabel.get(label);
+    const prev = priorByLabel.get(label);
+    const milestoneFeatures = (features ?? []).filter((f) => f.milestone.trim() === label);
+    const activeFeatures = milestoneFeatures.filter((f) => f.status !== "cancelled");
+
+    const claimedIds = new Set<string>();
+    for (const f of activeFeatures) {
+      for (const aid of f.fulfills ?? []) {
+        claimedIds.add(aid);
+      }
+    }
+    const hadResetAssertion = Array.from(claimedIds).some((aid) =>
+      resetAssertionIds?.has(aid),
+    );
+    const allClaimedPassed = Array.from(claimedIds).every(
+      (aid) => assertionMap.get(aid)?.status === "passed",
+    );
+    const allFeaturesCompleted =
+      activeFeatures.length > 0 &&
+      activeFeatures.every((f) => f.status === "completed");
+    const anyProgress = activeFeatures.some(
+      (f) => f.status === "in_progress" || f.status === "completed",
+    );
+
+    if (hadResetAssertion) {
+      return {
+        label,
+        status: "in_progress",
+        ...(exp?.owner ?? prev?.owner ? { owner: exp?.owner ?? prev?.owner } : {}),
+        sealed: false,
+      };
+    }
+
+    const wasSealed = Boolean(prev?.sealed ?? exp?.sealed);
+    if (
+      wasSealed &&
+      (activeFeatures.length === 0 || (allFeaturesCompleted && allClaimedPassed))
+    ) {
+      return {
+        label,
+        status: "done",
+        ...(exp?.owner ?? prev?.owner ? { owner: exp?.owner ?? prev?.owner } : {}),
+        sealed: true,
+        ...(prev?.sealedAt ?? exp?.sealedAt
+          ? { sealedAt: prev?.sealedAt ?? exp?.sealedAt }
+          : {}),
+      };
+    }
+
+    let status: SwarmMilestone["status"] =
+      exp?.status ?? prev?.status ?? "pending";
+    if (activeFeatures.length > 0) {
+      if (allFeaturesCompleted && allClaimedPassed) {
+        status = "done";
+      } else if (exp?.status === "blocked") {
+        status = "blocked";
+      } else if (anyProgress || status === "done") {
+        status = "in_progress";
+      } else {
+        status = exp?.status ?? "pending";
+      }
+    }
+
+    return {
+      label,
+      status,
+      ...(exp?.owner ?? prev?.owner ? { owner: exp?.owner ?? prev?.owner } : {}),
+      ...(exp?.sealed !== undefined ? { sealed: exp.sealed } : {}),
+      ...(exp?.sealedAt ? { sealedAt: exp.sealedAt } : {}),
+    };
+  });
+}
+
+function mergeTweakedMissionArtifacts(
+  existingRun: SwarmRunState,
+  plan: ProposedSwarmPlan,
+  nowIso: string,
+): {
+  assertions?: MissionAssertion[];
+  features?: MissionFeature[];
+  milestones?: SwarmMilestone[];
+  commands?: MissionCommandEntry[];
+  boundaries?: string[];
+} {
+  const existingFeatureById = new Map<string, MissionFeature>();
+  for (const f of existingRun.features ?? []) {
+    existingFeatureById.set(f.id, f);
+  }
+  const sealedMilestones = new Set<string>(
+    (existingRun.milestones ?? [])
+      .filter((m) => m.sealed === true)
+      .map((m) => m.label.trim()),
+  );
+
+  let mergedFeatures: MissionFeature[] | undefined;
+  if (plan.features !== undefined) {
+    for (const inc of plan.features) {
+      const cleanMilestone = inc.milestone.trim();
+      if (sealedMilestones.has(cleanMilestone) && !existingFeatureById.has(inc.id)) {
+        throw new SwarmProtocolError(
+          "INVALID_INPUT",
+          `Cannot add new feature "${inc.id}" into sealed milestone "${cleanMilestone}". Place follow-up work into a new milestone.`,
+          { featureId: inc.id, milestone: cleanMilestone },
+        );
+      }
+    }
+
+    const incomingIds = new Set<string>();
+    const nextFeatures: MissionFeature[] = [];
+    for (const inc of plan.features) {
+      incomingIds.add(inc.id);
+      const prev = existingFeatureById.get(inc.id);
+      if (prev?.status === "completed") {
+        nextFeatures.push({
+          ...prev,
+          ...inc,
+          status: "completed",
+          ...(prev.mergedCommitSha ?? inc.mergedCommitSha
+            ? { mergedCommitSha: prev.mergedCommitSha ?? inc.mergedCommitSha }
+            : {}),
+          ...(prev.assignedMember ?? inc.assignedMember
+            ? { assignedMember: prev.assignedMember ?? inc.assignedMember }
+            : {}),
+          updatedAt: prev.updatedAt,
+        });
+      } else if (prev?.status === "in_progress" && inc.status === "pending") {
+        nextFeatures.push({
+          ...prev,
+          ...inc,
+          status: "in_progress",
+          ...(inc.assignedMember ?? prev.assignedMember
+            ? { assignedMember: inc.assignedMember ?? prev.assignedMember }
+            : {}),
+          ...(inc.mergedCommitSha ?? prev.mergedCommitSha
+            ? { mergedCommitSha: inc.mergedCommitSha ?? prev.mergedCommitSha }
+            : {}),
+          updatedAt: nowIso,
+        });
+      } else {
+        nextFeatures.push({
+          ...inc,
+          status: inc.status ?? prev?.status ?? "pending",
+          updatedAt: inc.updatedAt || nowIso,
+        });
+      }
+    }
+
+    // Preserve already-completed features when a tweak only supplies delta features
+    const preservedCompleted: MissionFeature[] = [];
+    for (const prev of existingRun.features ?? []) {
+      if (!incomingIds.has(prev.id) && prev.status === "completed") {
+        preservedCompleted.push(prev);
+      }
+    }
+    mergedFeatures = [...preservedCompleted, ...nextFeatures];
+  }
+
+  const resetAssertionIds = new Set<string>();
+  let mergedAssertions: MissionAssertion[] | undefined;
+  if (plan.assertions !== undefined) {
+    const existingAssertionById = new Map<string, MissionAssertion>();
+    for (const a of existingRun.assertions ?? []) {
+      existingAssertionById.set(a.id, a);
+    }
+
+    const seenAssertionIds = new Set<string>();
+    const nextAssertions: MissionAssertion[] = [];
+    for (const inc of plan.assertions) {
+      seenAssertionIds.add(inc.id);
+      const prev = existingAssertionById.get(inc.id);
+      if (prev) {
+        const unchangedReq =
+          prev.description.trim() === inc.description.trim() &&
+          (prev.evidenceRequired ?? "").trim() ===
+            (inc.evidenceRequired ?? "").trim();
+        if (prev.status === "passed" && unchangedReq) {
+          nextAssertions.push({
+            ...inc,
+            status: "passed",
+            ...(inc.evidence ?? prev.evidence
+              ? { evidence: inc.evidence ?? prev.evidence }
+              : {}),
+            ...(inc.verifiedBy ?? prev.verifiedBy
+              ? { verifiedBy: inc.verifiedBy ?? prev.verifiedBy }
+              : {}),
+            ...(inc.verifiedByRole ?? prev.verifiedByRole
+              ? { verifiedByRole: inc.verifiedByRole ?? prev.verifiedByRole }
+              : {}),
+            updatedAt: prev.updatedAt,
+          });
+        } else if (prev.status === "passed" && !unchangedReq) {
+          resetAssertionIds.add(inc.id);
+          nextAssertions.push({
+            id: inc.id,
+            title: inc.title,
+            description: inc.description,
+            ...(inc.evidenceRequired
+              ? { evidenceRequired: inc.evidenceRequired }
+              : {}),
+            status: "pending",
+            updatedAt: nowIso,
+          });
+        } else {
+          nextAssertions.push({
+            ...prev,
+            ...inc,
+            status:
+              inc.status && inc.status !== "pending" ? inc.status : prev.status,
+            updatedAt: nowIso,
+          });
+        }
+      } else {
+        nextAssertions.push({
+          ...inc,
+          status: inc.status ?? "pending",
+          updatedAt: inc.updatedAt || nowIso,
+        });
+      }
+    }
+
+    // Keep assertions referenced by preserved completed features when tweak supplied delta assertions
+    const effectiveFeatures = mergedFeatures ?? existingRun.features ?? [];
+    const completedClaimedIds = new Set<string>();
+    for (const f of effectiveFeatures) {
+      if (f.status === "completed") {
+        for (const aid of f.fulfills ?? []) {
+          completedClaimedIds.add(aid);
+        }
+      }
+    }
+    const preservedAssertions: MissionAssertion[] = [];
+    for (const prev of existingRun.assertions ?? []) {
+      if (!seenAssertionIds.has(prev.id) && completedClaimedIds.has(prev.id)) {
+        preservedAssertions.push(prev);
+      }
+    }
+    mergedAssertions = [...preservedAssertions, ...nextAssertions];
+  }
+
+  let mergedCommands: MissionCommandEntry[] | undefined;
+  if (plan.commands !== undefined) {
+    const cmdMap = new Map<string, MissionCommandEntry>();
+    for (const c of existingRun.commands ?? []) {
+      cmdMap.set(c.name, c);
+    }
+    for (const c of plan.commands) {
+      cmdMap.set(c.name, c);
+    }
+    mergedCommands = Array.from(cmdMap.values());
+  }
+
+  let mergedBoundaries: string[] | undefined;
+  if (plan.boundaries !== undefined) {
+    const boundarySet = new Set<string>();
+    for (const b of existingRun.boundaries ?? []) {
+      if (b.trim()) boundarySet.add(b.trim());
+    }
+    for (const b of plan.boundaries) {
+      if (b.trim()) boundarySet.add(b.trim());
+    }
+    mergedBoundaries = Array.from(boundarySet);
+  }
+
+  const effectiveFeaturesForMilestones = mergedFeatures ?? existingRun.features;
+  const effectiveAssertionsForMilestones =
+    mergedAssertions ?? existingRun.assertions;
+  const mergedMilestones =
+    plan.milestones !== undefined ||
+    mergedFeatures !== undefined ||
+    resetAssertionIds.size > 0
+      ? derivePlanMilestones(
+          plan.milestones,
+          effectiveFeaturesForMilestones,
+          effectiveAssertionsForMilestones,
+          existingRun.milestones,
+          resetAssertionIds,
+        )
+      : undefined;
+
+  return {
+    ...(mergedAssertions !== undefined ? { assertions: mergedAssertions } : {}),
+    ...(mergedFeatures !== undefined ? { features: mergedFeatures } : {}),
+    ...(mergedMilestones !== undefined ? { milestones: mergedMilestones } : {}),
+    ...(mergedCommands !== undefined ? { commands: mergedCommands } : {}),
+    ...(mergedBoundaries !== undefined ? { boundaries: mergedBoundaries } : {}),
+  };
+}
+
+export function buildLaunchKickoffPrompt(
   run: SwarmRunState,
   spawnedInitial: readonly SwarmMemberRecord[],
   failedInitial?: ReadonlyArray<{ name: string; error: string }>,
@@ -882,6 +1233,46 @@ function buildRunKickoffMessage(
   }
   if (feedback && feedback.trim()) {
     lines.push(`- **User Confirmation Notes:** ${feedback.trim()}`);
+  }
+
+  const activeFeatures = (run.features ?? []).filter(
+    (f) => f.status !== "cancelled",
+  );
+  const totalFeatures =
+    activeFeatures.length > 0 ? activeFeatures.length : (run.features?.length ?? 0);
+  const completedFeatures = activeFeatures.filter(
+    (f) => f.status === "completed",
+  ).length;
+  const totalAssertions = run.assertions?.length ?? 0;
+  const passedAssertions = (run.assertions ?? []).filter(
+    (a) => a.status === "passed",
+  ).length;
+  const milestoneCount = run.milestones?.length ?? 0;
+
+  if (totalFeatures > 0 || totalAssertions > 0) {
+    const goalParts: string[] = [];
+    if (totalFeatures > 0) {
+      const doneTag =
+        completedFeatures > 0 ? ` (${completedFeatures}/${totalFeatures} completed)` : "";
+      const msTag =
+        milestoneCount > 0 ? ` across ${milestoneCount} milestone(s)` : "";
+      goalParts.push(`Features: ${totalFeatures}${doneTag}${msTag}`);
+    }
+    if (totalAssertions > 0) {
+      const passTag =
+        passedAssertions > 0 ? ` (${passedAssertions}/${totalAssertions} passed)` : "";
+      goalParts.push(`Contract: ${totalAssertions} VAL-* assertions${passTag}`);
+    }
+    lines.push(`- **Mission Goal:** ${goalParts.join(" · ")}`);
+  }
+  if (run.commands && run.commands.length > 0) {
+    const cmdSummary = run.commands
+      .map((c) => `\`${c.name}\`: \`${c.command}\``)
+      .join(" · ");
+    lines.push(`- **Commands:** ${cmdSummary}`);
+  }
+  if (run.boundaries && run.boundaries.length > 0) {
+    lines.push(`- **Boundaries:** ${run.boundaries.join("; ")}`);
   }
 
   lines.push("");
@@ -903,7 +1294,7 @@ function buildRunKickoffMessage(
       run.validatorEnabled !== false ? "validate independently, " : "";
     lines.push(
       "",
-      `Coordinate dynamically via \`swarm\`, \`post_message\`, \`read_board\`, and \`swarm_wait\`. Call \`swarm_wait{since: ${run.boardHead}}\` to end your turn cleanly and sleep (non-blocking) while waiting — you'll wake automatically on board messages, \`all_idle\`, or any user redirection. Adjust members mid-flight via \`swarm{action:"steer"|"stop"|"model"|"add"}\`, ${validatorStep}merge worktrees/clones, kill finished helpers, and call \`swarm{action:"done", summary}\` when complete.`,
+      `Coordinate dynamically via \`swarm\`, \`post_message\`, \`read_board\`, and \`swarm_wait\`. Call \`swarm_wait{since: ${run.boardHead}}\` to end your turn cleanly and sleep (non-blocking) while waiting — you'll wake automatically on board messages, \`all_idle\`, or any user redirection. Adjust members mid-flight via \`swarm{action:"steer"|"stop"|"model"|"add"|"mission"}\`, ${validatorStep}merge worktrees/clones, kill finished helpers, and call \`swarm{action:"done", summary}\` when complete.`,
     );
   } else {
     const workflowHint =
@@ -917,6 +1308,8 @@ function buildRunKickoffMessage(
 
   return lines.join("\n");
 }
+
+const buildRunKickoffMessage = buildLaunchKickoffPrompt;
 
 function buildMissionResumePrompt(
   run: SwarmRunState,
@@ -935,6 +1328,19 @@ function buildMissionResumePrompt(
   }
   if (run.acceptanceCriteria.trim()) {
     lines.push(`- **Acceptance Criteria:** ${run.acceptanceCriteria.trim()}`);
+  }
+  if (run.features?.length || run.assertions?.length) {
+    const activeFeats = (run.features ?? []).filter((f) => f.status !== "cancelled");
+    const doneFeats = activeFeats.filter((f) => f.status === "completed").length;
+    const passedVals = (run.assertions ?? []).filter((a) => a.status === "passed").length;
+    const parts: string[] = [];
+    if (run.features?.length) {
+      parts.push(`Features: ${doneFeats}/${activeFeats.length || run.features.length} completed`);
+    }
+    if (run.assertions?.length) {
+      parts.push(`Contract: ${passedVals}/${run.assertions.length} VAL-* assertions passed`);
+    }
+    lines.push(`- **Mission Goal:** ${parts.join(" · ")}`);
   }
   if (guidance?.trim()) {
     lines.push(`- **User Resume Guidance:** ${guidance.trim()}`);
@@ -976,18 +1382,18 @@ function buildMissionResumePrompt(
 
 function buildHelpMarkdown(): string {
   return [
-    "### 🐝 Pi Swarm v0.7.0 (`/swarm`) — Dynamic Antigravity Swarm Commands",
+    "### 🐝 Pi Swarm v0.8.0 (`/swarm`) — Dynamic Mission Goal Engine & Antigravity Swarm Commands",
     "",
     "| Command | Description |",
     "| --- | --- |",
     "| `/swarm` | Open Droid-style Mission Hub (with `🔄 Resume Mission` when unfinished) or status menu |",
-    "| `/swarm <goal>` | Interactive upfront Q&A → Flexible Dynamic Swarm Plan confirmation (`[m]` models, `[c]` comment) |",
+    "| `/swarm <goal>` | Interactive upfront Q&A → Mission-Level TDD (`VAL-*` contract + feature queue) confirmation (`[m]` models, `[c]` comment) |",
     "| `/swarm direct <goal>` · `/swarm-direct <goal>` | Fast-path: skip Q&A, propose plan with auto-confirm, and launch Dynamic Swarm immediately |",
-    "| `/swarm tweak [guidance]` | Revise the focused Swarm plan, strategy, or add members interactively |",
-    "| `/swarm status` | Zero-LLM-turn dashboard: 3-role models, channels, member roster, recent board & events |",
+    "| `/swarm tweak [guidance]` | Dynamically revise the focused Mission plan, `VAL-*` assertions, features, or add members in place |",
+    "| `/swarm status` · `/swarm contract` · `/swarm mission` | Zero-LLM-turn dashboard: Mission Features, `VAL-*` Validation Contract, handoffs, 3-role models & roster (also `/swarm goal`) |",
     "| `/swarm board [limit] [--channel <ch>] [--search <q>]` | Zero-LLM-turn shared `#seq` Message Board feed (filterable by channel or substring) |",
     "| `/swarm graph` | Zero-LLM-turn ASCII/Unicode Spawn Tree & Peer `@mention` / `#channel` interaction graph |",
-    "| `/swarm tasks [tab\\|member\\|#ch]` · `/swarm ui` · `/swarm mc` | Open interactive 4-tab Mission Control (`[M]` models, `[P]` pause/resume, `[?]` help; aliases: `mc`, `open`, `panel`) |",
+    "| `/swarm tasks [tab\\|member\\|#ch]` · `/swarm ui` · `/swarm mc` | Open interactive 4-tab Mission Control (`[M]` models, `[P]` pause/resume, `[v]` contract/graph, `[?]` help; aliases: `mc`, `open`, `panel`) |",
     "| `/swarm models [role\\|--print]` | Open interactive Mission Model Picker (`Orchestrator` / `Worker` / `Validator` / `Fallbacks`), or `--print` overview |",
     "| `/swarm model <target> <model[:thinking]\\|default> [thinking] [--global]` | Set role default (propagates to live members) OR hot-switch a live member (`@name`) |",
     "| `/swarm steer <member> <message>` | Redirect a working member immediately or wake a parked member with new direction |",
@@ -1004,7 +1410,7 @@ function buildHelpMarkdown(): string {
     "| `/swarm settings` · `/swarm config` | Configure Mission Models, warm pool, smart LLM monitor, concurrency & git settings |",
     "| `/swarm help` | Print this command reference (zero LLM turn) |",
     "",
-    "**Mid-Flight Redirection:** While workers run after Orchestrator calls `swarm_wait`, simply type any message directly to the Orchestrator to adjust direction, or run `/swarm steer <member> <msg>`.",
+    "**Mid-Flight Redirection & Goal Continuation:** Type any message directly to the Orchestrator while workers run to adjust scope (`swarm{action:\"mission\"}`), or run `/swarm steer <member> <msg>`. Active Goal runs auto-continue until all features & `VAL-*` assertions pass (or `[NEEDS_HUMAN]` is raised).",
     "**TUI Shortcuts:** `Alt+S` / `Ctrl+Shift+S` opens Mission Control / Hub · `Alt+M` / `Ctrl+Shift+M` opens Mission Model Picker · `Alt+W` / `Ctrl+Shift+T` toggles expanded above-editor dashboard · `Esc` collapses expanded dashboard.",
   ].join("\n");
 }
@@ -1179,19 +1585,24 @@ function renderSwarmWakeupMessage(
   const details = (message.details ?? {}) as {
     kickoff?: boolean;
     stallDetected?: boolean;
+    goalCheckpoint?: boolean;
   };
 
   const isStall = Boolean(details.stallDetected) || /stall alert/i.test(firstRaw);
   const isResumed = /mission resumed/i.test(firstRaw);
+  const isGoalCheckpoint =
+    Boolean(details.goalCheckpoint) || /goal checkpoint/i.test(firstRaw);
   const isLiveKickoff = Boolean(details.kickoff) || /\bis live on\b/i.test(firstRaw);
 
   const badgeLabel = isStall
     ? "🐝 [SWARM STALL]"
     : isResumed
       ? "🐝 [MISSION RESUMED]"
-      : isLiveKickoff
-        ? "🐝 [MISSION LIVE]"
-        : "🐝 [MISSION EVENT]";
+      : isGoalCheckpoint
+        ? "🎯 [GOAL CHECKPOINT]"
+        : isLiveKickoff
+          ? "🐝 [MISSION LIVE]"
+          : "🐝 [MISSION EVENT]";
   const badgeColor: ThemeColor = isStall
     ? "warning"
     : isLiveKickoff
@@ -1200,7 +1611,7 @@ function renderSwarmWakeupMessage(
   const badge = fg(badgeColor, bold(badgeLabel));
 
   const cleanTitleSource = firstRaw
-    .replace(/^🐝\s*/, "")
+    .replace(/^(?:🐝|🎯)\s*/, "")
     .replace(/^\*\*Swarm Mission Resumed:\*\*\s*/i, "")
     .replace(/^Swarm Mission Resumed:\s*/i, "")
     .trim();
@@ -1598,6 +2009,85 @@ function buildMissionCompletionCard(
     `- **Validator:** ${validatorVerdict}`,
   ];
 
+  if (run.assertions && run.assertions.length > 0) {
+    const totalVal = run.assertions.length;
+    const passedVal = run.assertions.filter((a) => a.status === "passed").length;
+    const failedVal = run.assertions.filter((a) => a.status === "failed").length;
+    const blockedVal = run.assertions.filter((a) => a.status === "blocked").length;
+    const pendingVal = totalVal - passedVal - failedVal - blockedVal;
+    const valIcon =
+      passedVal === totalVal ? "✅" : failedVal > 0 ? "⚠️" : "ℹ️";
+    const extraParts: string[] = [];
+    if (failedVal > 0) extraParts.push(`${failedVal} failed`);
+    if (blockedVal > 0) extraParts.push(`${blockedVal} blocked`);
+    if (pendingVal > 0) extraParts.push(`${pendingVal} pending`);
+    const extraSuffix =
+      extraParts.length > 0 ? ` (${extraParts.join(", ")})` : "";
+    const idPreview = run.assertions
+      .slice(0, 6)
+      .map((a) => `\`${sanitizePlainText(a.id)}\``)
+      .join(", ");
+    const idMore =
+      run.assertions.length > 6 ? `, … +${run.assertions.length - 6} more` : "";
+    lines.push(
+      `- **Validation Contract:** ${valIcon} ${passedVal}/${totalVal} VAL-* passed${extraSuffix} (${idPreview}${idMore})`,
+    );
+  }
+
+  if (run.features && run.features.length > 0) {
+    const nonCancelled = run.features.filter((f) => f.status !== "cancelled");
+    const cancelledCount = run.features.length - nonCancelled.length;
+    const denom = nonCancelled.length > 0 ? nonCancelled.length : run.features.length;
+    const completedCount = nonCancelled.filter(
+      (f) => f.status === "completed",
+    ).length;
+    const featIcon = completedCount === denom && denom > 0 ? "✅" : "ℹ️";
+    const cancelledSuffix =
+      cancelledCount > 0 ? ` (${cancelledCount} cancelled)` : "";
+    const featPreview = run.features
+      .slice(0, 6)
+      .map((f) => `\`${sanitizePlainText(f.id)}\``)
+      .join(", ");
+    const featMore =
+      run.features.length > 6 ? `, … +${run.features.length - 6} more` : "";
+    lines.push(
+      `- **Features:** ${featIcon} ${completedCount}/${denom} completed${cancelledSuffix} (${featPreview}${featMore})`,
+    );
+  }
+
+  if (run.milestones && run.milestones.length > 0) {
+    const totalMs = run.milestones.length;
+    const doneMs = run.milestones.filter((m) => m.status === "done").length;
+    const sealedMs = run.milestones.filter((m) => m.sealed === true).length;
+    const msBadges = run.milestones
+      .map((m) => {
+        const safeLabel = sanitizePlainText(m.label);
+        return m.sealed ? `\`${safeLabel}\` [sealed]` : `\`${safeLabel}\` [${m.status}]`;
+      })
+      .join(", ");
+    lines.push(
+      `- **Sealed Milestones:** ${sealedMs}/${totalMs} sealed (${doneMs}/${totalMs} done) — ${msBadges}`,
+    );
+  }
+
+  if (run.handoffItems && run.handoffItems.length > 0) {
+    const totalHandoffs = run.handoffItems.length;
+    const trackedCount = run.handoffItems.filter(
+      (h) => h.resolution === "tracked",
+    ).length;
+    const dismissedCount = run.handoffItems.filter(
+      (h) => h.resolution === "dismissed",
+    ).length;
+    const openCount = run.handoffItems.filter(
+      (h) => h.resolution === "open",
+    ).length;
+    const resolvedCount = trackedCount + dismissedCount;
+    const openSuffix = openCount > 0 ? `, ⚠️ ${openCount} open` : "";
+    lines.push(
+      `- **Tech-Debt Handoffs:** ${resolvedCount}/${totalHandoffs} resolved (${trackedCount} tracked, ${dismissedCount} dismissed${openSuffix})`,
+    );
+  }
+
   if (mergedMembers.length > 0) {
     const mergedList = mergedMembers
       .map((m) => {
@@ -1641,6 +2131,242 @@ function buildMissionCompletionCard(
   if (options.diffStat) {
     lines.push("", "**Diff Summary (`git diff --stat`):**", "```text", options.diffStat, "```");
   }
+
+  return lines.join("\n");
+}
+
+function enrichLiveStateWithMissionSync(
+  sectionText: string,
+  run: SwarmRunState | null | undefined,
+  humanSteeringText: string | undefined,
+): string {
+  if (
+    !run ||
+    run.status !== "active" ||
+    !humanSteeringText ||
+    humanSteeringText.trim().length === 0
+  ) {
+    return sectionText;
+  }
+
+  const syncRule =
+    '- **Droid Shared-Truth Rule**: Before resuming or steering workers on changed requirements, sync shared Mission truth FIRST via `swarm{action:"mission"}` (`upsert_assertions` / `remove_assertion` for `assertions`, `upsert_features` / `update_feature` for `features`, `set_manifest` for `commands` / `boundaries`) and `swarm{action:"title"}` if the objective or strategy changed!';
+
+  const steerHeading = "### ⚡ Live User Direction Update";
+  const steerIdx = sectionText.indexOf(steerHeading);
+  if (steerIdx === -1) {
+    return `${sectionText}\n\n${steerHeading}\n${syncRule}`;
+  }
+
+  const tailAfterSteer = sectionText.slice(steerIdx);
+  if (tailAfterSteer.includes("Shared-Truth Rule")) {
+    return sectionText;
+  }
+
+  const nextHeadingMatch = tailAfterSteer
+    .slice(steerHeading.length)
+    .search(/\n#{2,3}\s+/);
+  if (nextHeadingMatch === -1) {
+    return `${sectionText}\n${syncRule}`;
+  }
+  const insertPos = steerIdx + steerHeading.length + nextHeadingMatch;
+  return `${sectionText.slice(0, insertPos)}\n${syncRule}${sectionText.slice(insertPos)}`;
+}
+
+function extractAgentMessagePlainText(msg: unknown): string | undefined {
+  if (!msg || typeof msg !== "object") {
+    return undefined;
+  }
+  const candidate = msg as {
+    role?: unknown;
+    content?: unknown;
+    text?: unknown;
+  };
+  if (typeof candidate.text === "string") {
+    return candidate.text;
+  }
+  if (typeof candidate.content === "string") {
+    return candidate.content;
+  }
+  if (Array.isArray(candidate.content)) {
+    const parts: string[] = [];
+    for (const part of candidate.content) {
+      if (
+        part &&
+        typeof part === "object" &&
+        (part as { type?: unknown }).type === "text" &&
+        typeof (part as { text?: unknown }).text === "string"
+      ) {
+        parts.push((part as { text: string }).text);
+      }
+    }
+    return parts.join("\n");
+  }
+  return undefined;
+}
+
+function inspectGoalRemainingWork(run: SwarmRunState): {
+  hasStructuredGoal: boolean;
+  unfinishedFeatures: MissionFeature[];
+  unpassedAssertions: MissionAssertion[];
+  openHandoffs: MissionHandoffItem[];
+  unfinishedMilestones: SwarmMilestone[];
+  unmergedMembers: SwarmMemberRecord[];
+} {
+  const unfinishedFeatures = (run.features ?? []).filter(
+    (f) =>
+      f.status === "pending" ||
+      f.status === "in_progress" ||
+      f.status === "failed",
+  );
+  const unpassedAssertions = (run.assertions ?? []).filter(
+    (a) => a.status !== "passed",
+  );
+  const openHandoffs = (run.handoffItems ?? []).filter(
+    (h) => h.resolution === "open",
+  );
+  const unfinishedMilestones = (run.milestones ?? []).filter(
+    (m) => m.status !== "done",
+  );
+  const unmergedMembers = getOrderedMembers(run).filter(
+    (m) =>
+      m.state !== "killed" &&
+      (m.workspace === "share" || m.workspace === "branch") &&
+      Boolean(m.branch) &&
+      !m.mergedCommitSha,
+  );
+
+  const hasStructuredGoal = Boolean(
+    unfinishedFeatures.length > 0 ||
+      unpassedAssertions.length > 0 ||
+      openHandoffs.length > 0 ||
+      unfinishedMilestones.length > 0 ||
+      (run.features && run.features.length > 0) ||
+      (run.assertions && run.assertions.length > 0),
+  );
+
+  return {
+    hasStructuredGoal,
+    unfinishedFeatures,
+    unpassedAssertions,
+    openHandoffs,
+    unfinishedMilestones,
+    unmergedMembers,
+  };
+}
+
+function buildGoalCheckpointMessage(
+  run: SwarmRunState,
+  snapshot: SwarmSnapshot,
+  goalState: ReturnType<typeof inspectGoalRemainingWork>,
+): string {
+  const lines: string[] = [
+    `🎯 Pi Swarm Goal Checkpoint (${run.id})`,
+    "",
+    `Mission "${sanitizePlainText(run.title || run.objective || run.id)}" is still \`active\` with 0 working members:`,
+  ];
+
+  const totalFeatures =
+    (run.features ?? []).filter((f) => f.status !== "cancelled").length ||
+    (run.features?.length ?? 0);
+  const totalAssertions = run.assertions?.length ?? 0;
+
+  if (goalState.unfinishedFeatures.length > 0) {
+    const featSummary = goalState.unfinishedFeatures
+      .slice(0, 8)
+      .map(
+        (f) =>
+          `\`${sanitizePlainText(f.id)}\` [${f.status}, milestone: ${sanitizePlainText(f.milestone)}]`,
+      )
+      .join(", ");
+    const featMore =
+      goalState.unfinishedFeatures.length > 8
+        ? `, … +${goalState.unfinishedFeatures.length - 8} more`
+        : "";
+    lines.push(
+      `- **Remaining Features (${goalState.unfinishedFeatures.length}/${totalFeatures}):** ${featSummary}${featMore}`,
+    );
+  }
+
+  if (goalState.unpassedAssertions.length > 0) {
+    const valSummary = goalState.unpassedAssertions
+      .slice(0, 8)
+      .map(
+        (a) =>
+          `\`${sanitizePlainText(a.id)}\` [${a.status}] — ${sanitizePlainText(a.title).slice(0, 64)}`,
+      )
+      .join("; ");
+    const valMore =
+      goalState.unpassedAssertions.length > 8
+        ? `; … +${goalState.unpassedAssertions.length - 8} more`
+        : "";
+    lines.push(
+      `- **Unpassed Validation Assertions (${goalState.unpassedAssertions.length}/${totalAssertions}):** ${valSummary}${valMore}`,
+    );
+  }
+
+  if (goalState.openHandoffs.length > 0) {
+    const handoffSummary = goalState.openHandoffs
+      .slice(0, 6)
+      .map(
+        (h) =>
+          `\`${sanitizePlainText(h.id)}\` (${h.type} from @${sanitizePlainText(h.sourceMember)}): ${sanitizePlainText(h.summary).slice(0, 72)}`,
+      )
+      .join("; ");
+    const handoffMore =
+      goalState.openHandoffs.length > 6
+        ? `; … +${goalState.openHandoffs.length - 6} more`
+        : "";
+    lines.push(
+      `- **Open Tech-Debt Handoffs (${goalState.openHandoffs.length}):** ${handoffSummary}${handoffMore}`,
+    );
+  }
+
+  if (
+    goalState.unfinishedMilestones.length > 0 &&
+    goalState.unfinishedFeatures.length === 0
+  ) {
+    const msSummary = goalState.unfinishedMilestones
+      .slice(0, 6)
+      .map((m) => `\`${sanitizePlainText(m.label)}\` [${m.status}]`)
+      .join(", ");
+    lines.push(
+      `- **Pending Milestones (${goalState.unfinishedMilestones.length}/${run.milestones?.length ?? goalState.unfinishedMilestones.length}):** ${msSummary}`,
+    );
+  }
+
+  if (goalState.unmergedMembers.length > 0) {
+    const unmergedSummary = goalState.unmergedMembers
+      .map((m) => `\`@${m.name}\` (\`${m.branch}\`)`)
+      .join(", ");
+    lines.push(
+      `- **Unmerged Branches (${goalState.unmergedMembers.length}):** ${unmergedSummary}`,
+    );
+  }
+
+  if (
+    goalState.unfinishedFeatures.length === 0 &&
+    goalState.unpassedAssertions.length === 0 &&
+    goalState.openHandoffs.length === 0 &&
+    goalState.unfinishedMilestones.length === 0
+  ) {
+    lines.push(
+      `- **Goal Contract Satisfied:** All features (${totalFeatures}/${totalFeatures}) and VAL-* assertions (${totalAssertions}/${totalAssertions}) are complete — merge any remaining worktrees and call \`swarm{action:"done", summary}\` now to close the Mission.`,
+    );
+  }
+
+  const validatorGuidance =
+    run.validatorEnabled !== false
+      ? 'verify unpassed `VAL-*` assertions via `@validator` (`swarm{action:"mission", mission_op:"verify_assertion"}`), '
+      : 'verify unpassed `VAL-*` assertions (`swarm{action:"mission", mission_op:"verify_assertion"}`), ';
+
+  lines.push(
+    "",
+    "Do NOT stop with plain text while the Mission is active:",
+    `- Advance the next wave via \`swarm{action:"add"}\` or wake/steer parked members via \`post_message\` / \`swarm{action:"steer"}\` (and call \`swarm_wait{since: ${snapshot.boardHead}}\` while members work).`,
+    `- Resolve any open handoff items via \`swarm{action:"mission", mission_op:"upsert_features"}\` + \`swarm{action:"mission", mission_op:"resolve_handoff"}\`, ${validatorGuidance}merge verified branches (\`swarm{action:"merge"}\`), or call \`swarm{action:"done", summary}\` once 100% complete.`,
+    "- Only if genuinely blocked on external credentials or a human product decision, explain the blocker clearly and output `[NEEDS_HUMAN]` to pause auto-continuation.",
+  );
 
   return lines.join("\n");
 }
@@ -1777,8 +2503,26 @@ export function createPiSwarmExtension(
     let activeRunSections: Record<string, string> | undefined;
     let currentTurnIndex = 0;
     let waitArmedTurnIndex: number | null = null;
+    let lastObservedAssistantText: string | undefined;
     const activatedRunIds = new Set<string>();
     const readOnlyAttachRunIds = new Set<string>();
+    const goalContinuationByRunId = new Map<
+      string,
+      {
+        count: number;
+        lastProgressKey?: string;
+        stagnantTurns: number;
+        tripped?: boolean;
+      }
+    >();
+
+    function resetGoalContinuation(runId?: string | null): void {
+      if (!runId) {
+        goalContinuationByRunId.clear();
+        return;
+      }
+      goalContinuationByRunId.delete(runId);
+    }
 
     const widgetState: SwarmWidgetState = createSwarmWidgetState();
 
@@ -2045,14 +2789,15 @@ export function createPiSwarmExtension(
         isCurrentSessionOwner(snapshot.run, options?.ctx)
       ) {
         activeRunSections.swarm = buildOrchestratorStaticSection(snapshot);
-        activeRunSections.swarm_state = buildOrchestratorLiveStateSection(
-          snapshot,
-          {
+        activeRunSections.swarm_state = enrichLiveStateWithMissionSync(
+          buildOrchestratorLiveStateSection(snapshot, {
             includeRecentBoard: options?.includeRecentBoard ?? false,
             ...(options?.humanSteeringText
               ? { humanSteeringText: options.humanSteeringText }
               : {}),
-          },
+          }),
+          snapshot.run,
+          options?.humanSteeringText,
         );
         return;
       }
@@ -2269,23 +3014,27 @@ export function createPiSwarmExtension(
       }
       completedCardEmittedRunIds.add(run.id);
 
+      const effectiveRun = activeStore
+        ? await activeStore.loadRun(run.id).catch(() => run)
+        : run;
+
       const targetCtx = options.ctx ?? lastCtx;
       const boardMessages = activeStore
         ? (
             await activeStore
-              .readBoard(run.id, { channel: "*", limit: 200 })
+              .readBoard(effectiveRun.id, { channel: "*", limit: 200 })
               .catch(() => ({ messages: [] as BoardMessage[] }))
           ).messages
         : (activeEngine?.getSnapshot().recentBoard ?? []);
 
       const remainingWorktrees =
         options.remainingWorktrees ??
-        (await inspectRemainingWorktrees(run, activeStore, activeWorktree)).remaining;
+        (await inspectRemainingWorktrees(effectiveRun, activeStore, activeWorktree)).remaining;
       const diffStat = await computeMergedGitDiffStat(
         boundCwd ?? targetCtx?.cwd,
-        run,
+        effectiveRun,
       );
-      const card = buildMissionCompletionCard(run, {
+      const card = buildMissionCompletionCard(effectiveRun, {
         summary: options.summary,
         nowMs: (overrides.now ?? Date.now)(),
         boardMessages,
@@ -2295,17 +3044,53 @@ export function createPiSwarmExtension(
         initiatedBy: options.initiatedBy,
       });
 
+      const nonCancelledFeatures = (effectiveRun.features ?? []).filter(
+        (f) => f.status !== "cancelled",
+      );
       pi.sendMessage(
         {
           customType: SWARM_STATUS_CUSTOM_TYPE,
           content: card,
           display: true,
           details: {
-            runId: run.id,
-            status: run.status,
+            runId: effectiveRun.id,
+            status: effectiveRun.status,
             summary: options.summary,
             missionCompleteCard: true,
             remainingWorktrees: remainingWorktrees.length,
+            ...(effectiveRun.assertions
+              ? {
+                  assertionsPassed: effectiveRun.assertions.filter(
+                    (a) => a.status === "passed",
+                  ).length,
+                  assertionsTotal: effectiveRun.assertions.length,
+                }
+              : {}),
+            ...(effectiveRun.features
+              ? {
+                  featuresCompleted: nonCancelledFeatures.filter(
+                    (f) => f.status === "completed",
+                  ).length,
+                  featuresTotal:
+                    nonCancelledFeatures.length || effectiveRun.features.length,
+                }
+              : {}),
+            ...(effectiveRun.milestones
+              ? {
+                  milestonesSealed: effectiveRun.milestones.filter(
+                    (m) => m.sealed === true,
+                  ).length,
+                  milestonesTotal: effectiveRun.milestones.length,
+                }
+              : {}),
+            ...(effectiveRun.handoffItems
+              ? {
+                  handoffsResolved: effectiveRun.handoffItems.filter(
+                    (h) => h.resolution !== "open",
+                  ).length,
+                  handoffsTotal: effectiveRun.handoffItems.length,
+                }
+              : {}),
           },
         },
         { triggerTurn: false },
@@ -2945,6 +3730,7 @@ export function createPiSwarmExtension(
         invalidateRunsCache();
         if (ev.runId) {
           activatedRunIds.delete(ev.runId);
+          resetGoalContinuation(ev.runId);
         }
         latestHumanDirection = undefined;
         waitArmedTurnIndex = null;
@@ -3283,8 +4069,10 @@ export function createPiSwarmExtension(
       activeRunSections = undefined;
       currentTurnIndex = 0;
       waitArmedTurnIndex = null;
+      lastObservedAssistantText = undefined;
       activatedRunIds.clear();
       readOnlyAttachRunIds.clear();
+      resetGoalContinuation();
       pendingWakeups.length = 0;
       wakeupFlushScheduled = false;
       clearWakeupInFlight();
@@ -3501,6 +4289,22 @@ export function createPiSwarmExtension(
             return res;
           };
         }
+        if (prop === "manageMission") {
+          if (typeof target.manageMission !== "function") {
+            return undefined;
+          }
+          return async (input: ManageMissionInput) => {
+            if (waitArmedTurnIndex !== null && currentTurnIndex > waitArmedTurnIndex) {
+              disarmOrchestratorWait(
+                'Tool "manageMission" invoked after swarm_wait turn',
+              );
+            }
+            if (input?.op !== "status") {
+              await assertToolEngineOwner(target);
+            }
+            return target.manageMission!(input);
+          };
+        }
         const value = Reflect.get(target, prop, receiver);
         if (typeof value !== "function") {
           return value;
@@ -3647,6 +4451,13 @@ export function createPiSwarmExtension(
           await releaseRunOwnershipIfHeld(store, prevFocusedRunId, ownerSessionId);
         }
 
+        const nowIso = new Date((overrides.now ?? Date.now)()).toISOString();
+        const mergedArtifacts = mergeTweakedMissionArtifacts(
+          existingRun,
+          plan,
+          nowIso,
+        );
+
         let revisedRun = await store.updateRun(existingRun.id, {
           title: plan.title,
           objective: plan.objective,
@@ -3655,6 +4466,8 @@ export function createPiSwarmExtension(
           maxConcurrency: plan.maxConcurrency,
           validatorEnabled: plan.validatorEnabled,
           roleModels: plan.roleModels ?? buildRoleModelsFromSettings(currentSettings),
+          ...mergedArtifacts,
+          ...(plan.lastAudit !== undefined ? { lastAudit: plan.lastAudit } : {}),
           ownerSessionId,
           ownerPid: process.pid,
           actor: ORCHESTRATOR_NAME,
@@ -3695,6 +4508,7 @@ export function createPiSwarmExtension(
 
         const finalRun = engine.getSnapshot().run ?? revisedRun;
         activatedRunIds.add(finalRun.id);
+        resetGoalContinuation(finalRun.id);
         invalidateRunsCache();
         syncSessionNameForRun(finalRun);
         applySwarmToolProfile(pi, "running");
@@ -3735,7 +4549,11 @@ export function createPiSwarmExtension(
         }
       }
 
-      // 3. Create v2 Swarm run in store
+      // 3. Create v2 Swarm run in store (including Mission-Level TDD artifacts when present)
+      const initialMilestones =
+        plan.milestones !== undefined || (plan.features && plan.features.length > 0)
+          ? derivePlanMilestones(plan.milestones, plan.features, plan.assertions)
+          : undefined;
       const createdRun = await store.createRun({
         title: plan.title,
         objective: plan.objective,
@@ -3748,6 +4566,13 @@ export function createPiSwarmExtension(
         validatorEnabled: plan.validatorEnabled,
         keepWorkersWarm: currentSettings.keepWorkersWarm,
         roleModels: plan.roleModels ?? buildRoleModelsFromSettings(currentSettings),
+        ...(initialMilestones !== undefined ? { milestones: initialMilestones } : {}),
+        ...(plan.assertions !== undefined ? { assertions: plan.assertions } : {}),
+        ...(plan.features !== undefined ? { features: plan.features } : {}),
+        ...(plan.handoffItems !== undefined ? { handoffItems: plan.handoffItems } : {}),
+        ...(plan.commands !== undefined ? { commands: plan.commands } : {}),
+        ...(plan.boundaries !== undefined ? { boundaries: plan.boundaries } : {}),
+        ...(plan.lastAudit !== undefined ? { lastAudit: plan.lastAudit } : {}),
       });
 
       // 4. Attach & start the run in SwarmEngine (defer focus entry until initialMembers settle)
@@ -3789,6 +4614,7 @@ export function createPiSwarmExtension(
 
       const finalRun = engine.getSnapshot().run ?? createdRun;
       activatedRunIds.add(finalRun.id);
+      resetGoalContinuation(finalRun.id);
       invalidateRunsCache();
       syncSessionNameForRun(finalRun);
 
@@ -4273,6 +5099,12 @@ export function createPiSwarmExtension(
       if (arg) {
         if (OVERLAY_TABS.has(lower as SwarmOverlayTab)) {
           initialTab = lower as SwarmOverlayTab;
+        } else if (
+          lower === "contract" ||
+          lower === "mission" ||
+          lower === "features"
+        ) {
+          initialTab = "graph";
         } else if (arg.startsWith("#") && arg.length > 1) {
           initialTab = "board";
           initialChannel = arg.slice(1).toLowerCase();
@@ -4293,6 +5125,20 @@ export function createPiSwarmExtension(
 
       const overlayEngine: ISwarmEngine = new Proxy(engine, {
         get(target, prop) {
+          if (prop === "manageMission") {
+            if (typeof target.manageMission !== "function") {
+              return undefined;
+            }
+            return async (input: ManageMissionInput) => {
+              if (input?.op !== "status") {
+                const snap = target.getSnapshot();
+                if (snap.run) {
+                  await assertFocusedRunOwner(store, snap.run.id, ctx);
+                }
+              }
+              return target.manageMission!(input);
+            };
+          }
           const value = Reflect.get(target, prop, target);
           if (typeof value !== "function") {
             return value;
@@ -5190,6 +6036,7 @@ export function createPiSwarmExtension(
         try {
           await assertFocusedRunOwner(store, snapshot.run.id, ctx);
           const updated = await engine.resume(snapshot.run.id, ctx);
+          resetGoalContinuation(updated.id);
           invalidateRunsCache();
           syncSessionNameForRun(updated);
           if (draftController.isActive()) {
@@ -5324,6 +6171,7 @@ export function createPiSwarmExtension(
         }
 
         const updated = await engine.resume(targetRun.id, ctx);
+        resetGoalContinuation(updated.id);
         invalidateRunsCache();
         syncSessionNameForRun(updated);
         persistFocusEntry(pi, updated.id, currentSid, "resume_mission");
@@ -5520,6 +6368,7 @@ export function createPiSwarmExtension(
       latestHumanDirection = undefined;
       waitArmedTurnIndex = null;
       activatedRunIds.delete(run.id);
+      resetGoalContinuation(run.id);
       invalidateRunsCache();
       purgePendingWakeupsForRun(run.id);
       await engine.attachRun(null, ctx);
@@ -5660,6 +6509,7 @@ export function createPiSwarmExtension(
       const prevFocused = engine.getSnapshot().activeRunId;
       if (prevFocused) {
         activatedRunIds.delete(prevFocused);
+        resetGoalContinuation(prevFocused);
       }
       await releaseRunOwnershipIfHeld(store, prevFocused, sessionId);
       purgePendingWakeupsForRun(null);
@@ -6883,7 +7733,7 @@ export function createPiSwarmExtension(
     // ------------------------------------------------------------------------
     pi.registerCommand("swarm", {
       description:
-        "Pi Swarm v0.7.0 — Dynamic Antigravity Swarm orchestrator (Droid Mission-style model/effort picker & cross-session resume, shared #seq board, non-blocking swarm_wait, warm disk sessions, fork & worktrees/clones)",
+        "Pi Swarm v0.8.0 — Dynamic Mission Goal Engine & Antigravity Swarm orchestrator (VAL-* contracts, Sisyphus auto-continuation, Droid Mission model/effort picker & cross-session resume, shared #seq board, non-blocking swarm_wait, warm sessions & worktrees)",
       getArgumentCompletions: getSwarmCompletions,
       handler: handleSwarmCommand,
     });
@@ -7087,6 +7937,141 @@ export function createPiSwarmExtension(
       }
     });
 
+    function extractLastAssistantText(
+      event: unknown,
+      ctx?: ExtensionContext,
+    ): string | undefined {
+      if (event && typeof event === "object") {
+        const ev = event as Record<string, unknown>;
+        if (typeof ev.lastAssistantText === "string") {
+          return ev.lastAssistantText;
+        }
+        if (typeof ev.text === "string") {
+          return ev.text;
+        }
+        if (ev.message && typeof ev.message === "object") {
+          const role = (ev.message as { role?: unknown }).role;
+          if (role === undefined || role === "assistant") {
+            const fromMsg = extractAgentMessagePlainText(ev.message);
+            if (fromMsg !== undefined) {
+              return fromMsg;
+            }
+          }
+        }
+        if (Array.isArray(ev.messages)) {
+          for (let i = ev.messages.length - 1; i >= 0; i--) {
+            const m = ev.messages[i] as { role?: unknown } | undefined;
+            if (!m || typeof m !== "object") continue;
+            if (m.role === "user") break;
+            if (m.role === "assistant") {
+              const fromArr = extractAgentMessagePlainText(m);
+              if (fromArr !== undefined) {
+                return fromArr;
+              }
+            }
+          }
+        }
+      }
+
+      if (lastObservedAssistantText !== undefined) {
+        return lastObservedAssistantText;
+      }
+
+      const targetCtx = ctx ?? lastCtx;
+      try {
+        const sm = targetCtx?.sessionManager as
+          | {
+              buildSessionContext?: () => { messages?: unknown[] };
+              buildSessionProjection?: () => { messages?: unknown[] };
+            }
+          | undefined;
+        const messages =
+          typeof sm?.buildSessionContext === "function"
+            ? sm.buildSessionContext()?.messages
+            : typeof sm?.buildSessionProjection === "function"
+              ? sm.buildSessionProjection()?.messages
+              : undefined;
+        if (Array.isArray(messages)) {
+          for (let i = messages.length - 1; i >= 0; i--) {
+            const m = messages[i] as { role?: unknown } | undefined;
+            if (!m || typeof m !== "object") continue;
+            if (m.role === "user") break;
+            if (m.role === "assistant") {
+              const txt = extractAgentMessagePlainText(m);
+              if (txt !== undefined) {
+                return txt;
+              }
+            }
+          }
+        }
+      } catch {
+        // ignore sessionManager read errors in mock/headless harnesses
+      }
+
+      try {
+        const branch = targetCtx?.sessionManager?.getBranch?.();
+        if (Array.isArray(branch)) {
+          for (let i = branch.length - 1; i >= 0; i--) {
+            const entry = branch[i] as
+              | { type?: unknown; message?: { role?: unknown } }
+              | undefined;
+            if (!entry || typeof entry !== "object") continue;
+            if (entry.type === "message" && entry.message) {
+              if (entry.message.role === "user") break;
+              if (entry.message.role === "assistant") {
+                const txt = extractAgentMessagePlainText(entry.message);
+                if (txt !== undefined) {
+                  return txt;
+                }
+              }
+            }
+          }
+        }
+      } catch {
+        // ignore branch inspection errors
+      }
+
+      return undefined;
+    }
+
+    pi.on("turn_end", (event) => {
+      const msg = (event as { message?: { role?: unknown } } | undefined)?.message;
+      if (msg && (msg.role === undefined || msg.role === "assistant")) {
+        const txt = extractAgentMessagePlainText(msg);
+        if (txt !== undefined) {
+          lastObservedAssistantText = txt;
+        }
+      }
+    });
+
+    pi.on("message_end", (event) => {
+      const msg = (event as { message?: { role?: unknown } } | undefined)?.message;
+      if (msg && msg.role === "assistant") {
+        const txt = extractAgentMessagePlainText(msg);
+        if (txt !== undefined) {
+          lastObservedAssistantText = txt;
+        }
+      }
+    });
+
+    pi.on("agent_end", (event) => {
+      const msgs = (event as { messages?: unknown[] } | undefined)?.messages;
+      if (Array.isArray(msgs)) {
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          const m = msgs[i] as { role?: unknown } | undefined;
+          if (!m || typeof m !== "object") continue;
+          if (m.role === "user") break;
+          if (m.role === "assistant") {
+            const txt = extractAgentMessagePlainText(m);
+            if (txt !== undefined) {
+              lastObservedAssistantText = txt;
+              break;
+            }
+          }
+        }
+      }
+    });
+
     pi.on("message_start", (event) => {
       if ((event.message as { role?: string } | undefined)?.role === "user") {
         disarmOrchestratorWait("User message started");
@@ -7105,6 +8090,7 @@ export function createPiSwarmExtension(
         trimmedText.length > 0 &&
         !shouldSkipInputPreflight(trimmedText)
       ) {
+        resetGoalContinuation(activeEngine?.getSnapshot().activeRunId);
         if ((ctx ?? lastCtx)?.isIdle()) {
           userPromptPreflight = true;
           if (userPromptPreflightTimer) {
@@ -7138,6 +8124,7 @@ export function createPiSwarmExtension(
     pi.on("before_agent_start", async (event, ctx) => {
       lastCtx = ctx;
       currentTurnIndex = 0;
+      lastObservedAssistantText = undefined;
       disarmOrchestratorWait("New agent run started");
       clearWakeupInFlight();
       clearUserPromptPreflight();
@@ -7167,10 +8154,14 @@ export function createPiSwarmExtension(
             event.systemPromptOptions.sections.swarm =
               buildOrchestratorStaticSection(snapshot);
             event.systemPromptOptions.sections.swarm_state =
-              buildOrchestratorLiveStateSection(snapshot, {
-                includeRecentBoard: event.messageType === "user",
-                ...(steerText ? { humanSteeringText: steerText } : {}),
-              });
+              enrichLiveStateWithMissionSync(
+                buildOrchestratorLiveStateSection(snapshot, {
+                  includeRecentBoard: event.messageType === "user",
+                  ...(steerText ? { humanSteeringText: steerText } : {}),
+                }),
+                snapshot.run,
+                steerText,
+              );
           } else {
             delete event.systemPromptOptions.sections.swarm;
             delete event.systemPromptOptions.sections.swarm_state;
@@ -7197,9 +8188,13 @@ export function createPiSwarmExtension(
           if (event.messageType === "user") {
             latestHumanDirection = undefined;
           }
-          sectionContent = buildOrchestratorPlaybookSection(snapshot, {
-            ...(steerText ? { humanSteeringText: steerText } : {}),
-          });
+          sectionContent = enrichLiveStateWithMissionSync(
+            buildOrchestratorPlaybookSection(snapshot, {
+              ...(steerText ? { humanSteeringText: steerText } : {}),
+            }),
+            snapshot.run,
+            steerText,
+          );
         }
       }
 
@@ -7227,6 +8222,134 @@ export function createPiSwarmExtension(
       }
       if (pendingWakeups.length > 0 && ctx.isIdle() && !ctx.hasPendingMessages()) {
         flushPendingWakeups(ctx);
+        return;
+      }
+
+      // Sisyphus Anti-Premature-Stop Auto-Continuation Guard:
+      // Relentlessly advance structured Goal Missions when Orchestrator ends a turn
+      // with plain text (without swarm_wait and without swarm{action:"done"}).
+      if (
+        isShutDown ||
+        wakeupInFlight ||
+        userPromptPreflight ||
+        draftController.isActive() ||
+        pendingWakeups.length > 0 ||
+        !ctx.isIdle() ||
+        ctx.hasPendingMessages()
+      ) {
+        return;
+      }
+
+      const snapshot = getSnapshotSafe();
+      const run = snapshot.run;
+      if (
+        !run ||
+        run.status !== "active" ||
+        !activatedRunIds.has(run.id) ||
+        !isCurrentSessionOwner(run, ctx) ||
+        snapshot.workingMemberNames.length > 0 ||
+        waitArmedTurnIndex !== null
+      ) {
+        return;
+      }
+
+      const goalState = inspectGoalRemainingWork(run);
+      if (!goalState.hasStructuredGoal) {
+        return;
+      }
+
+      const assistantText = extractLastAssistantText(event, ctx);
+      if (assistantText && /\[NEEDS_HUMAN\]/i.test(assistantText)) {
+        const needsHumanMsg = "🐝 Mission awaiting human input";
+        if (ctx.hasUI) {
+          ctx.ui.notify(needsHumanMsg, "info");
+          lastStatusText = needsHumanMsg;
+          ctx.ui.setStatus(SWARM_STATUS_KEY, needsHumanMsg);
+        } else {
+          emitZeroTurnMessage(ctx, needsHumanMsg, {
+            runId: run.id,
+            needsHuman: true,
+          });
+        }
+        return;
+      }
+
+      const progressKey = `${run.revision}:${snapshot.boardHead}`;
+      let contState = goalContinuationByRunId.get(run.id);
+      if (!contState) {
+        contState = { count: 0, stagnantTurns: 0 };
+        goalContinuationByRunId.set(run.id, contState);
+      }
+
+      if (contState.tripped && contState.lastProgressKey === progressKey) {
+        return;
+      }
+
+      if (contState.lastProgressKey === undefined) {
+        contState.lastProgressKey = progressKey;
+        contState.stagnantTurns = 0;
+      } else if (contState.lastProgressKey === progressKey) {
+        contState.stagnantTurns += 1;
+      } else {
+        contState.lastProgressKey = progressKey;
+        contState.stagnantTurns = 0;
+        contState.tripped = false;
+      }
+
+      if (contState.stagnantTurns >= 2 || contState.count >= 12) {
+        contState.tripped = true;
+        const pauseMsg =
+          "🐝 Auto-continue paused (no state progress) — send guidance or /swarm resume";
+        if (ctx.hasUI) {
+          ctx.ui.notify(pauseMsg, "warning");
+          lastStatusText = pauseMsg;
+          ctx.ui.setStatus(SWARM_STATUS_KEY, pauseMsg);
+        } else {
+          emitZeroTurnMessage(ctx, pauseMsg, {
+            runId: run.id,
+            autoContinuePaused: true,
+            stagnantTurns: contState.stagnantTurns,
+            count: contState.count,
+          });
+        }
+        return;
+      }
+
+      contState.count += 1;
+      wakeupInFlight = true;
+      try {
+        const checkpointBody = buildGoalCheckpointMessage(
+          run,
+          snapshot,
+          goalState,
+        );
+        pi.sendMessage(
+          {
+            customType: SWARM_WAKEUP_CUSTOM_TYPE,
+            content: checkpointBody,
+            display: true,
+            details: {
+              runId: run.id,
+              goalCheckpoint: true,
+              continuationCount: contState.count,
+              stagnantTurns: contState.stagnantTurns,
+              progressKey,
+            },
+          },
+          { triggerTurn: true, deliverAs: "followUp" },
+        );
+        if (wakeupSafetyTimer) {
+          clearTimeout(wakeupSafetyTimer);
+        }
+        wakeupSafetyTimer = setTimeout(() => {
+          wakeupInFlight = false;
+          wakeupSafetyTimer = undefined;
+          scheduleWakeupFlush();
+        }, 300);
+        wakeupSafetyTimer.unref?.();
+      } catch (err) {
+        clearWakeupInFlight();
+        throw err;
       }
     });
 
