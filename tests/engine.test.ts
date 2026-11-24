@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -14,6 +15,7 @@ import {
 import {
   DEFAULT_CHANNEL,
   DEFAULT_SWARM_SETTINGS,
+  findSafetySensitiveMemberSegment,
   ORCHESTRATOR_NAME,
   POST_MESSAGE_TOOL,
   READ_BOARD_TOOL,
@@ -31,9 +33,12 @@ import {
   ConcurrencyGate,
   createMemberScopedTools,
   createSwarmTools,
+  createValidatorGuardExtensionFactory,
   createWorkerGuardExtensionFactory,
   extractSessionMessages,
   formatBoardEntryFull,
+  getRunValidatorScratchRoot,
+  getValidatorScratchDir,
   InProcessPiTransport,
   isForbiddenWorkerBashCommand,
   isProtectedSwarmPath,
@@ -42,6 +47,7 @@ import {
   parseRetryAfterMs,
   RateLimitBreaker,
   resolveRoleModel,
+  resolveValidatorScratchPath,
   resolveWorktreeRelativePath,
   sanitizeForkSeedMessages,
   selectFallbackModel,
@@ -9987,3 +9993,280 @@ describe("SwarmEngine & Runtime — v0.9.0 Gap Closure", () => {
     }
   });
 });
+
+// ============================================================================
+// Validator Isolated Scratch Sandbox & Safety-Filter-Safe Member Naming
+// ============================================================================
+
+describe("Validator Isolated Scratch Sandbox & Safety-Filter-Safe Member Naming", () => {
+  it("allows write/edit and temporary build/fixture/mutation bash commands inside validator scratchDir while blocking repo, worktree, symlink & non-&& escapes", async () => {
+    const tmpRoot = await mkdtemp(path.join(os.tmpdir(), "pi-swarm-val-scratch-test-"));
+    const repoRoot = path.join(tmpRoot, "repo");
+    const scratchDir = getValidatorScratchDir("run_scratch_1", "validator", tmpRoot);
+    await mkdir(path.join(repoRoot, "src"), { recursive: true });
+    await mkdir(scratchDir, { recursive: true });
+    await writeFile(path.join(repoRoot, "src/index.ts"), "export const x = 1;\n", "utf8");
+
+    try {
+      // 1. Symlink escape inside scratchDir pointing to repo is blocked!
+      const outsideLink = path.join(scratchDir, "repo-link");
+      await symlink(path.join(repoRoot, "src"), outsideLink);
+      assert.equal(
+        resolveValidatorScratchPath(path.join(outsideLink, "index.ts"), scratchDir),
+        null,
+      );
+      assert.ok(
+        resolveValidatorScratchPath(path.join(scratchDir, "probe/fixture.ts"), scratchDir),
+      );
+      assert.equal(
+        resolveValidatorScratchPath(scratchDir, scratchDir, { allowRoot: false }),
+        null,
+      );
+      assert.equal(
+        resolveValidatorScratchPath(scratchDir, scratchDir, { allowRoot: true }),
+        path.resolve(scratchDir),
+      );
+
+      // 2. Validator tool_call guard allows write/edit inside scratchDir and blocks repo / outside / symlink targets
+      let toolHandler: ((event: Record<string, unknown>) => unknown) | undefined;
+      const factory = createValidatorGuardExtensionFactory(
+        "validator",
+        true,
+        repoRoot,
+        scratchDir,
+      );
+      factory({
+        on(eventName: string, cb: (event: Record<string, unknown>) => unknown) {
+          if (eventName === "tool_call") {
+            toolHandler = cb;
+          }
+        },
+      } as unknown as Parameters<typeof factory>[0]);
+      assert.ok(toolHandler);
+
+      assert.equal(
+        toolHandler!({
+          toolName: "write",
+          input: { path: path.join(scratchDir, "probe/test.rs"), content: "fn main() {}" },
+        }),
+        undefined,
+      );
+      assert.equal(
+        toolHandler!({
+          toolName: "edit",
+          input: { path: path.join(scratchDir, "probe/test.rs") },
+        }),
+        undefined,
+      );
+      const blockedRepoWrite = toolHandler!({
+        toolName: "write",
+        input: { path: "src/index.ts", content: "mutated" },
+      }) as { block?: boolean; reason?: string };
+      assert.equal(blockedRepoWrite?.block, true);
+      assert.match(blockedRepoWrite?.reason ?? "", /isolated scratch directory/);
+
+      const blockedSymlinkEdit = toolHandler!({
+        toolName: "edit",
+        input: { path: path.join(outsideLink, "index.ts") },
+      }) as { block?: boolean };
+      assert.equal(blockedSymlinkEdit?.block, true);
+
+      // 3. Bash guard with scratchDir allows safe build/fixture/mutation workflows inside scratchDir
+      assert.equal(
+        isReadOnlyValidationCommand(
+          `mkdir -p "${scratchDir}/work" && cp -r "${repoRoot}/src" "${scratchDir}/work/src" && cd "${scratchDir}/work" && sed -i '' 's/1/2/' src/index.ts && cargo test --target-dir "${scratchDir}/target" > "${scratchDir}/test.log" 2>&1`,
+          scratchDir,
+        ).allowed,
+        true,
+      );
+      assert.equal(
+        isReadOnlyValidationCommand(
+          `cd "${scratchDir}" && mkdir -p sub && touch sub/a.txt && mv sub/a.txt sub/b.txt && chmod +x sub/b.txt && rm -rf sub`,
+          scratchDir,
+        ).allowed,
+        true,
+      );
+      assert.equal(
+        isReadOnlyValidationCommand(
+          `git diff | tee "${scratchDir}/diff.patch"`,
+          scratchDir,
+        ).allowed,
+        true,
+      );
+
+      // 4. Bash guard still strictly blocks outside /tmp, scratch root deletion, symlink creation, repo copies, and non-&& cwd escapes
+      assert.equal(isReadOnlyValidationCommand("rm -rf /tmp/other", scratchDir).allowed, false);
+      assert.equal(isReadOnlyValidationCommand(`rm -rf "${scratchDir}"`, scratchDir).allowed, false);
+      assert.equal(
+        isReadOnlyValidationCommand(
+          `cp "${scratchDir}/bad.ts" "${repoRoot}/src/index.ts"`,
+          scratchDir,
+        ).allowed,
+        false,
+      );
+      assert.equal(
+        isReadOnlyValidationCommand(
+          `cp -s "${repoRoot}/src/index.ts" "${scratchDir}/sym.ts"`,
+          scratchDir,
+        ).allowed,
+        false,
+      );
+      assert.equal(
+        isReadOnlyValidationCommand(
+          `ln -s "${repoRoot}/src" "${scratchDir}/new-link"`,
+          scratchDir,
+        ).allowed,
+        false,
+      );
+      assert.equal(
+        isReadOnlyValidationCommand(
+          `mv "${repoRoot}/src/index.ts" "${scratchDir}/stolen.ts"`,
+          scratchDir,
+        ).allowed,
+        false,
+      );
+      assert.equal(
+        isReadOnlyValidationCommand(
+          `cd "${scratchDir}/nonexistent" || rm -rf src`,
+          scratchDir,
+        ).allowed,
+        false,
+      );
+      assert.equal(
+        isReadOnlyValidationCommand(
+          `cd "${scratchDir}/nonexistent"; rm -rf src`,
+          scratchDir,
+        ).allowed,
+        false,
+      );
+      assert.equal(
+        isReadOnlyValidationCommand(
+          `rm -rf "${outsideLink}/index.ts"`,
+          scratchDir,
+        ).allowed,
+        false,
+      );
+      assert.equal(
+        isReadOnlyValidationCommand(
+          `sh -c 'rm -rf "${scratchDir}/work"'`,
+          scratchDir,
+        ).allowed,
+        false,
+      );
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  it("provisions & cleans validator scratchDir in SwarmEngine, rejects safety-sensitive handles (attack/exploit/hack), and sanitizes dispatch_ready handles", async () => {
+    assert.equal(findSafetySensitiveMemberSegment("attack"), "attack");
+    assert.equal(findSafetySensitiveMemberSegment("attack-2"), "attack");
+    assert.equal(findSafetySensitiveMemberSegment("attack2"), "attack");
+    assert.equal(findSafetySensitiveMemberSegment("db-exploit"), "exploit");
+    assert.equal(findSafetySensitiveMemberSegment("hack-1"), "hack");
+    assert.equal(findSafetySensitiveMemberSegment("probe-2"), undefined);
+    assert.equal(findSafetySensitiveMemberSegment("hackathon"), undefined);
+
+    const { engine, transport, run } = await createTestHarness();
+    try {
+      // 1. Safety-sensitive handles rejected with actionable suggestion
+      for (const badName of ["attack", "attack-1", "db-exploit", "hack2"]) {
+        await assert.rejects(
+          () => engine.addMembers({ name: badName, brief: "Negative-case checks" }),
+          (err: unknown) =>
+            err instanceof SwarmProtocolError &&
+            err.code === "INVALID_NAME" &&
+            /probe|audit|verify/i.test(err.message),
+        );
+      }
+
+      // 2. Validator spawned by SwarmEngine receives live scratchDir on disk & in systemPrompt, cleaned on killMember
+      await engine.addMembers({
+        name: "probe-val",
+        role: "validator",
+        brief: "Audit with isolated scratch sandbox",
+      });
+      await waitUntil(() => engine.getSnapshot().workingMemberNames.length === 0);
+
+      const valSpawn = transport.spawns.find((s) => s.name === "probe-val");
+      assert.ok(valSpawn?.scratchDir, "Validator SpawnMemberRequest must include scratchDir");
+      assert.equal(valSpawn!.scratchDir, getValidatorScratchDir(run.id, "probe-val"));
+      assert.equal(existsSync(valSpawn!.scratchDir!), true);
+      assert.ok(valSpawn!.systemPrompt.includes(valSpawn!.scratchDir!));
+      assert.ok(valSpawn!.systemPrompt.includes("STRICTLY READ-ONLY"));
+
+      await writeFile(path.join(valSpawn!.scratchDir!, "temp.txt"), "scratch artifact", "utf8");
+      await engine.killMember("probe-val", { reason: "audit finished" });
+      assert.equal(existsSync(valSpawn!.scratchDir!), false, "killMember must clean validator scratchDir");
+
+      // 3. dispatch_ready strips safety-sensitive words when deriving worker handle from feature.id
+      await engine.manageMission({
+        op: "upsert_assertions",
+        assertions: [
+          {
+            id: "VAL-CSRF-001",
+            title: "CSRF token check",
+            description: "Rejects missing CSRF token.",
+          },
+        ],
+        callerRole: "orchestrator",
+        callerName: ORCHESTRATOR_NAME,
+      });
+      await engine.manageMission({
+        op: "upsert_features",
+        features: [
+          {
+            id: "mitigate-csrf-attack",
+            title: "Mitigate CSRF",
+            description: "Add CSRF token check.",
+            milestone: "M1",
+            filesOwned: ["src/csrf.ts"],
+            fulfills: ["VAL-CSRF-001"],
+          },
+        ],
+        callerRole: "orchestrator",
+        callerName: ORCHESTRATOR_NAME,
+      });
+
+      const dispatched = await engine.manageMission({
+        op: "dispatch_ready",
+        callerRole: "orchestrator",
+        callerName: ORCHESTRATOR_NAME,
+      });
+      assert.deepEqual(dispatched.dispatchedFeatures, ["mitigate-csrf-attack"]);
+      assert.equal(
+        engine.getSnapshot().run?.features?.find((f) => f.id === "mitigate-csrf-attack")
+          ?.assignedMember,
+        "mitigate-csrf",
+      );
+      await waitUntil(() => engine.getSnapshot().workingMemberNames.length === 0);
+
+      // Verify run scratch root is also cleaned on completeRun
+      const runScratchRoot = getRunValidatorScratchRoot(run.id);
+      await mkdir(path.join(runScratchRoot, "leftover"), { recursive: true });
+      await engine.killMember("mitigate-csrf", { force: true, reason: "cleanup test" });
+      await engine.manageMission({
+        op: "update_feature",
+        featureId: "mitigate-csrf-attack",
+        featureStatus: "completed",
+        mergedCommitSha: "deadbeef",
+        callerRole: "orchestrator",
+        callerName: ORCHESTRATOR_NAME,
+      });
+      await engine.manageMission({
+        op: "verify_assertion",
+        assertionId: "VAL-CSRF-001",
+        assertionStatus: "passed",
+        evidence: "Verified CSRF guard",
+        force: true,
+        callerRole: "human",
+        callerName: "human",
+      });
+      await engine.completeRun({ summary: "Completed", callerRole: "orchestrator" });
+      assert.equal(existsSync(runScratchRoot), false, "completeRun must clean run scratch root");
+    } finally {
+      await engine.dispose();
+    }
+  });
+});
+

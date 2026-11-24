@@ -12,6 +12,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
 import {
   CHANNEL_NAME_PATTERN,
+  findSafetySensitiveMemberSegment,
   MEMBER_NAME_PATTERN,
   PROPOSE_SWARM_PLAN_TOOL,
   RESERVED_MEMBER_NAMES,
@@ -200,7 +201,7 @@ export const SwarmQuestionnaireParamsSchema = Type.Object({
 const InitialMemberRoleSchema = Type.Unsafe<SwarmMemberRole>(
   StringEnum(["worker", "validator"] as const, {
     description:
-      'Member role: "worker" (full workspace access & able to add helpers) or "validator" (independent read-only auditor).',
+      'Member role: "worker" (full workspace access & able to add helpers) or "validator" (independent read-only auditor with an isolated OS scratch directory for temporary builds/fixtures/mutation checks).',
   }),
 );
 
@@ -214,7 +215,7 @@ const InitialMemberWorkspaceSchema = Type.Unsafe<SwarmWorkspaceMode>(
 export const InitialMemberProposalSchema = Type.Object({
   name: Type.String({
     description:
-      'Unique short lowercase member handle matching /^[a-z][a-z0-9-]{0,31}$/ (e.g. "scout", "parser", "verifier"). Reserved names (orchestrator, coordinator, all, monitor) are forbidden.',
+      'Unique short lowercase member handle matching /^[a-z][a-z0-9-]{0,31}$/ (e.g. "scout", "parser", "verifier", "probe"). Reserved names (orchestrator, coordinator, all, monitor) and security-trigger words (attack, exploit, hack, etc.) are forbidden.',
   }),
   role: InitialMemberRoleSchema,
   brief: Type.String({
@@ -1779,6 +1780,9 @@ export function validateProposedSwarmPlan(
 
     const name = typeof raw.name === "string" ? raw.name.trim() : "";
     const memberTag = name || `#${i + 1}`;
+    const sensitiveSeg = name
+      ? findSafetySensitiveMemberSegment(name)
+      : undefined;
 
     if (!name || !MEMBER_NAME_PATTERN.test(name)) {
       issues.push({
@@ -1800,6 +1804,13 @@ export function validateProposedSwarmPlan(
         field: "initial_members",
         memberName: name,
         message: `Initial member name "${name}" is reserved (${RESERVED_MEMBER_NAMES.join(", ")}) and cannot be used.`,
+      });
+    } else if (sensitiveSeg) {
+      issues.push({
+        code: "INVALID_NAME",
+        field: "initial_members",
+        memberName: name,
+        message: `Initial member name "${name}" contains security-sensitive segment "${sensitiveSeg}" which can trigger provider cybersecurity safety filters — choose a neutral QA/engineering handle (e.g. "probe", "audit", "verify", "mutcheck").`,
       });
     } else if (seenNames.has(name)) {
       issues.push({

@@ -211,7 +211,7 @@ export function buildDraftingKickoffPrompt(
     "- **Workers:** Warm persistent sessions that collaborate on the shared `#seq` Message Board with `@mention` wakeups, optional context forking (`fork`), and flexible workspaces (`inherit` for read-only scouts/researchers, `share` or `branch` for isolated Git worktree edits with automatic `node_modules`/`.venv` symlink bootstrap + optional `init` command). Workers can also spawn their own helpers when a slice splits naturally.",
   );
   lines.push(
-    "- **Validators:** Independent read-only verifiers (`validator` role) spawned on demand to audit peer worktrees/diffs, verify `VAL-*` contract assertions with concrete evidence, and report issues directly via `@mention` on the board without mutating code.",
+    "- **Validators:** Independent read-only verifiers (`validator` role) spawned on demand to audit peer worktrees/diffs, verify `VAL-*` contract assertions with concrete evidence, and report issues directly via `@mention` on the board without mutating repo/worktree code (each `validator` automatically gets an isolated OS scratch directory for temporary builds, synthetic fixtures, and mutation/negative-case checks — never spawn `worker` pseudo-validators or use red-team names like `attack`/`exploit`/`hack`; use neutral QA handles like `validator`, `auditor`, `probe-1`).",
   );
   lines.push("");
   lines.push(

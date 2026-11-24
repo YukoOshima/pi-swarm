@@ -1255,6 +1255,8 @@ export interface SpawnMemberRequest {
   seedMessages?: AgentMessage[];
   sessionDir?: string;
   sessionFile?: string;
+  /** Dedicated isolated OS temp scratch directory granted to live `validator` sessions for temporary build/fixture/mutation checks. */
+  scratchDir?: string;
   isMonitor?: boolean;
   hostContext?: ExtensionContext;
   onTelemetry?: (event: AgentTelemetryEvent) => void;

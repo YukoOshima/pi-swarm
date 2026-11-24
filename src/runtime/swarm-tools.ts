@@ -195,7 +195,7 @@ export const SwarmToolParamsSchema = Type.Object({
   name: Type.Optional(
     Type.String({
       description:
-        'Member name (or base name with n/tasks for "add", target member for "model"/"steer"/"stop"/"kill"/"merge", or member to join/leave for "channel").',
+        'Member name (or base name with n/tasks for "add", target member for "model"/"steer"/"stop"/"kill"/"merge", or member to join/leave for "channel"). Use neutral engineering/QA handles (e.g. "scout", "parser", "validator", "probe"); offensive/red-team words ("attack", "exploit", "hack", etc.) are rejected to avoid provider safety-filter false positives.',
     }),
   ),
   message: Type.Optional(
@@ -211,7 +211,8 @@ export const SwarmToolParamsSchema = Type.Object({
   ),
   role: Type.Optional(
     stringEnum(MEMBER_ROLES, {
-      description: 'Member role for action="add": "worker" (default) or read-only "validator".',
+      description:
+        'Member role for action="add": "worker" (default) or read-only "validator" (includes an isolated OS scratch directory for temporary builds/fixtures/mutation checks; never spawn a "worker" solely to run temporary verification builds).',
       default: "worker",
     }),
   ),

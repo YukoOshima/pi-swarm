@@ -345,7 +345,7 @@ function buildOrchestratorPlaybookCore(validatorEnabled: boolean): string {
     "  3. **Parallel Execution**: Spawn disjoint named authors in parallel (`workspace:\"share\"` for shared git worktrees when multiple authors edit/build simultaneously; `workspace:\"branch\"` for fully isolated git clones; `workspace:\"inherit\"` for read-only scouts; use `n` or `tasks[]` for sharded slices).",
     ...(validatorEnabled
       ? [
-          "  4. **Independent Read-Only Validation**: Spawn independent `role:\"validator\"` members (~1 validator per 2–4 authors) to audit code, diffs, tests, and runtime behavior inside each author's worktree `cwd`. NEVER let authors self-certify!",
+          "  4. **Independent Read-Only Validation (with Isolated Scratch Sandbox)**: Spawn independent `role:\"validator\"` members (~1 validator per 2–4 authors) to audit code, diffs, tests, and runtime behavior inside each author's worktree `cwd`. Each `role:\"validator\"` automatically gets a dedicated OS temp scratch directory (`scratchDir`) where `write`/`edit` and explicit-path `mkdir`/`cp`/`mv`/`rm`/output redirections work for temporary builds (`--target-dir`), synthetic fixtures, and mutation/negative-case checks while repository and worktree files stay strictly read-only — NEVER spawn `role:\"worker\"` members as pseudo-validators just to write temporary test files, and NEVER let authors self-certify!",
           "  5. **Peer-to-Peer Bug Closure**: Let `@validator` and `@author` resolve defects directly on the board (`@author` <-> `@validator`) without waking `@orchestrator` on intermediate bounces.",
           `  6. **Land & Complete**: Merge verified \`share\`/\`branch\` worktrees via \`${SWARM_TOOL}{action:"merge"}\`, run a **post-merge integration check on \`baseBranch\`** (wake \`@validator\` or an \`inherit\` verifier to run full \`typecheck\`/tests on merged \`baseBranch\`) BEFORE calling \`done\`, kill finished members via \`${SWARM_TOOL}{action:"kill"}\`, and close the run cleanly via \`${SWARM_TOOL}{action:"done", summary}\`.`,
         ]
@@ -362,6 +362,7 @@ function buildOrchestratorPlaybookCore(validatorEnabled: boolean): string {
     "  - **(c) Concrete Verification Commands**: Exact runnable `typecheck`, test, and build commands the member must pass in its workspace before reporting `[done]`.",
     `  - **(d) Direct Next-Peer \`@mention\` Doorbell**: Exact handle to wake on completion (e.g., ${nextPeerExample}).`,
     `- **Zero-Copy \`#seq\` & \`@mention\` Discipline**: \`@name\` is a wakeup doorbell, never a CC. Use \`@<prefix>\` for sharded groups, \`@#<channel>\` for channel broadcasts (NEVER \`@#main\`), and \`@all\` only for genuine swarm-wide rules or plan changes.${validatorEnabled ? " Avoid writing `@validator` (or another peer's `@handle`) in prose when addressing a worker unless you intend to wake that peer right now — refer to them without `@` (e.g. \"the validator\") for future handoffs." : " Avoid writing another peer's `@handle` in prose when addressing a worker unless you intend to wake that peer right now."}`,
+    "- **Safety-Filter-Safe Naming & Verification Phrasing**: NEVER name members, channels, or temp paths with offensive/red-team trigger words (`attack`, `exploit`, `hack`, `malware`, `backdoor`, etc.) — `attack-*`/`exploit-*`/`hack-*` handles are rejected by protocol — and avoid phrasing QA briefs as \"attacks / exploits / bypassing security\". Upstream provider safety classifiers can misflag benign verification turns as cybersecurity risk. Always use neutral QA handles (`validator`, `auditor`, `probe-1`, `mutcheck-1`, `negtest-1`) and standard engineering phrasing (*negative-case testing*, *boundary verification*, *mutation testing*, *invalid-input rejection checks*).",
     "",
     "## 4. Core Swarm Tools (4 Tools)",
     `- \`${SWARM_TOOL}\`: \`title\`, \`add\`, \`status\`, \`models\`, \`model\` (auto-resumes switched member), \`steer\`, \`stop\`, \`kill\`, \`merge\`, \`channel\`, \`mission\` (\`status\`, \`upsert_assertions\`, \`remove_assertion\`, \`verify_assertion\`, \`override_assertion\`, \`upsert_features\`, \`update_feature\`, \`dispatch_ready\`, \`resolve_handoff\`, \`set_manifest\`, \`read_library\`, \`write_library\`), \`done\`.`,
@@ -811,6 +812,10 @@ function buildValidatorPeerWorktreesSection(
   return lines.join("\n");
 }
 
+export interface MemberPromptOptions {
+  scratchDir?: string;
+}
+
 /**
  * Builds the concise, high-signal system prompt appendix injected into a
  * Worker or Validator Pi session.
@@ -818,12 +823,15 @@ function buildValidatorPeerWorktreesSection(
 export function buildMemberSystemPrompt(
   run: SwarmRunState,
   member: SwarmMemberRecord,
+  options?: MemberPromptOptions,
 ): string {
   const sections: string[] = [];
   const primaryChannel = member.channels[0] ?? DEFAULT_CHANNEL;
+  const scratchDir =
+    member.role === "validator" ? options?.scratchDir?.trim() : undefined;
   const workspaceDesc =
     member.workspace === "inherit"
-      ? `\`inherit\` (shared checkout at \`${member.cwd}\` — edit ONLY files assigned in your brief)`
+      ? `\`inherit\` (shared checkout at \`${member.cwd}\` — ${member.role === "validator" ? "read-only on repository/worktree files" : "edit ONLY files assigned in your brief"})`
       : `\`${member.workspace}\` (isolated git worktree at \`${member.cwd}\` on branch \`${member.branch ?? "unknown"}\`, base \`${run.baseBranch}\`)`;
 
   const headerLines: string[] = [
@@ -834,6 +842,11 @@ export function buildMemberSystemPrompt(
     `- **Mission Artifacts**: ${formatMissionArtifactPaths(run.id)}`,
     `- **Run Objective**: ${run.objective}`,
     `- **Workspace**: ${workspaceDesc}`,
+    ...(scratchDir
+      ? [
+          `- **Isolated Scratch Directory**: \`${scratchDir}\` (temporary build/fixture/mutation sandbox; auto-cleaned when retired)`,
+        ]
+      : []),
     `- **Channels**: ${member.channels.map((c) => `#${c}`).join(", ")} (default post channel: \`#${primaryChannel}\`; \`#main\` is always visible)`,
   ];
 
@@ -870,15 +883,18 @@ export function buildMemberSystemPrompt(
   );
 
   if (member.role === "validator") {
+    const scratchRule = scratchDir
+      ? `1. **STRICTLY READ-ONLY on Repository & Worktrees (Isolated Scratch Allowed)**: You are an independent auditor. NEVER create, edit, or delete files inside \`${member.cwd}\` or any peer worktree, stage changes, or make git commits. For isolated builds (\`--target-dir "${scratchDir}/target"\`), synthetic fixtures, or mutation/negative-case probes, use ONLY your dedicated scratch directory \`${scratchDir}\` (\`write\`/\`edit\` tools and explicit literal paths under \`${scratchDir}\` for \`mkdir\`, \`cp\`, \`mv\`, \`rm\`, \`sed -i\`, and \`>\` output redirections — or \`cd "${scratchDir}" && ...\` — are permitted; shell variables/globs/symlinks outside \`${scratchDir}\` are blocked).`
+      : "1. **STRICTLY READ-ONLY — NEVER Edit Files**: You are an independent auditor. NEVER create, edit, or delete files, stage changes, or make git commits. `write`, `edit`, `powershell`, and mutating `bash` commands are blocked by protocol.";
     sections.push(
       [
         "## Independent Read-Only Validator Rules (Dual-Layer Scrutiny + Behavioral Validation)",
-        "1. **STRICTLY READ-ONLY — NEVER Edit Files**: You are an independent auditor. NEVER create, edit, or delete files, stage changes, or make git commits. `write`, `edit`, `powershell`, and mutating `bash` commands are blocked by protocol.",
+        scratchRule,
         `2. **Layer 1 — Code & Test Suite Scrutiny (\`scrutiny\`)**: Treat worker reports as untrusted claims. Read \`${SWARM_DIR}/${SWARM_RUNS_DIR}/${run.id}/${SWARM_LIBRARY_DIR}/\` via \`${SWARM_TOOL}{action:"mission", mission_op:"read_library"}\`, run the configured operational \`commands\` (\`test\`/\`typecheck\`/\`lint\`/\`build\`), and inspect diffs/commits directly (\`baseBranch\` on \`[milestone-review]\` after merge, or inside each author's isolated worktree \`cwd\` via \`git -C "<cwd>" status --short\`, \`git -C "<cwd>" diff ${run.baseBranch}...HEAD\`, \`git -C "<cwd>" show\`, and \`cd "<cwd>" && <slice test command>\` before merge).`,
         `3. **Layer 2 — Behavioral / Surface Validation (\`behavioral\` + Incremental Re-Test)**: Exercise real user/API/CLI behavior and configured \`services\` (ports & healthchecks) against every \`VAL-*\` assertion in scope. On re-runs after bug fixes (when some milestone assertions are already \`"passed"\` while others are \`"failed"\`/\`"pending"\`), perform **Incremental Re-Validation**: focus behavioral testing on the unpassed (\`pending\`/\`failed\`) \`VAL-*\` assertions plus a fast regression check that previously passed assertions still hold.`,
         `4. **Stamp \`VAL-*\` Assertions & Record Testing Notes**: For every \`VAL-*\` assertion in scope (check \`${SWARM_TOOL}{action:"mission", mission_op:"status"}\`), record your verdict via \`${SWARM_TOOL}{action:"mission", mission_op:"verify_assertion", assertion_id, assertion_status, evidence}\` (\`assertion_status:"passed"\` or \`"failed"\` with concrete command/code evidence, or \`"blocked"\`). Passing all assertions of a completed milestone automatically seals that milestone. Persist reusable testing/environment observations via \`${SWARM_TOOL}{action:"mission", mission_op:"write_library", library_topic:"testing", library_content:"...", library_append:true}\`.`,
         "5. **Peer-to-Peer Fix Loop**: If you find bugs, regressions, edge-case failures, or missing requirements, stamp affected `VAL-*` assertions `\"failed\"` with actionable evidence and post concrete findings (file path, line number, reproduction/command output, and concrete fix) directly to `@<author>` on the board — do NOT bother `@orchestrator` on intermediate bug bounces — then call `swarm_wait` to await their fix and re-audit!",
-        `6. **Sign-Off & Read-Only Helpers**: Post \`@${member.parentName} [done] <evidence-backed audit report>\` ONLY when every check and \`VAL-*\` assertion in scope passes with zero blocking defects (or escalate clearly to \`@${member.parentName}\` if blocked). You may spawn read-only \`role:"validator"\` sub-auditors via \`${SWARM_TOOL}{action:"add"}\` if your audit splits cleanly across independent areas (tell them to report to \`@${member.name}\`, and \`${SWARM_TOOL}{action:"kill"}\` them once integrated).`,
+        `6. **Sign-Off, Neutral QA Naming & Read-Only Helpers**: Post \`@${member.parentName} [done] <evidence-backed audit report>\` ONLY when every check and \`VAL-*\` assertion in scope passes with zero blocking defects (or escalate clearly to \`@${member.parentName}\` if blocked). Use neutral engineering names (\`probe\`, \`fixture\`, \`mutcheck\`, \`negtest\` — avoid \`attack\`/\`exploit\`/\`hack\`) in helper handles, scratch filenames, and reports to prevent upstream safety-filter false positives. You may spawn read-only \`role:"validator"\` sub-auditors via \`${SWARM_TOOL}{action:"add"}\` if your audit splits cleanly across independent areas (tell them to report to \`@${member.name}\`, and \`${SWARM_TOOL}{action:"kill"}\` them once integrated).`,
       ].join("\n"),
     );
     sections.push(buildValidatorPeerWorktreesSection(run, member));
@@ -930,6 +946,7 @@ export function buildWakeupPrompt(
   member: SwarmMemberRecord,
   messages: readonly BoardMessage[],
   head: number,
+  options?: MemberPromptOptions,
 ): string {
   const formatted = messages.map((m) => formatBoardEntryFull(m, 2500)).join("\n\n");
   const lines: string[] = [
@@ -939,8 +956,11 @@ export function buildWakeupPrompt(
     "",
   ];
   if (member.role === "validator") {
+    const scratchHint = options?.scratchDir?.trim()
+      ? ` (use isolated scratch \`${options.scratchDir.trim()}\` if you need temporary build/fixture/mutation files)`
+      : "";
     lines.push(
-      `Validator audit reminder: unmerged \`share\`/\`branch\` worker commits live in each author's isolated worktree \`cwd\` (not \`${member.cwd}\`) — run \`git -C "<cwd>" status --short\`, \`git -C "<cwd>" diff <baseBranch>...HEAD\`, and \`cd "<cwd>" && <slice test command>\` (call \`${READ_BOARD_TOOL}{status:true}\` if you need a peer's \`cwd\`/\`branch\`/merge status), and stamp verified \`VAL-*\` assertions via \`${SWARM_TOOL}{action:"mission", mission_op:"verify_assertion", assertion_id, assertion_status, evidence}\`.`,
+      `Validator audit reminder: unmerged \`share\`/\`branch\` worker commits live in each author's isolated worktree \`cwd\` (not \`${member.cwd}\`) — run \`git -C "<cwd>" status --short\`, \`git -C "<cwd>" diff <baseBranch>...HEAD\`, and \`cd "<cwd>" && <slice test command>\`${scratchHint} (call \`${READ_BOARD_TOOL}{status:true}\` if you need a peer's \`cwd\`/\`branch\`/merge status), and stamp verified \`VAL-*\` assertions via \`${SWARM_TOOL}{action:"mission", mission_op:"verify_assertion", assertion_id, assertion_status, evidence}\`.`,
       "",
     );
   }

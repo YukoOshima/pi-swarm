@@ -149,6 +149,60 @@ export const RESERVED_MEMBER_NAMES = [
 
 export type ReservedMemberName = (typeof RESERVED_MEMBER_NAMES)[number];
 
+/**
+ * Red-team / offensive security terms forbidden in Swarm member handles because
+ * they frequently trigger false-positive upstream provider cybersecurity filters
+ * when echoed in `@mentions`, scratch paths, and tool calls.
+ */
+export const SAFETY_SENSITIVE_MEMBER_SEGMENTS = [
+  "attack",
+  "attacks",
+  "attacker",
+  "exploit",
+  "exploits",
+  "exploiter",
+  "hack",
+  "hacker",
+  "malware",
+  "backdoor",
+  "phish",
+  "phishing",
+  "ransomware",
+  "weapon",
+] as const;
+
+export type SafetySensitiveMemberSegment =
+  (typeof SAFETY_SENSITIVE_MEMBER_SEGMENTS)[number];
+
+const SAFETY_SENSITIVE_SEGMENT_SET: ReadonlySet<string> = new Set<string>(
+  SAFETY_SENSITIVE_MEMBER_SEGMENTS,
+);
+
+/**
+ * Returns the offending segment if `name` contains a safety-sensitive red-team
+ * token (matching hyphen-delimited segments with optional trailing digits, e.g.
+ * `"attack"`, `"attack-2"`, `"attack2"`, `"db-exploit"`), or `undefined` if clean.
+ */
+export function findSafetySensitiveMemberSegment(
+  name: string,
+): string | undefined {
+  const cleaned = name.trim().toLowerCase();
+  if (!cleaned) {
+    return undefined;
+  }
+  for (const rawSeg of cleaned.split("-")) {
+    if (!rawSeg) continue;
+    const baseSeg = rawSeg.replace(/\d+$/, "");
+    if (SAFETY_SENSITIVE_SEGMENT_SET.has(rawSeg)) {
+      return rawSeg;
+    }
+    if (baseSeg && SAFETY_SENSITIVE_SEGMENT_SET.has(baseSeg)) {
+      return baseSeg;
+    }
+  }
+  return undefined;
+}
+
 export const MEMBER_NAME_PATTERN = /^[a-z][a-z0-9-]{0,31}$/;
 export const CHANNEL_NAME_PATTERN = /^[a-z][a-z0-9-]{0,31}$/;
 

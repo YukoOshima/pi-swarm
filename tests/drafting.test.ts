@@ -6454,4 +6454,36 @@ describe("drafting-contract-hardening: VAL-CONTRACT-001, VAL-CONTRACT-002, VAL-D
     assert.equal(emptyAppendRes.action, "appended");
     assert.equal(emptyAppendRes.draft?.seed, "First real goal");
   });
+
+  it("rejects safety-sensitive initial_members handles (attack/exploit/hack) while permitting neutral QA handles", () => {
+    const rejected = validateProposedSwarmPlan({
+      title: "QA Plan",
+      objective: "Verify boundaries",
+      strategy: "Disjoint wave",
+      acceptance_criteria: "npm test",
+      initial_members: [
+        { name: "attack-1", role: "validator", brief: "Run boundary checks" },
+        { name: "db-exploit", role: "worker", brief: "Check SQL parser" },
+      ],
+    });
+    assert.equal(rejected.valid, false);
+    if (!rejected.valid) {
+      assert.equal(rejected.issues.length, 2);
+      assert.equal(rejected.issues[0]?.code, "INVALID_NAME");
+      assert.match(rejected.issues[0]?.message ?? "", /probe|audit|verify/i);
+      assert.equal(rejected.issues[1]?.code, "INVALID_NAME");
+    }
+
+    const accepted = validateProposedSwarmPlan({
+      title: "QA Plan",
+      objective: "Verify boundaries",
+      strategy: "Disjoint wave",
+      acceptance_criteria: "npm test",
+      initial_members: [
+        { name: "probe-1", role: "validator", brief: "Run boundary checks" },
+        { name: "hackathon-ui", role: "worker", brief: "Build event banner" },
+      ],
+    });
+    assert.equal(accepted.valid, true);
+  });
 });

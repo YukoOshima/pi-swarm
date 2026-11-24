@@ -1,5 +1,6 @@
 import { lstatSync, readlinkSync, realpathSync } from "node:fs";
 import { access, mkdir } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
@@ -542,21 +543,801 @@ function maskQuotedShellLiterals(command: string): string {
 }
 
 /**
+ * Sanitizes a run ID or member handle for safe use as a single scratch directory segment.
+ */
+function sanitizeScratchSegment(raw: string): string {
+  const clean = raw
+    .trim()
+    .replace(/[^a-zA-Z0-9._-]+/g, "_")
+    .replace(/^\.+|\.+$/g, "");
+  return clean.slice(0, 64) || "default";
+}
+
+/**
+ * Returns the run-scoped root directory under `os.tmpdir()` holding isolated
+ * scratch directories for `role: "validator"` sessions in `runId`.
+ */
+export function getRunValidatorScratchRoot(
+  runId: string,
+  tmpRoot: string = os.tmpdir(),
+): string {
+  return path.join(
+    path.resolve(tmpRoot),
+    "pi-swarm-validator",
+    sanitizeScratchSegment(runId),
+  );
+}
+
+/**
+ * Returns the dedicated isolated OS scratch directory for a validator member.
+ * Validators may write temporary fixtures, mutation copies, and build artifacts
+ * ONLY inside this directory while repository and worker worktrees stay read-only.
+ */
+export function getValidatorScratchDir(
+  runId: string,
+  memberName: string,
+  tmpRoot: string = os.tmpdir(),
+): string {
+  return path.join(
+    getRunValidatorScratchRoot(runId, tmpRoot),
+    sanitizeScratchSegment(memberName),
+  );
+}
+
+/**
+ * Resolves `targetPath` (optionally relative to `baseCwd`) and verifies symlink-safe
+ * containment inside `scratchDir`. Returns the resolved absolute path inside `scratchDir`,
+ * or `null` if the path escapes `scratchDir` (or equals `scratchDir` when `allowRoot` is false).
+ */
+export function resolveValidatorScratchPath(
+  targetPath: string,
+  scratchDir: string,
+  options?: { baseCwd?: string; allowRoot?: boolean },
+): string | null {
+  const raw = targetPath.trim();
+  if (!raw) {
+    return null;
+  }
+  const scratchRoot = path.resolve(scratchDir);
+  let realScratchRoot = scratchRoot;
+  try {
+    realScratchRoot = realpathSync(scratchRoot);
+  } catch {
+    // scratchRoot may not exist on disk yet during pure static guard checks
+  }
+
+  const candidateAbs = path.isAbsolute(raw)
+    ? path.resolve(raw)
+    : options?.baseCwd
+      ? path.resolve(options.baseCwd, raw)
+      : null;
+  if (!candidateAbs) {
+    return null;
+  }
+
+  const relPrimary = resolveWorktreeRelativePath(scratchRoot, candidateAbs);
+  const rel =
+    relPrimary !== null
+      ? relPrimary
+      : realScratchRoot !== scratchRoot
+        ? resolveWorktreeRelativePath(realScratchRoot, candidateAbs)
+        : null;
+  if (rel === null) {
+    return null;
+  }
+  if (rel === ".") {
+    return options?.allowRoot ? scratchRoot : null;
+  }
+  if (isProtectedSwarmPath(rel)) {
+    return null;
+  }
+  return path.resolve(scratchRoot, rel);
+}
+
+const VALIDATOR_NON_SCRATCH_PATTERNS: ReadonlyArray<{
+  pattern: RegExp;
+  reason: string;
+}> = VALIDATOR_FORBIDDEN_PATTERNS.filter(
+  (r) =>
+    r.reason.includes("perl -i") ||
+    r.reason.includes("Mutating `find`") ||
+    r.reason.includes("Mutating git subcommands") ||
+    r.reason.includes("Mutating `git branch`") ||
+    r.reason.includes("Package-mutating"),
+);
+
+interface ParsedShellWord {
+  raw: string;
+  value: string;
+  quoted: boolean;
+  hasUnsafeExpansion: boolean;
+}
+
+interface ParsedShellRedirection {
+  op: string;
+  benign: boolean;
+  target?: ParsedShellWord;
+}
+
+interface ParsedShellClause {
+  separatorBefore: "start" | "&&" | "other";
+  raw: string;
+}
+
+function hasUnquotedCommandSubstitutionOrHeredoc(command: string): boolean {
+  let i = 0;
+  while (i < command.length) {
+    const ch = command[i]!;
+    if (ch === "\\") {
+      i += 2;
+      continue;
+    }
+    if (ch === "$" && command[i + 1] === "'") {
+      return true;
+    }
+    if (ch === "'") {
+      i += 1;
+      while (i < command.length && command[i] !== "'") {
+        i += 1;
+      }
+      if (i >= command.length) return true;
+      i += 1;
+      continue;
+    }
+    if (ch === '"') {
+      i += 1;
+      while (i < command.length && command[i] !== '"') {
+        if (command[i] === "\\") {
+          i += 2;
+          continue;
+        }
+        if (command[i] === "`" || (command[i] === "$" && command[i + 1] === "(")) {
+          return true;
+        }
+        i += 1;
+      }
+      if (i >= command.length) return true;
+      i += 1;
+      continue;
+    }
+    if (ch === "`" || (ch === "$" && command[i + 1] === "(")) {
+      return true;
+    }
+    if (ch === "<" && command[i + 1] === "<") {
+      return true;
+    }
+    i += 1;
+  }
+  return false;
+}
+
+function splitTopLevelShellClauses(command: string): ParsedShellClause[] | null {
+  const clauses: ParsedShellClause[] = [];
+  let current = "";
+  let separatorBefore: "start" | "&&" | "other" = "start";
+  let i = 0;
+
+  const flush = (nextSep: "&&" | "other"): void => {
+    const trimmed = current.trim();
+    if (trimmed.length > 0) {
+      clauses.push({ separatorBefore, raw: trimmed });
+      separatorBefore = nextSep;
+    } else if (separatorBefore !== "start") {
+      separatorBefore = "other";
+    }
+    current = "";
+  };
+
+  while (i < command.length) {
+    const ch = command[i]!;
+    if (ch === "\\") {
+      if (i + 1 >= command.length) return null;
+      current += command.slice(i, i + 2);
+      i += 2;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      const quote = ch;
+      current += ch;
+      i += 1;
+      while (i < command.length && command[i] !== quote) {
+        if (quote === '"' && command[i] === "\\") {
+          if (i + 1 >= command.length) return null;
+          current += command.slice(i, i + 2);
+          i += 2;
+          continue;
+        }
+        current += command[i]!;
+        i += 1;
+      }
+      if (i >= command.length) return null;
+      current += quote;
+      i += 1;
+      continue;
+    }
+    if (ch === "&" && command[i + 1] === "&") {
+      flush("&&");
+      i += 2;
+      continue;
+    }
+    if (ch === "|" && command[i + 1] === "|") {
+      flush("other");
+      i += 2;
+      continue;
+    }
+    if (ch === "|" && command[i + 1] === "&") {
+      flush("other");
+      i += 2;
+      continue;
+    }
+    // Check `&>` or `>&` redirections BEFORE treating `&` or `|` as clause separators
+    if (
+      (ch === "&" && command[i + 1] === ">") ||
+      (ch === ">" && (command[i + 1] === "&" || command[i + 1] === "|"))
+    ) {
+      current += command.slice(i, i + 2);
+      i += 2;
+      continue;
+    }
+    if (
+      ch === ";" ||
+      ch === "|" ||
+      ch === "&" ||
+      ch === "\n" ||
+      ch === "\r" ||
+      ch === "(" ||
+      ch === ")" ||
+      ch === "{" ||
+      ch === "}"
+    ) {
+      flush("other");
+      i += 1;
+      continue;
+    }
+    current += ch;
+    i += 1;
+  }
+
+  const tail = current.trim();
+  if (tail.length > 0) {
+    clauses.push({ separatorBefore, raw: tail });
+  }
+  return clauses;
+}
+
+function tokenizeShellClause(
+  clause: string,
+): { words: ParsedShellWord[]; redirections: ParsedShellRedirection[] } | null {
+  const words: ParsedShellWord[] = [];
+  const redirections: ParsedShellRedirection[] = [];
+  let i = 0;
+
+  const readWord = (): ParsedShellWord | null => {
+    while (i < clause.length && /\s/.test(clause[i]!)) {
+      i += 1;
+    }
+    if (i >= clause.length) return null;
+    const start = i;
+    let value = "";
+    let quoted = false;
+    let hasUnsafeExpansion = false;
+
+    while (i < clause.length && !/\s/.test(clause[i]!)) {
+      const ch = clause[i]!;
+      if (ch === ">" || ch === "<") {
+        break;
+      }
+      if (ch === "\\") {
+        if (i + 1 >= clause.length) return null;
+        quoted = true;
+        hasUnsafeExpansion = true;
+        value += clause[i + 1]!;
+        i += 2;
+        continue;
+      }
+      if (ch === "'") {
+        quoted = true;
+        i += 1;
+        while (i < clause.length && clause[i] !== "'") {
+          value += clause[i]!;
+          i += 1;
+        }
+        if (i >= clause.length) return null;
+        i += 1;
+        continue;
+      }
+      if (ch === '"') {
+        quoted = true;
+        i += 1;
+        while (i < clause.length && clause[i] !== '"') {
+          const inner = clause[i]!;
+          if (inner === "\\" || inner === "$" || inner === "`") {
+            hasUnsafeExpansion = true;
+          }
+          if (inner === "\\" && i + 1 < clause.length) {
+            value += clause[i + 1]!;
+            i += 2;
+            continue;
+          }
+          value += inner;
+          i += 1;
+        }
+        if (i >= clause.length) return null;
+        i += 1;
+        continue;
+      }
+      if ("$`*?[]{}~".includes(ch)) {
+        hasUnsafeExpansion = true;
+      }
+      value += ch;
+      i += 1;
+    }
+
+    const raw = clause.slice(start, i);
+    if (!raw) return null;
+    return { raw, value, quoted, hasUnsafeExpansion };
+  };
+
+  while (i < clause.length) {
+    while (i < clause.length && /\s/.test(clause[i]!)) {
+      i += 1;
+    }
+    if (i >= clause.length) break;
+
+    // Detect redirection operator (`[0-9]*>>?`, `&>>?`, `<>`, `[0-9]*>&[0-9]+`, `[0-9]*<`)
+    const rest = clause.slice(i);
+    const fdRedirMatch = rest.match(
+      /^(?:(\d+)?(>>|>&|<>|>\|?|<&|<)|(&>>|&>))/,
+    );
+    if (fdRedirMatch) {
+      const fullOp = fdRedirMatch[0]!;
+      const op = fdRedirMatch[2] ?? fdRedirMatch[3]!;
+      i += fullOp.length;
+
+      // Dup fd redirection like `2>&1` or `1>&2` or `0<&0`
+      if ((op === ">&" || op === "<&") && /^\d+(?=\s|$|[><])/.test(clause.slice(i))) {
+        const fdDigits = clause.slice(i).match(/^\d+/)![0]!;
+        i += fdDigits.length;
+        redirections.push({ op: fullOp + fdDigits, benign: true });
+        continue;
+      }
+
+      const target = readWord();
+      if (!target) {
+        return null;
+      }
+      // Pure input `<` is read-only; `/dev/null` sink is always benign
+      const isReadInput = op === "<";
+      const isDevNull =
+        !target.hasUnsafeExpansion && target.value === "/dev/null";
+      redirections.push({
+        op: fullOp,
+        benign: isReadInput || isDevNull,
+        target,
+      });
+      continue;
+    }
+
+    const word = readWord();
+    if (!word) return null;
+    words.push(word);
+  }
+
+  return { words, redirections };
+}
+
+function isSafeScratchWord(
+  word: ParsedShellWord | undefined,
+  scratchDir: string,
+  effectiveScratchCwd: string | undefined,
+  options?: { allowRoot?: boolean },
+): string | null {
+  if (!word || word.hasUnsafeExpansion) {
+    return null;
+  }
+  const v = word.value.trim();
+  if (!v || v.startsWith("-") || /[\r\n\0$`*?[\]{}~\\]/.test(v)) {
+    return null;
+  }
+  return resolveValidatorScratchPath(v, scratchDir, {
+    baseCwd: effectiveScratchCwd,
+    allowRoot: options?.allowRoot,
+  });
+}
+
+function validateMutatingScratchUtility(
+  baseCmd: string,
+  args: readonly ParsedShellWord[],
+  scratchDir: string,
+  effectiveScratchCwd: string | undefined,
+): boolean {
+  const checkAllPaths = (
+    pathWords: readonly ParsedShellWord[],
+    allowRoot: boolean,
+  ): boolean =>
+    pathWords.length > 0 &&
+    pathWords.every(
+      (w) =>
+        isSafeScratchWord(w, scratchDir, effectiveScratchCwd, { allowRoot }) !==
+        null,
+    );
+
+  const splitFlagsAndPaths = (
+    allowedShortFlagChars: RegExp,
+    allowedLongFlags: ReadonlySet<string>,
+  ): ParsedShellWord[] | null => {
+    const paths: ParsedShellWord[] = [];
+    let endOfFlags = false;
+    for (const arg of args) {
+      if (!endOfFlags && !arg.quoted && arg.value === "--") {
+        endOfFlags = true;
+        continue;
+      }
+      if (!endOfFlags && arg.value.startsWith("-") && arg.value.length > 1) {
+        if (arg.value.startsWith("--")) {
+          if (!allowedLongFlags.has(arg.value)) return null;
+        } else {
+          const chars = arg.value.slice(1);
+          if (!allowedShortFlagChars.test(chars)) return null;
+        }
+        continue;
+      }
+      paths.push(arg);
+    }
+    return paths;
+  };
+
+  switch (baseCmd) {
+    case "mkdir": {
+      const paths = splitFlagsAndPaths(
+        /^[pv]+$/,
+        new Set(["--parents", "--verbose"]),
+      );
+      return paths !== null && checkAllPaths(paths, true);
+    }
+    case "touch": {
+      const paths = splitFlagsAndPaths(/^[acm]+$/, new Set());
+      return paths !== null && checkAllPaths(paths, false);
+    }
+    case "rm": {
+      const paths = splitFlagsAndPaths(
+        /^[rfivdI]+$/,
+        new Set(["--force", "--recursive"]),
+      );
+      return paths !== null && checkAllPaths(paths, false);
+    }
+    case "rmdir": {
+      const paths = splitFlagsAndPaths(
+        /^[pv]+$/,
+        new Set(["--parents", "--verbose"]),
+      );
+      return paths !== null && checkAllPaths(paths, false);
+    }
+    case "tee": {
+      const paths = splitFlagsAndPaths(
+        /^[ai]+$/,
+        new Set(["--append", "--ignore-interrupts"]),
+      );
+      return paths !== null && checkAllPaths(paths, false);
+    }
+    case "truncate": {
+      const paths: ParsedShellWord[] = [];
+      let endOfFlags = false;
+      for (let i = 0; i < args.length; i++) {
+        const arg = args[i]!;
+        if (!endOfFlags && !arg.quoted && arg.value === "--") {
+          endOfFlags = true;
+          continue;
+        }
+        if (!endOfFlags && (arg.value === "-s" || arg.value === "--size")) {
+          if (i + 1 >= args.length) return false;
+          i += 1;
+          continue;
+        }
+        if (
+          !endOfFlags &&
+          (arg.value.startsWith("-s") || arg.value.startsWith("--size="))
+        ) {
+          continue;
+        }
+        if (!endOfFlags && arg.value.startsWith("-")) {
+          return false;
+        }
+        paths.push(arg);
+      }
+      return checkAllPaths(paths, false);
+    }
+    case "cp": {
+      // Explicitly forbid `-s`/`-l`/`-a`/`-d`/`-t` so `cp` never plants symlinks or swaps dest arg order
+      const paths = splitFlagsAndPaths(
+        /^[rRpPfvxL]+$/,
+        new Set(["--recursive", "--force", "--dereference", "--no-dereference"]),
+      );
+      if (!paths || paths.length < 2) return false;
+      const dest = paths[paths.length - 1]!;
+      return (
+        isSafeScratchWord(dest, scratchDir, effectiveScratchCwd, {
+          allowRoot: true,
+        }) !== null
+      );
+    }
+    case "mv": {
+      const paths = splitFlagsAndPaths(
+        /^[fivn]+$/,
+        new Set(["--force", "--no-clobber"]),
+      );
+      if (!paths || paths.length < 2) return false;
+      return checkAllPaths(paths, false);
+    }
+    case "chmod": {
+      const positional: ParsedShellWord[] = [];
+      let endOfFlags = false;
+      for (const arg of args) {
+        if (!endOfFlags && !arg.quoted && arg.value === "--") {
+          endOfFlags = true;
+          continue;
+        }
+        if (
+          !endOfFlags &&
+          (arg.value === "-R" || arg.value === "--recursive")
+        ) {
+          continue;
+        }
+        if (!endOfFlags && arg.value.startsWith("-")) {
+          return false;
+        }
+        positional.push(arg);
+      }
+      if (positional.length < 2) return false;
+      const mode = positional[0]!.value;
+      if (
+        !/^(?:[0-7]{3,4}|[ugoa]*[+-=][rwxXst]+(?:,[ugoa]*[+-=][rwxXst]+)*)$/.test(
+          mode,
+        )
+      ) {
+        return false;
+      }
+      return checkAllPaths(positional.slice(1), false);
+    }
+    case "sed": {
+      let sawInPlace = false;
+      let sawExplicitScript = false;
+      let endOfFlags = false;
+      const positional: ParsedShellWord[] = [];
+      for (let i = 0; i < args.length; i++) {
+        const arg = args[i]!;
+        if (!endOfFlags && !arg.quoted && arg.value === "--") {
+          endOfFlags = true;
+          continue;
+        }
+        if (!endOfFlags && (arg.value === "-e" || arg.value === "--expression")) {
+          if (i + 1 >= args.length) return false;
+          sawExplicitScript = true;
+          i += 1;
+          continue;
+        }
+        if (!endOfFlags && arg.value.startsWith("-e") && arg.value.length > 2) {
+          sawExplicitScript = true;
+          continue;
+        }
+        if (!endOfFlags && (arg.value === "-i" || arg.value.startsWith("-i") || arg.value.startsWith("--in-place"))) {
+          sawInPlace = true;
+          // Handle macOS `sed -i '' 's/a/b/' file`: skip ONLY a quoted empty-string backup suffix
+          if (
+            arg.value === "-i" &&
+            i + 1 < args.length &&
+            args[i + 1]!.quoted &&
+            args[i + 1]!.value === ""
+          ) {
+            i += 1;
+          }
+          continue;
+        }
+        if (!endOfFlags && /^-[nEr]+$/.test(arg.value)) {
+          continue;
+        }
+        if (!endOfFlags && arg.value.startsWith("-")) {
+          return false;
+        }
+        positional.push(arg);
+      }
+      if (!sawInPlace) return true;
+      const fileArgs = sawExplicitScript ? positional : positional.slice(1);
+      return checkAllPaths(fileArgs, false);
+    }
+    default:
+      return false;
+  }
+}
+
+/**
  * Guard for bash commands executed by an independent read-only Validator.
  * Rejects file writes, redirects, mutating git commands, and package mutations
- * while permitting inspection and verification commands (git diff/log/show, tests, typecheck, lint).
+ * on repository and worker worktree files while permitting inspection/verification
+ * commands AND (when `scratchOrOptions` provides a dedicated `scratchDir`) permitting
+ * temporary build/fixture/mutation file operations strictly inside `scratchDir`.
  */
-export function isReadOnlyValidationCommand(command: string): CommandGuardResult {
+export function isReadOnlyValidationCommand(
+  command: string,
+  scratchOrOptions?: string | { scratchDir?: string },
+): CommandGuardResult {
   const trimmed = command.trim();
   if (!trimmed) {
     return { allowed: true };
   }
   const normalized = maskQuotedShellLiterals(trimmed);
+  let firstForbiddenReason: string | undefined;
   for (const rule of VALIDATOR_FORBIDDEN_PATTERNS) {
+    if (rule.pattern.test(normalized)) {
+      firstForbiddenReason = rule.reason;
+      break;
+    }
+  }
+  if (!firstForbiddenReason) {
+    return { allowed: true };
+  }
+
+  const scratchDir = (
+    typeof scratchOrOptions === "string"
+      ? scratchOrOptions
+      : scratchOrOptions?.scratchDir
+  )?.trim();
+  if (!scratchDir) {
+    return { allowed: false, reason: firstForbiddenReason };
+  }
+
+  // Fail closed on shell-eval (`sh -c`, `eval`), `xargs`, command substitutions, heredocs, or git/pkg mutations
+  if (
+    SHELL_EVAL_CMD_RE.test(normalized) ||
+    /\bxargs\b/.test(normalized) ||
+    hasUnquotedCommandSubstitutionOrHeredoc(trimmed)
+  ) {
+    return { allowed: false, reason: firstForbiddenReason };
+  }
+  for (const rule of VALIDATOR_NON_SCRATCH_PATTERNS) {
     if (rule.pattern.test(normalized)) {
       return { allowed: false, reason: rule.reason };
     }
   }
+
+  const clauses = splitTopLevelShellClauses(trimmed);
+  if (!clauses || clauses.length === 0) {
+    return { allowed: false, reason: firstForbiddenReason };
+  }
+
+  let effectiveScratchCwd: string | undefined;
+  for (const clause of clauses) {
+    if (clause.separatorBefore !== "&&") {
+      effectiveScratchCwd = undefined;
+    }
+    const tokenized = tokenizeShellClause(clause.raw);
+    if (!tokenized) {
+      return { allowed: false, reason: firstForbiddenReason };
+    }
+
+    // 1. Validate every non-benign redirection targets `scratchDir`
+    for (const redir of tokenized.redirections) {
+      if (redir.benign) continue;
+      if (
+        isSafeScratchWord(redir.target, scratchDir, effectiveScratchCwd, {
+          allowRoot: false,
+        }) === null
+      ) {
+        return { allowed: false, reason: firstForbiddenReason };
+      }
+    }
+
+    // 2. Skip leading `KEY=VALUE` env assignments
+    let idx = 0;
+    while (
+      idx < tokenized.words.length &&
+      !tokenized.words[idx]!.quoted &&
+      /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokenized.words[idx]!.raw)
+    ) {
+      idx += 1;
+    }
+    if (idx >= tokenized.words.length) {
+      continue;
+    }
+
+    // 3. Skip benign execution wrappers (`env`, `command`, `time`, `nice`, `timeout`)
+    while (idx < tokenized.words.length) {
+      const w = tokenized.words[idx]!;
+      if (w.quoted) break;
+      if (w.value === "command" || w.value === "time") {
+        idx += 1;
+        continue;
+      }
+      if (w.value === "env") {
+        idx += 1;
+        while (
+          idx < tokenized.words.length &&
+          /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokenized.words[idx]!.raw)
+        ) {
+          idx += 1;
+        }
+        continue;
+      }
+      if (w.value === "nice") {
+        idx += 1;
+        if (
+          idx + 1 < tokenized.words.length &&
+          tokenized.words[idx]!.value === "-n"
+        ) {
+          idx += 2;
+        }
+        continue;
+      }
+      if (w.value === "timeout") {
+        idx += 1;
+        while (
+          idx < tokenized.words.length &&
+          tokenized.words[idx]!.value.startsWith("-")
+        ) {
+          const flag = tokenized.words[idx]!.value;
+          idx += flag === "-k" || flag === "-s" ? 2 : 1;
+        }
+        // Skip timeout duration token
+        if (idx < tokenized.words.length) {
+          idx += 1;
+        }
+        continue;
+      }
+      break;
+    }
+
+    if (idx >= tokenized.words.length) {
+      return { allowed: false, reason: firstForbiddenReason };
+    }
+
+    const cmdWord = tokenized.words[idx]!;
+    const args = tokenized.words.slice(idx + 1);
+
+    // Track `cd <scratchPath>` across `&&`-chained clauses
+    if (!cmdWord.quoted && cmdWord.value === "cd") {
+      if (args.length === 1) {
+        effectiveScratchCwd =
+          isSafeScratchWord(args[0], scratchDir, effectiveScratchCwd, {
+            allowRoot: true,
+          }) ?? undefined;
+      } else {
+        effectiveScratchCwd = undefined;
+      }
+      continue;
+    }
+
+    // Check if stripping validated redirections makes this clause pass standard read-only rules
+    const reconstructedCmd = [cmdWord, ...args].map((w) => w.raw).join(" ");
+    const maskedCmd = maskQuotedShellLiterals(reconstructedCmd);
+    const clauseTripsForbidden = VALIDATOR_FORBIDDEN_PATTERNS.some((rule) =>
+      rule.pattern.test(maskedCmd),
+    );
+    if (!clauseTripsForbidden) {
+      continue;
+    }
+
+    // Otherwise, must be an unquoted/unescaped allowed scratch utility with scratch-only targets
+    if (
+      cmdWord.quoted ||
+      cmdWord.raw.includes("\\") ||
+      (cmdWord.value.includes("/") &&
+        !/^\/(?:usr\/)?bin\/[a-z0-9_-]+$/.test(cmdWord.value))
+    ) {
+      return { allowed: false, reason: firstForbiddenReason };
+    }
+    const baseCmd = path.posix.basename(cmdWord.value);
+    if (
+      !validateMutatingScratchUtility(
+        baseCmd,
+        args,
+        scratchDir,
+        effectiveScratchCwd,
+      )
+    ) {
+      return { allowed: false, reason: firstForbiddenReason };
+    }
+  }
+
   return { allowed: true };
 }
 
@@ -950,31 +1731,74 @@ export function createWorkerGuardExtensionFactory(
   };
 }
 
-function createValidatorGuardExtensionFactory(
+export function createValidatorGuardExtensionFactory(
   memberName: string,
   enforceReadOnlyBash: boolean,
+  requestCwd: string,
+  scratchDir?: string,
 ): ExtensionFactory {
+  const resolvedScratch = scratchDir?.trim()
+    ? path.resolve(scratchDir.trim())
+    : undefined;
+
   return (pi) => {
     pi.on("tool_call", (event) => {
-      if (
-        isToolCallEventType("write", event) ||
-        isToolCallEventType("edit", event) ||
-        isToolCallEventType("powershell", event)
-      ) {
+      if (isToolCallEventType("powershell", event)) {
         return {
           block: true,
           reason: `Independent validator @${memberName} is strictly read-only. Tool "${event.toolName}" is blocked.`,
         };
       }
 
-      if (enforceReadOnlyBash && isToolCallEventType("bash", event)) {
-        const check = isReadOnlyValidationCommand(event.input.command);
-        if (!check.allowed) {
+      if (
+        isToolCallEventType("write", event) ||
+        isToolCallEventType("edit", event)
+      ) {
+        if (!resolvedScratch) {
           return {
             block: true,
-            reason:
-              check.reason ??
-              `Mutating bash commands are blocked in read-only validator @${memberName} sessions.`,
+            reason: `Independent validator @${memberName} is strictly read-only. Tool "${event.toolName}" is blocked.`,
+          };
+        }
+        const rawInput = event.input as { path?: unknown; file_path?: unknown };
+        const rawPath =
+          typeof rawInput?.path === "string"
+            ? rawInput.path
+            : typeof rawInput?.file_path === "string"
+              ? rawInput.file_path
+              : "";
+        const safeScratchTarget = resolveValidatorScratchPath(
+          rawPath,
+          resolvedScratch,
+          {
+            baseCwd: requestCwd,
+            allowRoot: false,
+          },
+        );
+        if (!safeScratchTarget) {
+          return {
+            block: true,
+            reason: `Independent validator @${memberName} is strictly read-only on repository and worktree files. Tool "${event.toolName}" may only write temporary probe/fixture files inside your isolated scratch directory "${resolvedScratch}" (got "${rawPath}").`,
+          };
+        }
+        return undefined;
+      }
+
+      if (enforceReadOnlyBash && isToolCallEventType("bash", event)) {
+        const check = isReadOnlyValidationCommand(
+          event.input.command,
+          resolvedScratch,
+        );
+        if (!check.allowed) {
+          const baseReason =
+            check.reason ??
+            `Mutating bash commands are blocked in read-only validator @${memberName} sessions.`;
+          const scratchHint = resolvedScratch
+            ? ` Repository and worker worktrees are read-only; for temporary build/fixture/mutation checks, target explicit literal paths inside your isolated scratch directory "${resolvedScratch}" (or use write/edit inside "${resolvedScratch}").`
+            : "";
+          return {
+            block: true,
+            reason: `${baseReason}${scratchHint}`,
           };
         }
       }
@@ -1373,12 +2197,23 @@ export class InProcessPiTransport implements ISwarmTransport {
       }
     };
 
+    const validatorScratchDir =
+      !request.isMonitor &&
+      request.role === "validator" &&
+      request.scratchDir?.trim()
+        ? path.resolve(request.scratchDir.trim())
+        : undefined;
+    if (validatorScratchDir) {
+      await mkdir(validatorScratchDir, { recursive: true }).catch(() => {});
+    }
+
     const allowedTools: string[] = request.isMonitor
       ? [POST_MESSAGE_TOOL, READ_BOARD_TOOL]
       : request.role === "validator"
         ? Array.from(
             new Set<string>([
               ...VALIDATOR_BUILTIN_TOOLS,
+              ...(validatorScratchDir ? ["write", "edit"] : []),
               "bash",
               SWARM_TOOL,
               POST_MESSAGE_TOOL,
@@ -1414,7 +2249,12 @@ export class InProcessPiTransport implements ISwarmTransport {
 
     const guardFactory: ExtensionFactory =
       request.role === "validator"
-        ? createValidatorGuardExtensionFactory(request.name, this.validatorReadOnlyBash)
+        ? createValidatorGuardExtensionFactory(
+            request.name,
+            this.validatorReadOnlyBash,
+            request.cwd,
+            validatorScratchDir,
+          )
         : createWorkerGuardExtensionFactory(request, request.baseBranch);
 
     const readStats = (

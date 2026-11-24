@@ -25,9 +25,12 @@ export {
 
 export {
   type CommandGuardResult,
+  createValidatorGuardExtensionFactory,
   createWorkerGuardExtensionFactory,
   extractSessionMessages,
   findOutOfScopeFiles,
+  getRunValidatorScratchRoot,
+  getValidatorScratchDir,
   InProcessPiTransport,
   type InProcessPiTransportOptions,
   isForbiddenWorkerBashCommand,
@@ -36,6 +39,7 @@ export {
   isReadOnlyValidationCommand,
   normalizeRepoPath,
   resolveRoleModel,
+  resolveValidatorScratchPath,
   resolveWorktreeRelativePath,
   sanitizeForkSeedMessages,
 } from "./transport.js";

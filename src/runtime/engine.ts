@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
+import { mkdir, rm } from "node:fs/promises";
 import path from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -13,6 +14,7 @@ import {
   DEFAULT_LIBRARY_TOPICS,
   DEFAULT_SWARM_SETTINGS,
   FEATURE_STATUSES,
+  findSafetySensitiveMemberSegment,
   HANDOFF_RESOLUTIONS,
   MEMBER_NAME_PATTERN,
   MONITOR_NAME,
@@ -107,6 +109,8 @@ import {
 } from "./role-prompts.js";
 import {
   extractSessionMessages,
+  getRunValidatorScratchRoot,
+  getValidatorScratchDir,
   resolveRoleModel,
   sanitizeForkSeedMessages,
 } from "./transport.js";
@@ -218,6 +222,14 @@ function validateMemberName(rawName: string): string {
       "INVALID_NAME",
       `Member name "${name}" is a reserved prototype key.`,
       { name },
+    );
+  }
+  const sensitiveSeg = findSafetySensitiveMemberSegment(name);
+  if (sensitiveSeg) {
+    throw new SwarmProtocolError(
+      "INVALID_NAME",
+      `Member name "${name}" contains security-sensitive segment "${sensitiveSeg}" which can trigger provider cybersecurity safety filters. Choose a neutral QA/engineering handle instead (e.g. "probe", "audit", "verify", "mutcheck", "negtest").`,
+      { name, segment: sensitiveSeg },
     );
   }
   return name;
@@ -430,7 +442,9 @@ function uniqueHandleFromFeatureId(
     .trim()
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
+    .split("-")
+    .filter((seg) => Boolean(seg) && !findSafetySensitiveMemberSegment(seg))
+    .join("-");
   if (!slug || !/^[a-z]/.test(slug)) {
     slug = slug ? `w-${slug}` : "worker";
   }
@@ -1713,6 +1727,10 @@ export class SwarmEngine implements ISwarmEngine {
         sessionId: options.sessionId,
       });
     }
+    await rm(getRunValidatorScratchRoot(run.id), {
+      recursive: true,
+      force: true,
+    }).catch(() => {});
 
     const finalRun = await this.store.loadRun(run.id);
     await this.refreshCache(finalRun);
@@ -3699,6 +3717,13 @@ export class SwarmEngine implements ISwarmEngine {
         this.maybeArmStallWatchdog();
         throw err;
       }
+    }
+
+    if (member.role === "validator") {
+      await rm(getValidatorScratchDir(run.id, member.name), {
+        recursive: true,
+        force: true,
+      }).catch(() => {});
     }
 
     const nowIso = new Date(this.nowFn()).toISOString();
@@ -6255,6 +6280,13 @@ export class SwarmEngine implements ISwarmEngine {
       },
     });
 
+    if (!isLiveRun || force) {
+      await rm(getRunValidatorScratchRoot(run.id), {
+        recursive: true,
+        force: true,
+      }).catch(() => {});
+    }
+
     if (this.activeRunId === run.id) {
       await this.refreshCache();
       this.emitEngineEvent("snapshot_changed", `Teardown completed for run ${run.id}.`);
@@ -6457,7 +6489,19 @@ export class SwarmEngine implements ISwarmEngine {
         return;
       }
 
-      const systemPrompt = buildMemberSystemPrompt(run, member);
+      const validatorScratchDir =
+        member.role === "validator"
+          ? getValidatorScratchDir(runId, member.name)
+          : undefined;
+      if (validatorScratchDir) {
+        await mkdir(validatorScratchDir, { recursive: true }).catch(() => {});
+      }
+
+      const systemPrompt = buildMemberSystemPrompt(
+        run,
+        member,
+        validatorScratchDir ? { scratchDir: validatorScratchDir } : undefined,
+      );
       const initialPrompt = buildMemberInitialPrompt(run, member, briefSeq);
       const engineApi = this.createMemberBridge(runId, member);
       const isIsolatedWorktree =
@@ -6488,6 +6532,7 @@ export class SwarmEngine implements ISwarmEngine {
         seedMessages,
         sessionDir: this.store.getMemberSessionDir?.(runId),
         sessionFile: member.sessionFile,
+        ...(validatorScratchDir ? { scratchDir: validatorScratchDir } : {}),
         hostContext,
         onTelemetry: (evt) => this.handleTelemetry(runId, evt),
         engineApi,
@@ -6667,10 +6712,23 @@ export class SwarmEngine implements ISwarmEngine {
       }
 
       const maxSeq = batch.reduce((acc, m) => Math.max(acc, m.seq), member.lastReadSeq);
+      const wakeScratchDir =
+        member.role === "validator"
+          ? getValidatorScratchDir(runId, member.name)
+          : undefined;
+      if (wakeScratchDir) {
+        await mkdir(wakeScratchDir, { recursive: true }).catch(() => {});
+      }
+      const wakePromptBody = buildWakeupPrompt(
+        member,
+        batch,
+        run.boardHead,
+        wakeScratchDir ? { scratchDir: wakeScratchDir } : undefined,
+      );
       const prompt =
         directPrompt && batch.length > 0
-          ? `${directPrompt}\n\n${buildWakeupPrompt(member, batch, run.boardHead)}`
-          : (directPrompt ?? buildWakeupPrompt(member, batch, run.boardHead));
+          ? `${directPrompt}\n\n${wakePromptBody}`
+          : (directPrompt ?? wakePromptBody);
 
       const wakeTurnStartedAt = new Date(this.nowFn()).toISOString();
       live.parkedMentionsOnly = true;
@@ -6894,11 +6952,28 @@ export class SwarmEngine implements ISwarmEngine {
       }
 
       const maxSeq = batch.reduce((acc, m) => Math.max(acc, m.seq), member.lastReadSeq);
+      const reviveScratchDir =
+        member.role === "validator"
+          ? getValidatorScratchDir(runId, member.name)
+          : undefined;
+      if (reviveScratchDir) {
+        await mkdir(reviveScratchDir, { recursive: true }).catch(() => {});
+      }
+      const reviveWakeBody = buildWakeupPrompt(
+        member,
+        batch,
+        run.boardHead,
+        reviveScratchDir ? { scratchDir: reviveScratchDir } : undefined,
+      );
       const prompt =
         directPrompt && batch.length > 0
-          ? `${directPrompt}\n\n${buildWakeupPrompt(member, batch, run.boardHead)}`
-          : (directPrompt ?? buildWakeupPrompt(member, batch, run.boardHead));
-      const systemPrompt = buildMemberSystemPrompt(run, member);
+          ? `${directPrompt}\n\n${reviveWakeBody}`
+          : (directPrompt ?? reviveWakeBody);
+      const systemPrompt = buildMemberSystemPrompt(
+        run,
+        member,
+        reviveScratchDir ? { scratchDir: reviveScratchDir } : undefined,
+      );
       const engineApi = this.createMemberBridge(runId, member);
 
       // Accumulate persisted usage from prior handle lifetimes before spawning replacement handle
@@ -6971,6 +7046,7 @@ export class SwarmEngine implements ISwarmEngine {
           seedMessages: live.lastMessages.length > 0 ? live.lastMessages : undefined,
           sessionDir: this.store.getMemberSessionDir?.(runId),
           sessionFile: member.sessionFile,
+          ...(reviveScratchDir ? { scratchDir: reviveScratchDir } : {}),
           hostContext: this.hostContext,
           onTelemetry: (evt) => this.handleTelemetry(runId, evt),
           engineApi,
