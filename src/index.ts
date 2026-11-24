@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { access } from "node:fs/promises";
+import { access, open } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
@@ -30,6 +30,7 @@ import {
 import {
   DEFAULT_CHANNEL,
   DEFAULT_SWARM_SETTINGS,
+  MEMBER_NAME_PATTERN,
   ORCHESTRATOR_NAME,
   SWARM_CONTRACT_CUSTOM_TYPE,
   SWARM_DIR,
@@ -44,6 +45,7 @@ import {
 } from "./constants.js";
 import {
   DraftStateController,
+  type StartDraftOptions,
   type SwarmDraftState,
   type SwarmToolProfileMode,
   applySwarmToolProfile,
@@ -53,6 +55,7 @@ import {
   buildRoleModelsFromSettings,
   escapeXml,
   isDraftActive,
+  mergeTweakedMissionContract,
   registerDraftingTools,
 } from "./drafting/index.js";
 import {
@@ -93,10 +96,8 @@ import {
   type ManageMissionInput,
   type MemberEngineBridge,
   type MissionAssertion,
-  type MissionCommandEntry,
   type MissionFeature,
   type MissionHandoffItem,
-  type MissionServiceEntry,
   type PersistentAgentHandle,
   type ProposedSwarmPlan,
   type RoleModelOrigin,
@@ -319,10 +320,63 @@ export interface ParsedSwarmInvocation {
   rest: string;
 }
 
+function isValidModelSubcommandRest(rest: string): boolean {
+  if (!rest) {
+    return true;
+  }
+  const tokens = tokenizeCommandArgs(rest);
+  let clearFlag = false;
+  const words: string[] = [];
+  for (const tok of tokens) {
+    const lower = tok.toLowerCase();
+    if (lower === "--global" || lower === "-g" || lower === "--project") {
+      continue;
+    }
+    if (lower === "--clear") {
+      clearFlag = true;
+      continue;
+    }
+    words.push(tok);
+  }
+  if (words.length === 0) {
+    return true;
+  }
+  const firstWord = words[0]!;
+  if (words.length === 1 && !clearFlag && firstWord.toLowerCase() === "--print") {
+    return true;
+  }
+  const cleanTarget = firstWord.replace(/^@/, "").trim().toLowerCase();
+  const validTarget =
+    isSwarmModelRole(cleanTarget) ||
+    (words.length === 1 && !clearFlag && cleanTarget === "fallbacks") ||
+    MEMBER_NAME_PATTERN.test(cleanTarget);
+  if (!validTarget) {
+    return false;
+  }
+  if (words.length === 1) {
+    return true;
+  }
+  if (clearFlag) {
+    return false;
+  }
+  if (words.length === 2) {
+    return true;
+  }
+  if (words.length === 3) {
+    return isThinkingLevel(words[2]!.toLowerCase());
+  }
+  return false;
+}
+
 export function parseSwarmCommand(rawArgs: string): ParsedSwarmInvocation {
   const trimmed = rawArgs.trim();
   if (!trimmed) {
     return { kind: "bare", rest: "" };
+  }
+
+  // Leading `--` escape forces literal goal routing regardless of first word
+  if (trimmed === "--" || /^--\s/.test(trimmed)) {
+    return { kind: "goal", rest: trimmed.slice(2).trim() };
   }
 
   const spaceIdx = trimmed.search(/\s/);
@@ -330,6 +384,16 @@ export function parseSwarmCommand(rawArgs: string): ParsedSwarmInvocation {
   const rest = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx).trim();
 
   if (ARG_SUBCOMMANDS.has(head)) {
+    // Disambiguate prose goals starting with `merge`, `focus`, or `model`
+    if (head === "merge" && rest && /\s/.test(rest)) {
+      return { kind: "goal", rest: trimmed };
+    }
+    if (head === "focus" && rest && /\s/.test(rest)) {
+      return { kind: "goal", rest: trimmed };
+    }
+    if (head === "model" && !isValidModelSubcommandRest(rest)) {
+      return { kind: "goal", rest: trimmed };
+    }
     return {
       kind: head as
         | "direct"
@@ -375,6 +439,455 @@ export function parseSwarmCommand(rawArgs: string): ParsedSwarmInvocation {
   }
 
   return { kind: "goal", rest: trimmed };
+}
+
+export const MAX_SPEC_FILE_BYTES = 64 * 1024; // 64 KiB per spec file
+export const MAX_TOTAL_SPEC_BYTES = 128 * 1024; // 128 KiB combined across spec files
+
+const LAUNCH_FLAGS_USAGE =
+  "Usage: /swarm [--no-validator|--validator] [--concurrency|-c <1..64>] [--branch|-b <name>] [--fast|--no-review] [--file|-f <path>] [--] <goal>. Use `--` to pass literal goal text starting with `-` or a subcommand name.";
+
+export interface ParsedSwarmGoalLaunchOptions {
+  goal: string;
+  validatorEnabled?: boolean;
+  maxConcurrency?: number;
+  baseBranch?: string;
+  skipContractReview?: boolean;
+  files?: string[];
+  error?: string;
+}
+
+interface ScannedArgToken {
+  value: string;
+  start: number;
+  end: number;
+  startsWithQuote: boolean;
+}
+
+function scanNextArgToken(input: string, fromIndex: number): ScannedArgToken | null {
+  let i = fromIndex;
+  while (i < input.length && /\s/.test(input[i]!)) {
+    i++;
+  }
+  if (i >= input.length) {
+    return null;
+  }
+  const start = i;
+  const startsWithQuote = input[start] === '"' || input[start] === "'";
+  let value = "";
+  let quote: '"' | "'" | null = null;
+  while (i < input.length) {
+    const ch = input[i]!;
+    if (quote) {
+      if (ch === quote) {
+        quote = null;
+      } else if (ch === "\\" && quote === '"' && i + 1 < input.length) {
+        value += input[++i]!;
+      } else {
+        value += ch;
+      }
+      i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      i++;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      break;
+    }
+    value += ch;
+    i++;
+  }
+  return {
+    value,
+    start,
+    end: i,
+    startsWithQuote,
+  };
+}
+
+/**
+ * Pure parser for leading one-shot launch flags on `/swarm <goal>`, `/swarm direct <goal>`,
+ * and `/swarm-direct <goal>`. Only leading flags are parsed; bare `--` stops flag parsing
+ * and preserves the remaining text verbatim.
+ */
+export function parseSwarmGoalLaunchOptions(
+  rawInput: string,
+): ParsedSwarmGoalLaunchOptions {
+  let pos = 0;
+  let validatorEnabled: boolean | undefined;
+  let maxConcurrency: number | undefined;
+  let baseBranch: string | undefined;
+  let skipContractReview: boolean | undefined;
+  const files: string[] = [];
+
+  const makeError = (message: string): ParsedSwarmGoalLaunchOptions => ({
+    goal: "",
+    error: `${message} ${LAUNCH_FLAGS_USAGE}`,
+  });
+
+  const parseConcurrencyValue = (
+    rawVal: string,
+    flagLabel: string,
+  ): { ok: true; value: number } | { ok: false; error: string } => {
+    const trimmedVal = rawVal.trim();
+    if (!/^[+-]?\d+$/.test(trimmedVal)) {
+      return {
+        ok: false,
+        error: `Invalid ${flagLabel} value "${rawVal}" (must be an integer between ${SWARM_SETTINGS_BOUNDS.maxConcurrency.min} and ${SWARM_SETTINGS_BOUNDS.maxConcurrency.max}).`,
+      };
+    }
+    const parsed = Number.parseInt(trimmedVal, 10);
+    if (
+      !Number.isSafeInteger(parsed) ||
+      parsed < SWARM_SETTINGS_BOUNDS.maxConcurrency.min ||
+      parsed > SWARM_SETTINGS_BOUNDS.maxConcurrency.max
+    ) {
+      return {
+        ok: false,
+        error: `Out-of-range ${flagLabel} value "${rawVal}" (must be between ${SWARM_SETTINGS_BOUNDS.maxConcurrency.min} and ${SWARM_SETTINGS_BOUNDS.maxConcurrency.max}).`,
+      };
+    }
+    return { ok: true, value: parsed };
+  };
+
+  const parseBranchValue = (
+    rawVal: string,
+    flagLabel: string,
+  ): { ok: true; value: string } | { ok: false; error: string } => {
+    const trimmedVal = rawVal.trim();
+    if (!trimmedVal || trimmedVal === "HEAD" || trimmedVal.startsWith("-")) {
+      return {
+        ok: false,
+        error: `Invalid ${flagLabel} value "${rawVal}" (must be a branch name other than "HEAD" and not starting with "-").`,
+      };
+    }
+    return { ok: true, value: trimmedVal };
+  };
+
+  while (pos < rawInput.length) {
+    const tok = scanNextArgToken(rawInput, pos);
+    if (!tok) {
+      break;
+    }
+
+    if (tok.startsWithQuote) {
+      break;
+    }
+
+    if (tok.value === "--") {
+      pos = tok.end;
+      break;
+    }
+
+    if (!tok.value.startsWith("-") || tok.value === "-") {
+      break;
+    }
+
+    const eqIdx = tok.value.indexOf("=");
+    const flagPart = (eqIdx >= 0 ? tok.value.slice(0, eqIdx) : tok.value).toLowerCase();
+    const inlineVal = eqIdx >= 0 ? tok.value.slice(eqIdx + 1) : undefined;
+
+    if (flagPart === "--no-validator") {
+      if (inlineVal !== undefined) {
+        return makeError(`Flag "--no-validator" does not take a value.`);
+      }
+      validatorEnabled = false;
+      pos = tok.end;
+      continue;
+    }
+
+    if (flagPart === "--validator") {
+      if (inlineVal !== undefined) {
+        return makeError(`Flag "--validator" does not take a value.`);
+      }
+      validatorEnabled = true;
+      pos = tok.end;
+      continue;
+    }
+
+    if (flagPart === "--fast" || flagPart === "--no-review") {
+      if (inlineVal !== undefined) {
+        return makeError(`Flag "${flagPart}" does not take a value.`);
+      }
+      skipContractReview = true;
+      pos = tok.end;
+      continue;
+    }
+
+    if (flagPart === "--concurrency" || flagPart === "-c") {
+      let rawVal = inlineVal;
+      let nextPos = tok.end;
+      if (rawVal === undefined) {
+        const valTok = scanNextArgToken(rawInput, tok.end);
+        if (!valTok) {
+          return makeError(`Missing value after ${flagPart}.`);
+        }
+        rawVal = valTok.value;
+        nextPos = valTok.end;
+      } else if (!rawVal.trim()) {
+        return makeError(`Missing value after ${flagPart}=.`);
+      }
+      const checked = parseConcurrencyValue(rawVal, flagPart);
+      if (!checked.ok) {
+        return makeError(checked.error);
+      }
+      maxConcurrency = checked.value;
+      pos = nextPos;
+      continue;
+    }
+
+    if (flagPart === "--branch" || flagPart === "-b") {
+      let rawVal = inlineVal;
+      let nextPos = tok.end;
+      if (rawVal === undefined) {
+        const valTok = scanNextArgToken(rawInput, tok.end);
+        if (!valTok) {
+          return makeError(`Missing branch name after ${flagPart}.`);
+        }
+        rawVal = valTok.value;
+        nextPos = valTok.end;
+      } else if (!rawVal.trim()) {
+        return makeError(`Missing branch name after ${flagPart}=.`);
+      }
+      const checked = parseBranchValue(rawVal, flagPart);
+      if (!checked.ok) {
+        return makeError(checked.error);
+      }
+      baseBranch = checked.value;
+      pos = nextPos;
+      continue;
+    }
+
+    if (flagPart === "--file" || flagPart === "-f") {
+      let rawVal = inlineVal;
+      let nextPos = tok.end;
+      if (rawVal === undefined) {
+        const valTok = scanNextArgToken(rawInput, tok.end);
+        if (!valTok || (!valTok.startsWithQuote && valTok.value.startsWith("--"))) {
+          return makeError(`Missing file path after ${flagPart}.`);
+        }
+        rawVal = valTok.value;
+        nextPos = valTok.end;
+      } else if (!rawVal.trim()) {
+        return makeError(`Missing file path after ${flagPart}=.`);
+      }
+      const trimmedPath = rawVal.trim();
+      if (!trimmedPath) {
+        return makeError(`Missing file path after ${flagPart}.`);
+      }
+      files.push(trimmedPath);
+      pos = nextPos;
+      continue;
+    }
+
+    if (tok.value.startsWith("--")) {
+      return makeError(`Unknown launch flag "${tok.value}".`);
+    }
+
+    break;
+  }
+
+  const goal = rawInput.slice(pos).trim();
+  return {
+    goal,
+    ...(validatorEnabled !== undefined ? { validatorEnabled } : {}),
+    ...(maxConcurrency !== undefined ? { maxConcurrency } : {}),
+    ...(baseBranch !== undefined ? { baseBranch } : {}),
+    ...(skipContractReview !== undefined ? { skipContractReview } : {}),
+    ...(files.length > 0 ? { files } : {}),
+  };
+}
+
+interface ReadSpecFileResult {
+  content?: string;
+  bytesRead?: number;
+  notRegularFile?: boolean;
+  error?: string;
+}
+
+async function readSpecFileBounded(
+  cwd: string,
+  rawPath: string,
+  remainingTotalBytes: number,
+): Promise<ReadSpecFileResult> {
+  const resolved = path.resolve(cwd, rawPath);
+  let fh: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    fh = await open(resolved, "r");
+    const st = await fh.stat();
+    if (!st.isFile()) {
+      return {
+        notRegularFile: true,
+        error: `Spec path "${rawPath}" is not a regular file.`,
+      };
+    }
+    if (st.size > MAX_SPEC_FILE_BYTES) {
+      return {
+        error: `Spec file "${rawPath}" exceeds the ${Math.floor(MAX_SPEC_FILE_BYTES / 1024)} KiB limit (${st.size} bytes).`,
+      };
+    }
+    const effectiveCap = Math.min(MAX_SPEC_FILE_BYTES, remainingTotalBytes);
+    if (st.size > effectiveCap) {
+      return {
+        error: `Combined spec files exceed the ${Math.floor(MAX_TOTAL_SPEC_BYTES / 1024)} KiB total limit while reading "${rawPath}".`,
+      };
+    }
+    const buf = Buffer.allocUnsafe(effectiveCap + 1);
+    let total = 0;
+    while (total < buf.length) {
+      const { bytesRead } = await fh.read(buf, total, buf.length - total, total);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+    }
+    if (total > MAX_SPEC_FILE_BYTES) {
+      return {
+        error: `Spec file "${rawPath}" exceeds the ${Math.floor(MAX_SPEC_FILE_BYTES / 1024)} KiB limit.`,
+      };
+    }
+    if (total > effectiveCap) {
+      return {
+        error: `Combined spec files exceed the ${Math.floor(MAX_TOTAL_SPEC_BYTES / 1024)} KiB total limit while reading "${rawPath}".`,
+      };
+    }
+    return {
+      content: buf.subarray(0, total).toString("utf8"),
+      bytesRead: total,
+    };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (
+      code === "ENOENT" ||
+      code === "ENOTDIR" ||
+      code === "EISDIR" ||
+      code === "EINVAL" ||
+      code === "ENAMETOOLONG" ||
+      code === "ELOOP"
+    ) {
+      return {
+        notRegularFile: true,
+        error: `Spec file "${rawPath}" could not be read (${code}).`,
+      };
+    }
+    return {
+      error: `Failed to read spec file "${rawPath}": ${formatError(err)}`,
+    };
+  } finally {
+    await fh?.close().catch(() => {});
+  }
+}
+
+async function resolveGoalSpecFiles(
+  cwd: string,
+  goalText: string,
+  explicitFiles?: readonly string[],
+): Promise<{ seed: string; error?: string }> {
+  let remainingBudget = MAX_TOTAL_SPEC_BYTES;
+  const prependedBlocks: string[] = [];
+
+  if (explicitFiles && explicitFiles.length > 0) {
+    for (const filePath of explicitFiles) {
+      const readRes = await readSpecFileBounded(cwd, filePath, remainingBudget);
+      if (readRes.error || readRes.content === undefined) {
+        return {
+          seed: "",
+          error: readRes.error ?? `Failed to read spec file "${filePath}".`,
+        };
+      }
+      remainingBudget -= readRes.bytesRead ?? 0;
+      const trimmedContent = readRes.content.trim();
+      if (trimmedContent) {
+        prependedBlocks.push(trimmedContent);
+      }
+    }
+  }
+
+  let expandedGoal = goalText.trim();
+  if (expandedGoal) {
+    const tokenPattern = /(^|\s)(@(\S+))(?=\s|$)/g;
+    const matches = Array.from(expandedGoal.matchAll(tokenPattern));
+    if (matches.length > 0) {
+      const cache = new Map<string, { label: string; content: string } | null>();
+      const appendedBlocks: Array<{ label: string; content: string }> = [];
+      const appendedResolved = new Set<string>();
+      const replacements: Array<{ start: number; end: number; replacement: string }> = [];
+
+      for (const m of matches) {
+        const leadingWs = m[1] ?? "";
+        const candidatePath = m[3] ?? "";
+        if (!candidatePath) continue;
+        const tokenStart = (m.index ?? 0) + leadingWs.length;
+        const tokenEnd = tokenStart + (m[2]?.length ?? 0);
+        const resolvedKey = path.resolve(cwd, candidatePath);
+
+        let entry = cache.get(resolvedKey);
+        if (entry === undefined) {
+          const readRes = await readSpecFileBounded(cwd, candidatePath, remainingBudget);
+          if (readRes.notRegularFile) {
+            cache.set(resolvedKey, null);
+            continue;
+          }
+          if (readRes.error || readRes.content === undefined) {
+            return {
+              seed: "",
+              error: readRes.error ?? `Failed to read spec file "@${candidatePath}".`,
+            };
+          }
+          remainingBudget -= readRes.bytesRead ?? 0;
+          entry = {
+            label: candidatePath,
+            content: readRes.content.trim(),
+          };
+          cache.set(resolvedKey, entry);
+        }
+
+        if (!entry) {
+          continue;
+        }
+
+        replacements.push({
+          start: tokenStart,
+          end: tokenEnd,
+          replacement: entry.label,
+        });
+        if (!appendedResolved.has(resolvedKey) && entry.content) {
+          appendedResolved.add(resolvedKey);
+          appendedBlocks.push(entry);
+        }
+      }
+
+      if (replacements.length > 0) {
+        const soleToken =
+          replacements.length === 1 &&
+          replacements[0]!.start === 0 &&
+          replacements[0]!.end === expandedGoal.length;
+        if (soleToken) {
+          expandedGoal = appendedBlocks[0]?.content ?? "";
+        } else {
+          let rebuilt = "";
+          let cursor = 0;
+          for (const rep of replacements) {
+            rebuilt += expandedGoal.slice(cursor, rep.start) + rep.replacement;
+            cursor = rep.end;
+          }
+          rebuilt += expandedGoal.slice(cursor);
+          if (appendedBlocks.length > 0) {
+            const specSections = appendedBlocks
+              .map((b) => `[Spec: ${b.label}]\n${b.content}`)
+              .join("\n\n");
+            expandedGoal = `${rebuilt.trim()}\n\n${specSections}`;
+          } else {
+            expandedGoal = rebuilt.trim();
+          }
+        }
+      }
+    }
+  }
+
+  const sections = [...prependedBlocks, ...(expandedGoal ? [expandedGoal] : [])];
+  return { seed: sections.join("\n\n").trim() };
 }
 
 function tokenizeCommandArgs(input: string): string[] {
@@ -824,21 +1337,6 @@ function buildAdversarialContractReviewPrompts(plan: ProposedSwarmPlan): {
   ].join("\n\n");
 
   return { systemPrompt, initialPrompt };
-}
-
-function formatContractReviewBounceFeedback(review: ContractReviewResult): string {
-  const lines: string[] = [
-    `Adversarial Contract Review requested updates: ${review.summary}`,
-  ];
-  for (const f of review.findings) {
-    const sev = f.severity === "blocking" ? "[BLOCKING]" : "[WARNING]";
-    const sug = f.suggestion ? ` — Suggestion: ${f.suggestion}` : "";
-    lines.push(`- ${sev} (${f.category}) ${f.message}${sug}`);
-  }
-  lines.push(
-    "Address these gaps (update `assertions`, `features`, `commands`, or `services`) and call `propose_swarm_plan` again.",
-  );
-  return lines.join("\n");
 }
 
 function isSwarmModelRole(value: string): value is SwarmModelRole {
@@ -1331,235 +1829,6 @@ function derivePlanMilestones(
   });
 }
 
-function mergeTweakedMissionArtifacts(
-  existingRun: SwarmRunState,
-  plan: ProposedSwarmPlan,
-  nowIso: string,
-): {
-  assertions?: MissionAssertion[];
-  features?: MissionFeature[];
-  milestones?: SwarmMilestone[];
-  commands?: MissionCommandEntry[];
-  services?: MissionServiceEntry[];
-  boundaries?: string[];
-} {
-  const existingFeatureById = new Map<string, MissionFeature>();
-  for (const f of existingRun.features ?? []) {
-    existingFeatureById.set(f.id, f);
-  }
-  const sealedMilestones = new Set<string>(
-    (existingRun.milestones ?? [])
-      .filter((m) => m.sealed === true)
-      .map((m) => m.label.trim()),
-  );
-
-  let mergedFeatures: MissionFeature[] | undefined;
-  if (plan.features !== undefined) {
-    for (const inc of plan.features) {
-      const cleanMilestone = inc.milestone.trim();
-      if (sealedMilestones.has(cleanMilestone) && !existingFeatureById.has(inc.id)) {
-        throw new SwarmProtocolError(
-          "INVALID_INPUT",
-          `Cannot add new feature "${inc.id}" into sealed milestone "${cleanMilestone}". Place follow-up work into a new milestone.`,
-          { featureId: inc.id, milestone: cleanMilestone },
-        );
-      }
-    }
-
-    const incomingIds = new Set<string>();
-    const nextFeatures: MissionFeature[] = [];
-    for (const inc of plan.features) {
-      incomingIds.add(inc.id);
-      const prev = existingFeatureById.get(inc.id);
-      if (prev?.status === "completed") {
-        nextFeatures.push({
-          ...prev,
-          ...inc,
-          status: "completed",
-          ...(prev.mergedCommitSha ?? inc.mergedCommitSha
-            ? { mergedCommitSha: prev.mergedCommitSha ?? inc.mergedCommitSha }
-            : {}),
-          ...(prev.assignedMember ?? inc.assignedMember
-            ? { assignedMember: prev.assignedMember ?? inc.assignedMember }
-            : {}),
-          updatedAt: prev.updatedAt,
-        });
-      } else if (prev?.status === "in_progress" && inc.status === "pending") {
-        nextFeatures.push({
-          ...prev,
-          ...inc,
-          status: "in_progress",
-          ...(inc.assignedMember ?? prev.assignedMember
-            ? { assignedMember: inc.assignedMember ?? prev.assignedMember }
-            : {}),
-          ...(inc.mergedCommitSha ?? prev.mergedCommitSha
-            ? { mergedCommitSha: inc.mergedCommitSha ?? prev.mergedCommitSha }
-            : {}),
-          updatedAt: nowIso,
-        });
-      } else {
-        nextFeatures.push({
-          ...inc,
-          status: inc.status ?? prev?.status ?? "pending",
-          updatedAt: inc.updatedAt || nowIso,
-        });
-      }
-    }
-
-    // Preserve already-completed features when a tweak only supplies delta features
-    const preservedCompleted: MissionFeature[] = [];
-    for (const prev of existingRun.features ?? []) {
-      if (!incomingIds.has(prev.id) && prev.status === "completed") {
-        preservedCompleted.push(prev);
-      }
-    }
-    mergedFeatures = [...preservedCompleted, ...nextFeatures];
-  }
-
-  const resetAssertionIds = new Set<string>();
-  let mergedAssertions: MissionAssertion[] | undefined;
-  if (plan.assertions !== undefined) {
-    const existingAssertionById = new Map<string, MissionAssertion>();
-    for (const a of existingRun.assertions ?? []) {
-      existingAssertionById.set(a.id, a);
-    }
-
-    const seenAssertionIds = new Set<string>();
-    const nextAssertions: MissionAssertion[] = [];
-    for (const inc of plan.assertions) {
-      seenAssertionIds.add(inc.id);
-      const prev = existingAssertionById.get(inc.id);
-      if (prev) {
-        const unchangedReq =
-          prev.description.trim() === inc.description.trim() &&
-          (prev.evidenceRequired ?? "").trim() ===
-            (inc.evidenceRequired ?? "").trim();
-        if (prev.status === "passed" && unchangedReq) {
-          nextAssertions.push({
-            ...inc,
-            status: "passed",
-            ...(inc.evidence ?? prev.evidence
-              ? { evidence: inc.evidence ?? prev.evidence }
-              : {}),
-            ...(inc.verifiedBy ?? prev.verifiedBy
-              ? { verifiedBy: inc.verifiedBy ?? prev.verifiedBy }
-              : {}),
-            ...(inc.verifiedByRole ?? prev.verifiedByRole
-              ? { verifiedByRole: inc.verifiedByRole ?? prev.verifiedByRole }
-              : {}),
-            updatedAt: prev.updatedAt,
-          });
-        } else if (prev.status === "passed" && !unchangedReq) {
-          resetAssertionIds.add(inc.id);
-          nextAssertions.push({
-            id: inc.id,
-            title: inc.title,
-            description: inc.description,
-            ...(inc.evidenceRequired
-              ? { evidenceRequired: inc.evidenceRequired }
-              : {}),
-            status: "pending",
-            updatedAt: nowIso,
-          });
-        } else {
-          nextAssertions.push({
-            ...prev,
-            ...inc,
-            status:
-              inc.status && inc.status !== "pending" ? inc.status : prev.status,
-            updatedAt: nowIso,
-          });
-        }
-      } else {
-        nextAssertions.push({
-          ...inc,
-          status: inc.status ?? "pending",
-          updatedAt: inc.updatedAt || nowIso,
-        });
-      }
-    }
-
-    // Keep assertions referenced by preserved completed features when tweak supplied delta assertions
-    const effectiveFeatures = mergedFeatures ?? existingRun.features ?? [];
-    const completedClaimedIds = new Set<string>();
-    for (const f of effectiveFeatures) {
-      if (f.status === "completed") {
-        for (const aid of f.fulfills ?? []) {
-          completedClaimedIds.add(aid);
-        }
-      }
-    }
-    const preservedAssertions: MissionAssertion[] = [];
-    for (const prev of existingRun.assertions ?? []) {
-      if (!seenAssertionIds.has(prev.id) && completedClaimedIds.has(prev.id)) {
-        preservedAssertions.push(prev);
-      }
-    }
-    mergedAssertions = [...preservedAssertions, ...nextAssertions];
-  }
-
-  let mergedCommands: MissionCommandEntry[] | undefined;
-  if (plan.commands !== undefined) {
-    const cmdMap = new Map<string, MissionCommandEntry>();
-    for (const c of existingRun.commands ?? []) {
-      cmdMap.set(c.name, c);
-    }
-    for (const c of plan.commands) {
-      cmdMap.set(c.name, c);
-    }
-    mergedCommands = Array.from(cmdMap.values());
-  }
-
-  let mergedServices: MissionServiceEntry[] | undefined;
-  if (plan.services !== undefined) {
-    const svcMap = new Map<string, MissionServiceEntry>();
-    for (const s of existingRun.services ?? []) {
-      svcMap.set(s.name, s);
-    }
-    for (const s of plan.services) {
-      svcMap.set(s.name, s);
-    }
-    mergedServices = Array.from(svcMap.values());
-  }
-
-  let mergedBoundaries: string[] | undefined;
-  if (plan.boundaries !== undefined) {
-    const boundarySet = new Set<string>();
-    for (const b of existingRun.boundaries ?? []) {
-      if (b.trim()) boundarySet.add(b.trim());
-    }
-    for (const b of plan.boundaries) {
-      if (b.trim()) boundarySet.add(b.trim());
-    }
-    mergedBoundaries = Array.from(boundarySet);
-  }
-
-  const effectiveFeaturesForMilestones = mergedFeatures ?? existingRun.features;
-  const effectiveAssertionsForMilestones =
-    mergedAssertions ?? existingRun.assertions;
-  const mergedMilestones =
-    plan.milestones !== undefined ||
-    mergedFeatures !== undefined ||
-    resetAssertionIds.size > 0
-      ? derivePlanMilestones(
-          plan.milestones,
-          effectiveFeaturesForMilestones,
-          effectiveAssertionsForMilestones,
-          existingRun.milestones,
-          resetAssertionIds,
-        )
-      : undefined;
-
-  return {
-    ...(mergedAssertions !== undefined ? { assertions: mergedAssertions } : {}),
-    ...(mergedFeatures !== undefined ? { features: mergedFeatures } : {}),
-    ...(mergedMilestones !== undefined ? { milestones: mergedMilestones } : {}),
-    ...(mergedCommands !== undefined ? { commands: mergedCommands } : {}),
-    ...(mergedServices !== undefined ? { services: mergedServices } : {}),
-    ...(mergedBoundaries !== undefined ? { boundaries: mergedBoundaries } : {}),
-  };
-}
-
 export function buildLaunchKickoffPrompt(
   run: SwarmRunState,
   spawnedInitial: readonly SwarmMemberRecord[],
@@ -1742,9 +2011,9 @@ function buildHelpMarkdown(): string {
     "",
     "| Command | Description |",
     "| --- | --- |",
-    "| `/swarm` | Open Droid-style Mission Hub (with `🔄 Resume Mission` when unfinished) or status menu |",
-    "| `/swarm <goal>` | Interactive upfront Q&A → Mission-Level TDD (`VAL-*` contract + feature queue) confirmation (`[m]` models, `[c]` comment) |",
-    "| `/swarm direct <goal>` · `/swarm-direct <goal>` | Fast-path: skip Q&A, propose plan with auto-confirm, and launch Dynamic Swarm immediately |",
+    "| `/swarm` | Open Droid-style Mission Hub (with `🔄 Resume Mission` when unfinished, quick policy toggles `Alt+V`/`Alt++`/`Alt+-`, or active-run goal composer) or status menu |",
+    "| `/swarm [flags] [--] <goal>` | Interactive upfront Q&A → Mission-Level TDD (`VAL-*` contract + feature queue) confirmation (`[m]` models, `[c]` comment). Flags: `--no-validator`, `--validator`, `--concurrency\\|-c <1..64>`, `--branch\\|-b <name>`, `--fast\\|--no-review`, `--file\\|-f <path>`, `@<path>` spec tokens, `--` literal escape |",
+    "| `/swarm direct [flags] [--] <goal>` · `/swarm-direct [flags] [--] <goal>` | Fast-path: skip Q&A, propose plan with auto-confirm, and launch Dynamic Swarm immediately (supports the same launch flags & `@<path>` spec files) |",
     "| `/swarm tweak [guidance]` | Dynamically revise the focused Mission plan, `VAL-*` assertions, features, or add members in place |",
     "| `/swarm status` · `/swarm contract` · `/swarm mission` | Zero-LLM-turn dashboard: Mission Features, `VAL-*` Validation Contract, handoffs, 3-role models & roster (also `/swarm goal`) |",
     "| `/swarm board [limit] [--channel <ch>] [--search <q>]` | Zero-LLM-turn shared `#seq` Message Board feed (filterable by channel or substring) |",
@@ -4907,7 +5176,7 @@ export function createPiSwarmExtension(
         }
 
         const nowIso = new Date((overrides.now ?? Date.now)()).toISOString();
-        const mergedArtifacts = mergeTweakedMissionArtifacts(
+        const mergedArtifacts = mergeTweakedMissionContract(
           existingRun,
           plan,
           nowIso,
@@ -5353,71 +5622,19 @@ export function createPiSwarmExtension(
       }
     }
 
-    let draftingReviewHookActive = false;
-    const fallbackDraftReviewCounts = new Map<string, number>();
-
-    const runAdversarialContractReviewFromDrafting = async (
-      plan: ProposedSwarmPlan,
-      toolCtx: ExtensionContext,
-      signal?: AbortSignal,
-    ): Promise<ContractReviewResult | undefined> => {
-      draftingReviewHookActive = true;
-      return runAdversarialContractReview(plan, toolCtx, signal);
-    };
-
-    const reviewAwareQuestionnaireUI: IQuestionnaireUI = {
-      askQuestion: (qCtx, spec, signal) =>
-        questionnaireUI.askQuestion(qCtx, spec, signal),
-      askQuestionnaire: (qCtx, questions, signal) =>
-        questionnaireUI.askQuestionnaire(qCtx, questions, signal),
-      confirmProposal: async (qCtx, plan, options) => {
-        if (
-          !draftingReviewHookActive &&
-          plan.assertions &&
-          plan.assertions.length > 0 &&
-          plan.validatorEnabled !== false &&
-          (Boolean(overrides.contractReviewer) || hasLivePiModelRuntime(qCtx))
-        ) {
-          const activeDraft = draftController.getDraft();
-          const draftKey = activeDraft?.startedAt ?? `ad-hoc:${plan.title}`;
-          const priorPasses = fallbackDraftReviewCounts.get(draftKey) ?? 0;
-          fallbackDraftReviewCounts.set(draftKey, priorPasses + 1);
-          const review = await runAdversarialContractReview(
-            plan,
-            qCtx,
-            options?.signal,
-          );
-          if (
-            review &&
-            priorPasses === 0 &&
-            (!review.approved ||
-              review.findings.some((f) => f.severity === "blocking"))
-          ) {
-            return {
-              action: "continue",
-              validatorEnabled: plan.validatorEnabled,
-              maxConcurrency: plan.maxConcurrency,
-              feedback: formatContractReviewBounceFeedback(review),
-            };
-          }
-        }
-        return questionnaireUI.confirmProposal(qCtx, plan, options);
-      },
-    };
-
     // ------------------------------------------------------------------------
     // Tool Registrations (3 Drafting Tools + 4 Core Swarm Tools = 7 Tools)
     // ------------------------------------------------------------------------
     registerDraftingTools(pi, {
       store: storeProxy,
       worktree: worktreeProxy,
-      ui: reviewAwareQuestionnaireUI,
+      ui: questionnaireUI,
       getSettings: () => currentSettings,
       onPlanConfirmed: handlePlanConfirmed,
       onModalEnter,
       onModalExit,
       draftController,
-      reviewProposedContract: runAdversarialContractReviewFromDrafting,
+      reviewProposedContract: runAdversarialContractReview,
       confirmProposalOptions: (toolCtx) => {
         if (!canUseCustomTui(toolCtx)) {
           return {};
@@ -5542,26 +5759,176 @@ export function createPiSwarmExtension(
       return "main";
     }
 
-    async function startInteractiveDrafting(
-      seed: string,
+    interface ExplicitDraftOverrides {
+      validatorEnabled?: boolean;
+      maxConcurrency?: number;
+      baseBranch?: string;
+      skipContractReview?: boolean;
+    }
+
+    interface LaunchStartOptions extends ExplicitDraftOverrides {
+      /** True for CLI invocations (`/swarm <goal>`, `/swarm direct`, `/swarm-direct`). */
+      fromCli?: boolean;
+      /** Skip leading flag parsing when user already escaped via `/swarm -- ...`. */
+      skipFlagParsing?: boolean;
+    }
+
+    async function prepareGoalLaunchInput(
+      rawInput: string,
       ctx: ExtensionContext,
+      options?: LaunchStartOptions,
+    ): Promise<
+      | { ok: false }
+      | { ok: true; seed: string; overrides: ExplicitDraftOverrides }
+    > {
+      let goalText = rawInput;
+      let files: string[] | undefined;
+      const resolvedOverrides: ExplicitDraftOverrides = {
+        ...(options?.validatorEnabled !== undefined
+          ? { validatorEnabled: options.validatorEnabled }
+          : {}),
+        ...(options?.maxConcurrency !== undefined
+          ? { maxConcurrency: options.maxConcurrency }
+          : {}),
+        ...(options?.baseBranch !== undefined
+          ? { baseBranch: options.baseBranch }
+          : {}),
+        ...(options?.skipContractReview !== undefined
+          ? { skipContractReview: options.skipContractReview }
+          : {}),
+      };
+
+      if (options?.fromCli && !options.skipFlagParsing) {
+        const parsedFlags = parseSwarmGoalLaunchOptions(rawInput);
+        if (parsedFlags.error) {
+          if (ctx.hasUI) {
+            ctx.ui.notify(parsedFlags.error, "warning");
+          } else {
+            emitZeroTurnMessage(ctx, parsedFlags.error);
+          }
+          return { ok: false };
+        }
+        goalText = parsedFlags.goal;
+        files = parsedFlags.files;
+        if (parsedFlags.validatorEnabled !== undefined) {
+          resolvedOverrides.validatorEnabled = parsedFlags.validatorEnabled;
+        }
+        if (parsedFlags.maxConcurrency !== undefined) {
+          resolvedOverrides.maxConcurrency = parsedFlags.maxConcurrency;
+        }
+        if (parsedFlags.baseBranch !== undefined) {
+          resolvedOverrides.baseBranch = parsedFlags.baseBranch;
+        }
+        if (parsedFlags.skipContractReview !== undefined) {
+          resolvedOverrides.skipContractReview = parsedFlags.skipContractReview;
+        }
+      }
+
+      if (options?.fromCli) {
+        const specRes = await resolveGoalSpecFiles(ctx.cwd, goalText, files);
+        if (specRes.error) {
+          if (ctx.hasUI) {
+            ctx.ui.notify(specRes.error, "error");
+          } else {
+            emitZeroTurnMessage(ctx, specRes.error);
+          }
+          return { ok: false };
+        }
+        return { ok: true, seed: specRes.seed, overrides: resolvedOverrides };
+      }
+
+      return { ok: true, seed: goalText.trim(), overrides: resolvedOverrides };
+    }
+
+    async function promptActiveRunGoalConflict(
+      ctx: ExtensionContext,
+      resolvedSeed: string,
+      explicitOverrides: ExplicitDraftOverrides,
+    ): Promise<"proceed" | "handled"> {
+      if (!ctx.hasUI) {
+        return "proceed";
+      }
+      const focusedRun = getSnapshotSafe().run;
+      if (
+        !focusedRun ||
+        (focusedRun.status !== "active" && focusedRun.status !== "paused")
+      ) {
+        return "proceed";
+      }
+
+      const tweakChoice =
+        "Tweak current run — add this goal to the focused Swarm";
+      const newSwarmChoice =
+        "Start new Swarm — launch a separate Swarm run";
+      const cancelChoice = "Cancel — keep current Swarm unchanged";
+      const runSnippet = (focusedRun.title || focusedRun.objective).slice(0, 48);
+      const title = `Swarm "${runSnippet}" (${focusedRun.id} · ${focusedRun.status}) is ${focusedRun.status}. How do you want to proceed?`;
+
+      const picked = await withModalGuard(() =>
+        ctx.ui.select(title, [tweakChoice, newSwarmChoice, cancelChoice]),
+      );
+
+      if (picked === tweakChoice) {
+        await handleTweakCommand(resolvedSeed, ctx, explicitOverrides);
+        return "handled";
+      }
+      if (picked === newSwarmChoice) {
+        return "proceed";
+      }
+      ctx.ui.notify("Kept active Swarm run unchanged.", "info");
+      return "handled";
+    }
+
+    async function startInteractiveDrafting(
+      rawSeed: string,
+      ctx: ExtensionContext,
+      options?: LaunchStartOptions,
     ): Promise<void> {
       const { worktree } = await ensureBound(ctx);
       await reloadSettings(ctx.cwd);
+
+      const prepared = await prepareGoalLaunchInput(rawSeed, ctx, options);
+      if (!prepared.ok) {
+        return;
+      }
+
+      if (options?.fromCli) {
+        const conflictDecision = await promptActiveRunGoalConflict(
+          ctx,
+          prepared.seed,
+          prepared.overrides,
+        );
+        if (conflictDecision === "handled") {
+          return;
+        }
+      }
+
       void refreshAvailableModels(ctx);
       await applyOrchestratorModelWithSnapshot(
         ctx,
         currentSettings,
       );
 
-      const baseBranch = await resolveBaseBranchSafe(worktree, ctx.cwd);
-
-      const res = await draftController.startOrResolve(ctx, {
+      const defaultBaseBranch = await resolveBaseBranchSafe(worktree, ctx.cwd);
+      const startOptions: StartDraftOptions = {
         mode: "swarm",
-        seed,
-        validatorEnabled: currentSettings.validatorEnabled,
-        maxConcurrency: currentSettings.maxConcurrency,
-        baseBranch,
+        seed: prepared.seed,
+        ...(prepared.overrides.validatorEnabled !== undefined
+          ? { validatorEnabled: prepared.overrides.validatorEnabled }
+          : {}),
+        ...(prepared.overrides.maxConcurrency !== undefined
+          ? { maxConcurrency: prepared.overrides.maxConcurrency }
+          : {}),
+        ...(prepared.overrides.baseBranch !== undefined
+          ? { baseBranch: prepared.overrides.baseBranch }
+          : {}),
+        ...(prepared.overrides.skipContractReview !== undefined
+          ? { skipContractReview: prepared.overrides.skipContractReview }
+          : {}),
+      };
+
+      const res = await draftController.startOrResolve(ctx, startOptions, {
+        defaultBaseBranch,
       });
 
       if (res.action === "cancelled" || !res.draft) {
@@ -5571,17 +5938,37 @@ export function createPiSwarmExtension(
         return;
       }
 
+      if (res.action === "appended" && ctx.hasUI) {
+        ctx.ui.notify("Appended new goal details to active Swarm draft.", "info");
+      }
+
       syncDraftWidgetState(res.draft);
       if (!ctx.isIdle()) {
         syncActiveRunSections({ ctx });
       }
       refreshUI(ctx);
 
+      const focusedRun = getSnapshotSafe().run;
+      const targetRun =
+        res.draft.mode === "tweak" &&
+        focusedRun &&
+        focusedRun.id === res.draft.targetRunId
+          ? {
+              id: focusedRun.id,
+              title: focusedRun.title,
+              objective: focusedRun.objective,
+              baseBranch: focusedRun.baseBranch,
+              memberCount: focusedRun.memberOrder.length,
+            }
+          : undefined;
+
       const kickoffPrompt = buildDraftingKickoffPrompt(res.draft.seed, res.draft.mode, {
-        baseBranch: res.draft.baseBranch ?? baseBranch,
+        baseBranch: res.draft.baseBranch ?? defaultBaseBranch,
         maxConcurrency: res.draft.maxConcurrency,
         validatorEnabled: res.draft.validatorEnabled,
+        skipContractReview: res.draft.skipContractReview,
         roleModels: buildRoleModelsFromSettings(currentSettings),
+        ...(targetRun ? { targetRun } : {}),
         existingEcho: res.draft.questionnaireEcho,
       });
 
@@ -5594,12 +5981,30 @@ export function createPiSwarmExtension(
     async function startDirectSwarm(
       rawGoal: string,
       ctx: ExtensionContext,
+      options?: LaunchStartOptions,
     ): Promise<void> {
       const { worktree } = await ensureBound(ctx);
       await reloadSettings(ctx.cwd);
+
+      const prepared = await prepareGoalLaunchInput(rawGoal, ctx, options);
+      if (!prepared.ok) {
+        return;
+      }
+
+      if (options?.fromCli) {
+        const conflictDecision = await promptActiveRunGoalConflict(
+          ctx,
+          prepared.seed,
+          prepared.overrides,
+        );
+        if (conflictDecision === "handled") {
+          return;
+        }
+      }
+
       void refreshAvailableModels(ctx);
 
-      let goal = rawGoal.trim();
+      let goal = prepared.seed.trim();
       if (!goal && ctx.hasUI) {
         const entered = await withModalGuard(() =>
           ctx.ui.input("🐝 Swarm Direct Objective", "Describe what the swarm should build…"),
@@ -5608,9 +6013,9 @@ export function createPiSwarmExtension(
       }
       if (!goal) {
         if (ctx.hasUI) {
-          ctx.ui.notify("Usage: /swarm direct <goal>", "warning");
+          ctx.ui.notify("Usage: /swarm direct [flags] [--] <goal>", "warning");
         } else {
-          emitZeroTurnMessage(ctx, "Usage: `/swarm direct <goal>`");
+          emitZeroTurnMessage(ctx, "Usage: `/swarm direct [flags] [--] <goal>`");
         }
         return;
       }
@@ -5620,14 +6025,27 @@ export function createPiSwarmExtension(
         currentSettings,
       );
 
-      const baseBranch = await resolveBaseBranchSafe(worktree, ctx.cwd);
-      const res = await draftController.startOrResolve(ctx, {
+      const defaultBaseBranch = await resolveBaseBranchSafe(worktree, ctx.cwd);
+      const startOptions: StartDraftOptions = {
         mode: "swarm",
         seed: goal,
-        validatorEnabled: currentSettings.validatorEnabled,
-        maxConcurrency: currentSettings.maxConcurrency,
-        baseBranch,
         autoConfirm: true,
+        ...(prepared.overrides.validatorEnabled !== undefined
+          ? { validatorEnabled: prepared.overrides.validatorEnabled }
+          : {}),
+        ...(prepared.overrides.maxConcurrency !== undefined
+          ? { maxConcurrency: prepared.overrides.maxConcurrency }
+          : {}),
+        ...(prepared.overrides.baseBranch !== undefined
+          ? { baseBranch: prepared.overrides.baseBranch }
+          : {}),
+        ...(prepared.overrides.skipContractReview !== undefined
+          ? { skipContractReview: prepared.overrides.skipContractReview }
+          : {}),
+      };
+
+      const res = await draftController.startOrResolve(ctx, startOptions, {
+        defaultBaseBranch,
       });
 
       if (res.action === "cancelled" || !res.draft) {
@@ -5637,13 +6055,27 @@ export function createPiSwarmExtension(
         return;
       }
 
+      if (res.action === "appended" && ctx.hasUI) {
+        ctx.ui.notify("Appended new goal details to active Swarm draft.", "info");
+      }
+
       let activeDraft = res.draft;
       if (!activeDraft.autoConfirm) {
         activeDraft =
           draftController.update({
-            seed: goal,
-            baseBranch,
             autoConfirm: true,
+            ...(prepared.overrides.validatorEnabled !== undefined
+              ? { validatorEnabled: prepared.overrides.validatorEnabled }
+              : {}),
+            ...(prepared.overrides.maxConcurrency !== undefined
+              ? { maxConcurrency: prepared.overrides.maxConcurrency }
+              : {}),
+            ...(prepared.overrides.baseBranch !== undefined
+              ? { baseBranch: prepared.overrides.baseBranch }
+              : {}),
+            ...(prepared.overrides.skipContractReview !== undefined
+              ? { skipContractReview: prepared.overrides.skipContractReview }
+              : {}),
           }) ?? activeDraft;
       }
 
@@ -5653,7 +6085,15 @@ export function createPiSwarmExtension(
       }
       refreshUI(ctx);
 
-      const directPrompt = buildDirectPlanPrompt(goal, baseBranch, currentSettings);
+      const directPrompt = buildDirectPlanPrompt(
+        activeDraft.seed,
+        activeDraft.baseBranch ?? defaultBaseBranch,
+        {
+          maxConcurrency: activeDraft.maxConcurrency,
+          validatorEnabled: activeDraft.validatorEnabled,
+        },
+        { skipContractReview: activeDraft.skipContractReview },
+      );
       pi.sendUserMessage(directPrompt, {
         deliverAs: ctx.isIdle() ? "followUp" : "steer",
         expandPromptTemplates: false,
@@ -5663,6 +6103,7 @@ export function createPiSwarmExtension(
     async function handleTweakCommand(
       rawSeed: string,
       ctx: ExtensionContext,
+      explicitOverrides?: ExplicitDraftOverrides,
     ): Promise<void> {
       const { store, engine } = await ensureBound(ctx);
       await reloadSettings(ctx.cwd);
@@ -5698,13 +6139,29 @@ export function createPiSwarmExtension(
       );
 
       const seed = rawSeed.trim() || run.objective;
-      const res = await draftController.startOrResolve(ctx, {
+      const tweakStartOptions: StartDraftOptions = {
         mode: "tweak",
         seed,
         targetRunId: run.id,
-        validatorEnabled: run.validatorEnabled,
-        maxConcurrency: run.maxConcurrency,
-        baseBranch: run.baseBranch,
+        ...(explicitOverrides?.validatorEnabled !== undefined
+          ? { validatorEnabled: explicitOverrides.validatorEnabled }
+          : {}),
+        ...(explicitOverrides?.maxConcurrency !== undefined
+          ? { maxConcurrency: explicitOverrides.maxConcurrency }
+          : {}),
+        ...(explicitOverrides?.baseBranch !== undefined
+          ? { baseBranch: explicitOverrides.baseBranch }
+          : {}),
+        ...(explicitOverrides?.skipContractReview !== undefined
+          ? { skipContractReview: explicitOverrides.skipContractReview }
+          : {}),
+      };
+      const res = await draftController.startOrResolve(ctx, tweakStartOptions, {
+        settings: {
+          validatorEnabled: run.validatorEnabled,
+          maxConcurrency: run.maxConcurrency,
+        },
+        defaultBaseBranch: run.baseBranch,
       });
 
       if (res.action === "cancelled" || !res.draft) {
@@ -5712,6 +6169,10 @@ export function createPiSwarmExtension(
           ctx.ui.notify("Kept current Swarm draft state unchanged.", "info");
         }
         return;
+      }
+
+      if (res.action === "appended" && ctx.hasUI) {
+        ctx.ui.notify("Appended new goal details to active Swarm draft.", "info");
       }
 
       syncDraftWidgetState(res.draft);
@@ -5727,6 +6188,7 @@ export function createPiSwarmExtension(
               baseBranch: res.draft.baseBranch ?? run.baseBranch,
               maxConcurrency: res.draft.maxConcurrency,
               validatorEnabled: res.draft.validatorEnabled,
+              skipContractReview: res.draft.skipContractReview,
               roleModels: buildRoleModelsFromSettings(currentSettings),
               targetRun: {
                 id: run.id,
@@ -5741,6 +6203,7 @@ export function createPiSwarmExtension(
               baseBranch: res.draft.baseBranch ?? run.baseBranch,
               maxConcurrency: res.draft.maxConcurrency,
               validatorEnabled: res.draft.validatorEnabled,
+              skipContractReview: res.draft.skipContractReview,
               roleModels: buildRoleModelsFromSettings(currentSettings),
               existingEcho: res.draft.questionnaireEcho,
             });
@@ -7848,10 +8311,24 @@ export function createPiSwarmExtension(
         );
         switch (action.kind) {
           case "draft":
-            await startInteractiveDrafting(action.goal, ctx);
+            await startInteractiveDrafting(action.goal, ctx, {
+              ...(action.validatorEnabled !== undefined
+                ? { validatorEnabled: action.validatorEnabled }
+                : {}),
+              ...(action.maxConcurrency !== undefined
+                ? { maxConcurrency: action.maxConcurrency }
+                : {}),
+            });
             return;
           case "direct":
-            await startDirectSwarm(action.goal, ctx);
+            await startDirectSwarm(action.goal, ctx, {
+              ...(action.validatorEnabled !== undefined
+                ? { validatorEnabled: action.validatorEnabled }
+                : {}),
+              ...(action.maxConcurrency !== undefined
+                ? { maxConcurrency: action.maxConcurrency }
+                : {}),
+            });
             return;
           case "ui":
             await handleOverlayCommand("", ctx);
@@ -7983,10 +8460,15 @@ export function createPiSwarmExtension(
           await handleBareCommand(ctx);
           return;
         case "goal":
-          await startInteractiveDrafting(parsed.rest, ctx);
+          await startInteractiveDrafting(parsed.rest, ctx, {
+            fromCli: true,
+            skipFlagParsing: /^--(?:\s|$)/.test(args.trim()),
+          });
           return;
         case "direct":
-          await startDirectSwarm(parsed.rest, ctx);
+          await startDirectSwarm(parsed.rest, ctx, {
+            fromCli: true,
+          });
           return;
         case "tweak":
           await handleTweakCommand(parsed.rest, ctx);
@@ -8072,11 +8554,98 @@ export function createPiSwarmExtension(
       return items;
     }
 
+    const GOAL_LAUNCH_FLAG_CANDIDATES: ReadonlyArray<{
+      label: string;
+      description: string;
+      takesValue?: boolean;
+      group?: "validator" | "concurrency" | "branch" | "fast";
+    }> = [
+      { label: "--no-validator", description: "Disable independent validator for this run", group: "validator" },
+      { label: "--validator", description: "Enable independent validator for this run", group: "validator" },
+      { label: "--concurrency", description: "Max parallel workers (1..64; alias -c)", takesValue: true, group: "concurrency" },
+      { label: "--branch", description: "Explicit base branch name (alias -b)", takesValue: true, group: "branch" },
+      { label: "--fast", description: "Skip pre-modal adversarial contract review (alias --no-review)", group: "fast" },
+      { label: "--no-review", description: "Skip pre-modal adversarial contract review (alias --fast)", group: "fast" },
+      { label: "--file", description: "Read spec file into goal seed (alias -f)", takesValue: true },
+      { label: "--", description: "End launch flags; pass remaining text literally as goal" },
+    ];
+
+    function computeGoalLaunchFlagCompletions(
+      rawPrefix: string,
+      commandPrefix: string,
+    ): AutocompleteItem[] | null {
+      const hasTrailingSpace = /\s$/.test(rawPrefix);
+      const trimmed = rawPrefix.trimStart();
+      const rawTokens = trimmed ? trimmed.split(/\s+/).filter(Boolean) : [];
+      const priorTokens = hasTrailingSpace ? rawTokens : rawTokens.slice(0, -1);
+      const activeToken = hasTrailingSpace ? "" : (rawTokens[rawTokens.length - 1] ?? "");
+      const lowerActive = activeToken.toLowerCase();
+
+      // Stop completing flags once bare `--` or non-flag goal prose has started
+      const usedGroups = new Set<string>();
+      let expectingValueFor: string | null = null;
+      for (const tok of priorTokens) {
+        if (expectingValueFor) {
+          expectingValueFor = null;
+          continue;
+        }
+        const lower = tok.toLowerCase();
+        if (lower === "--") {
+          return null;
+        }
+        if (!lower.startsWith("-")) {
+          return null;
+        }
+        const flagName = lower.includes("=") ? lower.slice(0, lower.indexOf("=")) : lower;
+        const hasInline = lower.includes("=");
+        if (flagName === "--no-validator" || flagName === "--validator") {
+          usedGroups.add("validator");
+        } else if (flagName === "--fast" || flagName === "--no-review") {
+          usedGroups.add("fast");
+        } else if (flagName === "--concurrency" || flagName === "-c") {
+          usedGroups.add("concurrency");
+          if (!hasInline) expectingValueFor = "concurrency";
+        } else if (flagName === "--branch" || flagName === "-b") {
+          usedGroups.add("branch");
+          if (!hasInline) expectingValueFor = "branch";
+        } else if (flagName === "--file" || flagName === "-f") {
+          if (!hasInline) expectingValueFor = "file";
+        } else {
+          return null;
+        }
+      }
+
+      if (expectingValueFor) {
+        return null;
+      }
+      if (activeToken && !activeToken.startsWith("-")) {
+        return null;
+      }
+
+      const prefixParts = [commandPrefix, ...priorTokens].filter(Boolean);
+      const valuePrefix = prefixParts.length > 0 ? `${prefixParts.join(" ")} ` : "";
+      const items = GOAL_LAUNCH_FLAG_CANDIDATES.filter(
+        (c) =>
+          (!c.group || !usedGroups.has(c.group)) &&
+          c.label.startsWith(lowerActive),
+      ).map(
+        (c): AutocompleteItem => ({
+          value: `${valuePrefix}${c.label}`,
+          label: c.label,
+          description: c.description,
+        }),
+      );
+      return items.length > 0 ? items : null;
+    }
+
     async function computeSwarmCompletions(
       prefix: string,
     ): Promise<AutocompleteItem[] | null> {
       const trimmedStart = prefix.trimStart();
       if (!trimmedStart.includes(" ")) {
+        if (trimmedStart.startsWith("-")) {
+          return computeGoalLaunchFlagCompletions(prefix, "");
+        }
         const lower = trimmedStart.toLowerCase();
         const matches = SWARM_SUBCOMMANDS.filter((c) => c.name.startsWith(lower)).map(
           (c): AutocompleteItem => ({
@@ -8091,6 +8660,15 @@ export function createPiSwarmExtension(
       const spaceIdx = trimmedStart.search(/\s/);
       const sub = trimmedStart.slice(0, spaceIdx).toLowerCase();
       const argPrefix = trimmedStart.slice(spaceIdx).trimStart();
+
+      if (sub.startsWith("-")) {
+        return computeGoalLaunchFlagCompletions(prefix, "");
+      }
+
+      if (sub === "direct") {
+        const directArgWithTrailing = trimmedStart.slice(spaceIdx).replace(/^\s+/, "");
+        return computeGoalLaunchFlagCompletions(directArgWithTrailing, "direct");
+      }
 
       if (sub === "board") {
         const hasTrailingSpace = /\s$/.test(prefix);
@@ -8597,9 +9175,20 @@ export function createPiSwarmExtension(
 
     pi.registerCommand("swarm-direct", {
       description:
-        "Fast-path /swarm direct <goal> — skip Q&A and launch Dynamic Swarm immediately",
+        "Fast-path /swarm direct [flags] [--] <goal> — skip Q&A and launch Dynamic Swarm immediately",
+      getArgumentCompletions: async (prefix: string) => {
+        const items = computeGoalLaunchFlagCompletions(prefix, "");
+        if (!items || items.length === 0) return null;
+        const normalizedPrefix = /\s$/.test(prefix)
+          ? prefix.trimStart().toLowerCase()
+          : prefix.trim().replace(/\s+/g, " ").toLowerCase();
+        if (items.length === 1 && items[0]!.value.toLowerCase() === normalizedPrefix) {
+          return null;
+        }
+        return items;
+      },
       handler: async (args, ctx) => {
-        await startDirectSwarm(args, ctx);
+        await startDirectSwarm(args, ctx, { fromCli: true });
       },
     });
 
