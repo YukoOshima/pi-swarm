@@ -35,6 +35,8 @@ import {
   SWARM_DIR,
   SWARM_FOCUS_ENTRY,
   SWARM_FOCUS_VERSION,
+  SWARM_LIBRARY_DIR,
+  SWARM_RUNS_DIR,
   SWARM_STATUS_CUSTOM_TYPE,
   SWARM_STATUS_KEY,
   SWARM_WAKEUP_CUSTOM_TYPE,
@@ -78,18 +80,24 @@ import {
   type SettingsPathOptions,
 } from "./store/index.js";
 import {
+  type AgentTurnResult,
   type AvailableModelInfo,
   type BoardMessage,
+  type ContractReviewFinding,
+  type ContractReviewResult,
   type IQuestionnaireUI,
   type ISwarmEngine,
   type ISwarmStore,
   type ISwarmTransport,
   type IWorktreeManager,
   type ManageMissionInput,
+  type MemberEngineBridge,
   type MissionAssertion,
   type MissionCommandEntry,
   type MissionFeature,
   type MissionHandoffItem,
+  type MissionServiceEntry,
+  type PersistentAgentHandle,
   type ProposedSwarmPlan,
   type RoleModelOrigin,
   type RunSummary,
@@ -158,11 +166,19 @@ export interface PiSwarmExtensionOverrides {
   worktreeFactory?: (projectRoot: string, settings: SwarmSettings) => IWorktreeManager;
   /** Override questionnaire/proposal UI (defaults to createQuestionnaireUI). */
   questionnaireUI?: IQuestionnaireUI;
+  /** Optional pre-confirmation adversarial contract reviewer override (for deterministic tests or custom hooks). */
+  contractReviewer?: (
+    plan: ProposedSwarmPlan,
+    ctx: ExtensionContext,
+    signal?: AbortSignal,
+  ) => Promise<ContractReviewResult | undefined>;
   /** Optional dashboard widget configuration overrides. */
   widgetOptions?: SwarmWidgetOptions;
   /** Optional deterministic clock override. */
   now?: () => number;
 }
+
+export type SwarmExtensionOptions = PiSwarmExtensionOverrides;
 
 export const SWARM_SUBCOMMANDS: ReadonlyArray<{
   name: string;
@@ -508,6 +524,321 @@ function parseKillArgs(rawArgs: string): ParsedKillArgs {
     force,
     ...(reason ? { reason } : {}),
   };
+}
+
+interface ParsedDoneArgs {
+  force: boolean;
+  summary: string;
+}
+
+function parseDoneArgs(rawArgs: string): ParsedDoneArgs {
+  const trimmed = rawArgs.trim();
+  if (!trimmed) {
+    return { force: false, summary: "" };
+  }
+  const tokens = tokenizeCommandArgs(trimmed);
+  let force = false;
+  const summaryParts: string[] = [];
+  for (const token of tokens) {
+    const lower = token.toLowerCase();
+    if (lower === "--force" || lower === "-f") {
+      force = true;
+      continue;
+    }
+    summaryParts.push(token);
+  }
+  if (!force) {
+    return { force: false, summary: trimmed };
+  }
+  return {
+    force: true,
+    summary: summaryParts.join(" ").trim(),
+  };
+}
+
+const CONTRACT_REVIEW_TIMEOUT_MS = 35_000;
+const CONTRACT_REVIEW_WORKING_MESSAGE =
+  "🐝 Adversarial Contract Review (checking VAL-* coverage & commands)…";
+
+const VALID_CONTRACT_FINDING_CATEGORIES = new Set<ContractReviewFinding["category"]>([
+  "missing_assertion",
+  "ambiguous_criteria",
+  "invalid_command",
+  "file_collision",
+  "other",
+]);
+
+function normalizeContractFindingCategory(
+  raw: unknown,
+): ContractReviewFinding["category"] {
+  if (typeof raw !== "string") {
+    return "other";
+  }
+  const clean = raw.trim().toLowerCase() as ContractReviewFinding["category"];
+  return VALID_CONTRACT_FINDING_CATEGORIES.has(clean) ? clean : "other";
+}
+
+function normalizeContractFindings(
+  rawFindings: unknown,
+  defaultSeverity: "blocking" | "warning" = "blocking",
+): ContractReviewFinding[] {
+  if (!Array.isArray(rawFindings)) {
+    return [];
+  }
+  const findings: ContractReviewFinding[] = [];
+  for (const item of rawFindings) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const rec = item as Record<string, unknown>;
+    const message =
+      typeof rec.message === "string"
+        ? rec.message.trim()
+        : typeof rec.description === "string"
+          ? rec.description.trim()
+          : "";
+    if (!message) {
+      continue;
+    }
+    const severity: "blocking" | "warning" =
+      rec.severity === "warning"
+        ? "warning"
+        : rec.severity === "blocking"
+          ? "blocking"
+          : defaultSeverity;
+    const category = normalizeContractFindingCategory(rec.category);
+    const suggestion =
+      typeof rec.suggestion === "string" && rec.suggestion.trim()
+        ? rec.suggestion.trim()
+        : undefined;
+    findings.push({
+      severity,
+      category,
+      message,
+      ...(suggestion ? { suggestion } : {}),
+    });
+  }
+  return findings;
+}
+
+function tryParseContractReviewJson(
+  candidate: string,
+  defaultSeverity: "blocking" | "warning",
+): ContractReviewResult | undefined {
+  const stripped = candidate
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+  const firstBrace = stripped.indexOf("{");
+  const lastBrace = stripped.lastIndexOf("}");
+  if (firstBrace === -1 || lastBrace <= firstBrace) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(stripped.slice(firstBrace, lastBrace + 1)) as Record<
+      string,
+      unknown
+    >;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return undefined;
+    }
+    const hasReviewShape =
+      "approved" in parsed || "findings" in parsed || "gaps" in parsed;
+    if (!hasReviewShape) {
+      return undefined;
+    }
+    const findings = normalizeContractFindings(
+      parsed.findings ?? parsed.gaps,
+      defaultSeverity,
+    );
+    const hasBlocking = findings.some((f) => f.severity === "blocking");
+    const explicitApproved =
+      typeof parsed.approved === "boolean" ? parsed.approved : !hasBlocking;
+    const approved = explicitApproved && !hasBlocking;
+    const rawSummary =
+      typeof parsed.summary === "string" && parsed.summary.trim()
+        ? parsed.summary.trim()
+        : approved
+          ? "Adversarial contract review passed with no blocking gaps."
+          : `Adversarial contract review identified ${findings.length || 1} gap(s).`;
+    return {
+      approved,
+      summary: rawSummary,
+      findings,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+export function parseContractReviewOutput(
+  rawText: string,
+): ContractReviewResult | undefined {
+  const trimmed = rawText.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  const gapsMatch = trimmed.match(/<gaps_found>([\s\S]*?)<\/gaps_found>/i);
+  if (gapsMatch) {
+    const inner = gapsMatch[1]!.trim();
+    const fromJson = tryParseContractReviewJson(inner, "blocking");
+    if (fromJson) {
+      const ensuredFindings =
+        fromJson.findings.length > 0
+          ? fromJson.findings
+          : [
+              {
+                severity: "blocking" as const,
+                category: "other" as const,
+                message: fromJson.summary || "Contract review identified blocking gaps.",
+              },
+            ];
+      return {
+        approved: false,
+        summary: fromJson.summary,
+        findings: ensuredFindings,
+      };
+    }
+
+    const lineFindings: ContractReviewFinding[] = [];
+    for (const rawLine of inner.split(/\r?\n/)) {
+      const line = rawLine.replace(/^[-*•\d.)]+\s*/, "").trim();
+      if (!line || /^```/.test(line)) {
+        continue;
+      }
+      const sevMatch = line.match(/^\[(blocking|warning)\]\s*(.*)$/i);
+      const severity: "blocking" | "warning" =
+        sevMatch && sevMatch[1]!.toLowerCase() === "warning" ? "warning" : "blocking";
+      let remainder = sevMatch ? sevMatch[2]!.trim() : line;
+      let category: ContractReviewFinding["category"] = "other";
+      const catMatch = remainder.match(/^\(([a-z_]+)\):?\s*(.*)$/i);
+      if (catMatch) {
+        category = normalizeContractFindingCategory(catMatch[1]);
+        remainder = catMatch[2]!.trim();
+      }
+      let suggestion: string | undefined;
+      const sugIdx = remainder.search(/\s*\|\s*suggestion:\s*/i);
+      if (sugIdx >= 0) {
+        const parts = remainder.split(/\s*\|\s*suggestion:\s*/i);
+        remainder = parts[0]!.trim();
+        suggestion = parts.slice(1).join(" ").trim() || undefined;
+      }
+      if (remainder) {
+        lineFindings.push({
+          severity,
+          category,
+          message: remainder,
+          ...(suggestion ? { suggestion } : {}),
+        });
+      }
+    }
+
+    if (lineFindings.length === 0 && inner) {
+      lineFindings.push({
+        severity: "blocking",
+        category: "other",
+        message: inner.slice(0, 400),
+      });
+    }
+
+    const hasBlocking = lineFindings.some((f) => f.severity === "blocking");
+    return {
+      approved: !hasBlocking && lineFindings.length === 0,
+      summary:
+        lineFindings[0]?.message ??
+        "Adversarial contract review requested updates before launch.",
+      findings: lineFindings,
+    };
+  }
+
+  const approvedSelfClosing = /<approved\s*\/>/i.test(trimmed);
+  const approvedBlockMatch = trimmed.match(/<approved>([\s\S]*?)<\/approved>/i);
+  if (approvedSelfClosing || approvedBlockMatch) {
+    const inner = approvedBlockMatch?.[1]?.trim() ?? "";
+    const fromJson =
+      tryParseContractReviewJson(inner, "warning") ??
+      tryParseContractReviewJson(trimmed, "warning");
+    if (fromJson) {
+      return fromJson;
+    }
+    return {
+      approved: true,
+      summary: inner || "Adversarial contract review passed with no blocking gaps.",
+      findings: [],
+    };
+  }
+
+  return tryParseContractReviewJson(trimmed, "blocking");
+}
+
+function buildAdversarialContractReviewPrompts(plan: ProposedSwarmPlan): {
+  systemPrompt: string;
+  initialPrompt: string;
+} {
+  const systemPrompt = [
+    "# Skeptical Adversarial Contract Reviewer (`@contract-reviewer` — Ephemeral Read-Only Audit)",
+    "You perform a fast, skeptical pre-launch audit of a proposed Pi Swarm Mission Contract against actual repository files (`package.json`, `tsconfig.json`, source paths).",
+    "Rules:",
+    "1. Strictly read-only: use `read`, `grep`, `find`, or `ls` only when needed (e.g. verifying `package.json` scripts or owned paths). NEVER edit files, NEVER run mutating commands, and NEVER invoke `swarm`, `post_message`, `read_board`, or `swarm_wait`.",
+    "2. Report ONLY genuine high-impact gaps (do NOT nitpick wording or invent hypothetical scope):",
+    "   - `missing_assertion`: Critical user requirements in `<objective>` / `<acceptance_criteria>` missing from `assertions` (`VAL-*`) or unclaimed by `features[].fulfills`.",
+    "   - `invalid_command`: Non-existent scripts in `commands` or `services` vs `package.json`/repo files, or speculative `npx -y` network downloads.",
+    "   - `file_collision`: Overlapping `filesOwned` between parallel features in the same milestone that lack `dependsOn` ordering.",
+    "   - `ambiguous_criteria` / `other`: Untestable acceptance criteria or `services` port/boundary violations.",
+    "3. Output your final verdict concisely using EXACTLY ONE of:",
+    "   - `<approved/>` (when the contract has zero high-impact gaps), OR",
+    '   - `<gaps_found>{"approved":false,"summary":"...","findings":[{"severity":"blocking","category":"missing_assertion|ambiguous_criteria|invalid_command|file_collision|other","message":"...","suggestion":"..."}]}</gaps_found>`.',
+  ].join("\n");
+
+  const payload = {
+    title: plan.title,
+    baseBranch: plan.baseBranch,
+    assertions: (plan.assertions ?? []).map((a) => ({
+      id: a.id,
+      title: a.title,
+      description: a.description,
+      ...(a.evidenceRequired ? { evidenceRequired: a.evidenceRequired } : {}),
+    })),
+    features: (plan.features ?? []).map((f) => ({
+      id: f.id,
+      title: f.title,
+      milestone: f.milestone,
+      ...(f.dependsOn?.length ? { dependsOn: f.dependsOn } : {}),
+      ...(f.filesOwned?.length ? { filesOwned: f.filesOwned } : {}),
+      fulfills: f.fulfills,
+    })),
+    commands: plan.commands ?? [],
+    services: plan.services ?? [],
+    boundaries: plan.boundaries ?? [],
+  };
+
+  const initialPrompt = [
+    `<objective>\n${plan.objective}\n</objective>`,
+    `<strategy>\n${plan.strategy}\n</strategy>`,
+    `<acceptance_criteria>\n${plan.acceptanceCriteria}\n</acceptance_criteria>`,
+    `<proposed_contract>\n${JSON.stringify(payload, null, 2)}\n</proposed_contract>`,
+    "",
+    "Verify `commands`, `services`, `assertions` (`VAL-*`), and `features` (`filesOwned`, `fulfills`) against `package.json` / repo layout now, then emit `<approved/>` or `<gaps_found>...</gaps_found>`.",
+  ].join("\n\n");
+
+  return { systemPrompt, initialPrompt };
+}
+
+function formatContractReviewBounceFeedback(review: ContractReviewResult): string {
+  const lines: string[] = [
+    `Adversarial Contract Review requested updates: ${review.summary}`,
+  ];
+  for (const f of review.findings) {
+    const sev = f.severity === "blocking" ? "[BLOCKING]" : "[WARNING]";
+    const sug = f.suggestion ? ` — Suggestion: ${f.suggestion}` : "";
+    lines.push(`- ${sev} (${f.category}) ${f.message}${sug}`);
+  }
+  lines.push(
+    "Address these gaps (update `assertions`, `features`, `commands`, or `services`) and call `propose_swarm_plan` again.",
+  );
+  return lines.join("\n");
 }
 
 function isSwarmModelRole(value: string): value is SwarmModelRole {
@@ -1009,6 +1340,7 @@ function mergeTweakedMissionArtifacts(
   features?: MissionFeature[];
   milestones?: SwarmMilestone[];
   commands?: MissionCommandEntry[];
+  services?: MissionServiceEntry[];
   boundaries?: string[];
 } {
   const existingFeatureById = new Map<string, MissionFeature>();
@@ -1178,6 +1510,18 @@ function mergeTweakedMissionArtifacts(
     mergedCommands = Array.from(cmdMap.values());
   }
 
+  let mergedServices: MissionServiceEntry[] | undefined;
+  if (plan.services !== undefined) {
+    const svcMap = new Map<string, MissionServiceEntry>();
+    for (const s of existingRun.services ?? []) {
+      svcMap.set(s.name, s);
+    }
+    for (const s of plan.services) {
+      svcMap.set(s.name, s);
+    }
+    mergedServices = Array.from(svcMap.values());
+  }
+
   let mergedBoundaries: string[] | undefined;
   if (plan.boundaries !== undefined) {
     const boundarySet = new Set<string>();
@@ -1211,6 +1555,7 @@ function mergeTweakedMissionArtifacts(
     ...(mergedFeatures !== undefined ? { features: mergedFeatures } : {}),
     ...(mergedMilestones !== undefined ? { milestones: mergedMilestones } : {}),
     ...(mergedCommands !== undefined ? { commands: mergedCommands } : {}),
+    ...(mergedServices !== undefined ? { services: mergedServices } : {}),
     ...(mergedBoundaries !== undefined ? { boundaries: mergedBoundaries } : {}),
   };
 }
@@ -1271,6 +1616,16 @@ export function buildLaunchKickoffPrompt(
       .map((c) => `\`${c.name}\`: \`${c.command}\``)
       .join(" · ");
     lines.push(`- **Commands:** ${cmdSummary}`);
+  }
+  if (run.services && run.services.length > 0) {
+    const svcSummary = run.services
+      .map((s) => {
+        const portTag = s.port !== undefined ? ` (:${s.port})` : "";
+        const hcTag = s.healthcheck ? ` [health: \`${s.healthcheck}\`]` : "";
+        return `\`${s.name}\`${portTag}: \`${s.start}\`${hcTag}`;
+      })
+      .join(" · ");
+    lines.push(`- **Services:** ${svcSummary}`);
   }
   if (run.boundaries && run.boundaries.length > 0) {
     lines.push(`- **Boundaries:** ${run.boundaries.join("; ")}`);
@@ -1401,7 +1756,7 @@ function buildHelpMarkdown(): string {
     "| `/swarm stop <member> [reason]` | Stop a working member cleanly without deleting its worktree or conversation history |",
     "| `/swarm merge <member>` | Merge a member's `share` worktree or `branch` clone onto `baseBranch` (`autoRebase` + `--no-ff`) |",
     "| `/swarm kill <member> [--force] [reason]` | Permanently kill a member and remove its clean worktree (`--force` overrides dirty worktree guard) |",
-    "| `/swarm done [summary]` | Complete the active Swarm run, dispose warm handles, and restore `idle` tools |",
+    "| `/swarm done [--force] [summary]` | Complete the active Swarm run, dispose warm handles, and restore `idle` tools (`--force` force-closes unfinished Mission gates) |",
     "| `/swarm pause [reason]` | Pause member launches & board wakeups |",
     "| `/swarm resume [run-id] [--continue\\|-c] [--quiet\\|-q] [guidance]` | Zero-turn unpause (focused same-session) OR Droid-style cross-session Mission resume |",
     "| `/swarm cancel` | Cancel active draft (restores tools) or abandon focused run (preserves worktrees & `.pi/swarm/runs/`) |",
@@ -1976,6 +2331,7 @@ function buildMissionCompletionCard(
     diffStat?: string;
     remainingWorktrees: readonly RemainingWorktreeInfo[];
     teardownResult?: SafeTeardownResult;
+    libraryTopics?: readonly string[];
     initiatedBy: "tool" | "command" | "event";
   },
 ): string {
@@ -2016,9 +2372,14 @@ function buildMissionCompletionCard(
     const failedVal = run.assertions.filter((a) => a.status === "failed").length;
     const blockedVal = run.assertions.filter((a) => a.status === "blocked").length;
     const pendingVal = totalVal - passedVal - failedVal - blockedVal;
+    const overriddenAssertions = run.assertions.filter(
+      (a) => a.overridden === true,
+    );
+    const overriddenVal = overriddenAssertions.length;
     const valIcon =
       passedVal === totalVal ? "✅" : failedVal > 0 ? "⚠️" : "ℹ️";
     const extraParts: string[] = [];
+    if (overriddenVal > 0) extraParts.push(`${overriddenVal} overridden`);
     if (failedVal > 0) extraParts.push(`${failedVal} failed`);
     if (blockedVal > 0) extraParts.push(`${blockedVal} blocked`);
     if (pendingVal > 0) extraParts.push(`${pendingVal} pending`);
@@ -2026,13 +2387,37 @@ function buildMissionCompletionCard(
       extraParts.length > 0 ? ` (${extraParts.join(", ")})` : "";
     const idPreview = run.assertions
       .slice(0, 6)
-      .map((a) => `\`${sanitizePlainText(a.id)}\``)
+      .map((a) =>
+        a.overridden
+          ? `\`${sanitizePlainText(a.id)}\` [OVERRIDE]`
+          : `\`${sanitizePlainText(a.id)}\``,
+      )
       .join(", ");
     const idMore =
       run.assertions.length > 6 ? `, … +${run.assertions.length - 6} more` : "";
     lines.push(
       `- **Validation Contract:** ${valIcon} ${passedVal}/${totalVal} VAL-* passed${extraSuffix} (${idPreview}${idMore})`,
     );
+    if (overriddenVal > 0) {
+      const overrideDetails = overriddenAssertions
+        .slice(0, 4)
+        .map((a) => {
+          const just = sanitizePlainText(
+            a.overrideJustification || a.evidence || "audited exception",
+          )
+            .replace(/^\[OVERRIDE\]\s*/i, "")
+            .slice(0, 96);
+          return `\`${sanitizePlainText(a.id)}\` [OVERRIDE] (${just})`;
+        })
+        .join("; ");
+      const overrideMore =
+        overriddenAssertions.length > 4
+          ? `; … +${overriddenAssertions.length - 4} more`
+          : "";
+      lines.push(
+        `- **⚠️ Audited Overrides:** ${overriddenVal} overridden — ${overrideDetails}${overrideMore}`,
+      );
+    }
   }
 
   if (run.features && run.features.length > 0) {
@@ -2086,6 +2471,37 @@ function buildMissionCompletionCard(
     const openSuffix = openCount > 0 ? `, ⚠️ ${openCount} open` : "";
     lines.push(
       `- **Tech-Debt Handoffs:** ${resolvedCount}/${totalHandoffs} resolved (${trackedCount} tracked, ${dismissedCount} dismissed${openSuffix})`,
+    );
+  }
+
+  if (run.services && run.services.length > 0) {
+    const svcPreview = run.services
+      .slice(0, 6)
+      .map((s) =>
+        s.port !== undefined
+          ? `\`${sanitizePlainText(s.name)}\` (:${s.port})`
+          : `\`${sanitizePlainText(s.name)}\``,
+      )
+      .join(", ");
+    const svcMore =
+      run.services.length > 6 ? `, … +${run.services.length - 6} more` : "";
+    lines.push(
+      `- **Services:** ${run.services.length} configured (${svcPreview}${svcMore})`,
+    );
+  }
+
+  if (options.libraryTopics && options.libraryTopics.length > 0) {
+    const libraryRelPath = `${SWARM_DIR}/${SWARM_RUNS_DIR}/${run.id}/${SWARM_LIBRARY_DIR}/`;
+    const topicPreview = options.libraryTopics
+      .slice(0, 6)
+      .map((t) => `\`${sanitizePlainText(t)}.md\``)
+      .join(", ");
+    const topicMore =
+      options.libraryTopics.length > 6
+        ? `, … +${options.libraryTopics.length - 6} more`
+        : "";
+    lines.push(
+      `- **Shared Library:** \`${libraryRelPath}\` (${options.libraryTopics.length} topic(s): ${topicPreview}${topicMore})`,
     );
   }
 
@@ -3035,6 +3451,27 @@ export function createPiSwarmExtension(
         boundCwd ?? targetCtx?.cwd,
         effectiveRun,
       );
+      const libraryTopics: string[] = [];
+      if (activeStore?.listLibraryTopics) {
+        const rawTopics = await activeStore
+          .listLibraryTopics(effectiveRun.id)
+          .catch(() => [] as Array<{ topic: string; path: string; bytes: number }>);
+        for (const entry of rawTopics) {
+          if (entry.bytes <= 0) {
+            continue;
+          }
+          const starterHeading = `# ${entry.topic.charAt(0).toUpperCase()}${entry.topic.slice(1)}`;
+          if (entry.bytes <= starterHeading.length + 4 && activeStore.readLibraryTopic) {
+            const body = await activeStore
+              .readLibraryTopic(effectiveRun.id, entry.topic)
+              .catch(() => null);
+            if (!body || body.trim() === starterHeading) {
+              continue;
+            }
+          }
+          libraryTopics.push(entry.topic);
+        }
+      }
       const card = buildMissionCompletionCard(effectiveRun, {
         summary: options.summary,
         nowMs: (overrides.now ?? Date.now)(),
@@ -3042,12 +3479,17 @@ export function createPiSwarmExtension(
         diffStat,
         remainingWorktrees,
         teardownResult: options.teardownResult,
+        libraryTopics,
         initiatedBy: options.initiatedBy,
       });
 
       const nonCancelledFeatures = (effectiveRun.features ?? []).filter(
         (f) => f.status !== "cancelled",
       );
+      const overriddenCount = (effectiveRun.assertions ?? []).filter(
+        (a) => a.overridden === true,
+      ).length;
+      const libraryPath = `${SWARM_DIR}/${SWARM_RUNS_DIR}/${effectiveRun.id}/${SWARM_LIBRARY_DIR}/`;
       pi.sendMessage(
         {
           customType: SWARM_STATUS_CUSTOM_TYPE,
@@ -3064,6 +3506,7 @@ export function createPiSwarmExtension(
                   assertionsPassed: effectiveRun.assertions.filter(
                     (a) => a.status === "passed",
                   ).length,
+                  assertionsOverridden: overriddenCount,
                   assertionsTotal: effectiveRun.assertions.length,
                 }
               : {}),
@@ -3090,6 +3533,17 @@ export function createPiSwarmExtension(
                     (h) => h.resolution !== "open",
                   ).length,
                   handoffsTotal: effectiveRun.handoffItems.length,
+                }
+              : {}),
+            ...(effectiveRun.services && effectiveRun.services.length > 0
+              ? {
+                  servicesCount: effectiveRun.services.length,
+                }
+              : {}),
+            ...(libraryTopics.length > 0
+              ? {
+                  libraryTopics,
+                  libraryPath,
                 }
               : {}),
           },
@@ -4572,6 +5026,7 @@ export function createPiSwarmExtension(
         ...(plan.features !== undefined ? { features: plan.features } : {}),
         ...(plan.handoffItems !== undefined ? { handoffItems: plan.handoffItems } : {}),
         ...(plan.commands !== undefined ? { commands: plan.commands } : {}),
+        ...(plan.services !== undefined ? { services: plan.services } : {}),
         ...(plan.boundaries !== undefined ? { boundaries: plan.boundaries } : {}),
         ...(plan.lastAudit !== undefined ? { lastAudit: plan.lastAudit } : {}),
       });
@@ -4641,17 +5096,330 @@ export function createPiSwarmExtension(
     }
 
     // ------------------------------------------------------------------------
+    // Ephemeral Read-Only Adversarial Contract Reviewer (`runAdversarialContractReview`)
+    // ------------------------------------------------------------------------
+    function hasLivePiModelRuntime(ctx: ExtensionContext | undefined): boolean {
+      if (!ctx || (ctx.mode !== "tui" && ctx.mode !== "rpc")) {
+        return false;
+      }
+      const rawRuntime = (
+        ctx.modelRegistry as unknown as { runtime?: unknown } | undefined
+      )?.runtime;
+      if (!rawRuntime || typeof rawRuntime !== "object") {
+        return false;
+      }
+      return (
+        rawRuntime instanceof ModelRuntime ||
+        typeof (rawRuntime as { stream?: unknown }).stream === "function"
+      );
+    }
+
+    async function runAdversarialContractReview(
+      plan: ProposedSwarmPlan,
+      ctx: ExtensionContext,
+      signal?: AbortSignal,
+    ): Promise<ContractReviewResult | undefined> {
+      if (signal?.aborted) {
+        return undefined;
+      }
+      const customReviewer = overrides.contractReviewer;
+      if (!customReviewer && !hasLivePiModelRuntime(ctx)) {
+        return undefined;
+      }
+
+      const prevWorkingMsg =
+        lastWorkingMessage ??
+        computeSwarmWorkingMessage(getSnapshotSafe(), draftController.isActive());
+      const canShowWorkingMsg = Boolean(
+        ctx?.hasUI &&
+          ctx.mode === "tui" &&
+          typeof ctx.ui.setWorkingMessage === "function",
+      );
+      if (canShowWorkingMsg) {
+        try {
+          ctx.ui.setWorkingMessage(CONTRACT_REVIEW_WORKING_MESSAGE);
+        } catch {
+          // ignore UI working message errors
+        }
+      }
+
+      let handle: PersistentAgentHandle | undefined;
+      let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+      let onAbort: (() => void) | undefined;
+
+      try {
+        if (customReviewer) {
+          const customOutcome = await Promise.race([
+            customReviewer(plan, ctx, signal),
+            new Promise<undefined>((resolve) => {
+              timeoutTimer = setTimeout(
+                () => resolve(undefined),
+                CONTRACT_REVIEW_TIMEOUT_MS,
+              );
+              timeoutTimer.unref?.();
+              if (signal) {
+                onAbort = () => resolve(undefined);
+                signal.addEventListener("abort", onAbort, { once: true });
+              }
+            }),
+          ]);
+          return signal?.aborted ? undefined : customOutcome;
+        }
+
+        const { transport } = await ensureBound(ctx);
+        await reloadSettings(ctx.cwd);
+
+        const rawValidatorModel =
+          plan.roleModels?.validator?.model?.trim() ||
+          currentSettings.validatorModel?.trim() ||
+          undefined;
+        const parsedValidatorSpec = rawValidatorModel
+          ? parseModelSpec(rawValidatorModel)
+          : undefined;
+        const reviewerModel =
+          parsedValidatorSpec?.model || rawValidatorModel || undefined;
+        const reviewerThinking =
+          plan.roleModels?.validator?.thinkingLevel ??
+          currentSettings.validatorThinkingLevel ??
+          parsedValidatorSpec?.thinkingLevel;
+
+        const { systemPrompt, initialPrompt } =
+          buildAdversarialContractReviewPrompts(plan);
+
+        const readOnlyReviewBridge: MemberEngineBridge = {
+          async postMessage() {
+            throw new SwarmProtocolError(
+              "PERMISSION_DENIED",
+              "Contract reviewer is an ephemeral read-only audit; output <approved/> or <gaps_found>...</gaps_found> directly.",
+            );
+          },
+          async readBoard() {
+            return { messages: [], head: 0 };
+          },
+          async getStatus() {
+            return {
+              runId: "draft-contract-review",
+              title: plan.title,
+              status: "active",
+              baseBranch: plan.baseBranch,
+              boardHead: 0,
+              members: [],
+              channels: [],
+            };
+          },
+          async listModels() {
+            return [];
+          },
+          async addHelper() {
+            throw new SwarmProtocolError(
+              "PERMISSION_DENIED",
+              "Contract reviewer cannot spawn helpers.",
+            );
+          },
+          async killHelper() {
+            throw new SwarmProtocolError(
+              "PERMISSION_DENIED",
+              "Contract reviewer cannot kill members.",
+            );
+          },
+          async switchModel() {
+            throw new SwarmProtocolError(
+              "PERMISSION_DENIED",
+              "Contract reviewer cannot switch models.",
+            );
+          },
+          async manageChannel() {
+            throw new SwarmProtocolError(
+              "PERMISSION_DENIED",
+              "Contract reviewer cannot manage channels.",
+            );
+          },
+          async manageMission() {
+            throw new SwarmProtocolError(
+              "PERMISSION_DENIED",
+              "Contract reviewer cannot mutate Mission state.",
+            );
+          },
+          async waitForBoard() {
+            throw new SwarmProtocolError(
+              "PERMISSION_DENIED",
+              "Contract reviewer cannot wait on board.",
+            );
+          },
+        };
+
+        const nowMs = (overrides.now ?? Date.now)();
+        handle = await transport.spawnMember({
+          agentId: `contract-review-${nowMs.toString(36)}`,
+          name: "contract-reviewer",
+          role: "validator",
+          runId: "draft-contract-review",
+          cwd: ctx.cwd,
+          baseBranch: plan.baseBranch,
+          workspace: "inherit",
+          parentName: ORCHESTRATOR_NAME,
+          brief: "Read-only adversarial contract review",
+          systemPrompt,
+          initialPrompt,
+          keepWarm: false,
+          ...(reviewerModel ? { modelOverride: reviewerModel } : {}),
+          ...(reviewerThinking ? { thinkingLevel: reviewerThinking } : {}),
+          hostContext: ctx,
+          engineApi: readOnlyReviewBridge,
+        });
+
+        if (signal?.aborted || isShutDown) {
+          return undefined;
+        }
+
+        const turnResult = await Promise.race([
+          handle.currentTurn,
+          new Promise<AgentTurnResult | null>((resolve) => {
+            timeoutTimer = setTimeout(
+              () => resolve(null),
+              CONTRACT_REVIEW_TIMEOUT_MS,
+            );
+            timeoutTimer.unref?.();
+            if (signal) {
+              onAbort = () => resolve(null);
+              signal.addEventListener("abort", onAbort, { once: true });
+            }
+          }),
+        ]);
+
+        if (!turnResult || signal?.aborted) {
+          return undefined;
+        }
+        if (
+          turnResult.outcome === "failed" ||
+          turnResult.outcome === "rate_limited"
+        ) {
+          return undefined;
+        }
+
+        let candidateText = turnResult.summary?.trim() ?? "";
+        const parsedFromSummary = candidateText
+          ? parseContractReviewOutput(candidateText)
+          : undefined;
+        if (parsedFromSummary) {
+          return parsedFromSummary;
+        }
+
+        const convMsgs = handle.getConversationMessages();
+        for (let i = convMsgs.length - 1; i >= 0; i--) {
+          const msg = convMsgs[i] as { role?: unknown } | undefined;
+          if (!msg || typeof msg !== "object" || msg.role !== "assistant") {
+            continue;
+          }
+          const assistantTxt = extractAgentMessagePlainText(msg)?.trim();
+          if (assistantTxt) {
+            candidateText = assistantTxt;
+            const parsedFromAssistant = parseContractReviewOutput(assistantTxt);
+            if (parsedFromAssistant) {
+              return parsedFromAssistant;
+            }
+            break;
+          }
+        }
+
+        return undefined;
+      } catch {
+        return undefined;
+      } finally {
+        if (timeoutTimer) {
+          clearTimeout(timeoutTimer);
+        }
+        if (onAbort && signal) {
+          signal.removeEventListener("abort", onAbort);
+        }
+        if (handle) {
+          await handle
+            .kill("Adversarial contract review complete")
+            .catch(() => {});
+        }
+        if (canShowWorkingMsg) {
+          try {
+            const restoreMsg =
+              computeSwarmWorkingMessage(
+                getSnapshotSafe(),
+                draftController.isActive(),
+              ) ?? prevWorkingMsg;
+            lastWorkingMessage = restoreMsg;
+            ctx.ui.setWorkingMessage(restoreMsg);
+          } catch {
+            // ignore UI restore errors
+          }
+        }
+      }
+    }
+
+    let draftingReviewHookActive = false;
+    const fallbackDraftReviewCounts = new Map<string, number>();
+
+    const runAdversarialContractReviewFromDrafting = async (
+      plan: ProposedSwarmPlan,
+      toolCtx: ExtensionContext,
+      signal?: AbortSignal,
+    ): Promise<ContractReviewResult | undefined> => {
+      draftingReviewHookActive = true;
+      return runAdversarialContractReview(plan, toolCtx, signal);
+    };
+
+    const reviewAwareQuestionnaireUI: IQuestionnaireUI = {
+      askQuestion: (qCtx, spec, signal) =>
+        questionnaireUI.askQuestion(qCtx, spec, signal),
+      askQuestionnaire: (qCtx, questions, signal) =>
+        questionnaireUI.askQuestionnaire(qCtx, questions, signal),
+      confirmProposal: async (qCtx, plan, options) => {
+        if (
+          !draftingReviewHookActive &&
+          plan.assertions &&
+          plan.assertions.length > 0 &&
+          plan.validatorEnabled !== false &&
+          (Boolean(overrides.contractReviewer) || hasLivePiModelRuntime(qCtx))
+        ) {
+          const activeDraft = draftController.getDraft();
+          const draftKey = activeDraft?.startedAt ?? `ad-hoc:${plan.title}`;
+          const priorPasses = fallbackDraftReviewCounts.get(draftKey) ?? 0;
+          fallbackDraftReviewCounts.set(draftKey, priorPasses + 1);
+          const review = await runAdversarialContractReview(
+            plan,
+            qCtx,
+            options?.signal,
+          );
+          if (
+            review &&
+            priorPasses === 0 &&
+            (!review.approved ||
+              review.findings.some((f) => f.severity === "blocking"))
+          ) {
+            return {
+              action: "continue",
+              validatorEnabled: plan.validatorEnabled,
+              maxConcurrency: plan.maxConcurrency,
+              feedback: formatContractReviewBounceFeedback(review),
+            };
+          }
+        }
+        return questionnaireUI.confirmProposal(qCtx, plan, options);
+      },
+    };
+
+    // ------------------------------------------------------------------------
     // Tool Registrations (3 Drafting Tools + 4 Core Swarm Tools = 7 Tools)
     // ------------------------------------------------------------------------
     registerDraftingTools(pi, {
       store: storeProxy,
       worktree: worktreeProxy,
-      ui: questionnaireUI,
+      ui: reviewAwareQuestionnaireUI,
       getSettings: () => currentSettings,
       onPlanConfirmed: handlePlanConfirmed,
       onModalEnter,
       onModalExit,
       draftController,
+      ...({
+        reviewProposedContract: runAdversarialContractReviewFromDrafting,
+      } as Record<string, unknown>),
       confirmProposalOptions: (toolCtx) => {
         if (!canUseCustomTui(toolCtx)) {
           return {};
@@ -5846,8 +6614,68 @@ export function createPiSwarmExtension(
         return;
       }
 
-      let summary = rawSummary.trim();
-      if (!summary && ctx.hasUI) {
+      const parsedDone = parseDoneArgs(rawSummary);
+      if (!parsedDone.force) {
+        const runToCheck = await store
+          .loadRun(snapshot.run.id)
+          .catch(() => snapshot.run!);
+        const engineWithUnmerged = engine as ISwarmEngine & {
+          getUnmergedMembersWithCommits?: () => Promise<
+            Array<{ member: SwarmMemberRecord; commitsAhead: number }>
+          >;
+        };
+        const unmergedAhead =
+          (await engineWithUnmerged.getUnmergedMembersWithCommits?.().catch(() => [])) ??
+          [];
+        const incompleteFeatures = (runToCheck.features ?? []).filter(
+          (f) =>
+            f.status === "pending" ||
+            f.status === "in_progress" ||
+            f.status === "failed",
+        );
+        const openTechDebt = (runToCheck.handoffItems ?? []).filter(
+          (h) =>
+            h.resolution === "open" &&
+            (h.type === "discovered_issue" || h.type === "incomplete_work"),
+        );
+        const unpassedAssertions = (runToCheck.assertions ?? []).filter(
+          (a) => a.status !== "passed",
+        );
+
+        const gateIssues: string[] = [];
+        if (unmergedAhead.length > 0) {
+          gateIssues.push(
+            `${unmergedAhead.length} unmerged branch(es) (${unmergedAhead.map((u) => `@${u.member.name}`).join(", ")})`,
+          );
+        }
+        if (incompleteFeatures.length > 0) {
+          gateIssues.push(
+            `${incompleteFeatures.length} incomplete feature(s) (${incompleteFeatures.map((f) => f.id).join(", ")})`,
+          );
+        }
+        if (openTechDebt.length > 0) {
+          gateIssues.push(`${openTechDebt.length} open tech-debt handoff(s)`);
+        }
+        if (unpassedAssertions.length > 0) {
+          gateIssues.push(
+            `${unpassedAssertions.length} unpassed VAL-* assertion(s) (${unpassedAssertions.map((a) => a.id).join(", ")})`,
+          );
+        }
+
+        if (gateIssues.length > 0) {
+          const msg = `Cannot complete Mission while Goal Gates remain unfinished: ${gateIssues.join("; ")}. Complete remaining items or run \`/swarm done --force [summary]\` to force-close.`;
+          if (ctx.hasUI) ctx.ui.notify(msg, "warning");
+          emitZeroTurnMessage(ctx, `⚠ ${msg}`, {
+            runId: runToCheck.id,
+            blockedByGoalGates: true,
+            gateIssues,
+          });
+          return;
+        }
+      }
+
+      let summary = parsedDone.summary;
+      if (!summary && !parsedDone.force && ctx.hasUI) {
         const entered = await withModalGuard(() =>
           ctx.ui.input(
             `Complete Swarm "${snapshot.run!.title}" — summary`,
@@ -5872,7 +6700,9 @@ export function createPiSwarmExtension(
         summary = entered.trim() || "Completed by user via /swarm done";
       }
       if (!summary) {
-        summary = "Completed by user via /swarm done";
+        summary = parsedDone.force
+          ? "Force-completed by user via /swarm done --force"
+          : "Completed by user via /swarm done";
       }
 
       try {
@@ -7629,6 +8459,31 @@ export function createPiSwarmExtension(
           });
         }
         return items.length > 0 ? items : null;
+      }
+
+      if (sub === "done") {
+        const hasTrailingSpace = /\s$/.test(prefix);
+        const rawTokens = argPrefix ? argPrefix.split(/\s+/).filter(Boolean) : [];
+        const priorTokens = hasTrailingSpace ? rawTokens : rawTokens.slice(0, -1);
+        const activeToken = hasTrailingSpace ? "" : (rawTokens[rawTokens.length - 1] ?? "");
+        const valuePrefix =
+          priorTokens.length > 0 ? `done ${priorTokens.join(" ")} ` : "done ";
+        const usedTokens = new Set(priorTokens.map((t) => t.toLowerCase()));
+        if (
+          !usedTokens.has("--force") &&
+          !usedTokens.has("-f") &&
+          "--force".startsWith(activeToken.toLowerCase())
+        ) {
+          return [
+            {
+              value: `${valuePrefix}--force`,
+              label: "--force",
+              description:
+                "Force-close Mission even if features, VAL-* assertions, or branches are unfinished",
+            },
+          ];
+        }
+        return null;
       }
 
       if (sub === "teardown") {
