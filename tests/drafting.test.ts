@@ -58,8 +58,16 @@ import {
   type SwarmQuestionToolDetails,
 } from "../src/drafting/index.js";
 import {
+  assertFeatureDependencyDag,
+  deriveMilestonesFromFeatures,
+  MissionAssertionProposalSchema,
+  MissionCommandProposalSchema,
+  MissionFeatureProposalSchema,
+} from "../src/drafting/draft-tools.js";
+import {
   SwarmProtocolError,
   type IQuestionnaireUI,
+  type ISwarmStore,
   type IWorktreeManager,
   type ProposalDialogOutcome,
   type ProposedSwarmPlan,
@@ -3325,5 +3333,981 @@ describe("v0.7.0 collapsible proposal renderCall, wave-1 prompt guidance & schem
     assert.equal(/\bType\.Union\b/.test(source), false, "draft-tools.ts must not use Type.Union");
     assert.equal(/\banyOf\b/.test(source), false, "draft-tools.ts must not contain anyOf");
     assert.equal(/\boneOf\b/.test(source), false, "draft-tools.ts must not contain oneOf");
+  });
+});
+
+// ============================================================================
+// 11. v0.8.0 Contract-First Mission TDD, Tweak Merge & Proposal Rendering
+// ============================================================================
+
+describe("v0.8.0 Mission-Level TDD planning, 100% fulfills & DAG gates, tweak merge & renderCall", () => {
+  it("normalizes VAL-* assertions, milestone features, auto-derived milestones, commands & boundaries onto ProposedSwarmPlan", async () => {
+    const harness = new MockPiHarness();
+    const seenModalPlans: ProposedSwarmPlan[] = [];
+    const confirmedPlans: ProposedSwarmPlan[] = [];
+
+    const controller = registerDraftingTools(harness.api, {
+      worktree: createMockWorktree({ currentBranch: "main" }),
+      ui: {
+        askQuestion: async () => ({ cancelled: true, isCustom: false }),
+        askQuestionnaire: async () => ({ cancelled: true, answers: {}, items: [] }),
+        confirmProposal: async (_ctx, plan) => {
+          seenModalPlans.push(plan);
+          return {
+            action: "confirm",
+            validatorEnabled: plan.validatorEnabled,
+            maxConcurrency: plan.maxConcurrency,
+          };
+        },
+      },
+      getSettings: () => ({ ...DEFAULT_SWARM_SETTINGS }),
+      onPlanConfirmed: async (plan) => {
+        confirmedPlans.push(plan);
+        return createMockRun(plan);
+      },
+    });
+
+    controller.start({
+      mode: "swarm",
+      seed: "Build PKCE auth + audit pipeline",
+      baseBranch: "main",
+      maxConcurrency: 4,
+      validatorEnabled: true,
+    });
+
+    const proposeTool = harness.registeredTools.get(PROPOSE_SWARM_PLAN_TOOL);
+    const rawParams = proposeTool.prepareArguments({
+      ...makeSamplePlanParams({ initial_members: undefined }),
+      commands: [
+        { name: " typecheck ", command: " npm run typecheck " },
+        { name: "test", command: "npm test" },
+      ],
+      boundaries: [
+        "  Do not modify legacy-db/  ",
+        "Reserve local ports 4100-4110",
+      ],
+      assertions: [
+        {
+          id: " VAL-AUTH-001 ",
+          title: " PKCE Exchange ",
+          description: " Exchanges authorization code + verifier for session token ",
+          evidence_required: " npm run test:file tests/auth.test.ts passes ",
+        },
+        {
+          id: "VAL-AUTH-002",
+          title: "Token Refresh Rotation",
+          description: "Rotates refresh family and rejects replayed tokens",
+        },
+        {
+          id: "VAL-AUDIT-001",
+          title: "Structured Audit Sink",
+          description: "Emits JSONL security events for login and refresh",
+          evidence_required: "tests/audit.test.ts verifies JSONL output",
+        },
+      ],
+      features: [
+        {
+          id: " pkce-client ",
+          title: " OAuth2 PKCE Client ",
+          description: " Implement PKCE challenge/verifier exchange ",
+          milestone: " M1: Core Auth ",
+          files_owned: [" src/auth/pkce.ts ", "tests/auth.test.ts"],
+          preconditions: [" package.json scripts verified "],
+          expected_behavior: [" Valid code returns token "],
+          verification_steps: [" npm run test:file tests/auth.test.ts "],
+          fulfills: [" VAL-AUTH-001 "],
+        },
+        {
+          id: "audit-sink",
+          title: "Audit Event Sink",
+          description: "Implement append-only JSONL audit sink in parallel worktree",
+          milestone: "M1: Core Auth",
+          files_owned: ["src/audit/sink.ts", "tests/audit.test.ts"],
+          fulfills: ["VAL-AUDIT-001"],
+        },
+        {
+          id: "refresh-rotation",
+          title: "Refresh Rotation Guard",
+          description: "Wire token family rotation with audit logging",
+          milestone: "M2: Session Hardening",
+          depends_on: ["pkce-client", "audit-sink"],
+          files_owned: ["src/auth/refresh.ts"],
+          fulfills: ["VAL-AUTH-002"],
+        },
+      ],
+    });
+
+    const res = await proposeTool.execute(
+      "tc-v080-norm",
+      rawParams,
+      undefined,
+      undefined,
+      harness.createContext(),
+    );
+
+    assert.equal(res.isError, undefined);
+    assert.equal(seenModalPlans.length, 1);
+    assert.equal(confirmedPlans.length, 1);
+
+    const plan = confirmedPlans[0]!;
+    assert.deepEqual(plan.commands, [
+      { name: "typecheck", command: "npm run typecheck" },
+      { name: "test", command: "npm test" },
+    ]);
+    assert.deepEqual(plan.boundaries, [
+      "Do not modify legacy-db/",
+      "Reserve local ports 4100-4110",
+    ]);
+
+    assert.equal(plan.assertions?.length, 3);
+    assert.equal(plan.assertions?.[0]?.id, "VAL-AUTH-001");
+    assert.equal(plan.assertions?.[0]?.title, "PKCE Exchange");
+    assert.equal(
+      plan.assertions?.[0]?.evidenceRequired,
+      "npm run test:file tests/auth.test.ts passes",
+    );
+    assert.equal(plan.assertions?.[0]?.status, "pending");
+    assert.ok(plan.assertions?.[0]?.updatedAt);
+    assert.equal(plan.assertions?.[1]?.evidenceRequired, undefined);
+
+    assert.equal(plan.features?.length, 3);
+    assert.equal(plan.features?.[0]?.id, "pkce-client");
+    assert.equal(plan.features?.[0]?.milestone, "M1: Core Auth");
+    assert.deepEqual(plan.features?.[0]?.filesOwned, [
+      "src/auth/pkce.ts",
+      "tests/auth.test.ts",
+    ]);
+    assert.deepEqual(plan.features?.[0]?.preconditions, [
+      "package.json scripts verified",
+    ]);
+    assert.deepEqual(plan.features?.[0]?.expectedBehavior, [
+      "Valid code returns token",
+    ]);
+    assert.deepEqual(plan.features?.[0]?.verificationSteps, [
+      "npm run test:file tests/auth.test.ts",
+    ]);
+    assert.deepEqual(plan.features?.[0]?.fulfills, ["VAL-AUTH-001"]);
+    assert.equal(plan.features?.[0]?.status, "pending");
+    assert.deepEqual(plan.features?.[2]?.dependsOn, ["pkce-client", "audit-sink"]);
+
+    // Milestones auto-derived in exact first-seen feature milestone order
+    assert.deepEqual(plan.milestones, [
+      { label: "M1: Core Auth", status: "pending" },
+      { label: "M2: Session Hardening", status: "pending" },
+    ]);
+  });
+
+  it("enforces pre-modal 100% fulfills coverage gate (unclaimed orphan assertions, omitted features, unknown fulfills, duplicate 1-to-1 fulfills, and duplicate IDs)", async () => {
+    const harness = new MockPiHarness();
+    let confirmCalls = 0;
+
+    const controller = registerDraftingTools(harness.api, {
+      worktree: createMockWorktree(),
+      ui: {
+        askQuestion: async () => ({ cancelled: true, isCustom: false }),
+        askQuestionnaire: async () => ({ cancelled: true, answers: {}, items: [] }),
+        confirmProposal: async () => {
+          confirmCalls += 1;
+          return { action: "confirm", validatorEnabled: true, maxConcurrency: 3 };
+        },
+      },
+      getSettings: () => ({ ...DEFAULT_SWARM_SETTINGS }),
+      onPlanConfirmed: async (plan) => createMockRun(plan),
+    });
+    controller.start({ seed: "Fulfills gate test" });
+
+    const ctx = harness.createContext();
+    const proposeTool = harness.registeredTools.get(PROPOSE_SWARM_PLAN_TOOL);
+
+    // 1. Unclaimed orphan assertion when features only claim 1 of 2 assertions
+    const unclaimedRes = await proposeTool.execute(
+      "tc-unclaimed",
+      makeSamplePlanParams({
+        assertions: [
+          {
+            id: "VAL-CORE-001",
+            title: "Claimed",
+            description: "Claimed behavior",
+          },
+          {
+            id: "VAL-CORE-002",
+            title: "Orphan",
+            description: "Unclaimed behavior",
+          },
+        ],
+        features: [
+          {
+            id: "feat-1",
+            title: "Feature 1",
+            description: "Implements VAL-CORE-001 only",
+            milestone: "M1",
+            fulfills: ["VAL-CORE-001"],
+          },
+        ],
+      }),
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(unclaimedRes.isError, true);
+    assert.equal(confirmCalls, 0);
+    assert.match(unclaimedRes.content[0].text, /\[SwarmProtocolError:INVALID_INPUT\]/);
+    assert.match(unclaimedRes.content[0].text, /VAL-CORE-002/);
+    assert.match(unclaimedRes.content[0].text, /100%/);
+
+    // 2. Non-empty assertions with features omitted altogether
+    const noFeaturesRes = await proposeTool.execute(
+      "tc-no-features",
+      makeSamplePlanParams({
+        assertions: [
+          {
+            id: "VAL-ONLY-001",
+            title: "Standalone assertion",
+            description: "No features provided",
+          },
+        ],
+        features: undefined,
+      }),
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(noFeaturesRes.isError, true);
+    assert.equal(confirmCalls, 0);
+    assert.match(noFeaturesRes.content[0].text, /VAL-ONLY-001/);
+
+    // 3. Feature fulfills an unknown assertion ID not defined in assertions
+    const unknownValRes = await proposeTool.execute(
+      "tc-unknown-val",
+      makeSamplePlanParams({
+        assertions: [
+          {
+            id: "VAL-KNOWN-001",
+            title: "Known",
+            description: "Defined assertion",
+          },
+        ],
+        features: [
+          {
+            id: "feat-1",
+            title: "Feature 1",
+            description: "Claims unknown VAL",
+            milestone: "M1",
+            fulfills: ["VAL-KNOWN-001", "VAL-GHOST-999"],
+          },
+        ],
+      }),
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(unknownValRes.isError, true);
+    assert.equal(confirmCalls, 0);
+    assert.match(unknownValRes.content[0].text, /VAL-GHOST-999/);
+    assert.match(unknownValRes.content[0].text, /unknown assertion/i);
+
+    // 4. Duplicate fulfills claiming the same VAL-* across multiple features (1-to-1 leaf rule)
+    const dupFulfillsRes = await proposeTool.execute(
+      "tc-dup-fulfills",
+      makeSamplePlanParams({
+        assertions: [
+          {
+            id: "VAL-SHARED-001",
+            title: "Shared assertion",
+            description: "Must be owned by one feature",
+          },
+        ],
+        features: [
+          {
+            id: "feat-alpha",
+            title: "Alpha",
+            description: "First claimant",
+            milestone: "M1",
+            fulfills: ["VAL-SHARED-001"],
+          },
+          {
+            id: "feat-beta",
+            title: "Beta",
+            description: "Second claimant",
+            milestone: "M1",
+            fulfills: ["VAL-SHARED-001"],
+          },
+        ],
+      }),
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(dupFulfillsRes.isError, true);
+    assert.equal(confirmCalls, 0);
+    assert.match(dupFulfillsRes.content[0].text, /Duplicate fulfills claim/i);
+    assert.match(dupFulfillsRes.content[0].text, /VAL-SHARED-001/);
+    assert.match(dupFulfillsRes.content[0].text, /feat-alpha/);
+    assert.match(dupFulfillsRes.content[0].text, /feat-beta/);
+
+    // 5. Duplicate assertion IDs & duplicate feature IDs
+    const dupIdsValidation = validateProposedSwarmPlan(
+      makeSamplePlanParams({
+        assertions: [
+          { id: "VAL-DUP-001", title: "One", description: "First" },
+          { id: "VAL-DUP-001", title: "Two", description: "Duplicate" },
+        ],
+        features: [
+          {
+            id: "same-feat",
+            title: "F1",
+            description: "First",
+            milestone: "M1",
+            fulfills: ["VAL-DUP-001"],
+          },
+          {
+            id: "same-feat",
+            title: "F2",
+            description: "Second",
+            milestone: "M1",
+          },
+        ],
+      }),
+    );
+    assert.equal(dupIdsValidation.valid, false);
+    if (!dupIdsValidation.valid) {
+      assert.ok(
+        dupIdsValidation.issues.some((i) =>
+          /Duplicate assertion id "VAL-DUP-001"/.test(i.message),
+        ),
+      );
+      assert.ok(
+        dupIdsValidation.issues.some((i) =>
+          /Duplicate feature id "same-feat"/.test(i.message),
+        ),
+      );
+    }
+  });
+
+  it("rejects depends_on unknown targets, self-cycles, and multi-hop dependency cycles with SwarmProtocolError('INVALID_INPUT')", async () => {
+    // Direct helper throws genuine SwarmProtocolError("INVALID_INPUT", ...)
+    assert.throws(
+      () =>
+        assertFeatureDependencyDag([
+          { id: "feat-self", dependsOn: ["feat-self"] },
+        ]),
+      (err: unknown) =>
+        err instanceof SwarmProtocolError &&
+        err.code === "INVALID_INPUT" &&
+        /self-cycle/i.test(err.message),
+    );
+
+    assert.throws(
+      () =>
+        assertFeatureDependencyDag([
+          { id: "feat-a", dependsOn: ["feat-missing"] },
+        ]),
+      (err: unknown) =>
+        err instanceof SwarmProtocolError &&
+        err.code === "INVALID_INPUT" &&
+        /unknown feature "feat-missing"/i.test(err.message),
+    );
+
+    assert.throws(
+      () =>
+        assertFeatureDependencyDag([
+          { id: "root" },
+          { id: "cycle-a", dependsOn: ["cycle-b"] },
+          { id: "cycle-b", dependsOn: ["cycle-c"] },
+          { id: "cycle-c", dependsOn: ["cycle-a"] },
+        ]),
+      (err: unknown) =>
+        err instanceof SwarmProtocolError &&
+        err.code === "INVALID_INPUT" &&
+        /cycle-a -> cycle-b -> cycle-c -> cycle-a/.test(err.message),
+    );
+
+    // Pre-modal tool execution rejects cycles before confirmProposal
+    const harness = new MockPiHarness();
+    let confirmCalls = 0;
+    const controller = registerDraftingTools(harness.api, {
+      worktree: createMockWorktree(),
+      ui: {
+        askQuestion: async () => ({ cancelled: true, isCustom: false }),
+        askQuestionnaire: async () => ({ cancelled: true, answers: {}, items: [] }),
+        confirmProposal: async () => {
+          confirmCalls += 1;
+          return { action: "confirm", validatorEnabled: true, maxConcurrency: 3 };
+        },
+      },
+      getSettings: () => ({ ...DEFAULT_SWARM_SETTINGS }),
+      onPlanConfirmed: async (plan) => createMockRun(plan),
+    });
+    controller.start({ seed: "Cycle check" });
+
+    const proposeTool = harness.registeredTools.get(PROPOSE_SWARM_PLAN_TOOL);
+    const cycleRes = await proposeTool.execute(
+      "tc-cycle",
+      makeSamplePlanParams({
+        assertions: [
+          { id: "VAL-1", title: "V1", description: "D1" },
+          { id: "VAL-2", title: "V2", description: "D2" },
+        ],
+        features: [
+          {
+            id: "f1",
+            title: "Feature 1",
+            description: "Depends on f2",
+            milestone: "M1",
+            depends_on: ["f2"],
+            fulfills: ["VAL-1"],
+          },
+          {
+            id: "f2",
+            title: "Feature 2",
+            description: "Depends on f1",
+            milestone: "M1",
+            depends_on: ["f1"],
+            fulfills: ["VAL-2"],
+          },
+        ],
+      }),
+      undefined,
+      undefined,
+      harness.createContext(),
+    );
+
+    assert.equal(cycleRes.isError, true);
+    assert.equal(confirmCalls, 0);
+    const details = cycleRes.details as ProposeSwarmPlanToolDetails;
+    assert.equal(details.outcome, "validation_error");
+    assert.equal(details.errorCode, "INVALID_INPUT");
+    assert.match(cycleRes.content[0].text, /\[SwarmProtocolError:INVALID_INPUT\]/);
+    assert.match(cycleRes.content[0].text, /f1 -> f2 -> f1/);
+  });
+
+  it("smart-merges assertions & features in tweak mode (preserving passed/completed state, resetting modified assertions, and blocking new features in sealed milestones)", async () => {
+    const existingRun: SwarmRunState = {
+      ...createMockRun({
+        title: "Active Auth Mission",
+        objective: "Ship auth & session",
+        strategy: "Wave 1 -> Wave 2",
+        acceptanceCriteria: "npm test",
+        baseBranch: "main",
+        maxConcurrency: 4,
+        validatorEnabled: true,
+      }),
+      id: "run_tweak_target",
+      commands: [{ name: "test", command: "npm test" }],
+      boundaries: ["Keep port 3000 untouched"],
+      assertions: [
+        {
+          id: "VAL-AUTH-001",
+          title: "PKCE Login",
+          description: "PKCE login issues signed session token",
+          evidenceRequired: "tests/auth.test.ts passes",
+          status: "passed",
+          evidence: "tests/auth.test.ts: 8/8 passed",
+          verifiedBy: "verifier",
+          verifiedByRole: "validator",
+          updatedAt: "2026-11-24T01:00:00.000Z",
+        },
+        {
+          id: "VAL-SESS-001",
+          title: "Session Refresh",
+          description: "Refresh endpoint rotates session token",
+          evidenceRequired: "unit test",
+          status: "passed",
+          evidence: "tests/session.test.ts: 4/4 passed",
+          verifiedBy: "verifier",
+          verifiedByRole: "validator",
+          updatedAt: "2026-11-24T01:10:00.000Z",
+        },
+      ],
+      features: [
+        {
+          id: "feat-login",
+          title: "PKCE Login Slice",
+          description: "Implement PKCE login handler",
+          milestone: "M1: Core Auth",
+          fulfills: ["VAL-AUTH-001"],
+          status: "completed",
+          assignedMember: "auth-worker",
+          mergedCommitSha: "a1b2c3d4e5f6",
+          updatedAt: "2026-11-24T00:55:00.000Z",
+        },
+        {
+          id: "feat-session",
+          title: "Session Refresh Slice",
+          description: "Implement session rotation",
+          milestone: "M2: Session",
+          dependsOn: ["feat-login"],
+          fulfills: ["VAL-SESS-001"],
+          status: "in_progress",
+          assignedMember: "sess-worker",
+          updatedAt: "2026-11-24T01:08:00.000Z",
+        },
+      ],
+      milestones: [
+        {
+          label: "M1: Core Auth",
+          status: "done",
+          owner: "verifier",
+          sealed: true,
+          sealedAt: "2026-11-24T01:02:00.000Z",
+        },
+        {
+          label: "M2: Session",
+          status: "in_progress",
+        },
+      ],
+    };
+
+    const mockStore = {
+      loadRun: async (runId: string) => {
+        if (runId === existingRun.id) {
+          return structuredClone(existingRun);
+        }
+        throw new SwarmProtocolError("NOT_FOUND", `Run ${runId} not found`);
+      },
+    } as unknown as ISwarmStore;
+
+    const harness = new MockPiHarness();
+    let confirmCalls = 0;
+    const confirmedPlans: ProposedSwarmPlan[] = [];
+
+    const controller = registerDraftingTools(harness.api, {
+      store: mockStore,
+      worktree: createMockWorktree({ currentBranch: "main" }),
+      ui: {
+        askQuestion: async () => ({ cancelled: true, isCustom: false }),
+        askQuestionnaire: async () => ({ cancelled: true, answers: {}, items: [] }),
+        confirmProposal: async (_ctx, plan) => {
+          confirmCalls += 1;
+          return {
+            action: "confirm",
+            validatorEnabled: plan.validatorEnabled,
+            maxConcurrency: plan.maxConcurrency,
+          };
+        },
+      },
+      getSettings: () => ({ ...DEFAULT_SWARM_SETTINGS }),
+      onPlanConfirmed: async (plan) => {
+        confirmedPlans.push(plan);
+        return createMockRun(plan);
+      },
+    });
+
+    controller.start({
+      mode: "tweak",
+      targetRunId: existingRun.id,
+      seed: "Add audit logging milestone and tighten session refresh evidence",
+      baseBranch: "main",
+      maxConcurrency: 4,
+      validatorEnabled: true,
+    });
+
+    const ctx = harness.createContext();
+    const proposeTool = harness.registeredTools.get(PROPOSE_SWARM_PLAN_TOOL);
+
+    // 1. Reject adding a new feature into already sealed "M1: Core Auth" BEFORE modal
+    const sealedErrRes = await proposeTool.execute(
+      "tc-tweak-sealed-err",
+      makeSamplePlanParams({
+        assertions: [
+          {
+            id: "VAL-AUTH-001",
+            title: "PKCE Login",
+            description: "PKCE login issues signed session token",
+            evidence_required: "tests/auth.test.ts passes",
+          },
+          {
+            id: "VAL-SESS-001",
+            title: "Session Refresh",
+            description: "Refresh endpoint rotates session token",
+            evidence_required: "unit test",
+          },
+          {
+            id: "VAL-EXTRA-001",
+            title: "Extra Auth Check",
+            description: "Intruding into sealed milestone",
+          },
+        ],
+        features: [
+          {
+            id: "feat-login",
+            title: "PKCE Login Slice",
+            description: "Implement PKCE login handler",
+            milestone: "M1: Core Auth",
+            fulfills: ["VAL-AUTH-001"],
+          },
+          {
+            id: "feat-intruder",
+            title: "Intruder Feature",
+            description: "Attempts to enter sealed M1: Core Auth",
+            milestone: "M1: Core Auth",
+            fulfills: ["VAL-EXTRA-001"],
+          },
+          {
+            id: "feat-session",
+            title: "Session Refresh Slice",
+            description: "Implement session rotation",
+            milestone: "M2: Session",
+            depends_on: ["feat-login"],
+            fulfills: ["VAL-SESS-001"],
+          },
+        ],
+      }),
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    assert.equal(sealedErrRes.isError, true);
+    assert.equal(confirmCalls, 0);
+    assert.match(sealedErrRes.content[0].text, /\[SwarmProtocolError:INVALID_INPUT\]/);
+    assert.match(sealedErrRes.content[0].text, /sealed milestone "M1: Core Auth"/i);
+    assert.equal(controller.isActive(), true);
+
+    // 2. Valid tweak:
+    // - VAL-AUTH-001 unchanged -> preserves "passed" + evidence + verifiedBy
+    // - VAL-SESS-001 evidence_required changed -> resets to "pending" & clears stale evidence
+    // - VAL-AUDIT-001 added -> "pending"
+    // - feat-login -> preserves "completed" + mergedCommitSha
+    // - feat-session -> preserves "in_progress" + assignedMember
+    // - feat-audit added in new milestone "M3: Audit" -> "pending"
+    // - sealed milestone "M1: Core Auth" stays sealed!
+    const validTweakRes = await proposeTool.execute(
+      "tc-tweak-ok",
+      makeSamplePlanParams({
+        assertions: [
+          {
+            id: "VAL-AUTH-001",
+            title: "PKCE Login (Retitled)",
+            description: "PKCE login issues signed session token",
+            evidence_required: "tests/auth.test.ts passes",
+          },
+          {
+            id: "VAL-SESS-001",
+            title: "Session Refresh",
+            description: "Refresh endpoint rotates session token",
+            evidence_required: "integration replay-detection test",
+          },
+          {
+            id: "VAL-AUDIT-001",
+            title: "Audit Log",
+            description: "Writes JSONL audit entries",
+            evidence_required: "tests/audit.test.ts passes",
+          },
+        ],
+        features: [
+          {
+            id: "feat-login",
+            title: "PKCE Login Slice",
+            description: "Implement PKCE login handler",
+            milestone: "M1: Core Auth",
+            fulfills: ["VAL-AUTH-001"],
+          },
+          {
+            id: "feat-session",
+            title: "Session Refresh Slice",
+            description: "Implement session rotation",
+            milestone: "M2: Session",
+            depends_on: ["feat-login"],
+            fulfills: ["VAL-SESS-001"],
+          },
+          {
+            id: "feat-audit",
+            title: "Audit Trail Slice",
+            description: "Add structured audit trail",
+            milestone: "M3: Audit",
+            depends_on: ["feat-session"],
+            fulfills: ["VAL-AUDIT-001"],
+          },
+        ],
+      }),
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    assert.equal(validTweakRes.isError, undefined);
+    assert.equal(confirmCalls, 1);
+    assert.equal(confirmedPlans.length, 1);
+
+    const tweakedPlan = confirmedPlans[0]!;
+    // Unchanged commands & boundaries preserved from existingRun when omitted in tweak params
+    assert.deepEqual(tweakedPlan.commands, [{ name: "test", command: "npm test" }]);
+    assert.deepEqual(tweakedPlan.boundaries, ["Keep port 3000 untouched"]);
+
+    const aAuth = tweakedPlan.assertions?.find((a) => a.id === "VAL-AUTH-001");
+    assert.ok(aAuth);
+    assert.equal(aAuth.status, "passed");
+    assert.equal(aAuth.evidence, "tests/auth.test.ts: 8/8 passed");
+    assert.equal(aAuth.verifiedBy, "verifier");
+    assert.equal(aAuth.verifiedByRole, "validator");
+    assert.equal(aAuth.title, "PKCE Login (Retitled)");
+
+    const aSess = tweakedPlan.assertions?.find((a) => a.id === "VAL-SESS-001");
+    assert.ok(aSess);
+    assert.equal(aSess.status, "pending");
+    assert.equal(aSess.evidence, undefined);
+    assert.equal(aSess.verifiedBy, undefined);
+
+    const aAudit = tweakedPlan.assertions?.find((a) => a.id === "VAL-AUDIT-001");
+    assert.ok(aAudit);
+    assert.equal(aAudit.status, "pending");
+
+    const fLogin = tweakedPlan.features?.find((f) => f.id === "feat-login");
+    assert.ok(fLogin);
+    assert.equal(fLogin.status, "completed");
+    assert.equal(fLogin.mergedCommitSha, "a1b2c3d4e5f6");
+    assert.equal(fLogin.assignedMember, "auth-worker");
+
+    const fSession = tweakedPlan.features?.find((f) => f.id === "feat-session");
+    assert.ok(fSession);
+    assert.equal(fSession.status, "in_progress");
+    assert.equal(fSession.assignedMember, "sess-worker");
+
+    const fAudit = tweakedPlan.features?.find((f) => f.id === "feat-audit");
+    assert.ok(fAudit);
+    assert.equal(fAudit.status, "pending");
+
+    assert.deepEqual(tweakedPlan.milestones, [
+      {
+        label: "M1: Core Auth",
+        status: "done",
+        owner: "verifier",
+        sealed: true,
+        sealedAt: "2026-11-24T01:02:00.000Z",
+      },
+      {
+        label: "M2: Session",
+        status: "in_progress",
+      },
+      {
+        label: "M3: Audit",
+        status: "pending",
+      },
+    ]);
+
+    // Also verify deriveMilestonesFromFeatures unseals a milestone if its fulfilled assertion resets to pending
+    const unsealedCheck = deriveMilestonesFromFeatures(
+      [fLogin],
+      existingRun.milestones,
+      [{ ...aAuth, status: "pending" }],
+    );
+    assert.equal(unsealedCheck[0]?.sealed, undefined);
+  });
+
+  it("renders crisp collapsed counts and rich expanded Commands & Boundaries, Validation Contract (VAL-*), and Features by Milestone views + Droid contract prompts", () => {
+    const harness = new MockPiHarness();
+    registerDraftingTools(harness.api, {
+      worktree: createMockWorktree(),
+      ui: {
+        askQuestion: async () => ({ cancelled: true, isCustom: false }),
+        askQuestionnaire: async () => ({ cancelled: true, answers: {}, items: [] }),
+        confirmProposal: async () => ({
+          action: "cancel",
+          validatorEnabled: true,
+          maxConcurrency: 4,
+        }),
+      },
+      getSettings: () => ({ ...DEFAULT_SWARM_SETTINGS }),
+      onPlanConfirmed: async (plan) => createMockRun(plan),
+    });
+
+    const proposeTool = harness.registeredTools.get(PROPOSE_SWARM_PLAN_TOOL);
+    const theme = createMockTheme();
+
+    const missionParams = makeSamplePlanParams({
+      commands: [
+        { name: "typecheck", command: "npm run typecheck" },
+        { name: "test", command: "npm test" },
+      ],
+      boundaries: ["Never modify prod-secrets/", "Use ports 4500-4510"],
+      assertions: [
+        {
+          id: "VAL-AUTH-001",
+          title: "PKCE Exchange",
+          description: "Validates code_verifier and issues token",
+          evidence_required: "tests/auth.test.ts green",
+        },
+        {
+          id: "VAL-AUDIT-001",
+          title: "Audit Log",
+          description: "Appends JSONL security event",
+          evidence_required: "tests/audit.test.ts green",
+        },
+        {
+          id: "VAL-INT-001",
+          title: "End-to-End Flow",
+          description: "Full login + audit smoke check",
+        },
+      ],
+      features: [
+        {
+          id: "oauth-pkce",
+          title: "OAuth PKCE",
+          description: "PKCE token endpoint",
+          milestone: "M1: Foundation",
+          files_owned: ["src/auth/pkce.ts"],
+          fulfills: ["VAL-AUTH-001"],
+        },
+        {
+          id: "audit-logger",
+          title: "Audit Logger",
+          description: "JSONL audit event writer",
+          milestone: "M1: Foundation",
+          files_owned: ["src/audit/logger.ts"],
+          fulfills: ["VAL-AUDIT-001"],
+        },
+        {
+          id: "auth-integration",
+          title: "Auth Integration",
+          description: "Wire PKCE with audit logger",
+          milestone: "M2: Integration",
+          depends_on: ["oauth-pkce", "audit-logger"],
+          files_owned: ["src/auth/index.ts"],
+          fulfills: ["VAL-INT-001"],
+        },
+      ],
+    });
+
+    // Collapsed renderCall includes crisp counts: 3 features · 3 VAL assertions · 2 milestones
+    const collapsedText = proposeTool
+      .renderCall(missionParams, theme, { expanded: false } as any)
+      .render(180)
+      .join("\n");
+    assert.match(collapsedText, /3 features · 3 VAL assertions · 2 milestones/);
+
+    // Expanded renderCall & formatProposalTranscriptSummary include all 3 new sections
+    const expandedText = proposeTool
+      .renderCall(missionParams, theme, { expanded: true } as any)
+      .render(180)
+      .join("\n");
+    assert.match(expandedText, /### Commands & Boundaries/);
+    assert.match(expandedText, /`typecheck`: `npm run typecheck`/);
+    assert.match(expandedText, /Never modify prod-secrets\//);
+    assert.match(expandedText, /### Validation Contract \(VAL-\*\) \(3\)/);
+    assert.match(expandedText, /`VAL-AUTH-001`/);
+    assert.match(expandedText, /tests\/auth\.test\.ts green/);
+    assert.match(
+      expandedText,
+      /### Features by Milestone \(3 features · 2 milestones\)/,
+    );
+    assert.match(expandedText, /#### M1: Foundation/);
+    assert.match(expandedText, /#### M2: Integration/);
+    assert.match(expandedText, /dependsOn/);
+    assert.match(expandedText, /fulfills/);
+    assert.match(expandedText, /`oauth-pkce`, `audit-logger`/);
+    assert.match(expandedText, /`VAL-INT-001`/);
+
+    // Prompts instill Operational Recon, Mission-Level TDD (VAL-* -> features), and Living Dynamic Workflow
+    const kickoff = buildDraftingKickoffPrompt("Ship mission", "swarm", {
+      baseBranch: "main",
+    });
+    const overlay = buildDraftingSystemOverlay({
+      version: 2,
+      mode: "swarm",
+      seed: "Ship mission",
+      startedAt: new Date().toISOString(),
+      validatorEnabled: true,
+      maxConcurrency: 4,
+      baseBranch: "main",
+    });
+    const direct = buildDirectPlanPrompt("Ship mission", "main", {
+      maxConcurrency: 4,
+      validatorEnabled: true,
+    });
+
+    for (const [label, promptText] of [
+      ["kickoff", kickoff],
+      ["overlay", overlay],
+      ["direct", direct],
+    ] as const) {
+      assert.match(promptText, /VAL-<AREA>-<NNN>/, `${label} must reference VAL-<AREA>-<NNN>`);
+      assert.match(promptText, /fulfills/, `${label} must reference 100% fulfills coverage`);
+      assert.match(promptText, /depends_on/, `${label} must reference depends_on DAG`);
+      assert.match(promptText, /files_owned/, `${label} must reference disjoint files_owned`);
+      assert.match(
+        promptText,
+        /swarm\{action:"mission"\}/,
+        `${label} must document dynamic mid-mission extensibility via swarm{action:"mission"}`,
+      );
+      assert.match(
+        promptText,
+        /swarm\{action:"add"\}/,
+        `${label} must document dynamic worker extensibility via swarm{action:"add"}`,
+      );
+    }
+  });
+
+  it("enforces zero Type.Union, Type.Record, anyOf, oneOf, replaceControlCharacters, and tower across drafting schemas and sources", () => {
+    const forbiddenKeys: string[] = [];
+    const visitSchema = (node: unknown, path: string): void => {
+      if (!node || typeof node !== "object") {
+        return;
+      }
+      if (Array.isArray(node)) {
+        for (let i = 0; i < node.length; i++) {
+          visitSchema(node[i], `${path}[${i}]`);
+        }
+        return;
+      }
+      for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+        if (k === "anyOf" || k === "oneOf") {
+          forbiddenKeys.push(`${path}.${k}`);
+        }
+        visitSchema(v, `${path}.${k}`);
+      }
+    };
+
+    visitSchema(MissionAssertionProposalSchema, "MissionAssertionProposalSchema");
+    visitSchema(MissionFeatureProposalSchema, "MissionFeatureProposalSchema");
+    visitSchema(MissionCommandProposalSchema, "MissionCommandProposalSchema");
+    visitSchema(ProposeSwarmPlanParamsSchema, "ProposeSwarmPlanParamsSchema");
+    assert.deepEqual(forbiddenKeys, []);
+
+    const draftToolsSource = readFileSync(
+      fileURLToPath(new URL("../src/drafting/draft-tools.ts", import.meta.url)),
+      "utf8",
+    );
+    const draftPromptsSource = readFileSync(
+      fileURLToPath(new URL("../src/drafting/draft-prompts.ts", import.meta.url)),
+      "utf8",
+    );
+
+    assert.equal(
+      /\bType\.Union\b/.test(draftToolsSource),
+      false,
+      "draft-tools.ts must not use Type.Union",
+    );
+    assert.equal(
+      /\bType\.Record\b/.test(draftToolsSource),
+      false,
+      "draft-tools.ts must not use Type.Record",
+    );
+    assert.equal(
+      /\banyOf\b/.test(draftToolsSource),
+      false,
+      "draft-tools.ts must not contain anyOf",
+    );
+    assert.equal(
+      /\boneOf\b/.test(draftToolsSource),
+      false,
+      "draft-tools.ts must not contain oneOf",
+    );
+
+    for (const [name, src] of [
+      ["draft-tools.ts", draftToolsSource],
+      ["draft-prompts.ts", draftPromptsSource],
+    ] as const) {
+      assert.equal(
+        /replaceControlCharacters/.test(src),
+        false,
+        `${name} must not reference replaceControlCharacters`,
+      );
+      assert.equal(
+        /tower/i.test(src),
+        false,
+        `${name} must not contain case-insensitive 'tower'`,
+      );
+    }
   });
 });

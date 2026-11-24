@@ -20,19 +20,25 @@ import {
 } from "../constants.js";
 import { SWARM_SETTINGS_BOUNDS, isPrototypeKey } from "../store/index.js";
 import {
+  SwarmProtocolError,
   isSwarmProtocolError,
   type ConfirmProposalOptions,
   type InitialMemberProposal,
   type IQuestionnaireUI,
   type ISwarmStore,
   type IWorktreeManager,
+  type MissionAssertion,
+  type MissionCommandEntry,
+  type MissionFeature,
   type ProposalDialogOutcome,
   type ProposedSwarmPlan,
   type QuestionAnswer,
   type QuestionOption,
   type QuestionSpec,
+  type SwarmDraftMode,
   type SwarmErrorCode,
   type SwarmMemberRole,
+  type SwarmMilestone,
   type SwarmRoleModelConfig,
   type SwarmRoleModels,
   type SwarmRunState,
@@ -206,6 +212,91 @@ export const InitialMemberProposalSchema = Type.Object({
   ),
 });
 
+export const MissionAssertionProposalSchema = Type.Object({
+  id: Type.String({
+    description:
+      'Unique validation contract assertion ID (e.g. "VAL-AUTH-001", "VAL-API-002").',
+  }),
+  title: Type.String({
+    description: "Short human-readable behavioral assertion title.",
+  }),
+  description: Type.String({
+    description:
+      "Concrete testable behavioral requirement verified before completion.",
+  }),
+  evidence_required: Type.Optional(
+    Type.String({
+      description:
+        "Optional concrete evidence required from independent verification (e.g. passing test command output, CLI check, or endpoint response).",
+    }),
+  ),
+});
+
+export const MissionFeatureProposalSchema = Type.Object({
+  id: Type.String({
+    description:
+      'Unique lowercase feature identifier (e.g. "oauth-pkce-client", "audit-log-sink").',
+  }),
+  title: Type.String({
+    description: "Short human-readable feature title.",
+  }),
+  description: Type.String({
+    description:
+      "Focused vertical implementation slice description with clear scope.",
+  }),
+  milestone: Type.String({
+    description:
+      'Ordered vertical milestone label this feature belongs to (e.g. "M1: Core Auth", "M2: Integration").',
+  }),
+  depends_on: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        "Optional upstream feature IDs that must complete before this feature starts (must form an acyclic DAG; omit for independent parallel features in the same milestone).",
+    }),
+  ),
+  files_owned: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        "Optional disjoint file or directory paths owned by this feature so parallel share workers never collide on the same file.",
+    }),
+  ),
+  preconditions: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        "Optional preconditions checked before starting this feature.",
+    }),
+  ),
+  expected_behavior: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        "Optional concrete behavioral outcomes expected from this feature.",
+    }),
+  ),
+  verification_steps: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        "Optional runnable verification commands/checks for this feature using already-installed repo scripts (no speculative npx -y downloads).",
+    }),
+  ),
+  fulfills: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        "Validation assertion IDs (VAL-*) claimed and fulfilled by this feature (100% of assertions must be claimed; each VAL-* ID must be claimed by a single feature).",
+    }),
+  ),
+});
+
+export const MissionCommandProposalSchema = Type.Object({
+  name: Type.String({
+    description:
+      'Canonical command slot name (e.g. "test", "typecheck", "build", "lint").',
+  }),
+  command: Type.String({
+    description:
+      "Exact runnable command discovered from package.json/repo config using already-installed tools (avoid speculative npx -y downloads).",
+  }),
+});
+
 export const ProposeSwarmPlanParamsSchema = Type.Object({
   title: Type.String({
     description: "Short human-readable title for this Dynamic Swarm run.",
@@ -246,11 +337,38 @@ export const ProposeSwarmPlanParamsSchema = Type.Object({
         "Optional wave-1 workers only by default (1–2 workers for small/single-module tasks; disjoint parallel 'share' workers for multi-module work). Spawn an independent 'validator' on demand once a worker commits/posts '[done]' (only include a validator initially when reviewing already-existing code). Keep briefs concise and grounded in already-installed repo verification scripts (no speculative 'npx -y' downloads). Leave omitted/empty to spawn dynamically after launch.",
     }),
   ),
+  assertions: Type.Optional(
+    Type.Array(MissionAssertionProposalSchema, {
+      description:
+        "Optional contract-first validation assertions (e.g. VAL-AUTH-001) defining concrete testable behaviors and required evidence. When provided, features must claim 100% of assertions via fulfills.",
+    }),
+  ),
+  features: Type.Optional(
+    Type.Array(MissionFeatureProposalSchema, {
+      description:
+        "Optional ordered vertical features grouped by milestone with acyclic depends_on, disjoint files_owned for parallel share worktrees, and 1-to-1 fulfills coverage of assertions.",
+    }),
+  ),
+  commands: Type.Optional(
+    Type.Array(MissionCommandProposalSchema, {
+      description:
+        "Optional canonical command manifest (test, typecheck, build, lint) discovered from package.json and repo configs.",
+    }),
+  ),
+  boundaries: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        "Optional mission boundaries (reserved port ranges, off-limits directories, external service rules).",
+    }),
+  ),
 });
 
 export type SwarmQuestionParams = Static<typeof SwarmQuestionParamsSchema>;
 export type SwarmQuestionnaireParams = Static<typeof SwarmQuestionnaireParamsSchema>;
 export type InitialMemberProposalParams = Static<typeof InitialMemberProposalSchema>;
+export type MissionAssertionProposalParams = Static<typeof MissionAssertionProposalSchema>;
+export type MissionFeatureProposalParams = Static<typeof MissionFeatureProposalSchema>;
+export type MissionCommandProposalParams = Static<typeof MissionCommandProposalSchema>;
 export type ProposeSwarmPlanParams = Static<typeof ProposeSwarmPlanParamsSchema>;
 
 // ============================================================================
@@ -384,14 +502,255 @@ function isReservedMemberName(name: string): name is ReservedMemberName {
   return (RESERVED_MEMBER_NAMES as readonly string[]).includes(name);
 }
 
+export interface ValidateProposedSwarmPlanOptions {
+  mode?: SwarmDraftMode;
+  existingRun?: SwarmRunState | null;
+  now?: string;
+}
+
+/**
+ * Auto-derives ordered `SwarmMilestone[]` in first-seen feature `milestone` order.
+ * When `existingMilestones` are supplied (e.g. during `/swarm tweak`), preserves
+ * `owner` and `sealed` / `sealedAt` on milestones whose features remain completed
+ * and whose fulfilled `VAL-*` assertions remain `"passed"`.
+ */
+export function deriveMilestonesFromFeatures(
+  features: readonly MissionFeature[],
+  existingMilestones?: readonly SwarmMilestone[],
+  assertions?: readonly MissionAssertion[],
+): SwarmMilestone[] {
+  const orderedLabels: string[] = [];
+  const seenLabels = new Set<string>();
+  for (const feat of features) {
+    const label = typeof feat.milestone === "string" ? feat.milestone.trim() : "";
+    if (label && !seenLabels.has(label)) {
+      seenLabels.add(label);
+      orderedLabels.push(label);
+    }
+  }
+
+  const existingByLabel = new Map<string, SwarmMilestone>();
+  if (Array.isArray(existingMilestones)) {
+    for (const ms of existingMilestones) {
+      if (ms && typeof ms.label === "string" && ms.label.trim()) {
+        existingByLabel.set(ms.label.trim(), ms);
+      }
+    }
+  }
+
+  const assertionById = new Map<string, MissionAssertion>();
+  if (Array.isArray(assertions)) {
+    for (const a of assertions) {
+      if (a && typeof a.id === "string" && a.id.trim()) {
+        assertionById.set(a.id.trim(), a);
+      }
+    }
+  }
+
+  return orderedLabels.map((label) => {
+    const group = features.filter((f) => f.milestone.trim() === label);
+    const activeGroup = group.filter((f) => f.status !== "cancelled");
+    let status: SwarmMilestone["status"] = "pending";
+    if (activeGroup.length > 0 && activeGroup.every((f) => f.status === "completed")) {
+      status = "done";
+    } else if (
+      group.some((f) => f.status === "in_progress" || f.status === "completed")
+    ) {
+      status = "in_progress";
+    } else if (group.some((f) => f.status === "failed")) {
+      status = "blocked";
+    }
+
+    const prev = existingByLabel.get(label);
+    const allFulfilledPassed = group.every((f) =>
+      f.fulfills.every((valId) => {
+        const linked = assertionById.get(valId);
+        return linked ? linked.status === "passed" : true;
+      }),
+    );
+    const preserveSealed =
+      prev?.sealed === true && status === "done" && allFulfilledPassed;
+
+    return {
+      label,
+      status,
+      ...(prev?.owner ? { owner: prev.owner } : {}),
+      ...(preserveSealed
+        ? {
+            sealed: true,
+            ...(prev?.sealedAt ? { sealedAt: prev.sealedAt } : {}),
+          }
+        : {}),
+    };
+  });
+}
+
+function collectFeatureDagErrors(
+  features: readonly Pick<MissionFeature, "id" | "dependsOn">[],
+  knownCompletedIds?: ReadonlySet<string>,
+): SwarmProtocolError[] {
+  const errors: SwarmProtocolError[] = [];
+  const featureById = new Map<string, Pick<MissionFeature, "id" | "dependsOn">>();
+  for (const feat of features) {
+    featureById.set(feat.id, feat);
+  }
+
+  for (const feat of features) {
+    for (const depId of feat.dependsOn ?? []) {
+      if (depId === feat.id) {
+        errors.push(
+          new SwarmProtocolError(
+            "INVALID_INPUT",
+            `Feature "${feat.id}" cannot depend on itself (self-cycle in depends_on: ${feat.id} -> ${feat.id}).`,
+            { featureId: feat.id, dependsOn: depId },
+          ),
+        );
+      } else if (!featureById.has(depId) && !knownCompletedIds?.has(depId)) {
+        errors.push(
+          new SwarmProtocolError(
+            "INVALID_INPUT",
+            `Feature "${feat.id}" depends_on unknown feature "${depId}".`,
+            { featureId: feat.id, dependsOn: depId },
+          ),
+        );
+      }
+    }
+  }
+
+  // 3-color DFS (0 = unvisited, 1 = visiting, 2 = visited) for cycle detection
+  const visitState = new Map<string, 0 | 1 | 2>();
+  const pathStack: string[] = [];
+  const reportedCycles = new Set<string>();
+
+  const dfs = (nodeId: string): void => {
+    visitState.set(nodeId, 1);
+    pathStack.push(nodeId);
+
+    const node = featureById.get(nodeId);
+    for (const depId of node?.dependsOn ?? []) {
+      if (depId === nodeId || !featureById.has(depId)) {
+        continue;
+      }
+      const depState = visitState.get(depId) ?? 0;
+      if (depState === 1) {
+        const cycleStart = pathStack.indexOf(depId);
+        const cycleSlice =
+          cycleStart >= 0 ? [...pathStack.slice(cycleStart), depId] : [nodeId, depId];
+        const cycleKey = cycleSlice.join("->");
+        if (!reportedCycles.has(cycleKey)) {
+          reportedCycles.add(cycleKey);
+          errors.push(
+            new SwarmProtocolError(
+              "INVALID_INPUT",
+              `Dependency cycle detected in features.depends_on: ${cycleSlice.join(" -> ")}. Features must form an acyclic DAG.`,
+              { cycle: cycleSlice },
+            ),
+          );
+        }
+      } else if (depState === 0) {
+        dfs(depId);
+      }
+    }
+
+    pathStack.pop();
+    visitState.set(nodeId, 2);
+  };
+
+  for (const feat of features) {
+    if ((visitState.get(feat.id) ?? 0) === 0) {
+      dfs(feat.id);
+    }
+  }
+
+  return errors;
+}
+
+/**
+ * Validates that `features` form a valid acyclic `dependsOn` DAG where every
+ * referenced dependency exists, throwing `SwarmProtocolError("INVALID_INPUT", ...)`
+ * on self-cycles, multi-hop cycles, or unknown feature references.
+ */
+export function assertFeatureDependencyDag(
+  features: readonly Pick<MissionFeature, "id" | "dependsOn">[],
+  knownCompletedIds?: ReadonlySet<string>,
+): void {
+  const errors = collectFeatureDagErrors(features, knownCompletedIds);
+  if (errors.length > 0) {
+    throw errors[0]!;
+  }
+}
+
+function normalizeValidatedStringList(
+  raw: unknown,
+  field: string,
+  ownerLabel: string,
+  issues: DraftPlanValidationIssue[],
+  options?: { rejectEmptyItems?: boolean; dedupe?: boolean },
+): string[] | undefined {
+  if (raw === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(raw)) {
+    issues.push({
+      code: "INVALID_INPUT",
+      field,
+      message: `${ownerLabel} "${field}" must be an array of strings.`,
+    });
+    return undefined;
+  }
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (let idx = 0; idx < raw.length; idx++) {
+    const item = raw[idx];
+    if (typeof item !== "string") {
+      issues.push({
+        code: "INVALID_INPUT",
+        field,
+        message: `${ownerLabel} "${field}" entry #${idx + 1} must be a string.`,
+      });
+      continue;
+    }
+    const trimmed = item.trim();
+    if (!trimmed) {
+      if (options?.rejectEmptyItems) {
+        issues.push({
+          code: "INVALID_INPUT",
+          field,
+          message: `${ownerLabel} "${field}" entry #${idx + 1} must not be empty.`,
+        });
+      }
+      continue;
+    }
+    if (isPrototypeKey(trimmed)) {
+      issues.push({
+        code: "INVALID_INPUT",
+        field,
+        message: `${ownerLabel} "${field}" entry "${trimmed}" is forbidden (prototype key).`,
+      });
+      continue;
+    }
+    if (options?.dedupe) {
+      if (!seen.has(trimmed)) {
+        seen.add(trimmed);
+        result.push(trimmed);
+      }
+    } else {
+      result.push(trimmed);
+    }
+  }
+  return result;
+}
+
 /**
  * Validates `propose_swarm_plan` parameters BEFORE opening any confirmation modal.
- * Verifies non-empty `title`/`objective`/`strategy`/`acceptance_criteria`, and checks
- * `initial_members` against `MEMBER_NAME_PATTERN`, `RESERVED_MEMBER_NAMES`, uniqueness,
- * valid role/workspace/brief, and valid `CHANNEL_NAME_PATTERN` channels.
+ * Verifies non-empty `title`/`objective`/`strategy`/`acceptance_criteria`, checks
+ * `initial_members`, validates Mission-Level TDD contracts (`assertions` + `features`
+ * uniqueness, `depends_on` DAG, 100% 1-to-1 `fulfills` coverage), and smart-merges
+ * existing progress + sealed milestone protection during `/swarm tweak`.
  */
 export function validateProposedSwarmPlan(
   params: ProposeSwarmPlanParams,
+  options?: ValidateProposedSwarmPlanOptions,
 ):
   | {
       valid: true;
@@ -400,12 +759,20 @@ export function validateProposedSwarmPlan(
       strategy: string;
       acceptanceCriteria: string;
       initialMembers?: InitialMemberProposal[];
+      assertions?: MissionAssertion[];
+      features?: MissionFeature[];
+      milestones?: SwarmMilestone[];
+      commands?: MissionCommandEntry[];
+      boundaries?: string[];
     }
   | {
       valid: false;
       issues: DraftPlanValidationIssue[];
     } {
   const issues: DraftPlanValidationIssue[] = [];
+  const nowIso = options?.now ?? new Date().toISOString();
+  const isTweak = options?.mode === "tweak" && Boolean(options?.existingRun);
+  const existingRun = isTweak ? options?.existingRun ?? null : null;
 
   const title = typeof params.title === "string" ? params.title.trim() : "";
   const objective =
@@ -593,8 +960,561 @@ export function validateProposedSwarmPlan(
     }
   }
 
+  // --------------------------------------------------------------------------
+  // Commands & Boundaries Validation
+  // --------------------------------------------------------------------------
+  let normalizedCommands: MissionCommandEntry[] | undefined;
+  if (params.commands !== undefined) {
+    if (!Array.isArray(params.commands)) {
+      issues.push({
+        code: "INVALID_INPUT",
+        field: "commands",
+        message: "Plan commands must be an array of { name, command } objects.",
+      });
+    } else {
+      const cmdMap = new Map<string, MissionCommandEntry>();
+      for (let i = 0; i < params.commands.length; i++) {
+        const rawCmd = params.commands[i];
+        if (!rawCmd || typeof rawCmd !== "object" || Array.isArray(rawCmd)) {
+          issues.push({
+            code: "INVALID_INPUT",
+            field: "commands",
+            message: `Command entry #${i + 1} must be an object with non-empty name and command.`,
+          });
+          continue;
+        }
+        const cmdName =
+          typeof rawCmd.name === "string" ? rawCmd.name.trim() : "";
+        const cmdBody =
+          typeof rawCmd.command === "string" ? rawCmd.command.trim() : "";
+        if (!cmdName || isPrototypeKey(cmdName)) {
+          issues.push({
+            code: "INVALID_INPUT",
+            field: "commands",
+            message: `Command entry #${i + 1} must have a valid non-empty name.`,
+          });
+          continue;
+        }
+        if (!cmdBody) {
+          issues.push({
+            code: "INVALID_INPUT",
+            field: "commands",
+            message: `Command "${cmdName}" must have a non-empty runnable command string.`,
+          });
+          continue;
+        }
+        cmdMap.set(cmdName, { name: cmdName, command: cmdBody });
+      }
+      if (cmdMap.size > 0) {
+        normalizedCommands = [...cmdMap.values()];
+      }
+    }
+  } else if (existingRun?.commands && existingRun.commands.length > 0) {
+    normalizedCommands = existingRun.commands.map((c) => ({ ...c }));
+  }
+
+  let normalizedBoundaries: string[] | undefined;
+  if (params.boundaries !== undefined) {
+    if (!Array.isArray(params.boundaries)) {
+      issues.push({
+        code: "INVALID_INPUT",
+        field: "boundaries",
+        message: "Plan boundaries must be an array of strings.",
+      });
+    } else {
+      const bounds: string[] = [];
+      for (let i = 0; i < params.boundaries.length; i++) {
+        const rawB = params.boundaries[i];
+        if (typeof rawB !== "string") {
+          issues.push({
+            code: "INVALID_INPUT",
+            field: "boundaries",
+            message: `Boundary entry #${i + 1} must be a string.`,
+          });
+          continue;
+        }
+        const trimmedB = rawB.trim();
+        if (trimmedB) {
+          bounds.push(trimmedB);
+        }
+      }
+      if (bounds.length > 0) {
+        normalizedBoundaries = bounds;
+      }
+    }
+  } else if (existingRun?.boundaries && existingRun.boundaries.length > 0) {
+    normalizedBoundaries = [...existingRun.boundaries];
+  }
+
+  // --------------------------------------------------------------------------
+  // Mission-Level TDD Validation (assertions & features) + Dynamic Tweak Merge
+  // --------------------------------------------------------------------------
+  const incomingAssertions: MissionAssertion[] = [];
+  const seenAssertionIds = new Set<string>();
+  if (params.assertions !== undefined) {
+    if (!Array.isArray(params.assertions)) {
+      issues.push({
+        code: "INVALID_INPUT",
+        field: "assertions",
+        message: "Plan assertions must be an array of validation assertion objects.",
+      });
+    } else {
+      for (let i = 0; i < params.assertions.length; i++) {
+        const rawA = params.assertions[i];
+        if (!rawA || typeof rawA !== "object" || Array.isArray(rawA)) {
+          issues.push({
+            code: "INVALID_INPUT",
+            field: "assertions",
+            message: `Assertion #${i + 1} must be an object.`,
+          });
+          continue;
+        }
+        const aId = typeof rawA.id === "string" ? rawA.id.trim() : "";
+        const aTag = aId || `#${i + 1}`;
+        if (!aId) {
+          issues.push({
+            code: "INVALID_INPUT",
+            field: "assertions",
+            message: `Assertion #${i + 1} must have a non-empty id (e.g. "VAL-AUTH-001").`,
+          });
+        } else if (isPrototypeKey(aId)) {
+          issues.push({
+            code: "INVALID_INPUT",
+            field: "assertions",
+            message: `Assertion id "${aId}" is forbidden (prototype key).`,
+          });
+        } else if (seenAssertionIds.has(aId)) {
+          issues.push({
+            code: "INVALID_INPUT",
+            field: "assertions",
+            message: `Duplicate assertion id "${aId}" — every assertion must have a unique id.`,
+          });
+        } else {
+          seenAssertionIds.add(aId);
+        }
+
+        const aTitle = typeof rawA.title === "string" ? rawA.title.trim() : "";
+        if (!aTitle) {
+          issues.push({
+            code: "INVALID_INPUT",
+            field: "assertions",
+            message: `Assertion "${aTag}" must have a non-empty title.`,
+          });
+        }
+
+        const aDesc =
+          typeof rawA.description === "string" ? rawA.description.trim() : "";
+        if (!aDesc) {
+          issues.push({
+            code: "INVALID_INPUT",
+            field: "assertions",
+            message: `Assertion "${aTag}" must have a non-empty description.`,
+          });
+        }
+
+        const aEvReq =
+          typeof rawA.evidence_required === "string" &&
+          rawA.evidence_required.trim().length > 0
+            ? rawA.evidence_required.trim()
+            : undefined;
+
+        if (aId && !isPrototypeKey(aId) && aTitle && aDesc) {
+          incomingAssertions.push({
+            id: aId,
+            title: aTitle,
+            description: aDesc,
+            ...(aEvReq !== undefined ? { evidenceRequired: aEvReq } : {}),
+            status: "pending",
+            updatedAt: nowIso,
+          });
+        }
+      }
+    }
+  }
+
+  const incomingFeatures: MissionFeature[] = [];
+  const seenFeatureIds = new Set<string>();
+  if (params.features !== undefined) {
+    if (!Array.isArray(params.features)) {
+      issues.push({
+        code: "INVALID_INPUT",
+        field: "features",
+        message: "Plan features must be an array of feature objects.",
+      });
+    } else {
+      for (let i = 0; i < params.features.length; i++) {
+        const rawF = params.features[i];
+        if (!rawF || typeof rawF !== "object" || Array.isArray(rawF)) {
+          issues.push({
+            code: "INVALID_INPUT",
+            field: "features",
+            message: `Feature #${i + 1} must be an object.`,
+          });
+          continue;
+        }
+        const fId = typeof rawF.id === "string" ? rawF.id.trim() : "";
+        const fTag = fId || `#${i + 1}`;
+        if (!fId) {
+          issues.push({
+            code: "INVALID_INPUT",
+            field: "features",
+            message: `Feature #${i + 1} must have a non-empty id.`,
+          });
+        } else if (isPrototypeKey(fId)) {
+          issues.push({
+            code: "INVALID_INPUT",
+            field: "features",
+            message: `Feature id "${fId}" is forbidden (prototype key).`,
+          });
+        } else if (seenFeatureIds.has(fId)) {
+          issues.push({
+            code: "INVALID_INPUT",
+            field: "features",
+            message: `Duplicate feature id "${fId}" — every feature must have a unique id.`,
+          });
+        } else {
+          seenFeatureIds.add(fId);
+        }
+
+        const fTitle = typeof rawF.title === "string" ? rawF.title.trim() : "";
+        if (!fTitle) {
+          issues.push({
+            code: "INVALID_INPUT",
+            field: "features",
+            message: `Feature "${fTag}" must have a non-empty title.`,
+          });
+        }
+
+        const fDesc =
+          typeof rawF.description === "string" ? rawF.description.trim() : "";
+        if (!fDesc) {
+          issues.push({
+            code: "INVALID_INPUT",
+            field: "features",
+            message: `Feature "${fTag}" must have a non-empty description.`,
+          });
+        }
+
+        const fMilestone =
+          typeof rawF.milestone === "string" ? rawF.milestone.trim() : "";
+        if (!fMilestone) {
+          issues.push({
+            code: "INVALID_INPUT",
+            field: "features",
+            message: `Feature "${fTag}" must have a non-empty milestone.`,
+          });
+        }
+
+        const ownerLabel = `Feature "${fTag}"`;
+        const dependsOn = normalizeValidatedStringList(
+          rawF.depends_on,
+          "depends_on",
+          ownerLabel,
+          issues,
+          { rejectEmptyItems: true, dedupe: true },
+        );
+        const filesOwned = normalizeValidatedStringList(
+          rawF.files_owned,
+          "files_owned",
+          ownerLabel,
+          issues,
+          { dedupe: true },
+        );
+        const preconditions = normalizeValidatedStringList(
+          rawF.preconditions,
+          "preconditions",
+          ownerLabel,
+          issues,
+        );
+        const expectedBehavior = normalizeValidatedStringList(
+          rawF.expected_behavior,
+          "expected_behavior",
+          ownerLabel,
+          issues,
+        );
+        const verificationSteps = normalizeValidatedStringList(
+          rawF.verification_steps,
+          "verification_steps",
+          ownerLabel,
+          issues,
+        );
+        const fulfills =
+          normalizeValidatedStringList(
+            rawF.fulfills,
+            "fulfills",
+            ownerLabel,
+            issues,
+            { rejectEmptyItems: true, dedupe: true },
+          ) ?? [];
+
+        if (fId && !isPrototypeKey(fId) && fTitle && fDesc && fMilestone) {
+          incomingFeatures.push({
+            id: fId,
+            title: fTitle,
+            description: fDesc,
+            milestone: fMilestone,
+            ...(dependsOn && dependsOn.length > 0 ? { dependsOn } : {}),
+            ...(filesOwned && filesOwned.length > 0 ? { filesOwned } : {}),
+            ...(preconditions && preconditions.length > 0
+              ? { preconditions }
+              : {}),
+            ...(expectedBehavior && expectedBehavior.length > 0
+              ? { expectedBehavior }
+              : {}),
+            ...(verificationSteps && verificationSteps.length > 0
+              ? { verificationSteps }
+              : {}),
+            fulfills,
+            status: "pending",
+            updatedAt: nowIso,
+          });
+        }
+      }
+    }
+  }
+
+  const existingAssertionMap = new Map<string, MissionAssertion>();
+  for (const prevA of existingRun?.assertions ?? []) {
+    if (prevA && typeof prevA.id === "string" && prevA.id.trim()) {
+      existingAssertionMap.set(prevA.id.trim(), prevA);
+    }
+  }
+
+  const existingFeatureMap = new Map<string, MissionFeature>();
+  for (const prevF of existingRun?.features ?? []) {
+    if (prevF && typeof prevF.id === "string" && prevF.id.trim()) {
+      existingFeatureMap.set(prevF.id.trim(), prevF);
+    }
+  }
+
+  const sealedMilestoneLabels = new Set<string>();
+  for (const ms of existingRun?.milestones ?? []) {
+    if (ms && ms.sealed === true && typeof ms.label === "string" && ms.label.trim()) {
+      sealedMilestoneLabels.add(ms.label.trim());
+    }
+  }
+
+  // Sealed milestone gate in tweak mode: reject adding new features (or moving features) into sealed milestones
+  if (existingRun && sealedMilestoneLabels.size > 0) {
+    for (const feat of incomingFeatures) {
+      const prevFeat = existingFeatureMap.get(feat.id);
+      if (
+        sealedMilestoneLabels.has(feat.milestone) &&
+        (!prevFeat || prevFeat.milestone.trim() !== feat.milestone)
+      ) {
+        const err = new SwarmProtocolError(
+          "INVALID_INPUT",
+          `Cannot add new feature "${feat.id}" into already sealed milestone "${feat.milestone}" — add a follow-up milestone instead.`,
+          { featureId: feat.id, milestone: feat.milestone },
+        );
+        issues.push({
+          code: err.code,
+          field: "features",
+          message: err.message,
+        });
+      }
+    }
+  }
+
+  // Known completed features from existingRun (supports incremental tweak depends_on references)
+  const carriedCompletedIds = new Set<string>();
+  if (existingRun && params.features !== undefined) {
+    for (const [prevId, prevFeat] of existingFeatureMap.entries()) {
+      if (
+        prevFeat.status === "completed" &&
+        !seenFeatureIds.has(prevId) &&
+        !prevFeat.fulfills.some((valId) => seenAssertionIds.has(valId))
+      ) {
+        carriedCompletedIds.add(prevId);
+      }
+    }
+  }
+
+  // Validate depends_on existence & acyclic DAG
+  if (incomingFeatures.length > 0) {
+    const dagErrors = collectFeatureDagErrors(
+      incomingFeatures,
+      carriedCompletedIds.size > 0 ? carriedCompletedIds : undefined,
+    );
+    for (const err of dagErrors) {
+      issues.push({
+        code: err.code,
+        field: "features",
+        message: err.message,
+      });
+    }
+  }
+
+  // Validate fulfills references:
+  // - Every ID in feature.fulfills[] must match a defined assertion.id in assertions
+  // - Reject duplicate fulfills claiming the same VAL-* across multiple features (1-to-1 leaf rule)
+  // - If assertions is non-empty, require features to claim 100% of assertions (zero orphan assertions)
+  const claimedAssertions = new Map<string, string>();
+  for (const feat of incomingFeatures) {
+    for (const valId of feat.fulfills) {
+      if (!seenAssertionIds.has(valId)) {
+        issues.push({
+          code: "INVALID_INPUT",
+          field: "features",
+          message: `Feature "${feat.id}" fulfills unknown assertion "${valId}" — define "${valId}" in assertions first.`,
+        });
+        continue;
+      }
+      const existingOwner = claimedAssertions.get(valId);
+      if (existingOwner && existingOwner !== feat.id) {
+        issues.push({
+          code: "INVALID_INPUT",
+          field: "features",
+          message: `Duplicate fulfills claim for assertion "${valId}" across features "${existingOwner}" and "${feat.id}" — each assertion must be claimed by a single feature (1-to-1).`,
+        });
+      } else {
+        claimedAssertions.set(valId, feat.id);
+      }
+    }
+  }
+
+  if (incomingAssertions.length > 0) {
+    const unclaimed = incomingAssertions
+      .filter((a) => !claimedAssertions.has(a.id))
+      .map((a) => a.id);
+    if (unclaimed.length > 0) {
+      issues.push({
+        code: "INVALID_INPUT",
+        field: "assertions",
+        message: `Unclaimed assertion(s) in validation contract: ${unclaimed.join(", ")} — features must claim 100% of assertions via fulfills[].`,
+      });
+    }
+  }
+
   if (issues.length > 0) {
     return { valid: false, issues };
+  }
+
+  // Smart normalization & tweak-mode merge onto ProposedSwarmPlan
+  let finalAssertions: MissionAssertion[] | undefined;
+  let finalFeatures: MissionFeature[] | undefined;
+  let finalMilestones: SwarmMilestone[] | undefined;
+
+  const hasExplicitContractInput =
+    params.assertions !== undefined || params.features !== undefined;
+
+  if (hasExplicitContractInput) {
+    const mergedAssertions: MissionAssertion[] = [];
+    const mergedFeatures: MissionFeature[] = [];
+
+    // Carry forward already-completed features & their assertions on incremental tweak
+    if (existingRun && carriedCompletedIds.size > 0) {
+      const carriedAssertionIds = new Set<string>();
+      for (const prevId of carriedCompletedIds) {
+        const prevFeat = existingFeatureMap.get(prevId);
+        if (!prevFeat) continue;
+        mergedFeatures.push(structuredClone(prevFeat));
+        for (const valId of prevFeat.fulfills) {
+          if (!seenAssertionIds.has(valId) && !carriedAssertionIds.has(valId)) {
+            const prevAssert = existingAssertionMap.get(valId);
+            if (prevAssert) {
+              carriedAssertionIds.add(valId);
+              mergedAssertions.push(structuredClone(prevAssert));
+            }
+          }
+        }
+      }
+    }
+
+    for (const incA of incomingAssertions) {
+      const prevA = existingAssertionMap.get(incA.id);
+      if (prevA) {
+        const prevDesc = (prevA.description ?? "").trim();
+        const prevEvReq = (prevA.evidenceRequired ?? "").trim();
+        const nextEvReq = (incA.evidenceRequired ?? "").trim();
+        const contractUnchanged =
+          prevDesc === incA.description && prevEvReq === nextEvReq;
+
+        if (contractUnchanged) {
+          mergedAssertions.push({
+            id: incA.id,
+            title: incA.title,
+            description: incA.description,
+            ...(incA.evidenceRequired !== undefined
+              ? { evidenceRequired: incA.evidenceRequired }
+              : {}),
+            status: prevA.status,
+            ...(prevA.evidence !== undefined ? { evidence: prevA.evidence } : {}),
+            ...(prevA.verifiedBy !== undefined
+              ? { verifiedBy: prevA.verifiedBy }
+              : {}),
+            ...(prevA.verifiedByRole !== undefined
+              ? { verifiedByRole: prevA.verifiedByRole }
+              : {}),
+            updatedAt: prevA.updatedAt || nowIso,
+          });
+          continue;
+        }
+      }
+      // Brand-new assertion OR description/evidenceRequired changed -> reset to "pending"
+      mergedAssertions.push(incA);
+    }
+
+    for (const incF of incomingFeatures) {
+      const prevF = existingFeatureMap.get(incF.id);
+      if (prevF && prevF.status === "completed") {
+        mergedFeatures.push({
+          ...incF,
+          status: "completed",
+          ...(prevF.assignedMember !== undefined
+            ? { assignedMember: prevF.assignedMember }
+            : {}),
+          ...(prevF.mergedCommitSha !== undefined
+            ? { mergedCommitSha: prevF.mergedCommitSha }
+            : {}),
+          updatedAt: prevF.updatedAt || nowIso,
+        });
+        continue;
+      }
+      if (prevF && prevF.status === "in_progress") {
+        mergedFeatures.push({
+          ...incF,
+          status: "in_progress",
+          ...(prevF.assignedMember !== undefined
+            ? { assignedMember: prevF.assignedMember }
+            : {}),
+          ...(prevF.mergedCommitSha !== undefined
+            ? { mergedCommitSha: prevF.mergedCommitSha }
+            : {}),
+          updatedAt: prevF.updatedAt || nowIso,
+        });
+        continue;
+      }
+      mergedFeatures.push(incF);
+    }
+
+    if (mergedAssertions.length > 0) {
+      finalAssertions = mergedAssertions;
+    }
+    if (mergedFeatures.length > 0) {
+      finalFeatures = mergedFeatures;
+      finalMilestones = deriveMilestonesFromFeatures(
+        mergedFeatures,
+        existingRun?.milestones,
+        mergedAssertions,
+      );
+    }
+  } else if (existingRun) {
+    if (existingRun.assertions && existingRun.assertions.length > 0) {
+      finalAssertions = structuredClone(existingRun.assertions);
+    }
+    if (existingRun.features && existingRun.features.length > 0) {
+      finalFeatures = structuredClone(existingRun.features);
+    }
+    if (existingRun.milestones && existingRun.milestones.length > 0) {
+      finalMilestones = structuredClone(existingRun.milestones);
+    } else if (finalFeatures && finalFeatures.length > 0) {
+      finalMilestones = deriveMilestonesFromFeatures(
+        finalFeatures,
+        undefined,
+        finalAssertions,
+      );
+    }
   }
 
   return {
@@ -604,6 +1524,13 @@ export function validateProposedSwarmPlan(
     strategy,
     acceptanceCriteria,
     ...(normalizedMembers.length > 0 ? { initialMembers: normalizedMembers } : {}),
+    ...(finalAssertions ? { assertions: finalAssertions } : {}),
+    ...(finalFeatures ? { features: finalFeatures } : {}),
+    ...(finalMilestones && finalMilestones.length > 0
+      ? { milestones: finalMilestones }
+      : {}),
+    ...(normalizedCommands ? { commands: normalizedCommands } : {}),
+    ...(normalizedBoundaries ? { boundaries: normalizedBoundaries } : {}),
   };
 }
 
@@ -1391,11 +2318,11 @@ export function createProposeSwarmPlanTool(
     name: PROPOSE_SWARM_PLAN_TOOL,
     label: "Swarm Plan",
     description:
-      "Validate a Flexible Dynamic Swarm Plan, render a compact expandable summary card (with full strategy, acceptance criteria, 3-role models, and optional initial members on expand), and ask the user to Confirm, Continue refining, or Cancel.",
+      "Validate a Contract-First Dynamic Swarm Plan (including optional VAL-* assertions, milestone features with 100% fulfills coverage, commands, and boundaries), render a compact expandable summary card, and ask the user to Confirm, Continue refining, or Cancel.",
     promptSnippet:
-      "Validate and present a Flexible Dynamic Swarm Plan (title, objective, strategy, acceptance criteria, optional initial members) for user confirmation before launching.",
+      "Validate and present a Contract-First Dynamic Swarm Plan (title, objective, strategy, acceptance criteria, VAL-* assertions, milestone features, commands, boundaries, optional initial members) for user confirmation before launching.",
     promptGuidelines: [
-      `Call \`${PROPOSE_SWARM_PLAN_TOOL}\` once requirements are clear with wave-by-wave disjoint file/directory ownership in \`strategy\`, exact runnable verification commands using already-installed repo scripts (no speculative \`npx -y\` downloads) in \`acceptance_criteria\`, and wave-1 workers only in \`initial_members\` (spawn \`validator\` on demand once workers commit/post \`[done]\`); do NOT duplicate the full plan in prose beforehand because the expandable proposal card and confirmation modal present it automatically.`,
+      `Call \`${PROPOSE_SWARM_PLAN_TOOL}\` once requirements are clear with wave-by-wave disjoint file/directory ownership in \`strategy\`, exact runnable verification commands using already-installed repo scripts (no speculative \`npx -y\` downloads) in \`acceptance_criteria\` and \`commands\`, testable \`VAL-<AREA>-<NNN>\` \`assertions\` paired with ordered \`features\` (100% \`fulfills\` coverage + acyclic \`depends_on\` + disjoint \`files_owned\`), and wave-1 workers only in \`initial_members\` (spawn \`validator\` on demand once workers commit/post \`[done]\`); do NOT duplicate the full plan in prose beforehand because the expandable proposal card and confirmation modal present it automatically.`,
     ],
     exposure: "model-only",
     defaultActive: false,
@@ -1444,14 +2371,83 @@ export function createProposeSwarmPlanTool(
         });
       }
 
+      if (Array.isArray(obj.assertions)) {
+        prepared.assertions = obj.assertions.map((item) => {
+          if (!item || typeof item !== "object" || Array.isArray(item)) {
+            return item;
+          }
+          const a = item as Record<string, unknown>;
+          const evReq =
+            typeof a.evidence_required === "string"
+              ? a.evidence_required
+              : typeof a.evidenceRequired === "string"
+                ? a.evidenceRequired
+                : undefined;
+          return {
+            ...a,
+            id: typeof a.id === "string" ? a.id : "",
+            title: typeof a.title === "string" ? a.title : "",
+            description: typeof a.description === "string" ? a.description : "",
+            ...(evReq !== undefined ? { evidence_required: evReq } : {}),
+          };
+        });
+      }
+
+      if (Array.isArray(obj.features)) {
+        prepared.features = obj.features.map((item) => {
+          if (!item || typeof item !== "object" || Array.isArray(item)) {
+            return item;
+          }
+          const f = item as Record<string, unknown>;
+          return {
+            ...f,
+            id: typeof f.id === "string" ? f.id : "",
+            title: typeof f.title === "string" ? f.title : "",
+            description: typeof f.description === "string" ? f.description : "",
+            milestone: typeof f.milestone === "string" ? f.milestone : "",
+          };
+        });
+      }
+
+      if (Array.isArray(obj.commands)) {
+        prepared.commands = obj.commands.map((item) => {
+          if (!item || typeof item !== "object" || Array.isArray(item)) {
+            return item;
+          }
+          const c = item as Record<string, unknown>;
+          return {
+            ...c,
+            name: typeof c.name === "string" ? c.name : "",
+            command: typeof c.command === "string" ? c.command : "",
+          };
+        });
+      }
+
       return prepared as ProposeSwarmPlanParams;
     },
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const currentDraft = ensureDraftSynced(draftController, ctx);
       const settings = deps.getSettings();
 
-      // Step 1: Pre-modal validation (non-empty required fields + valid/unique/non-reserved initial_members)
-      const validation = validateProposedSwarmPlan(params);
+      // Load existing run in tweak mode so pre-modal gates & smart progress merge inspect real state
+      let existingRun: SwarmRunState | null = null;
+      if (
+        currentDraft?.mode === "tweak" &&
+        currentDraft.targetRunId &&
+        deps.store
+      ) {
+        try {
+          existingRun = await deps.store.loadRun(currentDraft.targetRunId);
+        } catch {
+          existingRun = null;
+        }
+      }
+
+      // Step 1: Pre-modal validation (required fields, initial_members, VAL-* assertions, features DAG & fulfills, sealed milestones)
+      const validation = validateProposedSwarmPlan(params, {
+        mode: currentDraft?.mode,
+        existingRun,
+      });
       if (!validation.valid) {
         return {
           isError: true,
@@ -1495,6 +2491,17 @@ export function createProposeSwarmPlanTool(
         roleModels,
         ...(validation.initialMembers
           ? { initialMembers: validation.initialMembers }
+          : {}),
+        ...(validation.assertions ? { assertions: validation.assertions } : {}),
+        ...(validation.features ? { features: validation.features } : {}),
+        ...(validation.milestones ? { milestones: validation.milestones } : {}),
+        ...(validation.commands ? { commands: validation.commands } : {}),
+        ...(validation.boundaries ? { boundaries: validation.boundaries } : {}),
+        ...(existingRun?.handoffItems && existingRun.handoffItems.length > 0
+          ? { handoffItems: structuredClone(existingRun.handoffItems) }
+          : {}),
+        ...(existingRun?.lastAudit
+          ? { lastAudit: structuredClone(existingRun.lastAudit) }
           : {}),
       };
 
@@ -1711,6 +2718,105 @@ export function createProposeSwarmPlanTool(
             : {}),
         }));
 
+      const rawAssertions = Array.isArray(args?.assertions)
+        ? args.assertions
+        : [];
+      const previewTimestamp = "";
+      const previewAssertions: MissionAssertion[] = rawAssertions
+        .filter((item): item is MissionAssertionProposalParams =>
+          Boolean(item && typeof item === "object" && !Array.isArray(item)),
+        )
+        .map((a, idx) => {
+          const id =
+            typeof a.id === "string" && a.id.trim()
+              ? a.id.trim()
+              : `VAL-${idx + 1}`;
+          const title = typeof a.title === "string" ? a.title.trim() : "";
+          const description =
+            typeof a.description === "string" ? a.description.trim() : "";
+          const evReq =
+            typeof a.evidence_required === "string" && a.evidence_required.trim()
+              ? a.evidence_required.trim()
+              : undefined;
+          return {
+            id,
+            title,
+            description,
+            ...(evReq !== undefined ? { evidenceRequired: evReq } : {}),
+            status: "pending" as const,
+            updatedAt: previewTimestamp,
+          };
+        });
+
+      const toCleanStringArray = (raw: unknown): string[] =>
+        Array.isArray(raw)
+          ? raw
+              .filter((v): v is string => typeof v === "string")
+              .map((v) => v.trim())
+              .filter(Boolean)
+          : [];
+
+      const rawFeatures = Array.isArray(args?.features) ? args.features : [];
+      const previewFeatures: MissionFeature[] = rawFeatures
+        .filter((item): item is MissionFeatureProposalParams =>
+          Boolean(item && typeof item === "object" && !Array.isArray(item)),
+        )
+        .map((f, idx) => {
+          const id =
+            typeof f.id === "string" && f.id.trim()
+              ? f.id.trim()
+              : `feature-${idx + 1}`;
+          const title = typeof f.title === "string" ? f.title.trim() : "";
+          const description =
+            typeof f.description === "string" ? f.description.trim() : "";
+          const milestone =
+            typeof f.milestone === "string" && f.milestone.trim()
+              ? f.milestone.trim()
+              : "Milestone 1";
+          const dependsOn = toCleanStringArray(f.depends_on);
+          const filesOwned = toCleanStringArray(f.files_owned);
+          const preconditions = toCleanStringArray(f.preconditions);
+          const expectedBehavior = toCleanStringArray(f.expected_behavior);
+          const verificationSteps = toCleanStringArray(f.verification_steps);
+          const fulfills = toCleanStringArray(f.fulfills);
+          return {
+            id,
+            title,
+            description,
+            milestone,
+            ...(dependsOn.length > 0 ? { dependsOn } : {}),
+            ...(filesOwned.length > 0 ? { filesOwned } : {}),
+            ...(preconditions.length > 0 ? { preconditions } : {}),
+            ...(expectedBehavior.length > 0 ? { expectedBehavior } : {}),
+            ...(verificationSteps.length > 0 ? { verificationSteps } : {}),
+            fulfills,
+            status: "pending" as const,
+            updatedAt: previewTimestamp,
+          };
+        });
+
+      const previewMilestones =
+        previewFeatures.length > 0
+          ? deriveMilestonesFromFeatures(
+              previewFeatures,
+              undefined,
+              previewAssertions,
+            )
+          : [];
+
+      const rawCommands = Array.isArray(args?.commands) ? args.commands : [];
+      const previewCommands: MissionCommandEntry[] = rawCommands
+        .filter((item): item is MissionCommandProposalParams =>
+          Boolean(item && typeof item === "object" && !Array.isArray(item)),
+        )
+        .map((c) => ({
+          name: typeof c.name === "string" ? c.name.trim() : "",
+          command: typeof c.command === "string" ? c.command.trim() : "",
+        }))
+        .filter((c) => Boolean(c.name && c.command));
+
+      const previewBoundaries = toCleanStringArray(args?.boundaries);
+
       const draftBranch =
         draft?.baseBranch && draft.baseBranch !== "HEAD"
           ? draft.baseBranch
@@ -1739,6 +2845,11 @@ export function createProposeSwarmPlanTool(
             : draft?.validatorEnabled ?? settings.validatorEnabled,
         roleModels: buildRoleModelsFromSettings(settings),
         ...(previewMembers.length > 0 ? { initialMembers: previewMembers } : {}),
+        ...(previewAssertions.length > 0 ? { assertions: previewAssertions } : {}),
+        ...(previewFeatures.length > 0 ? { features: previewFeatures } : {}),
+        ...(previewMilestones.length > 0 ? { milestones: previewMilestones } : {}),
+        ...(previewCommands.length > 0 ? { commands: previewCommands } : {}),
+        ...(previewBoundaries.length > 0 ? { boundaries: previewBoundaries } : {}),
       };
 
       const modeBadge = draft?.autoConfirm
@@ -1772,6 +2883,39 @@ export function createProposeSwarmPlanTool(
           `  ${theme.fg("muted", "Title:")} ${theme.fg("accent", titleSnippet)}${streamingTag} ${expandHint}`,
           `  ${theme.fg("muted", "Role Models:")} ${modelPills}`,
         ];
+        const contractParts: string[] = [];
+        if (previewFeatures.length > 0) {
+          contractParts.push(
+            `${previewFeatures.length} ${previewFeatures.length === 1 ? "feature" : "features"}`,
+          );
+        }
+        if (previewAssertions.length > 0) {
+          contractParts.push(
+            `${previewAssertions.length} VAL ${previewAssertions.length === 1 ? "assertion" : "assertions"}`,
+          );
+        }
+        if (previewMilestones.length > 0) {
+          contractParts.push(
+            `${previewMilestones.length} ${previewMilestones.length === 1 ? "milestone" : "milestones"}`,
+          );
+        }
+        if (contractParts.length === 0) {
+          if (previewCommands.length > 0) {
+            contractParts.push(
+              `${previewCommands.length} ${previewCommands.length === 1 ? "command" : "commands"}`,
+            );
+          }
+          if (previewBoundaries.length > 0) {
+            contractParts.push(
+              `${previewBoundaries.length} ${previewBoundaries.length === 1 ? "boundary" : "boundaries"}`,
+            );
+          }
+        }
+        if (contractParts.length > 0) {
+          lines.push(
+            `  ${theme.fg("muted", "Contract:")} ${theme.fg("accent", contractParts.join(" · "))}`,
+          );
+        }
         if (previewMembers.length > 0) {
           const memberTags = previewMembers
             .slice(0, 4)
