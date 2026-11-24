@@ -175,6 +175,30 @@ async function assertNoSymlinksWithin(
   }
 }
 
+function normalizeOptionalBoardString(raw: unknown): string | undefined {
+  if (typeof raw !== "string") {
+    return undefined;
+  }
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function normalizeOptionalBoardStringList(raw: unknown): string[] | undefined {
+  if (!Array.isArray(raw)) {
+    return undefined;
+  }
+  const items: string[] = [];
+  for (const entry of raw) {
+    if (typeof entry === "string") {
+      const trimmed = entry.trim();
+      if (trimmed.length > 0) {
+        items.push(trimmed);
+      }
+    }
+  }
+  return items.length > 0 ? items : undefined;
+}
+
 function parseBoardLines(raw: string): BoardMessage[] {
   const messages: BoardMessage[] = [];
   // Split strictly on LF (\n) to prevent U+2028/U+2029 corruption.
@@ -219,6 +243,14 @@ function parseBoardLines(raw: string): BoardMessage[] {
               )
               .map((c) => c.trim().toLowerCase())
           : [];
+        const featureId = normalizeOptionalBoardString(parsed.featureId);
+        const discoveredIssues = normalizeOptionalBoardStringList(
+          parsed.discoveredIssues,
+        );
+        const leftUndone = normalizeOptionalBoardStringList(parsed.leftUndone);
+        const verificationEvidence = normalizeOptionalBoardString(
+          parsed.verificationEvidence,
+        );
         messages.push({
           seq: Math.floor(parsed.seq),
           runId: parsed.runId,
@@ -231,6 +263,12 @@ function parseBoardLines(raw: string): BoardMessage[] {
           ),
           channelMentions,
           kind,
+          ...(featureId !== undefined ? { featureId } : {}),
+          ...(discoveredIssues !== undefined ? { discoveredIssues } : {}),
+          ...(leftUndone !== undefined ? { leftUndone } : {}),
+          ...(verificationEvidence !== undefined
+            ? { verificationEvidence }
+            : {}),
           timestamp: parsed.timestamp,
         });
       }
@@ -634,6 +672,14 @@ export class SwarmBoard implements ISwarmBoard {
         : "orchestrator";
       const mentions = mergeMentions(text, input.mentions, input.knownMembers);
       const channelMentions = mergeChannelMentions(text, input.channelMentions);
+      const featureId = normalizeOptionalBoardString(input.featureId);
+      const discoveredIssues = normalizeOptionalBoardStringList(
+        input.discoveredIssues,
+      );
+      const leftUndone = normalizeOptionalBoardStringList(input.leftUndone);
+      const verificationEvidence = normalizeOptionalBoardString(
+        input.verificationEvidence,
+      );
 
       const minSeq =
         typeof input.minSeq === "number" && Number.isFinite(input.minSeq)
@@ -651,6 +697,10 @@ export class SwarmBoard implements ISwarmBoard {
         mentions,
         channelMentions,
         kind,
+        ...(featureId !== undefined ? { featureId } : {}),
+        ...(discoveredIssues !== undefined ? { discoveredIssues } : {}),
+        ...(leftUndone !== undefined ? { leftUndone } : {}),
+        ...(verificationEvidence !== undefined ? { verificationEvidence } : {}),
         timestamp: new Date().toISOString(),
       };
 
@@ -754,7 +804,19 @@ export class SwarmBoard implements ISwarmBoard {
               lower.includes(searchNeedle) ||
               `@#${lower}`.includes(searchNeedle)
             );
-          }),
+          }) ||
+          (m.featureId !== undefined &&
+            m.featureId.toLowerCase().includes(searchNeedle)) ||
+          (m.verificationEvidence !== undefined &&
+            m.verificationEvidence.toLowerCase().includes(searchNeedle)) ||
+          (m.discoveredIssues !== undefined &&
+            m.discoveredIssues.some((issue) =>
+              issue.toLowerCase().includes(searchNeedle),
+            )) ||
+          (m.leftUndone !== undefined &&
+            m.leftUndone.some((item) =>
+              item.toLowerCase().includes(searchNeedle),
+            )),
       );
     }
 

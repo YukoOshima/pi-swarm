@@ -1,5 +1,6 @@
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { SWARM_MISSION_OPS } from "./constants.js";
 
 // ============================================================================
 // 3-Role Model Configuration & Settings
@@ -92,7 +93,10 @@ export type SwarmAction =
   | "kill"
   | "merge"
   | "channel"
+  | "mission"
   | "done";
+
+export type SwarmMissionOp = (typeof SWARM_MISSION_OPS)[number];
 
 export type SwarmChannelAction =
   | "create"
@@ -193,6 +197,10 @@ export interface BoardMessage {
   mentions: string[];
   channelMentions: string[];
   kind: BoardMessageKind;
+  featureId?: string;
+  discoveredIssues?: string[];
+  leftUndone?: string[];
+  verificationEvidence?: string;
   timestamp: string;
 }
 
@@ -204,6 +212,10 @@ export interface PostBoardMessageInput {
   kind?: BoardMessageKind;
   mentions?: string[];
   channelMentions?: string[];
+  featureId?: string;
+  discoveredIssues?: string[];
+  leftUndone?: string[];
+  verificationEvidence?: string;
   /** Optional roster of valid member handles (and group prefixes) used to filter `@mentions` while preserving `"all"` and `"orchestrator"`. */
   knownMembers?: Iterable<string>;
   /** Optional minimum sequence floor (e.g. state.boardHead + 1) to preserve monotonicity after crash-truncated board recovery. */
@@ -253,6 +265,8 @@ export type SwarmEventType =
   | "channel_created"
   | "channel_updated"
   | "channel_archived"
+  | "mission_updated"
+  | "audit_completed"
   | "stall_detected"
   | "rate_limit_backoff"
   | "teardown_completed";
@@ -285,13 +299,114 @@ export interface SwarmEventInput {
 }
 
 // ============================================================================
-// Run State
+// Dynamic Mission Goal Engine & Run State Types
 // ============================================================================
+
+export type AssertionStatus = "pending" | "passed" | "failed" | "blocked";
+
+export interface MissionAssertion {
+  id: string;
+  title: string;
+  description: string;
+  evidenceRequired?: string;
+  status: AssertionStatus;
+  evidence?: string;
+  verifiedBy?: string;
+  verifiedByRole?: CallerRole;
+  updatedAt: string;
+}
+
+export interface MissionAssertionInput {
+  id: string;
+  title: string;
+  description: string;
+  evidenceRequired?: string;
+  status?: AssertionStatus;
+  evidence?: string;
+  verifiedBy?: string;
+  verifiedByRole?: CallerRole;
+  updatedAt?: string;
+}
+
+export type FeatureStatus =
+  | "pending"
+  | "in_progress"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export interface MissionFeature {
+  id: string;
+  title: string;
+  description: string;
+  milestone: string;
+  dependsOn?: string[];
+  filesOwned?: string[];
+  preconditions?: string[];
+  expectedBehavior?: string[];
+  verificationSteps?: string[];
+  fulfills: string[];
+  status: FeatureStatus;
+  assignedMember?: string;
+  mergedCommitSha?: string;
+  updatedAt: string;
+}
+
+export interface MissionFeatureInput {
+  id: string;
+  title: string;
+  description: string;
+  milestone: string;
+  dependsOn?: string[];
+  filesOwned?: string[];
+  preconditions?: string[];
+  expectedBehavior?: string[];
+  verificationSteps?: string[];
+  fulfills?: string[];
+  status?: FeatureStatus;
+  assignedMember?: string;
+  mergedCommitSha?: string;
+  updatedAt?: string;
+}
+
+export type HandoffItemType =
+  | "discovered_issue"
+  | "incomplete_work"
+  | "critical_context";
+
+export type HandoffItemResolution = "open" | "tracked" | "dismissed";
+
+export interface MissionHandoffItem {
+  id: string;
+  type: HandoffItemType;
+  sourceMember: string;
+  sourceFeatureId?: string;
+  summary: string;
+  resolution: HandoffItemResolution;
+  trackedFeatureId?: string;
+  justification?: string;
+  createdAt: string;
+  resolvedAt?: string;
+}
+
+export interface MissionCommandEntry {
+  name: string;
+  command: string;
+}
+
+export interface MissionAuditRecord {
+  verdict: "approved" | "disapproved";
+  summary: string;
+  auditor?: string;
+  timestamp: string;
+}
 
 export interface SwarmMilestone {
   label: string;
   status: "pending" | "in_progress" | "done" | "blocked";
   owner?: string;
+  sealed?: boolean;
+  sealedAt?: string;
 }
 
 export interface SwarmRunState {
@@ -307,6 +422,12 @@ export interface SwarmRunState {
   status: SwarmRunStatus;
   phase?: string;
   milestones?: SwarmMilestone[];
+  assertions?: MissionAssertion[];
+  features?: MissionFeature[];
+  handoffItems?: MissionHandoffItem[];
+  commands?: MissionCommandEntry[];
+  boundaries?: string[];
+  lastAudit?: MissionAuditRecord;
   maxConcurrency: number;
   validatorEnabled: boolean;
   keepWorkersWarm: boolean;
@@ -342,6 +463,13 @@ export interface ProposedSwarmPlan {
   maxConcurrency: number;
   validatorEnabled: boolean;
   initialMembers?: InitialMemberProposal[];
+  milestones?: SwarmMilestone[];
+  assertions?: MissionAssertion[];
+  features?: MissionFeature[];
+  handoffItems?: MissionHandoffItem[];
+  commands?: MissionCommandEntry[];
+  boundaries?: string[];
+  lastAudit?: MissionAuditRecord;
   roleModels?: SwarmRoleModels;
   feedback?: string;
 }
@@ -502,6 +630,12 @@ export interface CreateRunInput {
   roleModels?: SwarmRoleModels;
   phase?: string;
   milestones?: SwarmMilestone[];
+  assertions?: MissionAssertion[];
+  features?: MissionFeature[];
+  handoffItems?: MissionHandoffItem[];
+  commands?: MissionCommandEntry[];
+  boundaries?: string[];
+  lastAudit?: MissionAuditRecord;
 }
 
 export interface RunSummary {
@@ -535,6 +669,12 @@ export interface RunUpdateInput {
   ownerPid?: number;
   phase?: string | null;
   milestones?: SwarmMilestone[] | null;
+  assertions?: MissionAssertion[] | null;
+  features?: MissionFeature[] | null;
+  handoffItems?: MissionHandoffItem[] | null;
+  commands?: MissionCommandEntry[] | null;
+  boundaries?: string[] | null;
+  lastAudit?: MissionAuditRecord | null;
   completionSummary?: string;
   expectedRevision?: number;
   actor?: string;
@@ -914,6 +1054,43 @@ export interface ManageChannelResult {
   summary: string;
 }
 
+export interface ManageMissionInput {
+  op: SwarmMissionOp;
+  assertions?: MissionAssertionInput[];
+  assertionId?: string;
+  assertionStatus?: AssertionStatus;
+  evidence?: string;
+  features?: MissionFeatureInput[];
+  prepend?: boolean;
+  featureId?: string;
+  featureStatus?: FeatureStatus;
+  assignedMember?: string;
+  mergedCommitSha?: string;
+  handoffId?: string;
+  resolution?: HandoffItemResolution;
+  trackedFeatureId?: string;
+  justification?: string;
+  commands?: MissionCommandEntry[];
+  boundaries?: string[];
+  milestones?: SwarmMilestone[];
+  lastAudit?: MissionAuditRecord | null;
+  force?: boolean;
+  callerName?: string;
+  callerRole?: CallerRole;
+}
+
+export interface ManageMissionResult {
+  op: SwarmMissionOp;
+  assertions?: MissionAssertion[];
+  features?: MissionFeature[];
+  handoffItems?: MissionHandoffItem[];
+  milestones?: SwarmMilestone[];
+  commands?: MissionCommandEntry[];
+  boundaries?: string[];
+  lastAudit?: MissionAuditRecord;
+  summary: string;
+}
+
 export interface SwitchModelResult {
   targetName: string;
   model: string;
@@ -964,6 +1141,10 @@ export interface MemberEngineBridge {
     text: string;
     channel?: string;
     kind?: BoardMessageKind;
+    featureId?: string;
+    discoveredIssues?: string[];
+    leftUndone?: string[];
+    verificationEvidence?: string;
   }): Promise<BoardMessage>;
   readBoard(options?: ReadBoardOptions): Promise<ReadBoardResult>;
   getStatus(): Promise<SwarmRosterStatus>;
@@ -983,6 +1164,7 @@ export interface MemberEngineBridge {
     reason?: string,
   ): Promise<SwitchModelResult>;
   manageChannel(input: ManageChannelInput): Promise<ManageChannelResult>;
+  manageMission?(input: ManageMissionInput): Promise<ManageMissionResult>;
   waitForBoard?(options: WaitForBoardOptions): Promise<WaitForBoardResult>;
 }
 
@@ -1223,6 +1405,7 @@ export interface ISwarmEngine {
     options?: MergeMemberOptions,
   ): Promise<MergeBranchResult | null>;
   manageChannel(input: ManageChannelInput): Promise<ManageChannelResult>;
+  manageMission?(input: ManageMissionInput): Promise<ManageMissionResult>;
   completeRun(options: CompleteRunOptions): Promise<SwarmRunState>;
   pause(runId?: string, reason?: string): Promise<SwarmRunState>;
   resume(runId?: string, hostContext?: ExtensionContext): Promise<SwarmRunState>;

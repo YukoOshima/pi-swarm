@@ -14,32 +14,50 @@ import {
 import os from "node:os";
 import path from "node:path";
 import {
+  ASSERTION_STATUSES,
   CHANNEL_NAME_PATTERN,
   DEFAULT_CHANNEL,
   DEFAULT_SWARM_SETTINGS,
+  FEATURE_STATUSES,
+  HANDOFF_ITEM_TYPES,
+  HANDOFF_RESOLUTIONS,
   MEMBER_NAME_PATTERN,
   ORCHESTRATOR_NAME,
   RESERVED_MEMBER_NAMES,
   SWARM_BRANCH_PREFIX,
   SWARM_DIR,
   SWARM_EVENTS_FILE,
+  SWARM_FEATURES_FILE,
   SWARM_LOCKS_DIR,
   SWARM_LOG_TAIL_LIMIT,
+  SWARM_MISSION_FILE,
   SWARM_ROSTER_FILE,
   SWARM_RUNS_DIR,
   SWARM_SESSIONS_DIR,
   SWARM_STATE_FILE,
   SWARM_STATE_VERSION,
+  SWARM_VALIDATION_CONTRACT_FILE,
+  SWARM_VALIDATION_STATE_FILE,
   SWARM_WORKTREES_DIR,
   SWARM_WORKTREE_PREFIX,
 } from "../constants.js";
 import {
   SwarmProtocolError,
+  type AssertionStatus,
   type BoardMessage,
+  type CallerRole,
   type CreateChannelInput,
   type CreateRunInput,
+  type FeatureStatus,
+  type HandoffItemResolution,
+  type HandoffItemType,
   type ISwarmStore,
   type MemberUpdateInput,
+  type MissionAssertion,
+  type MissionAuditRecord,
+  type MissionCommandEntry,
+  type MissionFeature,
+  type MissionHandoffItem,
   type PostBoardMessageInput,
   type ReadBoardOptions,
   type ReadBoardResult,
@@ -90,6 +108,29 @@ const VALID_WORKSPACE_MODES: ReadonlySet<SwarmWorkspaceMode> =
 
 const VALID_MILESTONE_STATUSES: ReadonlySet<SwarmMilestone["status"]> =
   new Set<SwarmMilestone["status"]>(["pending", "in_progress", "done", "blocked"]);
+
+const VALID_ASSERTION_STATUSES: ReadonlySet<AssertionStatus> =
+  new Set<AssertionStatus>(ASSERTION_STATUSES);
+
+const VALID_FEATURE_STATUSES: ReadonlySet<FeatureStatus> =
+  new Set<FeatureStatus>(FEATURE_STATUSES);
+
+const VALID_HANDOFF_TYPES: ReadonlySet<HandoffItemType> =
+  new Set<HandoffItemType>(HANDOFF_ITEM_TYPES);
+
+const VALID_HANDOFF_RESOLUTIONS: ReadonlySet<HandoffItemResolution> =
+  new Set<HandoffItemResolution>(HANDOFF_RESOLUTIONS);
+
+const VALID_CALLER_ROLES: ReadonlySet<CallerRole> = new Set<CallerRole>([
+  "orchestrator",
+  "worker",
+  "validator",
+  "monitor",
+  "human",
+]);
+
+const VALID_AUDIT_VERDICTS: ReadonlySet<MissionAuditRecord["verdict"]> =
+  new Set<MissionAuditRecord["verdict"]>(["approved", "disapproved"]);
 
 const DEFAULT_STALE_LOCK_MS = 30_000;
 const DEFAULT_LOCK_TIMEOUT_MS = 10_000;
@@ -454,13 +495,281 @@ function normalizeMilestones(raw: unknown): SwarmMilestone[] | undefined {
       continue;
     }
     const owner = normalizeOptionalNonEmptyString(candidate.owner);
+    const sealed =
+      typeof candidate.sealed === "boolean" ? candidate.sealed : undefined;
+    const sealedAt = normalizeOptionalNonEmptyString(candidate.sealedAt);
     normalized.push({
       label,
       status: status as SwarmMilestone["status"],
       ...(owner !== undefined ? { owner } : {}),
+      ...(sealed !== undefined ? { sealed } : {}),
+      ...(sealedAt !== undefined ? { sealedAt } : {}),
     });
   }
   return normalized;
+}
+
+function normalizeStringArray(raw: unknown): string[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const result: string[] = [];
+  for (const entry of raw) {
+    if (typeof entry === "string") {
+      const trimmed = entry.trim();
+      if (trimmed.length > 0) {
+        result.push(trimmed);
+      }
+    }
+  }
+  return result;
+}
+
+function normalizeOptionalStringArray(raw: unknown): string[] | undefined {
+  if (!Array.isArray(raw)) {
+    return undefined;
+  }
+  return normalizeStringArray(raw);
+}
+
+function normalizeAssertions(
+  raw: unknown,
+  fallbackTimestamp: string,
+): MissionAssertion[] | undefined {
+  if (!Array.isArray(raw)) {
+    return undefined;
+  }
+  const normalized: MissionAssertion[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      continue;
+    }
+    const candidate = item as Record<string, unknown>;
+    const id = normalizeOptionalNonEmptyString(candidate.id);
+    const title = normalizeOptionalNonEmptyString(candidate.title);
+    const status = candidate.status;
+    if (
+      !id ||
+      isPrototypeKey(id) ||
+      !title ||
+      typeof status !== "string" ||
+      !VALID_ASSERTION_STATUSES.has(status as AssertionStatus)
+    ) {
+      continue;
+    }
+    const description =
+      typeof candidate.description === "string"
+        ? candidate.description.trim()
+        : "";
+    const evidenceRequired = normalizeOptionalNonEmptyString(
+      candidate.evidenceRequired,
+    );
+    const evidence = normalizeOptionalNonEmptyString(candidate.evidence);
+    const verifiedBy = normalizeOptionalNonEmptyString(candidate.verifiedBy);
+    const verifiedByRole =
+      typeof candidate.verifiedByRole === "string" &&
+      VALID_CALLER_ROLES.has(candidate.verifiedByRole as CallerRole)
+        ? (candidate.verifiedByRole as CallerRole)
+        : undefined;
+    const updatedAt =
+      normalizeOptionalNonEmptyString(candidate.updatedAt) ?? fallbackTimestamp;
+
+    normalized.push({
+      id,
+      title,
+      description,
+      ...(evidenceRequired !== undefined ? { evidenceRequired } : {}),
+      status: status as AssertionStatus,
+      ...(evidence !== undefined ? { evidence } : {}),
+      ...(verifiedBy !== undefined ? { verifiedBy } : {}),
+      ...(verifiedByRole !== undefined ? { verifiedByRole } : {}),
+      updatedAt,
+    });
+  }
+  return normalized;
+}
+
+function normalizeFeatures(
+  raw: unknown,
+  fallbackTimestamp: string,
+): MissionFeature[] | undefined {
+  if (!Array.isArray(raw)) {
+    return undefined;
+  }
+  const normalized: MissionFeature[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      continue;
+    }
+    const candidate = item as Record<string, unknown>;
+    const id = normalizeOptionalNonEmptyString(candidate.id);
+    const title = normalizeOptionalNonEmptyString(candidate.title);
+    const status = candidate.status;
+    if (
+      !id ||
+      isPrototypeKey(id) ||
+      !title ||
+      typeof candidate.milestone !== "string" ||
+      typeof status !== "string" ||
+      !VALID_FEATURE_STATUSES.has(status as FeatureStatus)
+    ) {
+      continue;
+    }
+    const milestone = candidate.milestone.trim();
+    const description =
+      typeof candidate.description === "string"
+        ? candidate.description.trim()
+        : "";
+    const dependsOn = normalizeOptionalStringArray(candidate.dependsOn);
+    const filesOwned = normalizeOptionalStringArray(candidate.filesOwned);
+    const preconditions = normalizeOptionalStringArray(candidate.preconditions);
+    const expectedBehavior = normalizeOptionalStringArray(
+      candidate.expectedBehavior,
+    );
+    const verificationSteps = normalizeOptionalStringArray(
+      candidate.verificationSteps,
+    );
+    const fulfills = normalizeStringArray(candidate.fulfills);
+    const assignedMember = normalizeOptionalNonEmptyString(
+      candidate.assignedMember,
+    );
+    const mergedCommitSha = normalizeOptionalNonEmptyString(
+      candidate.mergedCommitSha,
+    );
+    const updatedAt =
+      normalizeOptionalNonEmptyString(candidate.updatedAt) ?? fallbackTimestamp;
+
+    normalized.push({
+      id,
+      title,
+      description,
+      milestone,
+      ...(dependsOn !== undefined ? { dependsOn } : {}),
+      ...(filesOwned !== undefined ? { filesOwned } : {}),
+      ...(preconditions !== undefined ? { preconditions } : {}),
+      ...(expectedBehavior !== undefined ? { expectedBehavior } : {}),
+      ...(verificationSteps !== undefined ? { verificationSteps } : {}),
+      fulfills,
+      status: status as FeatureStatus,
+      ...(assignedMember !== undefined ? { assignedMember } : {}),
+      ...(mergedCommitSha !== undefined ? { mergedCommitSha } : {}),
+      updatedAt,
+    });
+  }
+  return normalized;
+}
+
+function normalizeHandoffItems(
+  raw: unknown,
+  fallbackTimestamp: string,
+): MissionHandoffItem[] | undefined {
+  if (!Array.isArray(raw)) {
+    return undefined;
+  }
+  const normalized: MissionHandoffItem[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      continue;
+    }
+    const candidate = item as Record<string, unknown>;
+    const id = normalizeOptionalNonEmptyString(candidate.id);
+    const type = candidate.type;
+    const sourceMember = normalizeOptionalNonEmptyString(
+      candidate.sourceMember,
+    );
+    const summary = normalizeOptionalNonEmptyString(candidate.summary);
+    const resolution = candidate.resolution;
+    if (
+      !id ||
+      isPrototypeKey(id) ||
+      typeof type !== "string" ||
+      !VALID_HANDOFF_TYPES.has(type as HandoffItemType) ||
+      !sourceMember ||
+      !summary ||
+      typeof resolution !== "string" ||
+      !VALID_HANDOFF_RESOLUTIONS.has(resolution as HandoffItemResolution)
+    ) {
+      continue;
+    }
+    const sourceFeatureId = normalizeOptionalNonEmptyString(
+      candidate.sourceFeatureId,
+    );
+    const trackedFeatureId = normalizeOptionalNonEmptyString(
+      candidate.trackedFeatureId,
+    );
+    const justification = normalizeOptionalNonEmptyString(
+      candidate.justification,
+    );
+    const createdAt =
+      normalizeOptionalNonEmptyString(candidate.createdAt) ?? fallbackTimestamp;
+    const resolvedAt = normalizeOptionalNonEmptyString(candidate.resolvedAt);
+
+    normalized.push({
+      id,
+      type: type as HandoffItemType,
+      sourceMember,
+      ...(sourceFeatureId !== undefined ? { sourceFeatureId } : {}),
+      summary,
+      resolution: resolution as HandoffItemResolution,
+      ...(trackedFeatureId !== undefined ? { trackedFeatureId } : {}),
+      ...(justification !== undefined ? { justification } : {}),
+      createdAt,
+      ...(resolvedAt !== undefined ? { resolvedAt } : {}),
+    });
+  }
+  return normalized;
+}
+
+function normalizeCommands(raw: unknown): MissionCommandEntry[] | undefined {
+  if (!Array.isArray(raw)) {
+    return undefined;
+  }
+  const normalized: MissionCommandEntry[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      continue;
+    }
+    const candidate = item as Record<string, unknown>;
+    const name = normalizeOptionalNonEmptyString(candidate.name);
+    const command = normalizeOptionalNonEmptyString(candidate.command);
+    if (!name || !command) {
+      continue;
+    }
+    normalized.push({ name, command });
+  }
+  return normalized;
+}
+
+function normalizeBoundaries(raw: unknown): string[] | undefined {
+  return normalizeOptionalStringArray(raw);
+}
+
+function normalizeLastAudit(
+  raw: unknown,
+  fallbackTimestamp: string,
+): MissionAuditRecord | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return undefined;
+  }
+  const candidate = raw as Record<string, unknown>;
+  const verdict = candidate.verdict;
+  if (
+    typeof verdict !== "string" ||
+    !VALID_AUDIT_VERDICTS.has(verdict as MissionAuditRecord["verdict"]) ||
+    typeof candidate.summary !== "string"
+  ) {
+    return undefined;
+  }
+  const summary = candidate.summary.trim();
+  const auditor = normalizeOptionalNonEmptyString(candidate.auditor);
+  const timestamp =
+    normalizeOptionalNonEmptyString(candidate.timestamp) ?? fallbackTimestamp;
+  return {
+    verdict: verdict as MissionAuditRecord["verdict"],
+    summary,
+    ...(auditor !== undefined ? { auditor } : {}),
+    timestamp,
+  };
 }
 
 function backfillRunState(state: SwarmRunState): SwarmRunState {
@@ -535,6 +844,67 @@ function backfillRunState(state: SwarmRunState): SwarmRunState {
       state.milestones = normalizedMilestones;
     } else {
       delete state.milestones;
+    }
+  }
+  const fallbackTimestamp =
+    normalizeOptionalNonEmptyString(raw.updatedAt) ??
+    normalizeOptionalNonEmptyString(raw.createdAt) ??
+    new Date().toISOString();
+  if (raw.assertions !== undefined) {
+    const normalizedAssertions = normalizeAssertions(
+      raw.assertions,
+      fallbackTimestamp,
+    );
+    if (normalizedAssertions !== undefined) {
+      state.assertions = normalizedAssertions;
+    } else {
+      delete state.assertions;
+    }
+  }
+  if (raw.features !== undefined) {
+    const normalizedFeatures = normalizeFeatures(
+      raw.features,
+      fallbackTimestamp,
+    );
+    if (normalizedFeatures !== undefined) {
+      state.features = normalizedFeatures;
+    } else {
+      delete state.features;
+    }
+  }
+  if (raw.handoffItems !== undefined) {
+    const normalizedHandoffs = normalizeHandoffItems(
+      raw.handoffItems,
+      fallbackTimestamp,
+    );
+    if (normalizedHandoffs !== undefined) {
+      state.handoffItems = normalizedHandoffs;
+    } else {
+      delete state.handoffItems;
+    }
+  }
+  if (raw.commands !== undefined) {
+    const normalizedCommands = normalizeCommands(raw.commands);
+    if (normalizedCommands !== undefined) {
+      state.commands = normalizedCommands;
+    } else {
+      delete state.commands;
+    }
+  }
+  if (raw.boundaries !== undefined) {
+    const normalizedBoundaries = normalizeBoundaries(raw.boundaries);
+    if (normalizedBoundaries !== undefined) {
+      state.boundaries = normalizedBoundaries;
+    } else {
+      delete state.boundaries;
+    }
+  }
+  if (raw.lastAudit !== undefined) {
+    const normalizedAudit = normalizeLastAudit(raw.lastAudit, fallbackTimestamp);
+    if (normalizedAudit !== undefined) {
+      state.lastAudit = normalizedAudit;
+    } else {
+      delete state.lastAudit;
     }
   }
   ensureMainChannel(state);
@@ -674,6 +1044,10 @@ interface RunStateCacheEntry {
   mtimeMs: number;
   state: SwarmRunState;
   lastCanonicalRosterBody?: string;
+  lastMissionBody?: string;
+  lastValidationContractBody?: string;
+  lastValidationStateBody?: string;
+  lastFeaturesBody?: string;
 }
 
 export interface SwarmStoreOptions {
@@ -1224,23 +1598,108 @@ export class SwarmStore implements ISwarmStore {
       this.projectRoot,
       path.join(runDir, SWARM_ROSTER_FILE),
     );
+    const missionMdPath = assertWithinRoot(
+      this.projectRoot,
+      path.join(runDir, SWARM_MISSION_FILE),
+    );
+    const validationContractPath = assertWithinRoot(
+      this.projectRoot,
+      path.join(runDir, SWARM_VALIDATION_CONTRACT_FILE),
+    );
+    const validationStatePath = assertWithinRoot(
+      this.projectRoot,
+      path.join(runDir, SWARM_VALIDATION_STATE_FILE),
+    );
+    const featuresJsonPath = assertWithinRoot(
+      this.projectRoot,
+      path.join(runDir, SWARM_FEATURES_FILE),
+    );
+
     const json = `${JSON.stringify(state, null, 2)}\n`;
     const rosterBody = this.renderRosterMarkdown(state);
     const canonicalRosterBody = canonicalizeRosterForDiff(rosterBody);
+    const missionBody = this.renderMissionMarkdown(state);
+    const validationContractBody =
+      state.assertions !== undefined
+        ? this.renderValidationContractMarkdown(state)
+        : undefined;
+    const validationStateBody =
+      state.assertions !== undefined
+        ? this.renderValidationStateJson(state)
+        : undefined;
+    const featuresBody =
+      state.features !== undefined ? this.renderFeaturesJson(state) : undefined;
+
     const cached = this.stateCache.get(state.id);
     const shouldWriteRoster =
       !cached?.lastCanonicalRosterBody ||
       canonicalRosterBody !== cached.lastCanonicalRosterBody;
+    const shouldWriteMission =
+      !cached?.lastMissionBody || missionBody !== cached.lastMissionBody;
+    const shouldWriteValidationContract =
+      validationContractBody !== undefined &&
+      (!cached?.lastValidationContractBody ||
+        validationContractBody !== cached.lastValidationContractBody);
+    const shouldWriteValidationState =
+      validationStateBody !== undefined &&
+      (!cached?.lastValidationStateBody ||
+        validationStateBody !== cached.lastValidationStateBody);
+    const shouldWriteFeatures =
+      featuresBody !== undefined &&
+      (!cached?.lastFeaturesBody || featuresBody !== cached.lastFeaturesBody);
+
+    const shouldRemoveValidationArtifacts =
+      state.assertions === undefined &&
+      (cached?.state.assertions !== undefined ||
+        cached?.lastValidationContractBody !== undefined ||
+        cached?.lastValidationStateBody !== undefined);
+    const shouldRemoveFeaturesArtifact =
+      state.features === undefined &&
+      (cached?.state.features !== undefined ||
+        cached?.lastFeaturesBody !== undefined);
 
     await assertLeafNotSymlink(statePath);
     if (shouldWriteRoster) {
       await assertLeafNotSymlink(rosterMdPath);
+    }
+    if (shouldWriteMission) {
+      await assertLeafNotSymlink(missionMdPath);
+    }
+    if (shouldWriteValidationContract || shouldRemoveValidationArtifacts) {
+      await assertLeafNotSymlink(validationContractPath);
+    }
+    if (shouldWriteValidationState || shouldRemoveValidationArtifacts) {
+      await assertLeafNotSymlink(validationStatePath);
+    }
+    if (shouldWriteFeatures || shouldRemoveFeaturesArtifact) {
+      await assertLeafNotSymlink(featuresJsonPath);
     }
 
     const [stateStat] = await Promise.all([
       writeTmpAndRename(statePath, json),
       ...(shouldWriteRoster
         ? [writeTmpAndRename(rosterMdPath, rosterBody)]
+        : []),
+      ...(shouldWriteMission
+        ? [writeTmpAndRename(missionMdPath, missionBody)]
+        : []),
+      ...(shouldWriteValidationContract && validationContractBody !== undefined
+        ? [writeTmpAndRename(validationContractPath, validationContractBody)]
+        : []),
+      ...(shouldWriteValidationState && validationStateBody !== undefined
+        ? [writeTmpAndRename(validationStatePath, validationStateBody)]
+        : []),
+      ...(shouldWriteFeatures && featuresBody !== undefined
+        ? [writeTmpAndRename(featuresJsonPath, featuresBody)]
+        : []),
+      ...(shouldRemoveValidationArtifacts
+        ? [
+            unlink(validationContractPath).catch(() => {}),
+            unlink(validationStatePath).catch(() => {}),
+          ]
+        : []),
+      ...(shouldRemoveFeaturesArtifact
+        ? [unlink(featuresJsonPath).catch(() => {})]
         : []),
     ]);
 
@@ -1253,6 +1712,14 @@ export class SwarmStore implements ISwarmStore {
       lastCanonicalRosterBody: shouldWriteRoster
         ? canonicalRosterBody
         : cached.lastCanonicalRosterBody,
+      lastMissionBody: missionBody,
+      ...(validationContractBody !== undefined
+        ? { lastValidationContractBody: validationContractBody }
+        : {}),
+      ...(validationStateBody !== undefined
+        ? { lastValidationStateBody: validationStateBody }
+        : {}),
+      ...(featuresBody !== undefined ? { lastFeaturesBody: featuresBody } : {}),
     });
     return structuredClone(cachedState);
   }
@@ -1360,6 +1827,15 @@ export class SwarmStore implements ISwarmStore {
 
       const initialPhase = normalizeOptionalNonEmptyString(input.phase);
       const initialMilestones = normalizeMilestones(input.milestones);
+      const initialAssertions = normalizeAssertions(input.assertions, now);
+      const initialFeatures = normalizeFeatures(input.features, now);
+      const initialHandoffItems = normalizeHandoffItems(
+        input.handoffItems,
+        now,
+      );
+      const initialCommands = normalizeCommands(input.commands);
+      const initialBoundaries = normalizeBoundaries(input.boundaries);
+      const initialAudit = normalizeLastAudit(input.lastAudit, now);
       const state: SwarmRunState = {
         version: SWARM_STATE_VERSION,
         id: runId,
@@ -1375,6 +1851,18 @@ export class SwarmStore implements ISwarmStore {
         ...(initialMilestones !== undefined
           ? { milestones: initialMilestones }
           : {}),
+        ...(initialAssertions !== undefined
+          ? { assertions: initialAssertions }
+          : {}),
+        ...(initialFeatures !== undefined ? { features: initialFeatures } : {}),
+        ...(initialHandoffItems !== undefined
+          ? { handoffItems: initialHandoffItems }
+          : {}),
+        ...(initialCommands !== undefined ? { commands: initialCommands } : {}),
+        ...(initialBoundaries !== undefined
+          ? { boundaries: initialBoundaries }
+          : {}),
+        ...(initialAudit !== undefined ? { lastAudit: initialAudit } : {}),
         maxConcurrency,
         validatorEnabled:
           input.validatorEnabled ?? DEFAULT_SWARM_SETTINGS.validatorEnabled,
@@ -1584,6 +2072,7 @@ export class SwarmStore implements ISwarmStore {
           delete state.phase;
         }
       }
+      const now = new Date().toISOString();
       if (patch.milestones === null) {
         delete state.milestones;
       } else if (patch.milestones !== undefined) {
@@ -1594,12 +2083,75 @@ export class SwarmStore implements ISwarmStore {
           delete state.milestones;
         }
       }
+      if (patch.assertions === null) {
+        delete state.assertions;
+      } else if (patch.assertions !== undefined) {
+        const normalizedAssertions = normalizeAssertions(patch.assertions, now);
+        if (normalizedAssertions !== undefined) {
+          state.assertions = normalizedAssertions;
+        } else {
+          delete state.assertions;
+        }
+      }
+      if (patch.features === null) {
+        delete state.features;
+      } else if (patch.features !== undefined) {
+        const normalizedFeatures = normalizeFeatures(patch.features, now);
+        if (normalizedFeatures !== undefined) {
+          state.features = normalizedFeatures;
+        } else {
+          delete state.features;
+        }
+      }
+      if (patch.handoffItems === null) {
+        delete state.handoffItems;
+      } else if (patch.handoffItems !== undefined) {
+        const normalizedHandoffs = normalizeHandoffItems(
+          patch.handoffItems,
+          now,
+        );
+        if (normalizedHandoffs !== undefined) {
+          state.handoffItems = normalizedHandoffs;
+        } else {
+          delete state.handoffItems;
+        }
+      }
+      if (patch.commands === null) {
+        delete state.commands;
+      } else if (patch.commands !== undefined) {
+        const normalizedCommands = normalizeCommands(patch.commands);
+        if (normalizedCommands !== undefined) {
+          state.commands = normalizedCommands;
+        } else {
+          delete state.commands;
+        }
+      }
+      if (patch.boundaries === null) {
+        delete state.boundaries;
+      } else if (patch.boundaries !== undefined) {
+        const normalizedBoundaries = normalizeBoundaries(patch.boundaries);
+        if (normalizedBoundaries !== undefined) {
+          state.boundaries = normalizedBoundaries;
+        } else {
+          delete state.boundaries;
+        }
+      }
+      if (patch.lastAudit === null) {
+        delete state.lastAudit;
+      } else if (patch.lastAudit !== undefined) {
+        const normalizedAudit = normalizeLastAudit(patch.lastAudit, now);
+        if (normalizedAudit !== undefined) {
+          state.lastAudit = normalizedAudit;
+        } else {
+          delete state.lastAudit;
+        }
+      }
       if (patch.completionSummary !== undefined) {
         state.completionSummary = patch.completionSummary;
       }
 
       state.revision += 1;
-      state.updatedAt = new Date().toISOString();
+      state.updatedAt = now;
       const saved = await this.persistStateUnlocked(state);
       const actor = patch.actor ?? ORCHESTRATOR_NAME;
 
@@ -2572,5 +3124,191 @@ export class SwarmStore implements ISwarmStore {
 
     lines.push("");
     return lines.join("\n");
+  }
+
+  // --------------------------------------------------------------------------
+  // Droid Mission Artifacts Auto-Materialization
+  // --------------------------------------------------------------------------
+
+  renderMissionMarkdown(state: SwarmRunState): string {
+    const lines: string[] = [
+      `# ${escapeMarkdownCell(state.title || state.id)}`,
+      "",
+      `- **Run ID:** \`${state.id}\``,
+      `- **Status:** \`${state.status}\``,
+      `- **Base Branch:** \`${state.baseBranch}\``,
+    ];
+    if (state.phase) {
+      lines.push(`- **Phase:** \`${escapeMarkdownCell(state.phase)}\``);
+    }
+
+    lines.push(
+      "",
+      "## Objective",
+      "",
+      state.objective.trim() || "(none)",
+      "",
+      "## Strategy",
+      "",
+      state.strategy.trim() || "(none)",
+      "",
+      "## Acceptance Criteria",
+      "",
+      state.acceptanceCriteria.trim() || "(none)",
+      "",
+      "## Commands Manifest",
+      "",
+    );
+
+    if (state.commands && state.commands.length > 0) {
+      for (const entry of state.commands) {
+        lines.push(
+          `- **${escapeMarkdownCell(entry.name)}:** \`${entry.command.replace(/`/g, "\\`")}\``,
+        );
+      }
+    } else {
+      lines.push("(none)");
+    }
+
+    lines.push("", "## Mission Boundaries", "");
+    if (state.boundaries && state.boundaries.length > 0) {
+      for (const boundary of state.boundaries) {
+        lines.push(`- ${boundary}`);
+      }
+    } else {
+      lines.push("(none)");
+    }
+
+    lines.push("", "## Milestones", "");
+    if (state.milestones && state.milestones.length > 0) {
+      for (const ms of state.milestones) {
+        const ownerPart = ms.owner ? ` (owner: @${ms.owner})` : "";
+        const sealedPart = ms.sealed
+          ? ms.sealedAt
+            ? ` [SEALED at ${ms.sealedAt}]`
+            : " [SEALED]"
+          : "";
+        lines.push(
+          `- [${ms.status}] **${escapeMarkdownCell(ms.label)}**${ownerPart}${sealedPart}`,
+        );
+      }
+    } else {
+      lines.push("(none)");
+    }
+
+    if (state.lastAudit) {
+      lines.push(
+        "",
+        "## Last Audit",
+        "",
+        `- **Verdict:** \`${state.lastAudit.verdict}\``,
+      );
+      if (state.lastAudit.auditor) {
+        lines.push(`- **Auditor:** \`${state.lastAudit.auditor}\``);
+      }
+      lines.push(
+        `- **Timestamp:** ${state.lastAudit.timestamp}`,
+        `- **Summary:** ${state.lastAudit.summary || "(none)"}`,
+      );
+    }
+
+    if (state.completionSummary && state.completionSummary.trim().length > 0) {
+      lines.push("", "## Completion Summary", "", state.completionSummary.trim());
+    }
+
+    lines.push("");
+    return lines.join("\n");
+  }
+
+  renderValidationContractMarkdown(state: SwarmRunState): string {
+    const assertions = state.assertions ?? [];
+    let passed = 0;
+    let pending = 0;
+    let failed = 0;
+    let blocked = 0;
+    for (const a of assertions) {
+      if (a.status === "passed") passed += 1;
+      else if (a.status === "failed") failed += 1;
+      else if (a.status === "blocked") blocked += 1;
+      else pending += 1;
+    }
+
+    const lines: string[] = [
+      `# Validation Contract — ${escapeMarkdownCell(state.title || state.id)}`,
+      "",
+      `- **Run ID:** \`${state.id}\``,
+      `- **Summary:** ${passed}/${assertions.length} passed, ${pending} pending, ${failed} failed, ${blocked} blocked`,
+      "",
+    ];
+
+    if (assertions.length === 0) {
+      lines.push("(no assertions defined)", "");
+      return lines.join("\n");
+    }
+
+    for (const a of assertions) {
+      const checkbox =
+        a.status === "passed"
+          ? "x"
+          : a.status === "failed"
+            ? "!"
+            : a.status === "blocked"
+              ? "-"
+              : " ";
+      const badge = a.status.toUpperCase();
+      const safeId = a.id.replace(/\r?\n/g, " ").trim();
+      const safeTitle = a.title.replace(/\r?\n/g, " ").trim();
+      const verifiedByText = a.verifiedBy
+        ? a.verifiedByRole
+          ? `@${a.verifiedBy} (${a.verifiedByRole})`
+          : `@${a.verifiedBy}`
+        : "(unverified)";
+
+      lines.push(
+        `### ${safeId}: ${safeTitle}`,
+        "",
+        `- **Status:** [${checkbox}] \`${badge}\``,
+        `- **Behavioral Description:** ${a.description || "(none)"}`,
+        `- **Required Evidence:** ${a.evidenceRequired || "(not specified)"}`,
+        `- **Collected Evidence:** ${a.evidence || "(none)"}`,
+        `- **Verified By:** ${verifiedByText}`,
+        `- **Updated At:** ${a.updatedAt}`,
+        "",
+      );
+    }
+
+    return lines.join("\n");
+  }
+
+  renderValidationStateJson(state: SwarmRunState): string {
+    const assertionsMap: Record<
+      string,
+      {
+        status: AssertionStatus;
+        evidence?: string;
+        verifiedBy?: string;
+        verifiedByRole?: CallerRole;
+        updatedAt: string;
+      }
+    > = {};
+    for (const a of state.assertions ?? []) {
+      if (isPrototypeKey(a.id)) {
+        continue;
+      }
+      assertionsMap[a.id] = {
+        status: a.status,
+        ...(a.evidence !== undefined ? { evidence: a.evidence } : {}),
+        ...(a.verifiedBy !== undefined ? { verifiedBy: a.verifiedBy } : {}),
+        ...(a.verifiedByRole !== undefined
+          ? { verifiedByRole: a.verifiedByRole }
+          : {}),
+        updatedAt: a.updatedAt,
+      };
+    }
+    return `${JSON.stringify({ assertions: assertionsMap }, null, 2)}\n`;
+  }
+
+  renderFeaturesJson(state: SwarmRunState): string {
+    return `${JSON.stringify({ features: state.features ?? [] }, null, 2)}\n`;
   }
 }

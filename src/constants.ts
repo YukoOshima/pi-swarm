@@ -15,7 +15,7 @@ export const DRAFTING_TOOLS = [
   PROPOSE_SWARM_PLAN_TOOL,
 ] as const;
 
-/** Core Antigravity Swarm coordination tool (`title`, `add`, `status`, `models`, `model`, `steer`, `stop`, `kill`, `merge`, `channel`, `done`). */
+/** Core Antigravity Swarm coordination tool (`title`, `add`, `status`, `models`, `model`, `steer`, `stop`, `kill`, `merge`, `channel`, `mission`, `done`). */
 export const SWARM_TOOL = "swarm" as const;
 export const POST_MESSAGE_TOOL = "post_message" as const;
 export const READ_BOARD_TOOL = "read_board" as const;
@@ -50,7 +50,51 @@ export const SWARM_ACTIONS = [
   "kill",
   "merge",
   "channel",
+  "mission",
   "done",
+] as const;
+
+/** Supported sub-operations on `swarm{action:"mission"}`. */
+export const SWARM_MISSION_OPS = [
+  "status",
+  "upsert_assertions",
+  "remove_assertion",
+  "verify_assertion",
+  "upsert_features",
+  "update_feature",
+  "resolve_handoff",
+  "set_manifest",
+] as const;
+
+/** Validation contract assertion lifecycle statuses. */
+export const ASSERTION_STATUSES = [
+  "pending",
+  "passed",
+  "failed",
+  "blocked",
+] as const;
+
+/** Mission feature execution lifecycle statuses. */
+export const FEATURE_STATUSES = [
+  "pending",
+  "in_progress",
+  "completed",
+  "failed",
+  "cancelled",
+] as const;
+
+/** Structured worker handoff follow-up item categories. */
+export const HANDOFF_ITEM_TYPES = [
+  "discovered_issue",
+  "incomplete_work",
+  "critical_context",
+] as const;
+
+/** Resolution states for structured worker handoff items. */
+export const HANDOFF_RESOLUTIONS = [
+  "open",
+  "tracked",
+  "dismissed",
 ] as const;
 
 /** Supported sub-actions on `swarm{action:"channel"}`. */
@@ -129,6 +173,10 @@ export const SWARM_RUNS_DIR = "runs" as const;
 export const SWARM_WORKTREES_DIR = "worktrees" as const;
 export const SWARM_SESSIONS_DIR = "sessions" as const;
 export const SWARM_ROSTER_FILE = "ROSTER.md" as const;
+export const SWARM_MISSION_FILE = "mission.md" as const;
+export const SWARM_VALIDATION_CONTRACT_FILE = "validation-contract.md" as const;
+export const SWARM_VALIDATION_STATE_FILE = "validation-state.json" as const;
+export const SWARM_FEATURES_FILE = "features.json" as const;
 export const SWARM_STATE_FILE = "state.json" as const;
 export const SWARM_BOARD_FILE = "board.jsonl" as const;
 export const SWARM_EVENTS_FILE = "events.jsonl" as const;
@@ -141,6 +189,10 @@ export const SWARM_PATHS = Object.freeze({
   worktrees: SWARM_WORKTREES_DIR,
   sessions: SWARM_SESSIONS_DIR,
   rosterFile: SWARM_ROSTER_FILE,
+  missionFile: SWARM_MISSION_FILE,
+  validationContractFile: SWARM_VALIDATION_CONTRACT_FILE,
+  validationStateFile: SWARM_VALIDATION_STATE_FILE,
+  featuresFile: SWARM_FEATURES_FILE,
   stateFile: SWARM_STATE_FILE,
   boardFile: SWARM_BOARD_FILE,
   eventsFile: SWARM_EVENTS_FILE,
