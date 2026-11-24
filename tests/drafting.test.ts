@@ -5612,6 +5612,257 @@ describe("drafting-contract-hardening: VAL-CONTRACT-001, VAL-CONTRACT-002, VAL-D
     assert.equal(unsealedM1?.sealed, undefined);
     assert.equal(unsealedM1?.status, "in_progress");
     assert.equal(unsealedM1?.owner, "validator");
+
+    // 6. Canonical parity regressions:
+    //    (a) failed/cancelled features are requeued to "pending" when incoming status is "pending"
+    //    (b) unchanged "passed" assertion cannot be downgraded by incoming non-pending status (e.g. "failed")
+    //    (c) assertion carry takes UNION of ALL completed features (both omitted carried AND incoming retained)
+    //    (d) contradictory reclaim of a VAL-* already fulfilled by an omitted completed feature is rejected
+    const parityRun: SwarmRunState = {
+      ...existingRun,
+      milestones: [
+        { label: "M1: Done", status: "done" },
+        { label: "M2: Retry", status: "blocked" },
+      ],
+      assertions: [
+        {
+          id: "VAL-D1",
+          title: "Done 1",
+          description: "Done 1 behavior",
+          status: "passed",
+          evidence: "d1 green",
+          verifiedBy: "verifier",
+          verifiedByRole: "validator",
+          updatedAt: "2026-11-24T10:00:00.000Z",
+        },
+        {
+          id: "VAL-D2",
+          title: "Done 2",
+          description: "Done 2 behavior",
+          status: "passed",
+          evidence: "d2 green",
+          verifiedBy: "verifier",
+          verifiedByRole: "validator",
+          updatedAt: "2026-11-24T10:01:00.000Z",
+        },
+        {
+          id: "VAL-D3",
+          title: "Done 3",
+          description: "Done 3 behavior",
+          status: "passed",
+          evidence: "d3 green",
+          verifiedBy: "verifier",
+          verifiedByRole: "validator",
+          updatedAt: "2026-11-24T10:02:00.000Z",
+        },
+        {
+          id: "VAL-RETRY-1",
+          title: "Retry 1",
+          description: "Previously failed",
+          status: "failed",
+          updatedAt: "2026-11-24T10:05:00.000Z",
+        },
+        {
+          id: "VAL-RETRY-2",
+          title: "Retry 2",
+          description: "Previously cancelled",
+          status: "pending",
+          updatedAt: "2026-11-24T10:06:00.000Z",
+        },
+      ],
+      features: [
+        {
+          id: "feat-done-omitted",
+          title: "Completed Omitted",
+          description: "Completed with two VALs",
+          milestone: "M1: Done",
+          fulfills: ["VAL-D1", "VAL-D2"],
+          status: "completed",
+          mergedCommitSha: "111aaaa",
+          updatedAt: "2026-11-24T10:00:00.000Z",
+        },
+        {
+          id: "feat-done-retained",
+          title: "Completed Retained",
+          description: "Completed and included in incoming features",
+          milestone: "M1: Done",
+          fulfills: ["VAL-D3"],
+          status: "completed",
+          mergedCommitSha: "222bbbb",
+          updatedAt: "2026-11-24T10:02:00.000Z",
+        },
+        {
+          id: "feat-failed",
+          title: "Failed Feature",
+          description: "Needs requeue",
+          milestone: "M2: Retry",
+          fulfills: ["VAL-RETRY-1"],
+          status: "failed",
+          updatedAt: "2026-11-24T10:05:00.000Z",
+        },
+        {
+          id: "feat-cancelled",
+          title: "Cancelled Feature",
+          description: "Needs requeue",
+          milestone: "M2: Retry",
+          fulfills: ["VAL-RETRY-2"],
+          status: "cancelled",
+          updatedAt: "2026-11-24T10:06:00.000Z",
+        },
+      ],
+    };
+
+    // (a), (b), (c): Requeue failed/cancelled, carry UNION of VAL-D1/VAL-D2 (omitted) + VAL-D3 (retained),
+    // and refuse to downgrade unchanged passed VAL-D3 even if incoming passes status: "failed"
+    const parityMerged = mergeTweakedMissionContract(
+      parityRun,
+      {
+        assertions: [
+          {
+            id: "VAL-RETRY-1",
+            title: "Retry 1",
+            description: "Previously failed",
+            status: "pending",
+            updatedAt: nowIso,
+          },
+          {
+            id: "VAL-RETRY-2",
+            title: "Retry 2",
+            description: "Previously cancelled",
+            status: "pending",
+            updatedAt: nowIso,
+          },
+        ],
+        features: [
+          {
+            id: "feat-done-retained",
+            title: "Completed Retained",
+            description: "Completed and included in incoming features",
+            milestone: "M1: Done",
+            fulfills: ["VAL-D3"],
+            status: "pending",
+            updatedAt: nowIso,
+          },
+          {
+            id: "feat-failed",
+            title: "Failed Feature",
+            description: "Needs requeue",
+            milestone: "M2: Retry",
+            fulfills: ["VAL-RETRY-1"],
+            status: "pending",
+            updatedAt: nowIso,
+          },
+          {
+            id: "feat-cancelled",
+            title: "Cancelled Feature",
+            description: "Needs requeue",
+            milestone: "M2: Retry",
+            fulfills: ["VAL-RETRY-2"],
+            status: "pending",
+            updatedAt: nowIso,
+          },
+        ],
+      },
+      nowIso,
+    );
+    assert.equal(
+      parityMerged.features?.find((f) => f.id === "feat-failed")?.status,
+      "pending",
+      "failed feature must be requeued to pending on tweak",
+    );
+    assert.equal(
+      parityMerged.features?.find((f) => f.id === "feat-cancelled")?.status,
+      "pending",
+      "cancelled feature must be requeued to pending on tweak",
+    );
+    assert.equal(
+      parityMerged.features?.find((f) => f.id === "feat-done-omitted")?.status,
+      "completed",
+    );
+    // UNION of completed features' assertions carried forward: VAL-D1, VAL-D2 (omitted) AND VAL-D3 (retained)!
+    const carriedValIds = (parityMerged.assertions ?? []).map((a) => a.id);
+    assert.ok(carriedValIds.includes("VAL-D1"), "Must carry VAL-D1 from omitted completed feature");
+    assert.ok(carriedValIds.includes("VAL-D2"), "Must carry VAL-D2 from omitted completed feature");
+    assert.ok(carriedValIds.includes("VAL-D3"), "Must carry VAL-D3 from retained completed feature");
+
+    // (b) Incoming non-pending status (e.g. "failed") cannot downgrade unchanged "passed" assertion
+    const noDowngrade = mergeTweakedMissionContract(
+      parityRun,
+      {
+        assertions: [
+          {
+            id: "VAL-D3",
+            title: "Done 3",
+            description: "Done 3 behavior",
+            status: "failed",
+            evidence: "spurious downgrade",
+            updatedAt: nowIso,
+          },
+        ],
+      },
+      nowIso,
+    );
+    const d3 = noDowngrade.assertions?.find((a) => a.id === "VAL-D3");
+    assert.equal(d3?.status, "passed");
+    assert.equal(d3?.evidence, "d3 green");
+    assert.equal(d3?.verifiedBy, "verifier");
+
+    // (d) Contradictory reclaim of VAL-D1 from omitted completed feature feat-done-omitted is rejected
+    assert.throws(
+      () =>
+        mergeTweakedMissionContract(
+          parityRun,
+          {
+            assertions: [
+              { id: "VAL-D1", title: "Done 1", description: "Done 1 behavior", status: "pending", updatedAt: nowIso },
+            ],
+            features: [
+              {
+                id: "feat-reclaimer",
+                title: "Reclaimer",
+                description: "Tries to steal VAL-D1 from omitted feat-done-omitted",
+                milestone: "M2: Retry",
+                fulfills: ["VAL-D1"],
+                status: "pending",
+                updatedAt: nowIso,
+              },
+            ],
+          },
+          nowIso,
+        ),
+      (err: unknown) =>
+        err instanceof SwarmProtocolError &&
+        err.code === "INVALID_INPUT" &&
+        /cannot reclaim assertion "VAL-D1" already fulfilled by completed feature "feat-done-omitted"/i.test(
+          err.message,
+        ),
+    );
+
+    const validateReclaim = validateProposedSwarmPlan(
+      {
+        ...makeSamplePlanParams(),
+        assertions: [
+          { id: "VAL-D1", title: "Done 1", description: "Done 1 behavior" },
+        ],
+        features: [
+          {
+            id: "feat-reclaimer",
+            title: "Reclaimer",
+            description: "Tries to steal VAL-D1",
+            milestone: "M2: Retry",
+            fulfills: ["VAL-D1"],
+          },
+        ],
+      },
+      { mode: "tweak", existingRun: parityRun, now: nowIso },
+    );
+    assert.equal(validateReclaim.valid, false);
+    if (!validateReclaim.valid) {
+      assert.match(
+        validateReclaim.issues[0]?.message ?? "",
+        /cannot reclaim assertion "VAL-D1"/i,
+      );
+    }
   });
 
   it("VAL-DRAFT-001: persists skipContractReview durably on ActiveSwarmDraft and bypasses reviewProposedContract while keeping local validation active", async () => {

@@ -926,12 +926,33 @@ export function mergeTweakedMissionContract(
     const incomingFeatureIds = new Set<string>(
       incoming.features.map((f) => f.id),
     );
+    const incomingClaimOwner = new Map<string, string>();
+    for (const inc of incoming.features) {
+      for (const valId of inc.fulfills ?? []) {
+        if (!incomingClaimOwner.has(valId)) {
+          incomingClaimOwner.set(valId, inc.id);
+        }
+      }
+    }
+
+    // Carry forward omitted already-completed features; reject contradictory VAL-* reclaims
+    // rather than silently dropping completed history or creating duplicate assertion ownership.
     for (const prev of existingRun.features ?? []) {
-      if (
-        prev.status === "completed" &&
-        !incomingFeatureIds.has(prev.id) &&
-        !prev.fulfills.some((valId) => incomingAssertionIds.has(valId))
-      ) {
+      if (prev.status === "completed" && !incomingFeatureIds.has(prev.id)) {
+        for (const valId of prev.fulfills ?? []) {
+          const reclaimingFeatureId = incomingClaimOwner.get(valId);
+          if (reclaimingFeatureId) {
+            throw new SwarmProtocolError(
+              "INVALID_INPUT",
+              `Feature "${reclaimingFeatureId}" cannot reclaim assertion "${valId}" already fulfilled by completed feature "${prev.id}" — keep "${prev.id}" in features or define a new assertion ID instead.`,
+              {
+                featureId: reclaimingFeatureId,
+                completedFeatureId: prev.id,
+                assertionId: valId,
+              },
+            );
+          }
+        }
         carriedCompletedFeatures.push(structuredClone(prev));
       }
     }
@@ -961,10 +982,8 @@ export function mergeTweakedMissionContract(
           }),
         );
       } else {
-        const nextStatus =
-          inc.status && inc.status !== "pending"
-            ? inc.status
-            : prev?.status ?? inc.status ?? "pending";
+        // Allow failed/cancelled work to be requeued to "pending" on tweak (matches legacy index helper)
+        const nextStatus = inc.status ?? prev?.status ?? "pending";
         nextFeatures.push(
           mergeFeaturePreservingUntouched(prev, inc, {
             status: nextStatus,
@@ -985,13 +1004,13 @@ export function mergeTweakedMissionContract(
   const resetAssertionIds = new Set<string>();
   let mergedAssertions: MissionAssertion[] | undefined;
   if (incoming.assertions !== undefined) {
+    // Carry forward omitted assertions across the UNION of all completed features
+    // (both carried-forward omitted completed features AND incoming retained completed features)
     const carriedAssertions: MissionAssertion[] = [];
     const seenCarried = new Set<string>();
-    const completedForCarry =
-      carriedCompletedFeatures.length > 0
-        ? carriedCompletedFeatures
-        : (mergedFeatures ?? []).filter((f) => f.status === "completed");
-    for (const feat of completedForCarry) {
+    const effectiveFeatures = mergedFeatures ?? existingRun.features ?? [];
+    for (const feat of effectiveFeatures) {
+      if (feat.status !== "completed") continue;
       for (const valId of feat.fulfills ?? []) {
         if (!incomingAssertionIds.has(valId) && !seenCarried.has(valId)) {
           const prevA = existingAssertionById.get(valId);
@@ -1014,17 +1033,32 @@ export function mergeTweakedMissionContract(
         const contractUnchanged = prevDesc === nextDesc && prevEvReq === nextEvReq;
 
         if (contractUnchanged) {
-          const mergedStatus =
-            incA.status && incA.status !== "pending"
+          // An unchanged "passed" assertion cannot be downgraded by incoming non-pending status
+          const isPrevPassed = prevA.status === "passed";
+          const mergedStatus = isPrevPassed
+            ? "passed"
+            : incA.status && incA.status !== "pending"
               ? incA.status
               : prevA.status;
-          const evidence = incA.evidence ?? prevA.evidence;
-          const verifiedBy = incA.verifiedBy ?? prevA.verifiedBy;
-          const verifiedByRole = incA.verifiedByRole ?? prevA.verifiedByRole;
-          const overridden =
-            incA.overridden !== undefined ? incA.overridden : prevA.overridden;
-          const overrideJustification =
-            incA.overrideJustification ?? prevA.overrideJustification;
+          const evidence = isPrevPassed
+            ? prevA.evidence ?? incA.evidence
+            : incA.evidence ?? prevA.evidence;
+          const verifiedBy = isPrevPassed
+            ? prevA.verifiedBy ?? incA.verifiedBy
+            : incA.verifiedBy ?? prevA.verifiedBy;
+          const verifiedByRole = isPrevPassed
+            ? prevA.verifiedByRole ?? incA.verifiedByRole
+            : incA.verifiedByRole ?? prevA.verifiedByRole;
+          const overridden = isPrevPassed
+            ? prevA.overridden !== undefined
+              ? prevA.overridden
+              : incA.overridden
+            : incA.overridden !== undefined
+              ? incA.overridden
+              : prevA.overridden;
+          const overrideJustification = isPrevPassed
+            ? prevA.overrideJustification ?? incA.overrideJustification
+            : incA.overrideJustification ?? prevA.overrideJustification;
           nextAssertions.push({
             id: incA.id,
             title: incA.title,
@@ -2460,16 +2494,17 @@ export function validateProposedSwarmPlan(
     }
   }
 
-  // Known completed features from existingRun (supports incremental tweak depends_on references)
+  // Known omitted completed features from existingRun (supports incremental tweak depends_on
+  // references and rejects contradictory VAL-* reclaims without dropping completed history)
   const carriedCompletedIds = new Set<string>();
+  const carriedCompletedOwnerByVal = new Map<string, string>();
   if (existingRun && params.features !== undefined) {
     for (const [prevId, prevFeat] of existingFeatureMap.entries()) {
-      if (
-        prevFeat.status === "completed" &&
-        !seenFeatureIds.has(prevId) &&
-        !prevFeat.fulfills.some((valId) => seenAssertionIds.has(valId))
-      ) {
+      if (prevFeat.status === "completed" && !seenFeatureIds.has(prevId)) {
         carriedCompletedIds.add(prevId);
+        for (const valId of prevFeat.fulfills ?? []) {
+          carriedCompletedOwnerByVal.set(valId, prevId);
+        }
       }
     }
   }
@@ -2499,9 +2534,15 @@ export function validateProposedSwarmPlan(
 
   // Validate fulfills references:
   // - Every ID in feature.fulfills[] must match a defined assertion.id in assertions
+  // - Reject contradictory reclaims of assertions already fulfilled by omitted completed features
   // - Reject duplicate fulfills claiming the same VAL-* across multiple features (1-to-1 leaf rule)
   // - If assertions is non-empty, require features to claim 100% of assertions (zero orphan assertions)
   const claimedAssertions = new Map<string, string>();
+  for (const [valId, prevFeatId] of carriedCompletedOwnerByVal.entries()) {
+    if (seenAssertionIds.has(valId)) {
+      claimedAssertions.set(valId, prevFeatId);
+    }
+  }
   for (const feat of incomingFeatures) {
     for (const valId of feat.fulfills) {
       if (!seenAssertionIds.has(valId)) {
@@ -2509,6 +2550,15 @@ export function validateProposedSwarmPlan(
           code: "INVALID_INPUT",
           field: "features",
           message: `Feature "${feat.id}" fulfills unknown assertion "${valId}" — define "${valId}" in assertions first.`,
+        });
+        continue;
+      }
+      const carriedOwner = carriedCompletedOwnerByVal.get(valId);
+      if (carriedOwner) {
+        issues.push({
+          code: "INVALID_INPUT",
+          field: "features",
+          message: `Feature "${feat.id}" cannot reclaim assertion "${valId}" already fulfilled by completed feature "${carriedOwner}" — keep "${carriedOwner}" in features or define a new assertion ID instead.`,
         });
         continue;
       }
