@@ -1738,7 +1738,7 @@ function buildMissionResumePrompt(
 
 function buildHelpMarkdown(): string {
   return [
-    "### 🐝 Pi Swarm v0.8.0 (`/swarm`) — Dynamic Mission Goal Engine & Antigravity Swarm Commands",
+    "### 🐝 Pi Swarm v0.9.0 (`/swarm`) — Dynamic Mission Goal Engine & Antigravity Swarm Commands",
     "",
     "| Command | Description |",
     "| --- | --- |",
@@ -4754,7 +4754,7 @@ export function createPiSwarmExtension(
                 'Tool "manageMission" invoked after swarm_wait turn',
               );
             }
-            if (input?.op !== "status") {
+            if (input?.op !== "status" && input?.op !== "read_library") {
               await assertToolEngineOwner(target);
             }
             return target.manageMission!(input);
@@ -5417,9 +5417,7 @@ export function createPiSwarmExtension(
       onModalEnter,
       onModalExit,
       draftController,
-      ...({
-        reviewProposedContract: runAdversarialContractReviewFromDrafting,
-      } as Record<string, unknown>),
+      reviewProposedContract: runAdversarialContractReviewFromDrafting,
       confirmProposalOptions: (toolCtx) => {
         if (!canUseCustomTui(toolCtx)) {
           return {};
@@ -5901,7 +5899,7 @@ export function createPiSwarmExtension(
               return undefined;
             }
             return async (input: ManageMissionInput) => {
-              if (input?.op !== "status") {
+              if (input?.op !== "status" && input?.op !== "read_library") {
                 const snap = target.getSnapshot();
                 if (snap.run) {
                   await assertFocusedRunOwner(store, snap.run.id, ctx);
@@ -8592,7 +8590,7 @@ export function createPiSwarmExtension(
     // ------------------------------------------------------------------------
     pi.registerCommand("swarm", {
       description:
-        "Pi Swarm v0.8.0 — Dynamic Mission Goal Engine & Antigravity Swarm orchestrator (VAL-* contracts, Sisyphus auto-continuation, Droid Mission model/effort picker & cross-session resume, shared #seq board, non-blocking swarm_wait, warm sessions & worktrees)",
+        "Pi Swarm v0.9.0 — Dynamic Mission Goal Engine & Antigravity Swarm orchestrator (VAL-* contracts, Sisyphus auto-continuation, Droid Mission model/effort picker & cross-session resume, shared #seq board, non-blocking swarm_wait, warm sessions & worktrees)",
       getArgumentCompletions: getSwarmCompletions,
       handler: handleSwarmCommand,
     });

@@ -32,6 +32,8 @@ export {
 
 export {
   assertFeatureDependencyDag,
+  assertProposedSwarmPlan,
+  assertServiceManifest,
   buildRoleModelsFromSettings,
   createDraftingTools,
   createProposeSwarmPlanTool,
@@ -42,6 +44,7 @@ export {
   MissionAssertionProposalSchema,
   MissionCommandProposalSchema,
   MissionFeatureProposalSchema,
+  MissionServiceProposalSchema,
   ProposeSwarmPlanParamsSchema,
   registerDraftingTools,
   SwarmQuestionnaireItemSchema,
@@ -54,6 +57,8 @@ export {
   type MissionAssertionProposalParams,
   type MissionCommandProposalParams,
   type MissionFeatureProposalParams,
+  type MissionServiceProposalParams,
+  type ProposeSwarmPlanInput,
   type ProposeSwarmPlanParams,
   type ProposeSwarmPlanToolDetails,
   type SwarmQuestionnaireParams,
