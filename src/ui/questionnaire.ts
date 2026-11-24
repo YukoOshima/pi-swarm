@@ -278,12 +278,20 @@ async function confirmProposalBasic(
   const planTitle = sanitizePlainText(plan.title);
 
   while (!signal?.aborted) {
+    const missionCounts: string[] = [];
+    if (plan.features && plan.features.length > 0) {
+      missionCounts.push(`Features: ${plan.features.length}`);
+    }
+    if (plan.assertions && plan.assertions.length > 0) {
+      missionCounts.push(`VAL: ${plan.assertions.length}`);
+    }
     const header = [
       options?.mode === "tweak"
         ? "Swarm Plan Confirmation (Revision)"
         : "Swarm Plan Confirmation",
       planTitle ? `${planTitle}` : sanitizePlainText(plan.objective),
       `base:${sanitizePlainText(plan.baseBranch)}${membersNote}`,
+      ...(missionCounts.length > 0 ? [missionCounts.join(" · ")] : []),
       `Models: ${modelsLine}`,
       `Independent Validator Policy: ${validatorEnabled ? "ON" : "OFF"} · Max Concurrency: ${maxConcurrency}`,
     ].join(" — ");
@@ -1219,10 +1227,11 @@ class MultiQuestionComponent implements Component, Focusable {
   }
 }
 
-class ConfirmProposalComponent implements Component, Focusable {
+export class ConfirmProposalComponent implements Component, Focusable {
   readonly capturesViewportInput = true;
   private _focused = false;
   private selectedIndex = 0;
+  private previewScrollOffset = 0;
   private validatorEnabled: boolean;
   private maxConcurrency: number;
   private roleModels: SwarmRoleModels | undefined;
@@ -1454,6 +1463,18 @@ class ConfirmProposalComponent implements Component, Focusable {
       return;
     }
 
+    if (ch === "[" || matchesKey(data, Key.pageUp)) {
+      this.previewScrollOffset = Math.max(0, this.previewScrollOffset - 4);
+      this.tui.requestRender();
+      return;
+    }
+
+    if (ch === "]" || matchesKey(data, Key.pageDown)) {
+      this.previewScrollOffset += 4;
+      this.tui.requestRender();
+      return;
+    }
+
     if (matchesKey(data, Key.up) || ch === "k") {
       this.selectedIndex =
         (this.selectedIndex - 1 + this.choices.length) % this.choices.length;
@@ -1587,6 +1608,16 @@ class ConfirmProposalComponent implements Component, Focusable {
 
     const body: string[] = [];
 
+    const commands = this.plan.commands ?? [];
+    const boundaries = this.plan.boundaries ?? [];
+    const assertions = this.plan.assertions ?? [];
+    const features = this.plan.features ?? [];
+    const hasMissionSections =
+      commands.length > 0 ||
+      boundaries.length > 0 ||
+      assertions.length > 0 ||
+      features.length > 0;
+
     // Plan title & objective snippet
     const cleanTitle = sanitizePlainText(this.plan.title);
     const cleanObjective = sanitizePlainText(this.plan.objective);
@@ -1596,10 +1627,14 @@ class ConfirmProposalComponent implements Component, Focusable {
       );
     }
     if (cleanObjective && cleanObjective !== cleanTitle && maxInnerLines >= 11) {
+      const objMaxLines =
+        maxInnerLines <= 12 || (hasMissionSections && maxInnerLines <= 24)
+          ? 1
+          : 2;
       const objLines = wrapLines(
         this.theme.bold(cleanObjective),
         innerWidth,
-        maxInnerLines <= 12 ? 1 : 2,
+        objMaxLines,
       );
       body.push(...objLines);
     }
@@ -1629,7 +1664,7 @@ class ConfirmProposalComponent implements Component, Focusable {
 
     if (innerWidth >= 66) {
       body.push(fitLine(`${valPart} · ${concPart}`, innerWidth));
-    } else if (maxInnerLines >= 13) {
+    } else if (maxInnerLines >= 13 && !hasMissionSections) {
       body.push(fitLine(valPart, innerWidth));
       body.push(fitLine(concPart, innerWidth));
     } else {
@@ -1646,54 +1681,283 @@ class ConfirmProposalComponent implements Component, Focusable {
     const bottomReserved = 1 + hasCommentRow + this.choices.length + 1;
     let previewBudget = Math.max(0, maxInnerLines - body.length - bottomReserved);
 
-    // Compact Strategy & Acceptance Criteria preview
     const cleanStrategy = sanitizePlainText(this.plan.strategy);
     const cleanAcceptance = sanitizePlainText(this.plan.acceptanceCriteria);
 
-    if (previewBudget >= 2 && (cleanStrategy || cleanAcceptance)) {
-      body.push(renderHorizontalRule(innerWidth, "Plan Strategy & Criteria", this.theme));
-      previewBudget -= 1;
+    if (hasMissionSections) {
+      const allPreviewLines: string[] = [];
+      const sep = this.theme.fg("dim", " · ");
 
-      if (cleanStrategy && previewBudget > 0) {
-        const stratMax = cleanAcceptance && previewBudget >= 3 ? 2 : 1;
-        const stratLines = wrapLines(
-          `${this.theme.fg("muted", "Strategy: ")}${cleanStrategy}`,
-          innerWidth,
-          Math.min(stratMax, previewBudget),
+      // 1. Commands & Boundaries
+      if (commands.length > 0 || boundaries.length > 0) {
+        allPreviewLines.push(
+          renderHorizontalRule(innerWidth, "Commands & Boundaries", this.theme),
         );
-        body.push(...stratLines);
-        previewBudget -= stratLines.length;
+        if (commands.length > 0) {
+          const inlineCmds =
+            "  " +
+            commands
+              .map(
+                (c) =>
+                  `${this.theme.fg("accent", "$")} ${this.theme.bold(sanitizePlainText(c.name))}: ${this.theme.fg("muted", sanitizePlainText(c.command))}`,
+              )
+              .join(sep);
+          if (visibleWidth(inlineCmds) <= innerWidth) {
+            allPreviewLines.push(fitLine(inlineCmds, innerWidth));
+          } else {
+            for (const c of commands) {
+              allPreviewLines.push(
+                fitLine(
+                  `  ${this.theme.fg("accent", "$")} ${this.theme.bold(sanitizePlainText(c.name))}: ${this.theme.fg("muted", sanitizePlainText(c.command))}`,
+                  innerWidth,
+                ),
+              );
+            }
+          }
+        }
+        for (const b of boundaries) {
+          allPreviewLines.push(
+            fitLine(
+              `  ${this.theme.fg("warning", "!")} ${this.theme.fg("muted", sanitizePlainText(b))}`,
+              innerWidth,
+            ),
+          );
+        }
       }
 
-      if (cleanAcceptance && previewBudget > 0) {
-        const accMax = initialMembers.length > 0 && previewBudget >= 3 ? 1 : 2;
-        const accLines = wrapLines(
-          `${this.theme.fg("muted", "Acceptance: ")}${cleanAcceptance}`,
-          innerWidth,
-          Math.min(accMax, previewBudget),
+      // 2. Validation Contract (N VAL-* assertions)
+      if (assertions.length > 0) {
+        const contractHeader =
+          innerWidth >= 42
+            ? `Validation Contract (${assertions.length} VAL-* assertion${assertions.length === 1 ? "" : "s"})`
+            : `Contract (${assertions.length} VAL-*)`;
+        allPreviewLines.push(
+          renderHorizontalRule(innerWidth, contractHeader, this.theme),
         );
-        body.push(...accLines);
-        previewBudget -= accLines.length;
+        for (const a of assertions) {
+          const glyph =
+            a.status === "passed"
+              ? this.theme.fg("success", "[✓]")
+              : a.status === "failed"
+                ? this.theme.fg("error", "[✗]")
+                : a.status === "blocked"
+                  ? this.theme.fg("warning", "[!]")
+                  : this.theme.fg("muted", "[ ]");
+          const idStr = this.theme.bold(sanitizePlainText(a.id));
+          const titleStr = sanitizePlainText(a.title);
+          const descStr = sanitizePlainText(a.description);
+          const descTail =
+            descStr && descStr !== titleStr
+              ? ` ${this.theme.fg("dim", `— ${descStr}`)}`
+              : "";
+          allPreviewLines.push(
+            fitLine(`  ${glyph} ${idStr}: ${titleStr}${descTail}`, innerWidth),
+          );
+        }
       }
-    }
 
-    // Optional initialMembers summary preview
-    if (initialMembers.length > 0 && previewBudget >= 2) {
-      body.push(
-        renderHorizontalRule(
+      // 3. Feature Queue (M features across K milestones, fulfills & dependsOn)
+      if (features.length > 0) {
+        const distinctMilestones = new Set(
+          features.map((f) => sanitizePlainText(f.milestone)).filter(Boolean),
+        );
+        const milestoneCount =
+          distinctMilestones.size > 0
+            ? distinctMilestones.size
+            : Math.max(1, this.plan.milestones?.length ?? 1);
+        const queueHeader =
+          innerWidth >= 48
+            ? `Feature Queue (${features.length} feature${features.length === 1 ? "" : "s"} across ${milestoneCount} milestone${milestoneCount === 1 ? "" : "s"})`
+            : `Features (${features.length} / ${milestoneCount} ms)`;
+        allPreviewLines.push(
+          renderHorizontalRule(innerWidth, queueHeader, this.theme),
+        );
+
+        const sealedSet = new Set(
+          (this.plan.milestones ?? [])
+            .filter((m) => Boolean(m.sealed))
+            .map((m) => sanitizePlainText(m.label)),
+        );
+        for (const f of features) {
+          const glyph =
+            f.status === "completed"
+              ? this.theme.fg("success", "[✓]")
+              : f.status === "in_progress"
+                ? this.theme.fg("accent", "[▸]")
+                : f.status === "failed"
+                  ? this.theme.fg("error", "[!]")
+                  : f.status === "cancelled"
+                    ? this.theme.fg("dim", "[~]")
+                    : this.theme.fg("muted", "[ ]");
+          const idStr = this.theme.bold(sanitizePlainText(f.id));
+          const msClean = sanitizePlainText(f.milestone);
+          const msPart = msClean
+            ? ` ${this.theme.fg("muted", `[${msClean}${sealedSet.has(msClean) ? " [S]" : ""}]`)}`
+            : "";
+          const titleStr = sanitizePlainText(f.title);
+          const fulfillsPlain =
+            f.fulfills && f.fulfills.length > 0
+              ? `fulfills: ${f.fulfills.map(sanitizePlainText).join(", ")}`
+              : "";
+          const depsPlain =
+            f.dependsOn && f.dependsOn.length > 0
+              ? `dependsOn: ${f.dependsOn.map(sanitizePlainText).join(", ")}`
+              : "";
+          const metaPlain = [fulfillsPlain, depsPlain].filter(Boolean).join(" · ");
+          const metaStyled = metaPlain ? this.theme.fg("dim", metaPlain) : "";
+          const primary = titleStr
+            ? `  ${glyph} ${idStr}${msPart}: ${titleStr}`
+            : `  ${glyph} ${idStr}${msPart}`;
+
+          if (!metaStyled) {
+            allPreviewLines.push(fitLine(primary, innerWidth));
+          } else {
+            const single = `${primary}${sep}${metaStyled}`;
+            if (visibleWidth(single) <= innerWidth) {
+              allPreviewLines.push(fitLine(single, innerWidth));
+            } else {
+              allPreviewLines.push(fitLine(primary, innerWidth));
+              allPreviewLines.push(fitLine(`      ${metaStyled}`, innerWidth));
+            }
+          }
+        }
+      }
+
+      // 4. Compact Strategy & Acceptance Criteria
+      if (cleanStrategy || cleanAcceptance) {
+        allPreviewLines.push(
+          renderHorizontalRule(innerWidth, "Plan Strategy & Criteria", this.theme),
+        );
+        if (cleanStrategy) {
+          allPreviewLines.push(
+            ...wrapLines(
+              `${this.theme.fg("muted", "Strategy: ")}${cleanStrategy}`,
+              innerWidth,
+              2,
+            ),
+          );
+        }
+        if (cleanAcceptance) {
+          allPreviewLines.push(
+            ...wrapLines(
+              `${this.theme.fg("muted", "Acceptance: ")}${cleanAcceptance}`,
+              innerWidth,
+              2,
+            ),
+          );
+        }
+      }
+
+      // 5. Optional initialMembers summary
+      if (initialMembers.length > 0) {
+        allPreviewLines.push(
+          renderHorizontalRule(
+            innerWidth,
+            `Initial Members (${initialMembers.length})`,
+            this.theme,
+          ),
+        );
+        allPreviewLines.push(
+          ...buildInitialMembersSummaryLines(
+            initialMembers,
+            innerWidth,
+            this.theme,
+            Math.max(3, initialMembers.length),
+          ),
+        );
+      }
+
+      if (previewBudget > 0 && allPreviewLines.length > 0) {
+        if (allPreviewLines.length <= previewBudget) {
+          this.previewScrollOffset = 0;
+          body.push(...allPreviewLines);
+        } else if (previewBudget === 1) {
+          const miniParts: string[] = [];
+          if (features.length > 0) miniParts.push(`Feat:${features.length}`);
+          if (assertions.length > 0) miniParts.push(`VAL:${assertions.length}`);
+          if (commands.length > 0) miniParts.push(`Cmd:${commands.length}`);
+          if (boundaries.length > 0) miniParts.push(`Bnd:${boundaries.length}`);
+          body.push(
+            fitLine(
+              this.theme.fg("muted", `  ◆ ${miniParts.join(" · ")}`),
+              innerWidth,
+            ),
+          );
+        } else {
+          const windowSize = previewBudget - 1;
+          const maxOffset = Math.max(0, allPreviewLines.length - windowSize);
+          this.previewScrollOffset = Math.max(
+            0,
+            Math.min(this.previewScrollOffset, maxOffset),
+          );
+          body.push(
+            ...allPreviewLines.slice(
+              this.previewScrollOffset,
+              this.previewScrollOffset + windowSize,
+            ),
+          );
+          const above = this.previewScrollOffset;
+          const below = Math.max(
+            0,
+            allPreviewLines.length - (this.previewScrollOffset + windowSize),
+          );
+          const dirParts: string[] = [];
+          if (above > 0) dirParts.push(`↑ ${above} above`);
+          if (below > 0) dirParts.push(`↓ ${below} more`);
+          const cueText =
+            innerWidth >= 48
+              ? `  ${dirParts.join(" · ")}  ([/]/PgUp/PgDn scroll)`
+              : `  ${dirParts.join(" · ")} ([/])`;
+          body.push(fitLine(this.theme.fg("accent", cueText), innerWidth));
+        }
+      }
+    } else {
+      // Compact Strategy & Acceptance Criteria preview
+      if (previewBudget >= 2 && (cleanStrategy || cleanAcceptance)) {
+        body.push(renderHorizontalRule(innerWidth, "Plan Strategy & Criteria", this.theme));
+        previewBudget -= 1;
+
+        if (cleanStrategy && previewBudget > 0) {
+          const stratMax = cleanAcceptance && previewBudget >= 3 ? 2 : 1;
+          const stratLines = wrapLines(
+            `${this.theme.fg("muted", "Strategy: ")}${cleanStrategy}`,
+            innerWidth,
+            Math.min(stratMax, previewBudget),
+          );
+          body.push(...stratLines);
+          previewBudget -= stratLines.length;
+        }
+
+        if (cleanAcceptance && previewBudget > 0) {
+          const accMax = initialMembers.length > 0 && previewBudget >= 3 ? 1 : 2;
+          const accLines = wrapLines(
+            `${this.theme.fg("muted", "Acceptance: ")}${cleanAcceptance}`,
+            innerWidth,
+            Math.min(accMax, previewBudget),
+          );
+          body.push(...accLines);
+          previewBudget -= accLines.length;
+        }
+      }
+
+      // Optional initialMembers summary preview
+      if (initialMembers.length > 0 && previewBudget >= 2) {
+        body.push(
+          renderHorizontalRule(
+            innerWidth,
+            `Initial Members (${initialMembers.length})`,
+            this.theme,
+          ),
+        );
+        previewBudget -= 1;
+        const memberLines = buildInitialMembersSummaryLines(
+          initialMembers,
           innerWidth,
-          `Initial Members (${initialMembers.length})`,
           this.theme,
-        ),
-      );
-      previewBudget -= 1;
-      const memberLines = buildInitialMembersSummaryLines(
-        initialMembers,
-        innerWidth,
-        this.theme,
-        Math.min(3, previewBudget),
-      );
-      body.push(...memberLines);
+          Math.min(3, previewBudget),
+        );
+        body.push(...memberLines);
+      }
     }
 
     body.push(renderHorizontalRule(innerWidth, undefined, this.theme));

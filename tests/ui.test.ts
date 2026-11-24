@@ -33,6 +33,7 @@ import type {
   SwitchModelOptions,
 } from "../src/types.js";
 import {
+  ConfirmProposalComponent,
   HardwareCursorController,
   SwarmDashboardComponent,
   SwarmHubView,
@@ -64,6 +65,7 @@ import {
   formatZeroTurnGraphView,
   formatZeroTurnModelsView,
   formatZeroTurnStatusDashboard,
+  formatZeroTurnStatusView,
   isModalOpen,
   joinColumns,
   memberStateIcon,
@@ -4662,5 +4664,674 @@ describe("v0.7.0 UI Live Dashboard & Mission Control Overhaul", () => {
       rendersAfterClose,
       "Overlay spinner timer must be cleaned up on dispose()",
     );
+  });
+});
+
+// ============================================================================
+// v0.8.0 UI Goal Progress, Contract Inspector & Proposal Card
+// ============================================================================
+
+describe("v0.8.0 UI Goal Progress, Contract Inspector & Proposal Card", () => {
+  const fixedNow = () => Date.parse("2026-11-24T10:30:00.000Z");
+  const WIDTH_MATRIX = [40, 60, 72, 80, 100, 120] as const;
+  const AMBIGUOUS_EMOJI_RE = /[\u23f0-\u23ff\u26a0\u{1f300}-\u{1f9ff}]\ufe0f?/u;
+
+  function assertIntactBoxBorders(
+    lines: readonly string[],
+    width: number,
+    label: string,
+    checkNoAmbiguousInnerEmoji = true,
+  ): void {
+    assert.ok(lines.length >= 2, `${label}: expected >= 2 lines, got ${lines.length}`);
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]!;
+      const w = visibleWidth(line);
+      const plain = stripTerminalSequences(line);
+      assert.equal(
+        w,
+        width,
+        `${label}: line ${i} visibleWidth expected ${width}, got ${w}: ${JSON.stringify(plain)}`,
+      );
+      if (i === 0) {
+        assert.ok(
+          plain.startsWith("╭") && plain.endsWith("╮"),
+          `${label}: top border broken on row 0: ${plain}`,
+        );
+      } else if (i === lines.length - 1) {
+        assert.ok(
+          plain.startsWith("╰") && plain.endsWith("╯"),
+          `${label}: bottom border broken on row ${i}: ${plain}`,
+        );
+      } else {
+        assert.ok(
+          plain.startsWith("│") && plain.endsWith("│"),
+          `${label}: side borders broken on row ${i}: ${plain}`,
+        );
+        if (checkNoAmbiguousInnerEmoji) {
+          assert.doesNotMatch(
+            plain,
+            AMBIGUOUS_EMOJI_RE,
+            `${label}: inner row ${i} must not contain ambiguous-width emoji: ${plain}`,
+          );
+        }
+      }
+    }
+  }
+
+  function makeMissionGoalSnapshot(): SwarmSnapshot {
+    const snap = makeSampleSnapshot();
+    const run = snap.run!;
+    run.phase = "Execution";
+    run.milestones = [
+      {
+        label: "Contract",
+        status: "done",
+        owner: "worker-1",
+        sealed: true,
+        sealedAt: "2026-11-24T10:10:00.000Z",
+      },
+      {
+        label: "Runtime",
+        status: "in_progress",
+        owner: "worker-2",
+      },
+      {
+        label: "Verify",
+        status: "pending",
+      },
+    ];
+    run.features = [
+      {
+        id: "feat-store",
+        title: "Persist validation state and features JSON",
+        description: "Materialize mission artifacts atomically",
+        milestone: "Contract",
+        fulfills: ["VAL-STORE-01"],
+        status: "completed",
+        assignedMember: "worker-1",
+        mergedCommitSha: "5065d6e070b3defe",
+        updatedAt: "2026-11-24T10:10:00.000Z",
+      },
+      {
+        id: "feat-done-2",
+        title: "Board handoff metadata normalization",
+        description: "Persist discoveredIssues and leftUndone",
+        milestone: "Contract",
+        dependsOn: ["feat-store"],
+        fulfills: ["VAL-STORE-01"],
+        status: "completed",
+        assignedMember: "worker-1",
+        mergedCommitSha: "6176e7f181c4ef0f",
+        updatedAt: "2026-11-24T10:12:00.000Z",
+      },
+      {
+        id: "feat-engine",
+        title: "Implement manageMission and done gates",
+        description: "Enforce 100% VAL pass and zero open debt",
+        milestone: "Runtime",
+        dependsOn: ["feat-store"],
+        fulfills: ["VAL-ENG-01"],
+        status: "in_progress",
+        assignedMember: "worker-2",
+        updatedAt: "2026-11-24T10:20:00.000Z",
+      },
+      {
+        id: "feat-audit",
+        title: "Run end-to-end validator check",
+        description: "Verify all contract items",
+        milestone: "Verify",
+        dependsOn: ["feat-engine"],
+        fulfills: ["VAL-UI-01"],
+        status: "failed",
+        assignedMember: "validator",
+        updatedAt: "2026-11-24T10:25:00.000Z",
+      },
+      {
+        id: "feat-legacy-drop",
+        title: "Deprecated prototype spike",
+        description: "Dropped by user scope update",
+        milestone: "Verify",
+        fulfills: [],
+        status: "cancelled",
+        updatedAt: "2026-11-24T10:15:00.000Z",
+      },
+    ];
+    run.assertions = [
+      {
+        id: "VAL-STORE-01",
+        title: "Artifacts materialized atomically",
+        description: "mission.md, validation-contract.md, and features.json exist",
+        evidenceRequired: "node --test tests/store.test.ts passes",
+        status: "passed",
+        evidence: "10/10 store tests passed; inode cache verified",
+        verifiedBy: "validator",
+        verifiedByRole: "validator",
+        updatedAt: "2026-11-24T10:12:00.000Z",
+      },
+      {
+        id: "VAL-ENG-01",
+        title: "Workers cannot self-verify assertions",
+        description: "verify_assertion rejects worker role with PERMISSION_DENIED",
+        evidenceRequired: "Unit test in tests/engine.test.ts",
+        status: "pending",
+        updatedAt: "2026-11-24T10:20:00.000Z",
+      },
+      {
+        id: "VAL-UI-01",
+        title: "Narrow 72x20 borders remain intact",
+        description: "Zero clipped borders across all overlays",
+        evidenceRequired: "UI border width matrix check",
+        status: "failed",
+        evidence: "Pending final audit pass",
+        verifiedBy: "validator",
+        verifiedByRole: "validator",
+        updatedAt: "2026-11-24T10:25:00.000Z",
+      },
+    ];
+    run.handoffItems = [
+      {
+        id: "handoff-1",
+        type: "discovered_issue",
+        sourceMember: "worker-1",
+        sourceFeatureId: "feat-done-2",
+        summary: "Unclaimed assertion warning needs clearer formatting",
+        resolution: "open",
+        createdAt: "2026-11-24T10:13:00.000Z",
+      },
+      {
+        id: "handoff-2",
+        type: "critical_context",
+        sourceMember: "worker-2",
+        sourceFeatureId: "feat-engine",
+        summary: "Sealed milestones reject non-forced feature inserts",
+        resolution: "open",
+        createdAt: "2026-11-24T10:21:00.000Z",
+      },
+      {
+        id: "handoff-3",
+        type: "incomplete_work",
+        sourceMember: "worker-1",
+        summary: "Add follow-up migration test",
+        resolution: "tracked",
+        trackedFeatureId: "feat-engine",
+        createdAt: "2026-11-24T10:11:00.000Z",
+        resolvedAt: "2026-11-24T10:14:00.000Z",
+      },
+    ];
+    run.commands = [
+      { name: "typecheck", command: "npm run typecheck" },
+      { name: "test", command: "npm run test:file tests/ui.test.ts" },
+    ];
+    run.boundaries = [
+      "Never read or print auth.json",
+      "Zero ambiguous-width emoji inside renderBox",
+    ];
+    run.lastAudit = {
+      verdict: "disapproved",
+      auditor: "validator",
+      summary: "1 assertion failed and 1 tech-debt handoff still open",
+      timestamp: "2026-11-24T10:26:00.000Z",
+    };
+    return snap;
+  }
+
+  it("(a) renders live Goal progress in compact widget, status line, and expanded dashboard (respecting 72x20 height cap & exact box borders across 40..120)", () => {
+    const theme = createMockTheme();
+    const snap = makeMissionGoalSnapshot();
+
+    // 1. Footer status line includes Feat 2/4 · VAL 1/3 · !1 debt
+    const statusLine = formatStatusLine(snap, false) ?? "";
+    assert.match(statusLine, /Feat 2\/4 · VAL 1\/3 · !1 debt/);
+
+    // 2. Compact widget above editor across 40, 60, 72, 80, 100, 120
+    {
+      const { tui } = createMockTUI(30, 100);
+      const compactWidget = createSwarmWidget(
+        () => snap,
+        createSwarmWidgetState({ expanded: false }),
+        { now: fixedNow },
+      )(tui, theme);
+      try {
+        for (const w of WIDTH_MATRIX) {
+          const lines = compactWidget.render(w);
+          assertAllLinesFit(lines, w, `v080-compact@${w}`);
+        }
+        const plain100 = stripTerminalSequences(compactWidget.render(100).join("\n"));
+        assert.match(plain100, /\[S\] 1/);
+        assert.match(plain100, /Feat \[██░░\] 2\/4/);
+        assert.match(plain100, /VAL 1\/3/);
+        assert.match(plain100, /!1 debt/);
+        assert.match(plain100, /▸ feat-engine/);
+
+        const plain40 = stripTerminalSequences(compactWidget.render(40).join("\n"));
+        assert.match(plain40, /Feat 2\/4 · VAL 1\/3 · !1 debt/);
+      } finally {
+        compactWidget.dispose();
+      }
+    }
+
+    // 3. Expanded dashboard at 72x20: height <= Math.max(8, 20 - 7) = 13, unclipped bottom border, exact border widths across 40..120
+    {
+      const { tui } = createMockTUI(20, 72);
+      const expanded72 = createSwarmWidget(
+        () => snap,
+        createSwarmWidgetState({ expanded: true }),
+        { now: fixedNow },
+      )(tui, theme);
+      try {
+        const lines72 = expanded72.render(72);
+        assert.ok(
+          lines72.length <= 13,
+          `72x20 expanded dashboard must be <= 13 lines (termRows - 7), got ${lines72.length}`,
+        );
+        assertIntactBoxBorders(lines72, 72, "v080-expanded@72x20");
+        const plain72 = stripTerminalSequences(lines72.join("\n"));
+        assert.match(plain72, /Goal Progress/);
+        assert.match(plain72, /Feat 2\/4/);
+        assert.match(plain72, /VAL 1\/3/);
+        assert.match(plain72, /\[S\] Contract/);
+        assert.match(plain72, /!1 debt/);
+        assert.match(plain72, /\[✓\]/);
+        assert.match(plain72, /\[▸\]/);
+        assert.match(plain72, /\[!\]/);
+        assert.match(plain72, /Alt\+W collapse/);
+
+        for (const w of WIDTH_MATRIX) {
+          const linesW = expanded72.render(w);
+          assert.ok(linesW.length <= 13, `20-row expanded@${w} exceeded 13 rows: ${linesW.length}`);
+          assertIntactBoxBorders(linesW, w, `v080-expanded@20x${w}`);
+        }
+      } finally {
+        expanded72.dispose();
+      }
+    }
+
+    // 4. Expanded dashboard at 100x30: shows full multi-row Goal Progress + [██░░] bar + [S] sealed milestone + exact borders across 40..120
+    {
+      const { tui } = createMockTUI(30, 100);
+      const expanded100 = createSwarmWidget(
+        () => snap,
+        createSwarmWidgetState({ expanded: true }),
+        { now: fixedNow },
+      )(tui, theme);
+      try {
+        for (const w of WIDTH_MATRIX) {
+          const linesW = expanded100.render(w);
+          assert.ok(linesW.length <= 23, `30-row expanded@${w} exceeded 23 rows: ${linesW.length}`);
+          assertIntactBoxBorders(linesW, w, `v080-expanded@30x${w}`);
+        }
+        const plain100 = stripTerminalSequences(expanded100.render(100).join("\n"));
+        assert.match(plain100, /── Goal Progress/);
+        assert.match(plain100, /Feat \[██░░\] 2\/4 · VAL 1\/3 · !1 debt · \[S\] Contract/);
+        assert.match(plain100, /\[✓\] feat-done-2/);
+        assert.match(plain100, /\[▸\] feat-engine/);
+        assert.match(plain100, /\[!\] feat-audit/);
+      } finally {
+        expanded100.dispose();
+      }
+    }
+  });
+
+  it("(b) formatZeroTurnStatusView renders Markdown tables for Mission Features, VAL-* Validation Contract, Open Handoffs, and Commands / Boundaries", () => {
+    assert.equal(formatZeroTurnStatusView, formatZeroTurnStatusDashboard);
+    const snap = makeMissionGoalSnapshot();
+    const md = formatZeroTurnStatusView(snap, {
+      hostModel: "anthropic/claude-sonnet-4-5",
+      now: fixedNow,
+    });
+
+    assert.match(md, /- \*\*Goal Progress:\*\* Features 2\/4 completed · Validation Contract 1\/3 `VAL-\*` passed · Sealed: `Contract` `\[S\]` · Open Debt: !1/);
+    assert.match(md, /- \*\*Last Audit:\*\* `disapproved` by `@validator`/);
+
+    // Mission Features table
+    assert.match(md, /#### Mission Features \(2\/4 completed\)/);
+    assert.match(md, /\| ID \| Milestone \| Status \| Assigned \| Fulfills \|/);
+    assert.match(md, /\| `feat-store` — Persist validation state and features JSON \| Contract `\[S\]` \| \[✓\] `completed` \(`5065d6e`\) \| `@worker-1` \| `VAL-STORE-01` \|/);
+    assert.match(md, /\| `feat-engine` — Implement manageMission and done gates \| Runtime \| \[▸\] `in_progress` \| `@worker-2` \| `VAL-ENG-01` \|/);
+    assert.match(md, /\| `feat-audit` — Run end-to-end validator check \| Verify \| \[!\] `failed` \| `@validator` \| `VAL-UI-01` \|/);
+    assert.match(md, /\| `feat-legacy-drop` — Deprecated prototype spike \| Verify \| \[~\] `cancelled` \| — \| — \|/);
+
+    // Validation Contract table
+    assert.match(md, /#### Validation Contract \(1\/3 passed\)/);
+    assert.match(md, /\| ID \| Status \| Verified By \| Title \/ Evidence \|/);
+    assert.match(md, /\| `VAL-STORE-01` \| \[✓\] `passed` \| `@validator` \(validator\) \| Artifacts materialized atomically — _10\/10 store tests passed; inode cache verified_ \|/);
+    assert.match(md, /\| `VAL-ENG-01` \| \[ \] `pending` \| — \| Workers cannot self-verify assertions _\(req: Unit test in tests\/engine\.test\.ts\)_ \|/);
+    assert.match(md, /\| `VAL-UI-01` \| \[✗\] `failed` \| `@validator` \(validator\) \| Narrow 72x20 borders remain intact — _Pending final audit pass_ \|/);
+
+    // Open Handoff Tech-Debt table
+    assert.match(md, /#### Open Handoff Tech-Debt \(2 open \/ 3 total\)/);
+    assert.match(md, /\| ID \| Type \| Source \| Resolution \| Summary \|/);
+    assert.match(md, /\| `handoff-1` \| `discovered_issue` \| `@worker-1` \(`feat-done-2`\) \| `open` \| Unclaimed assertion warning needs clearer formatting \|/);
+    assert.match(md, /\| `handoff-3` \| `incomplete_work` \| `@worker-1` \| `tracked` -> `feat-engine` \| Add follow-up migration test \|/);
+
+    // Commands & Boundaries section
+    assert.match(md, /#### Commands & Boundaries/);
+    assert.match(md, /\| `typecheck` \| `npm run typecheck` \|/);
+    assert.match(md, /\| `test` \| `npm run test:file tests\/ui\.test\.ts` \|/);
+    assert.match(md, /- \*\*Boundary:\*\* Never read or print auth\.json/);
+    assert.match(md, /- \*\*Boundary:\*\* Zero ambiguous-width emoji inside renderBox/);
+  });
+
+  it("(c) SwarmOverlayComponent surfaces Features, VAL, [S] sealed, and open debt in pipeline strip and toggles [v] Mission Contract & Features view on Graph tab", async () => {
+    const theme = createMockTheme();
+    const mockTui = createMockTUI(30, 100);
+    const snap = makeMissionGoalSnapshot();
+    // Add a pending feature so all 5 statuses ([✓], [▸], [ ], [!], [~]) are exercised in the inspector
+    snap.run!.features!.splice(3, 0, {
+      id: "feat-pending-docs",
+      title: "Update CLI help notes",
+      description: "Document /swarm contract",
+      milestone: "Verify",
+      dependsOn: ["feat-engine"],
+      fulfills: ["VAL-UI-01"],
+      status: "pending",
+      updatedAt: "2026-11-24T10:22:00.000Z",
+    });
+
+    const engine: ISwarmEngine = {
+      startRun: async () => snap.run!,
+      attachRun: async () => snap,
+      setTitle: async () => snap.run!,
+      updateDirection: async () => snap.run!,
+      addMembers: async () => [],
+      postMessage: async () => snap.recentBoard[0]!,
+      readBoard: async () => ({ messages: snap.recentBoard, head: snap.boardHead }),
+      waitForBoard: async () => ({ wokeBy: "timeout", messages: [], head: 0, summary: "" }),
+      parkOrchestratorWait: async () => ({
+        parked: false,
+        messages: [],
+        head: 0,
+        activeMembers: [],
+        summary: "",
+      }),
+      clearOrchestratorWait: () => {},
+      steerMember: async () => ({ delivery: "woken" }),
+      switchModel: async (o) => ({ targetName: o.targetName ?? "", model: o.model ?? "" }),
+      stopMember: async () => {},
+      killMember: async () => {},
+      mergeMember: async () => null,
+      manageChannel: async () => ({
+        action: "create",
+        name: "main",
+        topic: "",
+        createdBy: ORCHESTRATOR_NAME,
+        createdAt: "",
+        subscribers: [],
+        archived: false,
+        summary: "ok",
+      }),
+      completeRun: async () => snap.run!,
+      pause: async () => snap.run!,
+      resume: async () => snap.run!,
+      teardown: async () => ({ removed: [], skipped: [], errors: [] }),
+      listModels: async () => [],
+      getSnapshot: () => snap,
+      subscribe: () => () => {},
+      dispose: async () => {},
+    };
+
+    await openSwarmOverlay(
+      {
+        mode: "tui",
+        hasUI: true,
+        ui: {
+          theme,
+          notify() {},
+          async custom<T>(
+            factory: (
+              t: TUI,
+              th: Theme,
+              kb: unknown,
+              done: (r: T) => void,
+            ) => Component & { dispose?(): void },
+          ): Promise<T> {
+            return new Promise<T>((resolve) => {
+              const comp = factory(mockTui.tui, theme, {}, resolve);
+              if (isFocusable(comp)) comp.focused = true;
+
+              void (async () => {
+                await flushAsync();
+
+                // 1. Pipeline strip on Board [1] surfaces Features 2/5, VAL 1/3, [S] 1, and !1 debt
+                const board100 = stripTerminalSequences(comp.render(100).join("\n"));
+                assert.match(board100, /Features 2\/5/);
+                assert.match(board100, /VAL 1\/3/);
+                assert.match(board100, /\[S\] 1/);
+                assert.match(board100, /!1 debt/);
+
+                // 2. Switch to [3] Graph tab -> keeps 4 tabs intact, shows Mission summary banner at top + Spawn Tree + [v] Contract/Graph footer
+                comp.handleInput?.("3");
+                const graphView100 = stripTerminalSequences(comp.render(100).join("\n"));
+                assert.match(graphView100, /\[1\] Board/);
+                assert.match(graphView100, /\[2\] Members/);
+                assert.match(graphView100, /\[3\] Graph/);
+                assert.match(graphView100, /\[4\] Search/);
+                assert.match(graphView100, /Mission Contract & Features \[v: inspect\]/);
+                assert.match(graphView100, /Spawn Tree/);
+                assert.match(graphView100, /\[v\] Contract\/Graph/);
+
+                // Narrow 72x20 check on Graph tab: footer [v] Contract/Graph ... [?] help · [Esc/q] close stays unclipped
+                (mockTui.tui.terminal as unknown as { rows: number; columns: number }).rows = 20;
+                const graph72Lines = comp.render(72);
+                assertIntactBoxBorders(graph72Lines, 72, "v080-overlay-graph@72x20");
+                const graph72Plain = stripTerminalSequences(graph72Lines.join("\n"));
+                assert.match(graph72Plain, /\[v\] Contract\/Graph · \[↑↓\/jk\] scroll · \[\?\] help · \[Esc\/q\] close/);
+
+                // ? Help documents [v] Contract/Graph even at 72x20
+                comp.handleInput?.("?");
+                const help72Lines = comp.render(72);
+                assertIntactBoxBorders(help72Lines, 72, "v080-overlay-help@72x20");
+                assert.match(stripTerminalSequences(help72Lines.join("\n")), /\[v\] Contract\/Graph/);
+                comp.handleInput?.("?");
+
+                // 3. Press [v] on Graph tab -> switches to Mission Contract & Features view!
+                (mockTui.tui.terminal as unknown as { rows: number; columns: number }).rows = 40;
+                comp.handleInput?.("v");
+                for (const w of WIDTH_MATRIX) {
+                  const lines = comp.render(w);
+                  assertIntactBoxBorders(lines, w, `v080-overlay-contract@40x${w}`);
+                }
+
+                // Collect full scrollable Mission Contract & Features content via render + scroll
+                const topContract = stripTerminalSequences(comp.render(100).join("\n"));
+                comp.handleInput?.("G"); // jump to bottom of contract inspector
+                const bottomContract = stripTerminalSequences(comp.render(100).join("\n"));
+                const combinedContract = `${topContract}\n${bottomContract}`;
+
+                assert.match(combinedContract, /Mission Contract & Features \[v: Spawn Graph\]/);
+                assert.match(combinedContract, /Milestones \(1\/3\)/);
+                assert.match(combinedContract, /\[✓\] Contract \[S\]/);
+                assert.match(combinedContract, /\[✓\] feat-store.*@worker-1/);
+                assert.match(combinedContract, /\[▸\] feat-engine.*@worker-2/);
+                assert.match(combinedContract, /\[ \] feat-pending-docs/);
+                assert.match(combinedContract, /\[!\] feat-audit.*@validator/);
+                assert.match(combinedContract, /\[~\] feat-legacy-drop/);
+                assert.match(combinedContract, /fulfills: VAL-ENG-01/);
+                assert.match(combinedContract, /Validation Assertions \(1\/3 passed\)/);
+                assert.match(combinedContract, /\[✓\] VAL-STORE-01 \[passed\] \(@validator\)/);
+                assert.match(combinedContract, /evidence: 10\/10 store tests passed/);
+                assert.match(combinedContract, /\[✗\] VAL-UI-01 \[failed\] \(@validator\)/);
+                assert.match(combinedContract, /Open Handoffs \(2\)/);
+                assert.match(combinedContract, /\[!\] handoff-1 \[discovered_issue\] @worker-1/);
+                assert.match(combinedContract, /\[\*\] handoff-2 \[critical_context\] @worker-2/);
+                assert.match(combinedContract, /Commands & Boundaries/);
+
+                // Press [v] again -> toggles cleanly back to Spawn & Mention Graph
+                comp.handleInput?.("v");
+                assert.match(stripTerminalSequences(comp.render(100).join("\n")), /Spawn Tree/);
+
+                comp.handleInput?.("q");
+              })();
+            });
+          },
+        },
+      } as unknown as ExtensionContext,
+      engine,
+      null,
+      { now: fixedNow },
+    );
+  });
+
+  it("(d) ConfirmProposalComponent renders Commands & Boundaries, Validation Contract (N VAL-* assertions), and Feature Queue (M features across K milestones) with 0 broken box borders across 40..120, 72x20, and 100x30", () => {
+    const theme = createMockTheme();
+    const proposal: ProposedSwarmPlan = {
+      title: "v0.8.0 Dynamic Mission Goal Engine",
+      objective: "Deliver shared validation contract, feature queue, and relentless completion gates",
+      strategy: "Wave 1 shared contract & store; Wave 2 parallel runtime, drafting, UI & host slices",
+      acceptanceCriteria: "100% VAL-* assertions passed and zero open tech-debt handoffs",
+      baseBranch: "main",
+      maxConcurrency: 6,
+      validatorEnabled: true,
+      commands: [
+        { name: "typecheck", command: "npm run typecheck" },
+        { name: "test", command: "npm test" },
+      ],
+      boundaries: [
+        "Do not read auth.json or credentials",
+        "Keep 4 core tools and 3 drafting tools unchanged",
+      ],
+      milestones: [
+        { label: "m1-store", status: "done", sealed: true },
+        { label: "m2-slices", status: "in_progress" },
+      ],
+      assertions: [
+        {
+          id: "VAL-CONTRACT-01",
+          title: "Store persists mission.md and features.json",
+          description: "Atomic write with diff cache",
+          status: "passed",
+          updatedAt: "2026-11-24T10:00:00.000Z",
+        },
+        {
+          id: "VAL-RUNTIME-02",
+          title: "Done gate blocks incomplete features and open debt",
+          description: "Hard gate unless force=true",
+          status: "pending",
+          updatedAt: "2026-11-24T10:00:00.000Z",
+        },
+        {
+          id: "VAL-UI-03",
+          title: "Proposal card aligns borders across 40..120",
+          description: "Strict 1-cell safe glyphs",
+          status: "pending",
+          updatedAt: "2026-11-24T10:00:00.000Z",
+        },
+      ],
+      features: [
+        {
+          id: "feat-contract",
+          title: "Shared types & store materialization",
+          description: "Wave 1 store contract",
+          milestone: "m1-store",
+          fulfills: ["VAL-CONTRACT-01"],
+          status: "completed",
+          updatedAt: "2026-11-24T10:00:00.000Z",
+        },
+        {
+          id: "feat-runtime",
+          title: "Mission ops & verification gates",
+          description: "Wave 2 runtime",
+          milestone: "m2-slices",
+          dependsOn: ["feat-contract"],
+          fulfills: ["VAL-RUNTIME-02"],
+          status: "in_progress",
+          updatedAt: "2026-11-24T10:00:00.000Z",
+        },
+        {
+          id: "feat-ui",
+          title: "Goal dashboard, overlay & proposal card",
+          description: "Wave 2 UI",
+          milestone: "m2-slices",
+          dependsOn: ["feat-contract"],
+          fulfills: ["VAL-UI-03"],
+          status: "pending",
+          updatedAt: "2026-11-24T10:00:00.000Z",
+        },
+      ],
+    };
+
+    // 1. 100x30 viewport: verify all 3 Droid Mission sections + scroll + exact borders across 40..120
+    {
+      const { tui } = createMockTUI(30, 100);
+      let settledOutcome: unknown;
+      const comp = new ConfirmProposalComponent(
+        tui,
+        theme,
+        proposal,
+        undefined,
+        (res) => {
+          settledOutcome = res;
+        },
+      );
+      try {
+        for (const w of WIDTH_MATRIX) {
+          const lines = comp.render(w);
+          assert.ok(lines.length <= 26, `100x30 proposal@${w} exceeded 26 lines: ${lines.length}`);
+          assertIntactBoxBorders(lines, w, `v080-proposal@30x${w}`);
+        }
+
+        const initialPlain = stripTerminalSequences(comp.render(100).join("\n"));
+        assert.match(initialPlain, /Commands & Boundaries/);
+        assert.match(initialPlain, /\$ typecheck: npm run typecheck/);
+        assert.match(initialPlain, /\$ test: npm test/);
+        assert.match(initialPlain, /! Do not read auth\.json or credentials/);
+        assert.match(initialPlain, /Validation Contract \(3 VAL-\* assertions\)/);
+        assert.match(initialPlain, /\[✓\] VAL-CONTRACT-01/);
+        assert.match(initialPlain, /\[ \] VAL-RUNTIME-02/);
+        assert.match(initialPlain, /\[ \] VAL-UI-03/);
+        assert.match(initialPlain, /Feature Queue \(3 features across 2 milestones\)/);
+
+        // Scroll down with ']' / PgDn to inspect feature dependsOn & fulfills + Strategy
+        comp.handleInput("]");
+        comp.handleInput("]");
+        const scrolledPlain = stripTerminalSequences(comp.render(100).join("\n"));
+        const combined = `${initialPlain}\n${scrolledPlain}`;
+        assert.match(combined, /feat-runtime \[m2-slices\]/);
+        assert.match(combined, /fulfills: VAL-RUNTIME-02/);
+        assert.match(combined, /dependsOn: feat-contract/);
+        assert.match(combined, /feat-contract \[m1-store \[S\]\]/);
+
+        // Confirm & Launch still works seamlessly after scrolling
+        comp.handleInput("\r");
+        assert.deepEqual(settledOutcome, {
+          action: "confirm",
+          validatorEnabled: true,
+          maxConcurrency: 6,
+        });
+      } finally {
+        comp.dispose();
+      }
+    }
+
+    // 2. Narrow 72x20 viewport: intact box borders, height <= 16, scrollable preview, all 3 choices visible
+    {
+      const { tui } = createMockTUI(20, 72);
+      const comp72 = new ConfirmProposalComponent(
+        tui,
+        theme,
+        proposal,
+        undefined,
+        () => {},
+      );
+      try {
+        for (const w of WIDTH_MATRIX) {
+          const lines = comp72.render(w);
+          assert.ok(lines.length <= 16, `72x20 proposal@${w} exceeded 16 lines: ${lines.length}`);
+          assertIntactBoxBorders(lines, w, `v080-proposal@20x${w}`);
+        }
+        const top72 = stripTerminalSequences(comp72.render(72).join("\n"));
+        assert.match(top72, /Commands & Boundaries/);
+        assert.match(top72, /Confirm — launch dynamic Swarm/);
+        assert.match(top72, /Continue refining/);
+        assert.match(top72, /Cancel — discard draft/);
+
+        comp72.handleInput("\x1b[6~"); // PgDn scrolls into Validation Contract & Feature Queue
+        const mid72Lines = comp72.render(72);
+        assertIntactBoxBorders(mid72Lines, 72, "v080-proposal-scrolled@72x20");
+        assert.match(stripTerminalSequences(mid72Lines.join("\n")), /Validation Contract/);
+      } finally {
+        comp72.dispose();
+      }
+    }
   });
 });
