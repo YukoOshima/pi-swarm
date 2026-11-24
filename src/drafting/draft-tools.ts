@@ -1,3 +1,4 @@
+import path from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
@@ -573,6 +574,24 @@ export interface ValidateProposedSwarmPlanOptions {
   now?: string;
 }
 
+export interface TweakedMissionContractInput {
+  assertions?: MissionAssertion[];
+  features?: MissionFeature[];
+  milestones?: SwarmMilestone[];
+  commands?: MissionCommandEntry[];
+  services?: MissionServiceEntry[];
+  boundaries?: string[];
+}
+
+export interface MergedTweakedMissionContract {
+  assertions?: MissionAssertion[];
+  features?: MissionFeature[];
+  milestones?: SwarmMilestone[];
+  commands?: MissionCommandEntry[];
+  services?: MissionServiceEntry[];
+  boundaries?: string[];
+}
+
 /**
  * Auto-derives ordered `SwarmMilestone[]` in first-seen feature `milestone` order.
  * When `existingMilestones` are supplied (e.g. during `/swarm tweak`), preserves
@@ -627,12 +646,15 @@ export function deriveMilestonesFromFeatures(
     }
 
     const prev = existingByLabel.get(label);
-    const allFulfilledPassed = group.every((f) =>
+    const allFulfilledPassed = activeGroup.every((f) =>
       f.fulfills.every((valId) => {
         const linked = assertionById.get(valId);
         return linked ? linked.status === "passed" : true;
       }),
     );
+    if (status === "done" && !allFulfilledPassed && assertionById.size > 0) {
+      status = "in_progress";
+    }
     const preserveSealed =
       prev?.sealed === true && status === "done" && allFulfilledPassed;
 
@@ -648,6 +670,643 @@ export function deriveMilestonesFromFeatures(
         : {}),
     };
   });
+}
+
+/**
+ * Canonical shared tweak-merge helper for Mission contracts.
+ *
+ * Used by BOTH `validateProposedSwarmPlan` (pre-modal tweak normalization) and
+ * post-confirmation persistence (`handlePlanConfirmed`) so both stages apply the
+ * exact same merge semantics:
+ * - Blocks adding new features or moving features into `sealed: true` milestones
+ *   (`SwarmProtocolError("INVALID_INPUT", ...)`).
+ * - Preserves `completed` and `in_progress` feature progress (`mergedCommitSha`,
+ *   `assignedMember`, `updatedAt`) and carries forward omitted `completed` features
+ *   whose assertions were not re-claimed.
+ * - Preserves verification metadata (`status`, `evidence`, `verifiedBy`,
+ *   `verifiedByRole`, `overridden`, `overrideJustification`, `updatedAt`) on
+ *   unchanged assertions, and resets modified assertions (`description` or
+ *   `evidenceRequired` changed) back to `"pending"` without stale evidence.
+ * - Merges `commands` and `services` by `name`, unions `boundaries`, and derives
+ *   milestones while keeping untouched sealed milestones sealed and unsealing any
+ *   milestone whose assertion was reset.
+ * - Idempotent when invoked repeatedly with its own merged output.
+ */
+export function mergeTweakedMissionContract(
+  existingRun: Pick<
+    SwarmRunState,
+    | "assertions"
+    | "features"
+    | "milestones"
+    | "commands"
+    | "services"
+    | "boundaries"
+  >,
+  incoming: TweakedMissionContractInput,
+  nowIso?: string,
+): MergedTweakedMissionContract {
+  const effectiveNow = nowIso ?? new Date().toISOString();
+
+  const existingAssertionById = new Map<string, MissionAssertion>();
+  for (const prevA of existingRun.assertions ?? []) {
+    if (prevA && typeof prevA.id === "string" && prevA.id.trim()) {
+      existingAssertionById.set(prevA.id.trim(), prevA);
+    }
+  }
+
+  const existingFeatureById = new Map<string, MissionFeature>();
+  for (const prevF of existingRun.features ?? []) {
+    if (prevF && typeof prevF.id === "string" && prevF.id.trim()) {
+      existingFeatureById.set(prevF.id.trim(), prevF);
+    }
+  }
+
+  const sealedMilestones = new Set<string>();
+  for (const ms of existingRun.milestones ?? []) {
+    if (ms && ms.sealed === true && typeof ms.label === "string" && ms.label.trim()) {
+      sealedMilestones.add(ms.label.trim());
+    }
+  }
+
+  const incomingAssertionIds = new Set<string>(
+    (incoming.assertions ?? [])
+      .map((a) => a.id.trim())
+      .filter(Boolean),
+  );
+
+  // 1. Sealed milestone guard + feature merge
+  let mergedFeatures: MissionFeature[] | undefined;
+  const carriedCompletedFeatures: MissionFeature[] = [];
+  if (incoming.features !== undefined) {
+    for (const inc of incoming.features) {
+      const cleanMilestone = inc.milestone.trim();
+      const prev = existingFeatureById.get(inc.id);
+      if (
+        sealedMilestones.has(cleanMilestone) &&
+        (!prev || prev.milestone.trim() !== cleanMilestone)
+      ) {
+        throw new SwarmProtocolError(
+          "INVALID_INPUT",
+          `Cannot add new feature "${inc.id}" into already sealed milestone "${cleanMilestone}" — add a follow-up milestone instead.`,
+          { featureId: inc.id, milestone: cleanMilestone },
+        );
+      }
+    }
+
+    const incomingFeatureIds = new Set<string>(
+      incoming.features.map((f) => f.id),
+    );
+    for (const prev of existingRun.features ?? []) {
+      if (
+        prev.status === "completed" &&
+        !incomingFeatureIds.has(prev.id) &&
+        !prev.fulfills.some((valId) => incomingAssertionIds.has(valId))
+      ) {
+        carriedCompletedFeatures.push(structuredClone(prev));
+      }
+    }
+
+    const nextFeatures: MissionFeature[] = [];
+    for (const inc of incoming.features) {
+      const prev = existingFeatureById.get(inc.id);
+      if (prev?.status === "completed") {
+        const mergedCommitSha = prev.mergedCommitSha ?? inc.mergedCommitSha;
+        const assignedMember = prev.assignedMember ?? inc.assignedMember;
+        nextFeatures.push({
+          ...structuredClone(inc),
+          status: "completed",
+          ...(assignedMember !== undefined ? { assignedMember } : {}),
+          ...(mergedCommitSha !== undefined ? { mergedCommitSha } : {}),
+          updatedAt: prev.updatedAt || inc.updatedAt || effectiveNow,
+        });
+      } else if (
+        prev?.status === "in_progress" &&
+        (!inc.status || inc.status === "pending")
+      ) {
+        const assignedMember = inc.assignedMember ?? prev.assignedMember;
+        const mergedCommitSha = inc.mergedCommitSha ?? prev.mergedCommitSha;
+        nextFeatures.push({
+          ...structuredClone(inc),
+          status: "in_progress",
+          ...(assignedMember !== undefined ? { assignedMember } : {}),
+          ...(mergedCommitSha !== undefined ? { mergedCommitSha } : {}),
+          updatedAt: prev.updatedAt || inc.updatedAt || effectiveNow,
+        });
+      } else {
+        const nextStatus =
+          inc.status && inc.status !== "pending"
+            ? inc.status
+            : prev?.status ?? inc.status ?? "pending";
+        const assignedMember = inc.assignedMember ?? prev?.assignedMember;
+        const mergedCommitSha = inc.mergedCommitSha ?? prev?.mergedCommitSha;
+        nextFeatures.push({
+          ...structuredClone(inc),
+          status: nextStatus,
+          ...(assignedMember !== undefined ? { assignedMember } : {}),
+          ...(mergedCommitSha !== undefined ? { mergedCommitSha } : {}),
+          updatedAt: inc.updatedAt || effectiveNow,
+        });
+      }
+    }
+
+    mergedFeatures = [...carriedCompletedFeatures, ...nextFeatures];
+  } else if (existingRun.features && existingRun.features.length > 0) {
+    mergedFeatures = structuredClone(existingRun.features);
+  }
+
+  // 2. Assertion merge (preserve metadata when contract unchanged; reset when modified)
+  let mergedAssertions: MissionAssertion[] | undefined;
+  if (incoming.assertions !== undefined) {
+    const carriedAssertions: MissionAssertion[] = [];
+    const seenCarried = new Set<string>();
+    const completedForCarry =
+      carriedCompletedFeatures.length > 0
+        ? carriedCompletedFeatures
+        : (mergedFeatures ?? []).filter((f) => f.status === "completed");
+    for (const feat of completedForCarry) {
+      for (const valId of feat.fulfills ?? []) {
+        if (!incomingAssertionIds.has(valId) && !seenCarried.has(valId)) {
+          const prevA = existingAssertionById.get(valId);
+          if (prevA) {
+            seenCarried.add(valId);
+            carriedAssertions.push(structuredClone(prevA));
+          }
+        }
+      }
+    }
+
+    const nextAssertions: MissionAssertion[] = [];
+    for (const incA of incoming.assertions) {
+      const prevA = existingAssertionById.get(incA.id);
+      if (prevA) {
+        const prevDesc = (prevA.description ?? "").trim();
+        const nextDesc = incA.description.trim();
+        const prevEvReq = (prevA.evidenceRequired ?? "").trim();
+        const nextEvReq = (incA.evidenceRequired ?? "").trim();
+        const contractUnchanged = prevDesc === nextDesc && prevEvReq === nextEvReq;
+
+        if (contractUnchanged) {
+          const mergedStatus =
+            incA.status && incA.status !== "pending"
+              ? incA.status
+              : prevA.status;
+          const evidence = incA.evidence ?? prevA.evidence;
+          const verifiedBy = incA.verifiedBy ?? prevA.verifiedBy;
+          const verifiedByRole = incA.verifiedByRole ?? prevA.verifiedByRole;
+          const overridden =
+            incA.overridden !== undefined ? incA.overridden : prevA.overridden;
+          const overrideJustification =
+            incA.overrideJustification ?? prevA.overrideJustification;
+          nextAssertions.push({
+            id: incA.id,
+            title: incA.title,
+            description: nextDesc,
+            ...(incA.evidenceRequired !== undefined
+              ? { evidenceRequired: incA.evidenceRequired }
+              : {}),
+            status: mergedStatus,
+            ...(evidence !== undefined ? { evidence } : {}),
+            ...(verifiedBy !== undefined ? { verifiedBy } : {}),
+            ...(verifiedByRole !== undefined ? { verifiedByRole } : {}),
+            ...(overridden !== undefined ? { overridden } : {}),
+            ...(overrideJustification !== undefined
+              ? { overrideJustification }
+              : {}),
+            updatedAt: prevA.updatedAt || incA.updatedAt || effectiveNow,
+          });
+          continue;
+        }
+
+        // Contract description or evidenceRequired changed -> reset to "pending" & clear stale evidence
+        nextAssertions.push({
+          id: incA.id,
+          title: incA.title,
+          description: nextDesc,
+          ...(incA.evidenceRequired !== undefined
+            ? { evidenceRequired: incA.evidenceRequired }
+            : {}),
+          status: "pending",
+          updatedAt: effectiveNow,
+        });
+        continue;
+      }
+
+      nextAssertions.push({
+        ...structuredClone(incA),
+        status: incA.status ?? "pending",
+        updatedAt: incA.updatedAt || effectiveNow,
+      });
+    }
+
+    mergedAssertions = [...carriedAssertions, ...nextAssertions];
+  } else if (existingRun.assertions && existingRun.assertions.length > 0) {
+    mergedAssertions = structuredClone(existingRun.assertions);
+  }
+
+  // 3. Commands, Services & Boundaries merge
+  let mergedCommands: MissionCommandEntry[] | undefined;
+  if (incoming.commands !== undefined) {
+    const cmdMap = new Map<string, MissionCommandEntry>();
+    for (const c of existingRun.commands ?? []) {
+      cmdMap.set(c.name, { ...c });
+    }
+    for (const c of incoming.commands) {
+      cmdMap.set(c.name, { ...c });
+    }
+    if (cmdMap.size > 0) {
+      mergedCommands = [...cmdMap.values()];
+    }
+  } else if (existingRun.commands && existingRun.commands.length > 0) {
+    mergedCommands = existingRun.commands.map((c) => ({ ...c }));
+  }
+
+  let mergedServices: MissionServiceEntry[] | undefined;
+  if (incoming.services !== undefined) {
+    const svcMap = new Map<string, MissionServiceEntry>();
+    for (const s of existingRun.services ?? []) {
+      svcMap.set(s.name, structuredClone(s));
+    }
+    for (const s of incoming.services) {
+      svcMap.set(s.name, structuredClone(s));
+    }
+    if (svcMap.size > 0) {
+      mergedServices = [...svcMap.values()];
+    }
+  } else if (existingRun.services && existingRun.services.length > 0) {
+    mergedServices = structuredClone(existingRun.services);
+  }
+
+  let mergedBoundaries: string[] | undefined;
+  if (incoming.boundaries !== undefined) {
+    const seen = new Set<string>();
+    const combined: string[] = [];
+    for (const b of [
+      ...(existingRun.boundaries ?? []),
+      ...incoming.boundaries,
+    ]) {
+      const trimmed = b.trim();
+      if (trimmed && !seen.has(trimmed)) {
+        seen.add(trimmed);
+        combined.push(trimmed);
+      }
+    }
+    if (combined.length > 0) {
+      mergedBoundaries = combined;
+    }
+  } else if (existingRun.boundaries && existingRun.boundaries.length > 0) {
+    mergedBoundaries = [...existingRun.boundaries];
+  }
+
+  // 4. Milestones derivation (preserve prior sealed metadata, unseal on reset assertion)
+  let mergedMilestones: SwarmMilestone[] | undefined;
+  if (mergedFeatures && mergedFeatures.length > 0) {
+    // Combine prior milestone metadata (existingRun takes precedence for sealed/sealedAt; incoming may supply owner)
+    const combinedPriorMilestones: SwarmMilestone[] = [];
+    const seenPriorLabels = new Set<string>();
+    for (const prev of existingRun.milestones ?? []) {
+      const label = prev.label.trim();
+      if (!label || seenPriorLabels.has(label)) continue;
+      seenPriorLabels.add(label);
+      const incMatch = (incoming.milestones ?? []).find(
+        (m) => m.label.trim() === label,
+      );
+      combinedPriorMilestones.push({
+        ...prev,
+        ...(incMatch?.owner ?? prev.owner
+          ? { owner: incMatch?.owner ?? prev.owner }
+          : {}),
+      });
+    }
+    for (const incMs of incoming.milestones ?? []) {
+      const label = incMs.label.trim();
+      if (!label || seenPriorLabels.has(label)) continue;
+      seenPriorLabels.add(label);
+      combinedPriorMilestones.push({ ...incMs });
+    }
+
+    const derived = deriveMilestonesFromFeatures(
+      mergedFeatures,
+      combinedPriorMilestones,
+      mergedAssertions,
+    );
+    const derivedLabels = new Set(derived.map((m) => m.label));
+    const orphanedSealed = (existingRun.milestones ?? [])
+      .filter((m) => m.sealed === true && !derivedLabels.has(m.label.trim()))
+      .map((m) => ({ ...m }));
+    const finalMs = [...orphanedSealed, ...derived];
+    if (finalMs.length > 0) {
+      mergedMilestones = finalMs;
+    }
+  } else if (incoming.milestones && incoming.milestones.length > 0) {
+    mergedMilestones = structuredClone(incoming.milestones);
+  } else if (existingRun.milestones && existingRun.milestones.length > 0) {
+    mergedMilestones = structuredClone(existingRun.milestones);
+  }
+
+  return {
+    ...(mergedAssertions && mergedAssertions.length > 0
+      ? { assertions: mergedAssertions }
+      : {}),
+    ...(mergedFeatures && mergedFeatures.length > 0
+      ? { features: mergedFeatures }
+      : {}),
+    ...(mergedMilestones && mergedMilestones.length > 0
+      ? { milestones: mergedMilestones }
+      : {}),
+    ...(mergedCommands && mergedCommands.length > 0
+      ? { commands: mergedCommands }
+      : {}),
+    ...(mergedServices && mergedServices.length > 0
+      ? { services: mergedServices }
+      : {}),
+    ...(mergedBoundaries && mergedBoundaries.length > 0
+      ? { boundaries: mergedBoundaries }
+      : {}),
+  };
+}
+
+// ============================================================================
+// Static Local files_owned Overlap Validation Helpers
+// ============================================================================
+
+interface ParsedOwnedPath {
+  raw: string;
+  normalized: string;
+  hasGlob: boolean;
+  explicitDir: boolean;
+}
+
+function parseOwnedPath(raw: string): ParsedOwnedPath | null {
+  let p = raw.trim().replace(/\\/g, "/");
+  if (!p) return null;
+
+  const hadTrailingDirHint =
+    p.endsWith("/") ||
+    /\/\*+$/.test(p) ||
+    p === "." ||
+    p === "./" ||
+    p === "*" ||
+    p === "**";
+
+  p = p.replace(/\/+/g, "/");
+  while (p.startsWith("./")) {
+    p = p.slice(2);
+  }
+  p = p.replace(/^\/+/, "").replace(/\/+$/, "");
+
+  if (p === "" || p === "." || p === "*" || p === "**") {
+    return { raw, normalized: "", hasGlob: false, explicitDir: true };
+  }
+
+  const posixNorm = path.posix
+    .normalize(p)
+    .replace(/^\/+/, "")
+    .replace(/\/+$/, "");
+  if (
+    posixNorm === "" ||
+    posixNorm === "." ||
+    posixNorm === "*" ||
+    posixNorm === "**"
+  ) {
+    return { raw, normalized: "", hasGlob: false, explicitDir: true };
+  }
+
+  let stripped = posixNorm;
+  let strippedTrailingWildcard = false;
+  while (stripped.endsWith("/**") || stripped.endsWith("/*")) {
+    strippedTrailingWildcard = true;
+    stripped = stripped.replace(/\/\*+$/, "");
+  }
+  if (
+    stripped === "" ||
+    stripped === "." ||
+    stripped === "*" ||
+    stripped === "**"
+  ) {
+    return { raw, normalized: "", hasGlob: false, explicitDir: true };
+  }
+
+  return {
+    raw,
+    normalized: stripped,
+    hasGlob: /[*?]/.test(stripped),
+    explicitDir: hadTrailingDirHint || strippedTrailingWildcard,
+  };
+}
+
+function escapeRegExpChar(ch: string): string {
+  return ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+}
+
+function globToRegExp(glob: string): RegExp {
+  let pattern = "^";
+  let i = 0;
+  while (i < glob.length) {
+    if (glob[i] === "*" && glob[i + 1] === "*") {
+      if (glob[i + 2] === "/") {
+        pattern += "(?:.*/)?";
+        i += 3;
+      } else {
+        pattern += ".*";
+        i += 2;
+      }
+    } else if (glob[i] === "*") {
+      pattern += "[^/]*";
+      i += 1;
+    } else if (glob[i] === "?") {
+      pattern += "[^/]";
+      i += 1;
+    } else {
+      pattern += escapeRegExpChar(glob[i]!);
+      i += 1;
+    }
+  }
+  pattern += "$";
+  return new RegExp(pattern);
+}
+
+function staticDirPrefix(glob: string): string {
+  const parts = glob.split("/");
+  const prefix: string[] = [];
+  for (const part of parts) {
+    if (/[*?]/.test(part)) {
+      break;
+    }
+    prefix.push(part);
+  }
+  return prefix.join("/");
+}
+
+function concretePathsOverlap(a: string, b: string): boolean {
+  if (a === "" || b === "") return true;
+  if (a === b) return true;
+  return a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+}
+
+function literalTrailingSuffix(glob: string): string {
+  const base = glob.split("/").pop() ?? glob;
+  const lastWild = Math.max(base.lastIndexOf("*"), base.lastIndexOf("?"));
+  if (lastWild < 0) return base;
+  return base.slice(lastWild + 1);
+}
+
+function globAndConcreteOverlap(
+  globPath: ParsedOwnedPath,
+  concretePath: ParsedOwnedPath,
+): boolean {
+  const c = concretePath.normalized;
+  if (c === "") return true;
+
+  if (globToRegExp(globPath.normalized).test(c)) {
+    return true;
+  }
+
+  const globPrefix = staticDirPrefix(globPath.normalized);
+  if (globPrefix === c || globPrefix.startsWith(`${c}/`)) {
+    return true;
+  }
+
+  const looksLikeDirectory =
+    concretePath.explicitDir || !path.posix.basename(c).includes(".");
+  if (
+    looksLikeDirectory &&
+    globPath.normalized.includes("**") &&
+    (globPrefix === "" || c.startsWith(`${globPrefix}/`))
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+function parsedOwnedPathsOverlap(
+  a: ParsedOwnedPath,
+  b: ParsedOwnedPath,
+): boolean {
+  if (!a.hasGlob && !b.hasGlob) {
+    return concretePathsOverlap(a.normalized, b.normalized);
+  }
+  if (a.hasGlob && !b.hasGlob) {
+    return globAndConcreteOverlap(a, b);
+  }
+  if (!a.hasGlob && b.hasGlob) {
+    return globAndConcreteOverlap(b, a);
+  }
+
+  if (a.normalized === b.normalized) return true;
+  const prefA = staticDirPrefix(a.normalized);
+  const prefB = staticDirPrefix(b.normalized);
+  if (!concretePathsOverlap(prefA, prefB)) {
+    return false;
+  }
+  const aRec = a.normalized.includes("**");
+  const bRec = b.normalized.includes("**");
+  if (!aRec && !bRec && prefA !== prefB) {
+    return false;
+  }
+  const sufA = literalTrailingSuffix(a.normalized);
+  const sufB = literalTrailingSuffix(b.normalized);
+  if (sufA && sufB && !sufA.endsWith(sufB) && !sufB.endsWith(sufA)) {
+    return false;
+  }
+  return true;
+}
+
+function collectFeatureFileOverlapIssues(
+  features: readonly Pick<
+    MissionFeature,
+    "id" | "milestone" | "dependsOn" | "filesOwned"
+  >[],
+  existingFeatureMap?: ReadonlyMap<string, MissionFeature>,
+): DraftPlanValidationIssue[] {
+  const issues: DraftPlanValidationIssue[] = [];
+  if (features.length < 2) {
+    return issues;
+  }
+
+  const depsById = new Map<string, readonly string[]>();
+  if (existingFeatureMap) {
+    for (const [id, feat] of existingFeatureMap.entries()) {
+      depsById.set(id, feat.dependsOn ?? []);
+    }
+  }
+  for (const feat of features) {
+    depsById.set(feat.id, feat.dependsOn ?? []);
+  }
+
+  const ancestorCache = new Map<string, Set<string>>();
+  const getAncestors = (startId: string): Set<string> => {
+    const cached = ancestorCache.get(startId);
+    if (cached) return cached;
+    const visited = new Set<string>();
+    const stack = [...(depsById.get(startId) ?? [])];
+    while (stack.length > 0) {
+      const depId = stack.pop()!;
+      if (depId === startId || visited.has(depId)) continue;
+      visited.add(depId);
+      const nextDeps = depsById.get(depId);
+      if (nextDeps) {
+        for (const nd of nextDeps) {
+          if (!visited.has(nd)) {
+            stack.push(nd);
+          }
+        }
+      }
+    }
+    ancestorCache.set(startId, visited);
+    return visited;
+  };
+
+  const parsedByFeature = features.map((feat) => {
+    const prev = existingFeatureMap?.get(feat.id);
+    const isFinished =
+      prev?.status === "completed" || prev?.status === "cancelled";
+    const parsedPaths = isFinished
+      ? []
+      : (feat.filesOwned ?? [])
+          .map(parseOwnedPath)
+          .filter((p): p is ParsedOwnedPath => p !== null);
+    return { feat, milestone: feat.milestone.trim(), parsedPaths };
+  });
+
+  for (let i = 0; i < parsedByFeature.length; i++) {
+    const a = parsedByFeature[i]!;
+    if (a.parsedPaths.length === 0) continue;
+
+    for (let j = i + 1; j < parsedByFeature.length; j++) {
+      const b = parsedByFeature[j]!;
+      if (b.parsedPaths.length === 0) continue;
+      if (a.milestone !== b.milestone) continue;
+
+      if (
+        getAncestors(a.feat.id).has(b.feat.id) ||
+        getAncestors(b.feat.id).has(a.feat.id)
+      ) {
+        continue;
+      }
+
+      let overlapPair: [string, string] | null = null;
+      for (const pathA of a.parsedPaths) {
+        for (const pathB of b.parsedPaths) {
+          if (parsedOwnedPathsOverlap(pathA, pathB)) {
+            overlapPair = [pathA.raw, pathB.raw];
+            break;
+          }
+        }
+        if (overlapPair) break;
+      }
+
+      if (overlapPair) {
+        issues.push({
+          code: "INVALID_INPUT",
+          field: "features",
+          message: `Overlapping files_owned between parallel features "${a.feat.id}" ("${overlapPair[0]}") and "${b.feat.id}" ("${overlapPair[1]}") in milestone "${a.milestone}" without depends_on ordering — assign disjoint paths or add depends_on between them.`,
+        });
+      }
+    }
+  }
+
+  return issues;
 }
 
 function collectFeatureDagErrors(
@@ -1779,7 +2438,7 @@ export function validateProposedSwarmPlan(
     }
   }
 
-  // Validate depends_on existence & acyclic DAG
+  // Validate depends_on existence, acyclic DAG, and local static files_owned overlaps
   if (incomingFeatures.length > 0) {
     const dagErrors = collectFeatureDagErrors(
       incomingFeatures,
@@ -1791,6 +2450,14 @@ export function validateProposedSwarmPlan(
         field: "features",
         message: err.message,
       });
+    }
+
+    const overlapIssues = collectFeatureFileOverlapIssues(
+      incomingFeatures,
+      existingRun ? existingFeatureMap : undefined,
+    );
+    for (const overlapIssue of overlapIssues) {
+      issues.push(overlapIssue);
     }
   }
 
@@ -1839,135 +2506,60 @@ export function validateProposedSwarmPlan(
     return { valid: false, issues };
   }
 
-  // Smart normalization & tweak-mode merge onto ProposedSwarmPlan
+  // Smart normalization & canonical tweak-mode merge onto ProposedSwarmPlan
+  const hasExplicitContractInput =
+    params.assertions !== undefined || params.features !== undefined;
+
+  if (existingRun) {
+    const merged = mergeTweakedMissionContract(
+      existingRun,
+      {
+        ...(hasExplicitContractInput
+          ? { assertions: incomingAssertions, features: incomingFeatures }
+          : {}),
+        ...(params.commands !== undefined && normalizedCommands
+          ? { commands: normalizedCommands }
+          : {}),
+        ...(params.services !== undefined && normalizedServices
+          ? { services: normalizedServices }
+          : {}),
+        ...(params.boundaries !== undefined && normalizedBoundaries
+          ? { boundaries: normalizedBoundaries }
+          : {}),
+      },
+      nowIso,
+    );
+
+    return {
+      valid: true,
+      title,
+      objective,
+      strategy,
+      acceptanceCriteria,
+      ...(normalizedMembers.length > 0 ? { initialMembers: normalizedMembers } : {}),
+      ...(merged.assertions ? { assertions: merged.assertions } : {}),
+      ...(merged.features ? { features: merged.features } : {}),
+      ...(merged.milestones ? { milestones: merged.milestones } : {}),
+      ...(merged.commands ? { commands: merged.commands } : {}),
+      ...(merged.services ? { services: merged.services } : {}),
+      ...(merged.boundaries ? { boundaries: merged.boundaries } : {}),
+    };
+  }
+
   let finalAssertions: MissionAssertion[] | undefined;
   let finalFeatures: MissionFeature[] | undefined;
   let finalMilestones: SwarmMilestone[] | undefined;
 
-  const hasExplicitContractInput =
-    params.assertions !== undefined || params.features !== undefined;
-
   if (hasExplicitContractInput) {
-    const mergedAssertions: MissionAssertion[] = [];
-    const mergedFeatures: MissionFeature[] = [];
-
-    // Carry forward already-completed features & their assertions on incremental tweak
-    if (existingRun && carriedCompletedIds.size > 0) {
-      const carriedAssertionIds = new Set<string>();
-      for (const prevId of carriedCompletedIds) {
-        const prevFeat = existingFeatureMap.get(prevId);
-        if (!prevFeat) continue;
-        mergedFeatures.push(structuredClone(prevFeat));
-        for (const valId of prevFeat.fulfills) {
-          if (!seenAssertionIds.has(valId) && !carriedAssertionIds.has(valId)) {
-            const prevAssert = existingAssertionMap.get(valId);
-            if (prevAssert) {
-              carriedAssertionIds.add(valId);
-              mergedAssertions.push(structuredClone(prevAssert));
-            }
-          }
-        }
-      }
+    if (incomingAssertions.length > 0) {
+      finalAssertions = incomingAssertions;
     }
-
-    for (const incA of incomingAssertions) {
-      const prevA = existingAssertionMap.get(incA.id);
-      if (prevA) {
-        const prevDesc = (prevA.description ?? "").trim();
-        const prevEvReq = (prevA.evidenceRequired ?? "").trim();
-        const nextEvReq = (incA.evidenceRequired ?? "").trim();
-        const contractUnchanged =
-          prevDesc === incA.description && prevEvReq === nextEvReq;
-
-        if (contractUnchanged) {
-          mergedAssertions.push({
-            id: incA.id,
-            title: incA.title,
-            description: incA.description,
-            ...(incA.evidenceRequired !== undefined
-              ? { evidenceRequired: incA.evidenceRequired }
-              : {}),
-            status: prevA.status,
-            ...(prevA.evidence !== undefined ? { evidence: prevA.evidence } : {}),
-            ...(prevA.verifiedBy !== undefined
-              ? { verifiedBy: prevA.verifiedBy }
-              : {}),
-            ...(prevA.verifiedByRole !== undefined
-              ? { verifiedByRole: prevA.verifiedByRole }
-              : {}),
-            ...(prevA.overridden !== undefined
-              ? { overridden: prevA.overridden }
-              : {}),
-            ...(prevA.overrideJustification !== undefined
-              ? { overrideJustification: prevA.overrideJustification }
-              : {}),
-            updatedAt: prevA.updatedAt || nowIso,
-          });
-          continue;
-        }
-      }
-      // Brand-new assertion OR description/evidenceRequired changed -> reset to "pending"
-      mergedAssertions.push(incA);
-    }
-
-    for (const incF of incomingFeatures) {
-      const prevF = existingFeatureMap.get(incF.id);
-      if (prevF && prevF.status === "completed") {
-        mergedFeatures.push({
-          ...incF,
-          status: "completed",
-          ...(prevF.assignedMember !== undefined
-            ? { assignedMember: prevF.assignedMember }
-            : {}),
-          ...(prevF.mergedCommitSha !== undefined
-            ? { mergedCommitSha: prevF.mergedCommitSha }
-            : {}),
-          updatedAt: prevF.updatedAt || nowIso,
-        });
-        continue;
-      }
-      if (prevF && prevF.status === "in_progress") {
-        mergedFeatures.push({
-          ...incF,
-          status: "in_progress",
-          ...(prevF.assignedMember !== undefined
-            ? { assignedMember: prevF.assignedMember }
-            : {}),
-          ...(prevF.mergedCommitSha !== undefined
-            ? { mergedCommitSha: prevF.mergedCommitSha }
-            : {}),
-          updatedAt: prevF.updatedAt || nowIso,
-        });
-        continue;
-      }
-      mergedFeatures.push(incF);
-    }
-
-    if (mergedAssertions.length > 0) {
-      finalAssertions = mergedAssertions;
-    }
-    if (mergedFeatures.length > 0) {
-      finalFeatures = mergedFeatures;
+    if (incomingFeatures.length > 0) {
+      finalFeatures = incomingFeatures;
       finalMilestones = deriveMilestonesFromFeatures(
-        mergedFeatures,
-        existingRun?.milestones,
-        mergedAssertions,
-      );
-    }
-  } else if (existingRun) {
-    if (existingRun.assertions && existingRun.assertions.length > 0) {
-      finalAssertions = structuredClone(existingRun.assertions);
-    }
-    if (existingRun.features && existingRun.features.length > 0) {
-      finalFeatures = structuredClone(existingRun.features);
-    }
-    if (existingRun.milestones && existingRun.milestones.length > 0) {
-      finalMilestones = structuredClone(existingRun.milestones);
-    } else if (finalFeatures && finalFeatures.length > 0) {
-      finalMilestones = deriveMilestonesFromFeatures(
-        finalFeatures,
+        incomingFeatures,
         undefined,
-        finalAssertions,
+        incomingAssertions,
       );
     }
   }
@@ -3097,7 +3689,8 @@ export function createProposeSwarmPlanTool(
           : {}),
       };
 
-      // Step 2.5: Pre-Modal Adversarial Contract Reviewer (at most 1 automatic rejection bounce per draft)
+      // Step 2.5: Pre-Modal Adversarial Contract Reviewer (at most 1 automatic rejection bounce per draft;
+      // bypassed cleanly when draft.skipContractReview is true, while Step 1 local validation stays active)
       const draftReviewKey = resolveDraftReviewKey(currentDraft, ctx);
       let attachedContractReview: ContractReviewResult | undefined;
       let attachedReviewPass: number | undefined;
@@ -3105,6 +3698,7 @@ export function createProposeSwarmPlanTool(
         typeof deps.reviewProposedContract === "function" &&
         proposedPlan.assertions &&
         proposedPlan.assertions.length > 0 &&
+        currentDraft?.skipContractReview !== true &&
         currentDraft?.validatorEnabled !== false &&
         proposedPlan.validatorEnabled !== false
       ) {
@@ -3339,6 +3933,7 @@ export function createProposeSwarmPlanTool(
           validatorEnabled: refinedValidatorEnabled,
           maxConcurrency: refinedMaxConcurrency,
           baseBranch,
+          ...(currentDraft?.skipContractReview ? { skipContractReview: true } : {}),
           questionnaireEcho: currentDraft?.questionnaireEcho,
         });
       }

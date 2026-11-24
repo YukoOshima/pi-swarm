@@ -126,6 +126,7 @@ export interface DraftingKickoffOptions {
   baseBranch?: string;
   maxConcurrency?: number;
   validatorEnabled?: boolean;
+  skipContractReview?: boolean;
   roleModels?: SwarmRoleModels;
   targetRun?: {
     id: string;
@@ -158,10 +159,14 @@ export function buildDraftingKickoffPrompt(
   const validatorEnabled =
     options.validatorEnabled ?? DEFAULT_SWARM_SETTINGS.validatorEnabled;
 
+  const skipReviewAttr = options.skipContractReview
+    ? ' skip_contract_review="true"'
+    : "";
+
   const lines: string[] = [
     `<swarm_drafting_kickoff mode="${escapeXml(mode)}">`,
     `<seed>${escapeXml(trimmedSeed || "(User did not supply an initial goal yet — ask what they want to build.)")}</seed>`,
-    `<defaults base_branch="${escapeXml(baseBranch)}" max_concurrency="${maxConcurrency}" validator_enabled="${validatorEnabled ? "true" : "false"}" />`,
+    `<defaults base_branch="${escapeXml(baseBranch)}" max_concurrency="${maxConcurrency}" validator_enabled="${validatorEnabled ? "true" : "false"}"${skipReviewAttr} />`,
   ];
 
   if (options.roleModels) {
@@ -277,8 +282,11 @@ export function buildDraftingKickoffPrompt(
  */
 export function buildDraftingSystemOverlay(draft: ActiveSwarmDraft): string {
   const autoConfirmAttr = draft.autoConfirm ? ' auto_confirm="true"' : "";
+  const skipReviewAttr = draft.skipContractReview
+    ? ' skip_contract_review="true"'
+    : "";
   const lines: string[] = [
-    `<swarm_drafting_active mode="${escapeXml(draft.mode)}" base_branch="${escapeXml(draft.baseBranch ?? "auto")}" max_concurrency="${draft.maxConcurrency}" validator_enabled="${draft.validatorEnabled ? "true" : "false"}"${autoConfirmAttr}>`,
+    `<swarm_drafting_active mode="${escapeXml(draft.mode)}" base_branch="${escapeXml(draft.baseBranch ?? "auto")}" max_concurrency="${draft.maxConcurrency}" validator_enabled="${draft.validatorEnabled ? "true" : "false"}"${autoConfirmAttr}${skipReviewAttr}>`,
     `Active \`pi-swarm\` draft for a **Dynamic Antigravity Swarm** (Orchestrator dynamically spawns/steers warm Workers & read-only Validators on the shared \`#seq\` Message Board with \`@mention\` wakeups). Rules: (1) Operational Recon FIRST — run fast read-only recon (\`ls\`, \`find\`, \`grep\`, \`read\` key entrypoints/\`package.json\`/configs) FIRST to discover **already-installed** \`commands\` (\`test\`, \`typecheck\`, \`build\`, \`lint\`, plus optional \`"init"\` setup command if worktrees need setup beyond \`node_modules\`/\`.venv\` auto-symlinks), \`services\` (explicit unique ports in \`start\`/\`stop\`/\`healthcheck\` + \`port\` and acyclic \`depends_on\`), and \`boundaries\` (never invent speculative \`npx -y\` network downloads; do NOT edit files or implement code yet); (2) Requirement Echo & Lean Clarification — capture every user requirement, ask **0 questions** when clear, or **at most 1–3 high-leverage trade-off questions** for real ambiguities via \`${SWARM_QUESTIONNAIRE_TOOL}\` (or \`${SWARM_QUESTION_TOOL}\`) with the best option placed first and prefixed \`(Recommended)\` — never interrogate on obvious details; (3) Mission-Level TDD (**MANDATORY** \`assertions\` & \`features\`) & Right-Sizing — \`assertions\` (\`VAL-<AREA>-<NNN>\`, \`minItems: 1\`) and \`features\` (\`fulfills\`, \`minItems: 1\`) are **MANDATORY** in \`${PROPOSE_SWARM_PLAN_TOOL}\`: define testable \`VAL-<AREA>-<NNN>\` \`assertions\` with \`evidence_required\` FIRST, then decompose ordered vertical \`milestones\` and \`features\` (\`depends_on\` DAG + disjoint \`files_owned\` for parallel \`share\` worktrees + 100% 1-to-1 \`fulfills\` coverage), right-sizing to 1–2 workers for small/single-module tasks or disjoint parallel \`share\` authors + independent \`validator\` spawned on demand once workers commit/post \`[done]\`; (4) Adversarial Contract Review & Living Dynamic Workflow — finalize via \`${PROPOSE_SWARM_PLAN_TOOL}\` (which runs an automated **Adversarial Contract Review** for missing edge-case assertions, file-ownership collisions, and speculative commands) with \`title\`, \`objective\`, \`strategy\` specifying **wave-by-wave execution with disjoint file/directory ownership boundaries** (zero same-file collisions; not a rigid pre-locked file-level DAG — \`features\`, \`assertions\`, \`milestones\`, and workers remain dynamically extensible mid-mission via \`swarm{action:"mission"}\`, \`swarm{action:"mission", mission_op:"dispatch_ready"}\` auto-dispatching ready parallel features into fresh \`share\` worktrees, and \`swarm{action:"add"}\`), \`acceptance_criteria\` listing **exact runnable verification commands** using **already-installed** repo scripts, \`commands\`, \`services\`, \`boundaries\`, **MANDATORY** \`assertions\` & \`features\`, and optional valid \`initial_members\` populated with **wave-1 workers only** by default (concise briefs; only include a \`validator\` initially when reviewing already-existing code); (5) Do not repeat the full plan in prose before calling \`${PROPOSE_SWARM_PLAN_TOOL}\`.`,
   ];
 
@@ -306,6 +314,7 @@ export function buildDirectPlanPrompt(
   goal: string,
   baseBranch: string,
   settings: Pick<SwarmSettings, "maxConcurrency" | "validatorEnabled">,
+  options?: { skipContractReview?: boolean },
 ): string {
   const trimmedBranch = baseBranch?.trim();
   const hasNamedBranch = Boolean(trimmedBranch && trimmedBranch !== "HEAD");
@@ -315,8 +324,11 @@ export function buildDirectPlanPrompt(
   const baseBranchRule = hasNamedBranch
     ? `   - Use \`base_branch: "${escapeXml(trimmedBranch!)}"\`, \`max_concurrency: ${settings.maxConcurrency}\`, \`validator_enabled: ${settings.validatorEnabled ? "true" : "false"}\`.`
     : `   - Omit \`base_branch\` (auto-detect current branch), and use \`max_concurrency: ${settings.maxConcurrency}\`, \`validator_enabled: ${settings.validatorEnabled ? "true" : "false"}\`.`;
+  const skipReviewAttr = options?.skipContractReview
+    ? ' skip_contract_review="true"'
+    : "";
   const lines: string[] = [
-    `<swarm_direct_plan base_branch="${escapeXml(displayBranch)}" max_concurrency="${settings.maxConcurrency}" validator_enabled="${settings.validatorEnabled ? "true" : "false"}" auto_confirm="true">`,
+    `<swarm_direct_plan base_branch="${escapeXml(displayBranch)}" max_concurrency="${settings.maxConcurrency}" validator_enabled="${settings.validatorEnabled ? "true" : "false"}" auto_confirm="true"${skipReviewAttr}>`,
     `<goal>${escapeXml(goal.trim())}</goal>`,
     "<instructions>",
     "Fast-path `pi-swarm` launch (`/swarm direct`) as the **Orchestrator** (`autoConfirm: true`):",
