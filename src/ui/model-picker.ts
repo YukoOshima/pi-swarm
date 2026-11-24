@@ -9,7 +9,11 @@ import {
   matchesKey,
   type TUI,
 } from "@earendil-works/pi-tui";
-import { isProcessAlive, parseModelSpec } from "../store/index.js";
+import {
+  isProcessAlive,
+  parseModelSpec,
+  SWARM_SETTINGS_BOUNDS,
+} from "../store/index.js";
 import type {
   AvailableModelInfo,
   RoleModelOrigin,
@@ -100,8 +104,18 @@ export interface SwarmModelPickerViewOptions {
 
 export type SwarmHubAction =
   | { kind: "cancel" }
-  | { kind: "draft"; goal: string }
-  | { kind: "direct"; goal: string }
+  | {
+      kind: "draft";
+      goal: string;
+      validatorEnabled?: boolean;
+      maxConcurrency?: number;
+    }
+  | {
+      kind: "direct";
+      goal: string;
+      validatorEnabled?: boolean;
+      maxConcurrency?: number;
+    }
   | { kind: "ui" }
   | { kind: "tweak" }
   | { kind: "pause" }
@@ -1813,6 +1827,9 @@ interface HubMenuItem {
   runId?: string;
 }
 
+const MIN_CONCURRENCY = SWARM_SETTINGS_BOUNDS.maxConcurrency.min;
+const MAX_CONCURRENCY = SWARM_SETTINGS_BOUNDS.maxConcurrency.max;
+
 export class SwarmHubView implements Component, Focusable {
   readonly capturesViewportInput = true;
   private _focused = false;
@@ -1821,12 +1838,15 @@ export class SwarmHubView implements Component, Focusable {
   private readonly runs: readonly RunSummary[];
   private readonly goalInput: Input;
   private readonly hwCursor = new HardwareCursorController();
-  private subView: "hub" | "models" | "runs" = "hub";
+  private subView: "hub" | "models" | "runs" | "compose" = "hub";
+  private pickerReturnSubView: "hub" | "compose" = "hub";
   private embeddedPicker: SwarmModelPickerView | null = null;
   private selectedIndex = 0;
   private runSelectedIndex = 0;
   private menuItems: HubMenuItem[] = [];
   private hubFeedback: string | null = null;
+  private validatorOverride?: boolean;
+  private concurrencyOverride?: number;
 
   constructor(
     private readonly tui: TUI,
@@ -1864,7 +1884,7 @@ export class SwarmHubView implements Component, Focusable {
       this.hwCursor.sync(this.tui, false);
       return;
     }
-    const showGoal = value && this.subView === "hub" && !this.hasActiveOrPausedRun();
+    const showGoal = value && this.isGoalInputActive();
     this.goalInput.focused = showGoal;
     this.hwCursor.sync(this.tui, showGoal);
   }
@@ -1883,6 +1903,84 @@ export class SwarmHubView implements Component, Focusable {
   private hasActiveOrPausedRun(): boolean {
     const status = this.snapshot.run?.status;
     return status === "active" || status === "paused";
+  }
+
+  private isGoalInputActive(): boolean {
+    return (
+      this.subView === "compose" ||
+      (this.subView === "hub" && !this.hasActiveOrPausedRun())
+    );
+  }
+
+  private getEffectiveValidatorEnabled(): boolean {
+    return this.validatorOverride ?? this.state.settings.validatorEnabled;
+  }
+
+  private getEffectiveMaxConcurrency(): number {
+    const raw = this.concurrencyOverride ?? this.state.settings.maxConcurrency;
+    return Math.max(
+      MIN_CONCURRENCY,
+      Math.min(MAX_CONCURRENCY, Math.round(raw || 6)),
+    );
+  }
+
+  private buildPolicyOverrides(): {
+    validatorEnabled?: boolean;
+    maxConcurrency?: number;
+  } {
+    return {
+      ...(this.validatorOverride !== undefined
+        ? { validatorEnabled: this.validatorOverride }
+        : {}),
+      ...(this.concurrencyOverride !== undefined
+        ? { maxConcurrency: this.concurrencyOverride }
+        : {}),
+    };
+  }
+
+  private handlePolicyShortcut(data: string, allowBareKeys: boolean): boolean {
+    const ch = decodePrintableInput(data);
+    if (
+      matchesKey(data, Key.alt("v")) ||
+      matchesKey(data, Key.shiftAlt("v")) ||
+      data === "\x1bV" ||
+      (allowBareKeys && (ch === "v" || ch === "V"))
+    ) {
+      this.validatorOverride = !this.getEffectiveValidatorEnabled();
+      this.tui.requestRender();
+      return true;
+    }
+    if (
+      matchesKey(data, Key.alt("+")) ||
+      matchesKey(data, Key.alt("=")) ||
+      matchesKey(data, Key.shiftAlt("=")) ||
+      (allowBareKeys && (ch === "+" || ch === "="))
+    ) {
+      const cur = this.getEffectiveMaxConcurrency();
+      this.concurrencyOverride = Math.min(MAX_CONCURRENCY, cur + 1);
+      this.tui.requestRender();
+      return true;
+    }
+    if (
+      matchesKey(data, Key.alt("-")) ||
+      matchesKey(data, Key.alt("_")) ||
+      matchesKey(data, Key.shiftAlt("-")) ||
+      (allowBareKeys && (ch === "-" || ch === "_"))
+    ) {
+      const cur = this.getEffectiveMaxConcurrency();
+      this.concurrencyOverride = Math.max(MIN_CONCURRENCY, cur - 1);
+      this.tui.requestRender();
+      return true;
+    }
+    return false;
+  }
+
+  private openGoalComposer(): void {
+    this.subView = "compose";
+    this.hubFeedback = null;
+    this.goalInput.focused = this._focused;
+    this.hwCursor.sync(this.tui, this._focused);
+    this.tui.requestRender();
   }
 
   private getResumableUnfinishedRun(): RunSummary | undefined {
@@ -1968,6 +2066,7 @@ export class SwarmHubView implements Component, Focusable {
   }
 
   private openEmbeddedModels(): void {
+    this.pickerReturnSubView = this.subView === "compose" ? "compose" : "hub";
     this.subView = "models";
     this.goalInput.focused = false;
     this.hwCursor.sync(this.tui, false);
@@ -1983,8 +2082,8 @@ export class SwarmHubView implements Component, Focusable {
           this.state = res.state;
         }
         this.embeddedPicker = null;
-        this.subView = "hub";
-        const showGoal = this._focused && !this.hasActiveOrPausedRun();
+        this.subView = this.pickerReturnSubView;
+        const showGoal = this._focused && this.isGoalInputActive();
         this.goalInput.focused = showGoal;
         this.hwCursor.sync(this.tui, showGoal);
         this.tui.requestRender();
@@ -2006,8 +2105,16 @@ export class SwarmHubView implements Component, Focusable {
         });
         return;
       case "draft":
+        if (this.hasActiveOrPausedRun()) {
+          this.openGoalComposer();
+          return;
+        }
         this.dispose();
-        this.options.onComplete({ kind: "draft", goal });
+        this.options.onComplete({
+          kind: "draft",
+          goal,
+          ...this.buildPolicyOverrides(),
+        });
         return;
       case "direct":
         if (!goal) {
@@ -2016,7 +2123,11 @@ export class SwarmHubView implements Component, Focusable {
           return;
         }
         this.dispose();
-        this.options.onComplete({ kind: "direct", goal });
+        this.options.onComplete({
+          kind: "direct",
+          goal,
+          ...this.buildPolicyOverrides(),
+        });
         return;
       case "models":
         this.openEmbeddedModels();
@@ -2072,6 +2183,69 @@ export class SwarmHubView implements Component, Focusable {
 
     if (this.subView === "models" && this.embeddedPicker) {
       this.embeddedPicker.handleInput(data);
+      return;
+    }
+
+    if (this.subView === "compose") {
+      if (isEscapeKey(data)) {
+        this.subView = "hub";
+        this.hubFeedback = null;
+        this.goalInput.focused = false;
+        this.hwCursor.sync(this.tui, false);
+        this.tui.requestRender();
+        return;
+      }
+      if (matchesKey(data, Key.ctrl("c"))) {
+        this.dispose();
+        this.options.onComplete({ kind: "cancel" });
+        return;
+      }
+
+      const isUnambiguousCtrlM =
+        data !== "\r" && data !== "\n" && matchesKey(data, Key.ctrl("m"));
+      if (isUnambiguousCtrlM || matchesKey(data, Key.alt("m"))) {
+        this.openEmbeddedModels();
+        return;
+      }
+
+      if (this.handlePolicyShortcut(data, false)) {
+        return;
+      }
+
+      if (matchesKey(data, Key.alt("enter"))) {
+        const goal = this.goalInput.getValue().trim();
+        if (!goal) {
+          this.hubFeedback =
+            "Type a goal in Goal: above first (or press Enter for Interactive Swarm).";
+          this.tui.requestRender();
+          return;
+        }
+        this.dispose();
+        this.options.onComplete({
+          kind: "direct",
+          goal,
+          ...this.buildPolicyOverrides(),
+        });
+        return;
+      }
+
+      if (matchesKey(data, Key.enter)) {
+        const goal = this.goalInput.getValue().trim();
+        this.dispose();
+        this.options.onComplete({
+          kind: "draft",
+          goal,
+          ...this.buildPolicyOverrides(),
+        });
+        return;
+      }
+
+      const normalized = isBackspaceKey(data) ? "\x7f" : normalizeEditorInput(data);
+      if (normalized) {
+        this.hubFeedback = null;
+        this.goalInput.handleInput(normalized);
+        this.tui.requestRender();
+      }
       return;
     }
 
@@ -2135,6 +2309,10 @@ export class SwarmHubView implements Component, Focusable {
       return;
     }
 
+    if (this.handlePolicyShortcut(data, this.hasActiveOrPausedRun())) {
+      return;
+    }
+
     if (matchesKey(data, Key.alt("enter")) && !this.hasActiveOrPausedRun()) {
       const goal = this.goalInput.getValue().trim();
       if (!goal) {
@@ -2143,7 +2321,11 @@ export class SwarmHubView implements Component, Focusable {
         return;
       }
       this.dispose();
-      this.options.onComplete({ kind: "direct", goal });
+      this.options.onComplete({
+        kind: "direct",
+        goal,
+        ...this.buildPolicyOverrides(),
+      });
       return;
     }
 
@@ -2215,6 +2397,111 @@ export class SwarmHubView implements Component, Focusable {
     }
   }
 
+  private renderPolicyLine(innerWidth: number, allowBareKeys: boolean): string {
+    const valEnabled = this.getEffectiveValidatorEnabled();
+    const maxConc = this.getEffectiveMaxConcurrency();
+    const valPill = valEnabled
+      ? this.theme.fg("success", this.theme.bold("ON"))
+      : this.theme.fg("warning", this.theme.bold("OFF"));
+    const concPill = this.theme.fg("accent", String(maxConc));
+    const valKey = allowBareKeys ? "[v]" : "[Alt+V]";
+    const concKey = allowBareKeys ? "[+/-]" : "[Alt+/-]";
+
+    if (innerWidth < 46) {
+      return fitLine(
+        `${this.theme.fg("muted", "Validator:")} ${valPill} ${this.theme.fg("dim", "·")} ${this.theme.fg("muted", "Max:")} ${concPill}`,
+        innerWidth,
+      );
+    }
+    if (allowBareKeys ? innerWidth < 56 : innerWidth < 66) {
+      return fitLine(
+        `${this.theme.fg("dim", valKey)} Validator: ${valPill} ${this.theme.fg("dim", "·")} ${this.theme.fg("dim", concKey)} Max: ${concPill}`,
+        innerWidth,
+      );
+    }
+    return fitLine(
+      `${this.theme.fg("dim", valKey)} Validator: ${valPill} ${this.theme.fg("dim", "·")} ${this.theme.fg("dim", concKey)} Max Concurrency: ${concPill}`,
+      innerWidth,
+    );
+  }
+
+  private renderGoalComposer(
+    safeWidth: number,
+    innerWidth: number,
+    maxInner: number,
+    compact: boolean,
+  ): string[] {
+    const body: string[] = [];
+    const run = this.snapshot.run;
+    if (run) {
+      const title = sanitizePlainText(run.title || run.objective) || run.id;
+      const badge = formatRunStatusBadge(run.status, this.theme);
+      body.push(
+        fitLine(
+          `${this.theme.fg("warning", "Current run:")} ${this.theme.bold(title)} [${badge}]`,
+          innerWidth,
+        ),
+      );
+    }
+
+    if (maxInner >= 9) {
+      body.push(
+        formatRoleModelsLine(
+          buildRoleModelsFromPickerState(this.state),
+          formatInheritedHostLabel(this.state.hostModel),
+          {
+            maxWidth: innerWidth,
+            theme: this.theme,
+            origins: compact ? undefined : this.state.origins,
+          },
+        ),
+      );
+    }
+
+    body.push(this.renderPolicyLine(innerWidth, false));
+
+    if (maxInner >= 7) {
+      body.push(renderHorizontalRule(innerWidth, "New Swarm Goal", this.theme));
+    }
+
+    const renderedInput = this.goalInput.render(innerWidth)[0] ?? "Goal: ";
+    body.push(renderedInput);
+
+    const feedbackReserve = this.hubFeedback ? 1 : 0;
+    if (maxInner - body.length - feedbackReserve >= 4) {
+      const guidance =
+        innerWidth >= 74
+          ? "  [Enter] Clarify & Plan (optional) · [Alt+Enter] Direct Launch (goal required)"
+          : innerWidth >= 52
+            ? "[Enter] Clarify & Plan · [Alt+Enter] Direct Launch"
+            : "[Enter] Draft · [Alt+Enter] Direct";
+      body.push(fitLine(this.theme.fg("dim", guidance), innerWidth));
+    }
+
+    if (this.hubFeedback) {
+      body.push(fitLine(this.theme.fg("warning", this.hubFeedback), innerWidth));
+    }
+
+    if (maxInner - body.length >= 2) {
+      body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
+    }
+
+    const footerHint =
+      innerWidth < 46
+        ? "Enter Draft · Alt+Enter · Esc"
+        : compact
+          ? "Enter Draft · Alt+Enter Direct · Alt+M · Esc Back"
+          : innerWidth < 86
+            ? "Enter Plan · Alt+Enter Direct · Alt+V/± Policy · Alt+M · Esc Back"
+            : "Enter Clarify & Plan · Alt+Enter Direct · Alt+V/± Policy · Alt+M Models · Esc Back";
+    body.push(fitLine(this.theme.fg("dim", footerHint), innerWidth));
+
+    return renderBox(body.slice(0, maxInner), safeWidth, {
+      title: this.theme.fg("accent", this.theme.bold("◆ Start New Swarm")),
+      borderColor: (t) => this.theme.fg("borderAccent", t),
+    });
+  }
+
   render(width: number): string[] {
     if (this.subView === "models" && this.embeddedPicker) {
       return this.embeddedPicker.render(width);
@@ -2227,6 +2514,9 @@ export class SwarmHubView implements Component, Focusable {
 
     const maxBoxLines = computeOverlayMaxBoxLines(this.tui);
     const maxInner = Math.max(2, maxBoxLines - 2);
+    if (this.subView === "compose") {
+      return this.renderGoalComposer(safeWidth, innerWidth, maxInner, compact);
+    }
     if (this.subView === "runs") {
       body.push(
         fitLine(
@@ -2380,6 +2670,8 @@ export class SwarmHubView implements Component, Focusable {
       body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
     }
 
+    const activeOrPaused = this.hasActiveOrPausedRun();
+
     // Mission Models Card (collapses cleanly on <= 14-row inner height terminals)
     if (maxInner <= 14) {
       body.push(
@@ -2393,6 +2685,9 @@ export class SwarmHubView implements Component, Focusable {
           },
         ),
       );
+      if (maxInner >= 10) {
+        body.push(this.renderPolicyLine(innerWidth, activeOrPaused));
+      }
     } else {
       const oCell = formatRoleSummaryCell(
         this.state.settings.orchestratorModel,
@@ -2439,11 +2734,9 @@ export class SwarmHubView implements Component, Focusable {
           ),
         );
       }
-      const policyLine = `Validator: ${this.state.settings.validatorEnabled ? "ON" : "OFF"} · Max Concurrency: ${this.state.settings.maxConcurrency}`;
-      body.push(fitLine(this.theme.fg("dim", policyLine), innerWidth));
+      body.push(this.renderPolicyLine(innerWidth, activeOrPaused));
     }
 
-    const activeOrPaused = this.hasActiveOrPausedRun();
     if (!activeOrPaused) {
       body.push(renderHorizontalRule(innerWidth, "Goal (optional)", this.theme));
       const renderedInput = this.goalInput.render(innerWidth)[0] ?? "Goal: ";
@@ -2520,10 +2813,10 @@ export class SwarmHubView implements Component, Focusable {
       ? innerWidth < 46
         ? "1-9/↑↓ · Enter · m/Alt+M · Esc"
         : compact
-          ? "1-9/↑↓ · Enter · m/Alt+M Models · Esc"
-          : innerWidth < 76
-            ? "1-9/↑↓/jk · Enter · m/Alt+M Models · Esc Close"
-            : "1-9 / ↑/↓/j/k Navigate · Enter Select · m / Alt+M Models · Esc Close"
+          ? "1-9/↑↓ · Enter · m/Alt+M · v/± · Esc"
+          : innerWidth < 86
+            ? "1-9/↑↓/jk · Enter · m/Alt+M Models · v/± Policy · Esc"
+            : "1-9 / ↑/↓/j/k Navigate · Enter Select · m/Alt+M Models · v/± Policy · Esc"
       : innerWidth < 46
         ? "Goal · Enter · Alt+M · Esc"
         : innerWidth < 50

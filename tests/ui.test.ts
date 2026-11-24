@@ -37,6 +37,7 @@ import {
   HardwareCursorController,
   SwarmDashboardComponent,
   SwarmHubView,
+  type SwarmHubAction,
   SwarmModelPickerView,
   SwarmOverlayComponent,
   type ModelPickerSettingsState,
@@ -5956,5 +5957,312 @@ describe("v0.9.0 UI Services, Audited Overrides & Library Inspector", () => {
       rpcHeader,
       /Services: 2 \(worker-redis:6379, api-server:3000\)/,
     );
+  });
+});
+
+// ============================================================================
+// SwarmHubView Quick Policy Toggles & Active-Run Goal Composer (VAL-HUB-001/002)
+// ============================================================================
+
+describe("SwarmHubView quick policy toggles & active-run goal composer (VAL-HUB-001, VAL-HUB-002)", () => {
+  it("VAL-HUB-001: idle Goal typing is never hijacked while Alt+V / Alt++ / Alt+= / Alt+- update policy display and emit draft/direct overrides", () => {
+    const theme = createMockTheme();
+    const { tui } = createMockTUI(28, 90);
+    const emptySnap = makeSampleSnapshot({ empty: true });
+    let completed: SwarmHubAction | undefined;
+
+    const hub = new SwarmHubView(tui, theme, {
+      state: {
+        settings: {
+          ...DEFAULT_SWARM_SETTINGS,
+          validatorEnabled: true,
+          maxConcurrency: 6,
+        },
+        origins: { orchestrator: "host", worker: "host", validator: "host" },
+      },
+      snapshot: emptySnap,
+      runs: [],
+      availableModels: [],
+      onComplete: (action) => {
+        completed = action;
+      },
+    });
+
+    try {
+      const initialPlain = stripTerminalSequences(hub.render(90).join("\n"));
+      assert.match(initialPlain, /\[Alt\+V\] Validator: ON/);
+      assert.match(initialPlain, /\[Alt\+\/-\] Max Concurrency: 6/);
+
+      // Normal typing including v, +, =, - goes strictly into Goal: without toggling policy
+      for (const ch of "v2 + x = y - 1") {
+        hub.handleInput(ch);
+      }
+      const afterTyping = stripTerminalSequences(hub.render(90).join("\n"));
+      assert.match(afterTyping, /v2 \+ x = y - 1/);
+      assert.match(afterTyping, /Validator: ON/);
+      assert.match(afterTyping, /Max Concurrency: 6/);
+
+      // Alt+V toggles validator OFF; Alt++, Alt+=, Alt+- adjust maxConcurrency (6 -> 7 -> 8 -> 7)
+      hub.handleInput("\x1bv");
+      hub.handleInput("\x1b+");
+      hub.handleInput("\x1b=");
+      hub.handleInput("\x1b-");
+      const afterToggle = stripTerminalSequences(hub.render(90).join("\n"));
+      assert.match(afterToggle, /Validator: OFF/);
+      assert.match(afterToggle, /Max Concurrency: 7/);
+
+      for (const w of [40, 60, 80, 120]) {
+        assertAllLinesFit(hub.render(w), w, `hub-idle-policy@${w}`);
+      }
+
+      // Enter launches draft with overrides
+      hub.handleInput("\r");
+      assert.deepEqual(completed, {
+        kind: "draft",
+        goal: "v2 + x = y - 1",
+        validatorEnabled: false,
+        maxConcurrency: 7,
+      });
+    } finally {
+      hub.dispose();
+    }
+
+    // Alt+Enter direct launch emits overrides and clamps concurrency bounds [1, 64]
+    let directAction: SwarmHubAction | undefined;
+    const { tui: tui16 } = createMockTUI(16, 80);
+    const hubDirect = new SwarmHubView(tui16, theme, {
+      state: {
+        settings: {
+          ...DEFAULT_SWARM_SETTINGS,
+          validatorEnabled: false,
+          maxConcurrency: 1,
+        },
+      },
+      snapshot: emptySnap,
+      runs: [],
+      availableModels: [],
+      onComplete: (action) => {
+        directAction = action;
+      },
+    });
+    try {
+      // Clamp at lower bound 1, then toggle validator ON
+      hubDirect.handleInput("\x1b-");
+      hubDirect.handleInput("\x1b[118;3u"); // CSI-u Alt+V
+      const plain16 = stripTerminalSequences(hubDirect.render(80).join("\n"));
+      assert.match(plain16, /Validator: ON/);
+      assert.match(plain16, /Max Concurrency: 1/);
+      assert.ok(hubDirect.render(80).length <= 16);
+
+      for (const ch of "Quick direct goal") {
+        hubDirect.handleInput(ch);
+      }
+      hubDirect.handleInput("\x1b\r"); // Alt+Enter -> direct
+      assert.deepEqual(directAction, {
+        kind: "direct",
+        goal: "Quick direct goal",
+        validatorEnabled: true,
+        maxConcurrency: 1,
+      });
+    } finally {
+      hubDirect.dispose();
+    }
+
+    // Upper bound clamp at 64
+    let upperAction: SwarmHubAction | undefined;
+    const hubMax = new SwarmHubView(tui, theme, {
+      state: {
+        settings: {
+          ...DEFAULT_SWARM_SETTINGS,
+          maxConcurrency: 64,
+        },
+      },
+      snapshot: emptySnap,
+      runs: [],
+      availableModels: [],
+      onComplete: (action) => {
+        upperAction = action;
+      },
+    });
+    try {
+      hubMax.handleInput("\x1b+");
+      hubMax.handleInput("\r");
+      assert.deepEqual(upperAction, {
+        kind: "draft",
+        goal: "",
+        maxConcurrency: 64,
+      });
+    } finally {
+      hubMax.dispose();
+    }
+  });
+
+  it("VAL-HUB-001 & VAL-HUB-002: active/paused Hub supports v/+/- policy toggles and opens inline goal composer on + Start New Swarm…", () => {
+    const theme = createMockTheme();
+    const tuiHandle = createMockTUI(28, 96);
+    const activeSnap = makeSampleSnapshot({ status: "active" });
+    const actions: SwarmHubAction[] = [];
+
+    const hub = new SwarmHubView(tuiHandle.tui, theme, {
+      state: {
+        settings: {
+          ...DEFAULT_SWARM_SETTINGS,
+          validatorEnabled: true,
+          maxConcurrency: 4,
+        },
+        origins: { orchestrator: "host", worker: "host", validator: "host" },
+      },
+      snapshot: activeSnap,
+      runs: [],
+      availableModels: [],
+      onComplete: (action) => {
+        actions.push(action);
+      },
+    });
+    hub.focused = true;
+
+    try {
+      // Active Hub shows bare shortcut hints [v] and [+/-]
+      const hubInitial = stripTerminalSequences(hub.render(96).join("\n"));
+      assert.match(hubInitial, /\[v\] Validator: ON/);
+      assert.match(hubInitial, /\[(\+\/-)\] Max Concurrency: 4/);
+      assert.equal(tuiHandle.getHardwareCursor(), false);
+
+      // Bare v, +, -, = work on active Hub and survive Alt+M picker roundtrip
+      hub.handleInput("v"); // ON -> OFF
+      hub.handleInput("+"); // 4 -> 5
+      hub.handleInput("="); // 5 -> 6
+      hub.handleInput("-"); // 6 -> 5
+      const hubToggled = stripTerminalSequences(hub.render(96).join("\n"));
+      assert.match(hubToggled, /Validator: OFF/);
+      assert.match(hubToggled, /Max Concurrency: 5/);
+
+      hub.handleInput("\x1bm"); // Open embedded Model Picker
+      assert.match(
+        stripTerminalSequences(hub.render(96).join("\n")),
+        /Swarm Mission Models/,
+      );
+      hub.handleInput("\x1b"); // Close picker -> policy overrides preserved
+      const hubAfterPicker = stripTerminalSequences(hub.render(96).join("\n"));
+      assert.match(hubAfterPicker, /Validator: OFF/);
+      assert.match(hubAfterPicker, /Max Concurrency: 5/);
+
+      // Select item #6 (+ Start New Swarm…) -> opens inline goal composer instead of firing empty draft
+      hub.handleInput("6");
+      hub.handleInput("\r");
+      assert.equal(
+        actions.length,
+        0,
+        "Selecting + Start New Swarm… while active must open composer instead of emitting immediately",
+      );
+      assert.equal(tuiHandle.getHardwareCursor(), true);
+
+      const composerRendered = hub.render(96);
+      assert.ok(
+        composerRendered.some((l) => l.includes(CURSOR_MARKER)),
+        "Composer Goal input must render CURSOR_MARKER when focused",
+      );
+      const composerPlain = stripTerminalSequences(composerRendered.join("\n"));
+      assert.match(composerPlain, /Start New Swarm/);
+      assert.match(composerPlain, /Current run:/);
+      assert.match(composerPlain, /\[Alt\+V\] Validator: OFF/);
+      assert.match(composerPlain, /\[Alt\+\/-\] Max Concurrency: 5/);
+
+      for (const w of [40, 60, 80, 120]) {
+        assertAllLinesFit(hub.render(w), w, `hub-composer@${w}`);
+      }
+
+      // Alt+Enter with empty goal stays in composer with warning feedback
+      hub.handleInput("\x1b\r");
+      assert.equal(actions.length, 0);
+      assert.match(
+        stripTerminalSequences(hub.render(96).join("\n")),
+        /Type a goal in Goal: above first/,
+      );
+
+      // Esc returns cleanly to Hub without firing onComplete
+      hub.handleInput("\x1b");
+      assert.equal(actions.length, 0);
+      assert.equal(tuiHandle.getHardwareCursor(), false);
+      assert.match(
+        stripTerminalSequences(hub.render(96).join("\n")),
+        /Pi Swarm Mission Hub/,
+      );
+
+      // Re-open composer, test Alt+M roundtrip back into composer, type goal with v/+/-, adjust policy with Alt, launch Direct
+      hub.handleInput("6");
+      hub.handleInput("\r");
+      hub.handleInput("\x1bm");
+      assert.match(
+        stripTerminalSequences(hub.render(96).join("\n")),
+        /Swarm Mission Models/,
+      );
+      hub.handleInput("\x1b");
+      assert.match(
+        stripTerminalSequences(hub.render(96).join("\n")),
+        /Start New Swarm/,
+      );
+
+      for (const ch of "fix v2 + cache - stale") {
+        hub.handleInput(ch);
+      }
+      // Bare v/+/- typed in composer must NOT flip policy
+      const composerTyped = stripTerminalSequences(hub.render(96).join("\n"));
+      assert.match(composerTyped, /fix v2 \+ cache - stale/);
+      assert.match(composerTyped, /Validator: OFF/);
+      assert.match(composerTyped, /Max Concurrency: 5/);
+
+      // Alt+V and Alt++ inside composer update policy before Alt+Enter direct launch
+      hub.handleInput("\x1bv"); // OFF -> ON
+      hub.handleInput("\x1b+"); // 5 -> 6
+      hub.handleInput("\x1b\r"); // Alt+Enter -> direct
+      assert.deepEqual(actions, [
+        {
+          kind: "direct",
+          goal: "fix v2 + cache - stale",
+          validatorEnabled: true,
+          maxConcurrency: 6,
+        },
+      ]);
+      assert.equal(tuiHandle.getHardwareCursor(), false);
+    } finally {
+      hub.dispose();
+    }
+
+    // Paused run: + Start New Swarm… -> composer -> Enter launches draft (and fits 12-row tight terminal)
+    const pausedSnap = makeSampleSnapshot({ status: "paused" });
+    const { tui: tightTui } = createMockTUI(12, 60);
+    let pausedAction: SwarmHubAction | undefined;
+    const pausedHub = new SwarmHubView(tightTui, theme, {
+      state: {
+        settings: { ...DEFAULT_SWARM_SETTINGS, validatorEnabled: true, maxConcurrency: 6 },
+      },
+      snapshot: pausedSnap,
+      runs: [],
+      availableModels: [],
+      onComplete: (action) => {
+        pausedAction = action;
+      },
+    });
+    try {
+      pausedHub.handleInput("v"); // OFF
+      pausedHub.handleInput("6"); // + Start New Swarm…
+      pausedHub.handleInput("\r");
+      assert.equal(pausedAction, undefined);
+      const tightLines = pausedHub.render(60);
+      assert.ok(tightLines.length <= 12, `Composer height ${tightLines.length} must fit 12 rows`);
+      assertAllLinesFit(tightLines, 60, "hub-composer@12x60");
+      for (const ch of "Start fresh paused goal") {
+        pausedHub.handleInput(ch);
+      }
+      pausedHub.handleInput("\r"); // Enter -> draft
+      assert.deepEqual(pausedAction, {
+        kind: "draft",
+        goal: "Start fresh paused goal",
+        validatorEnabled: false,
+      });
+    } finally {
+      pausedHub.dispose();
+    }
   });
 });
