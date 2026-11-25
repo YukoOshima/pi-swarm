@@ -7776,19 +7776,50 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       [...IDLE_SWARM_TOOLS],
     );
 
+    const mergeOnceParked = async (h: MockHarness, memberName: string) => {
+      const deadline = Date.now() + 15_000;
+      while (true) {
+        const res = await h.executeTool(SWARM_TOOL, { action: "merge", name: memberName });
+        if (!res.isError) {
+          return res;
+        }
+        const errText = String(res.content?.[0]?.text ?? "");
+        if (!/MEMBER_NOT_WAITING/i.test(errText) || Date.now() >= deadline) {
+          assert.fail(`Expected merge of @${memberName} to succeed, got: ${JSON.stringify(res)}`);
+        }
+        await new Promise((r) => setTimeout(r, 20));
+      }
+    };
+    const doneOnceAllParked = async (h: MockHarness, summary: string) => {
+      const deadline = Date.now() + 15_000;
+      while (true) {
+        const res = await h.executeTool(SWARM_TOOL, { action: "done", summary });
+        if (!res.isError) {
+          return res;
+        }
+        const errText = String(res.content?.[0]?.text ?? "");
+        if (!/still working/i.test(errText) || Date.now() >= deadline) {
+          assert.fail(`Expected swarm done ("${summary}") to succeed, got: ${JSON.stringify(res)}`);
+        }
+        await new Promise((r) => setTimeout(r, 20));
+      }
+    };
+
     const scratch1 = getValidatorScratchDir(run1Id, "v1");
     assert.equal(await pathExists(scratch1), true, "Validator scratch dir must exist while live");
     const wt1 = (await store.loadRun(run1Id)).members.w1!.cwd;
     assert.equal(await pathExists(wt1), true);
-    await host.executeTool(SWARM_TOOL, { action: "merge", name: "w1" });
+    await mergeOnceParked(host, "w1");
+    await waitFor(async () => {
+      const statusRes = await host.executeTool(SWARM_TOOL, { action: "status" });
+      const members = (statusRes.details as { members?: Array<{ state: string }> })?.members ?? [];
+      return members.length > 0 && members.every((m) => m.state !== "working");
+    });
 
     const wakeupsBefore1 = host.sentMessages.filter(
       (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
     ).length;
-    await host.executeTool(SWARM_TOOL, {
-      action: "done",
-      summary: "Run 1 shipped cleanly",
-    });
+    await doneOnceAllParked(host, "Run 1 shipped cleanly");
     await host.emit("agent_settled", { aborted: false });
 
     // Members, worktree & validator scratch retired; Mission Complete card emitted once; 0 extra turns
@@ -7895,7 +7926,12 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       ],
     });
     const run2Id: string = plan2.details.runId;
-    await waitFor(async () => (await store.loadRun(run2Id)).members.v2?.state === "waiting");
+    await waitFor(async () => {
+      const statusRes = await host.executeTool(SWARM_TOOL, { action: "status" });
+      const members =
+        (statusRes.details as { members?: Array<{ name: string; state: string }> })?.members ?? [];
+      return members.find((m) => m.name === "v2")?.state === "waiting";
+    });
     const scratch2 = getValidatorScratchDir(run2Id, "v2");
     assert.equal(await pathExists(scratch2), true);
 
@@ -7929,7 +7965,13 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
         ],
       });
       run3Id = plan3.details.runId;
-      await waitFor(async () => (await store.loadRun(run3Id)).members.v3?.state === "waiting");
+      await waitFor(async () => {
+        const statusRes = await host.executeTool(SWARM_TOOL, { action: "status" });
+        const members =
+          (statusRes.details as { members?: Array<{ name: string; state: string }> })?.members ??
+          [];
+        return members.find((m) => m.name === "v3")?.state === "waiting";
+      });
       // Grab active engine instance via status command and complete directly on SwarmEngine
       const engineInstance = capturedEngine ?? undefined;
       assert.ok(run3Id);
@@ -8415,18 +8457,50 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     assert.equal(modalCalls, 1, "Interactive /swarm must open confirmation modal");
     const run1Id: string = run1Plan.details.runId;
 
+    const mergeOnceParked = async (h: MockHarness, memberName: string) => {
+      const deadline = Date.now() + 15_000;
+      while (true) {
+        const res = await h.executeTool(SWARM_TOOL, { action: "merge", name: memberName });
+        if (!res.isError) {
+          return res;
+        }
+        const errText = String(res.content?.[0]?.text ?? "");
+        if (!/MEMBER_NOT_WAITING/i.test(errText) || Date.now() >= deadline) {
+          assert.fail(`Expected merge of @${memberName} to succeed, got: ${JSON.stringify(res)}`);
+        }
+        await new Promise((r) => setTimeout(r, 20));
+      }
+    };
+    const doneOnceAllParked = async (h: MockHarness, summary: string) => {
+      const deadline = Date.now() + 15_000;
+      while (true) {
+        const res = await h.executeTool(SWARM_TOOL, { action: "done", summary });
+        if (!res.isError) {
+          return res;
+        }
+        const errText = String(res.content?.[0]?.text ?? "");
+        if (!/still working/i.test(errText) || Date.now() >= deadline) {
+          assert.fail(`Expected swarm done ("${summary}") to succeed, got: ${JSON.stringify(res)}`);
+        }
+        await new Promise((r) => setTimeout(r, 20));
+      }
+    };
+
     await waitFor(async () => (await store.loadRun(run1Id)).members["m1-worker"]?.state === "waiting");
-    const merge1Res = await host.executeTool(SWARM_TOOL, { action: "merge", name: "m1-worker" });
+    const merge1Res = await mergeOnceParked(host, "m1-worker");
     assert.equal(merge1Res.isError, undefined, JSON.stringify(merge1Res));
-    // Auto-spawned @validator verifies VAL-M-001 -> wait until VAL-M-001 is passed
+    // Auto-spawned @validator verifies VAL-M-001 -> wait until VAL-M-001 is passed AND live engine reports 0 working
     await waitFor(async () => {
       const r = await store.loadRun(run1Id);
-      return (
-        r.assertions?.[0]?.status === "passed" &&
-        Object.values(r.members).every((m) => m.state !== "working")
-      );
+      if (r.assertions?.[0]?.status !== "passed") {
+        return false;
+      }
+      const statusRes = await host.executeTool(SWARM_TOOL, { action: "status" });
+      const members = (statusRes.details as { members?: Array<{ state: string }> })?.members ?? [];
+      return members.length > 0 && members.every((m) => m.state !== "working");
     });
-    await host.executeTool(SWARM_TOOL, { action: "done", summary: "Mission 1 complete" });
+    const done1Res = await doneOnceAllParked(host, "Mission 1 complete");
+    assert.equal(done1Res.isError, undefined, JSON.stringify(done1Res));
 
     // Verify Sisyphus goal auto-continuation does NOT fire in standby!
     const wakeupsInStandbyBefore = host.sentMessages.filter(
@@ -8511,16 +8585,19 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
 
     // Complete Run 2 -> back to standby with Run 2 as priorRun!
     await waitFor(async () => (await store.loadRun(run2Id)).members["m2-worker"]?.state === "waiting");
-    const merge2Res = await host.executeTool(SWARM_TOOL, { action: "merge", name: "m2-worker" });
+    const merge2Res = await mergeOnceParked(host, "m2-worker");
     assert.equal(merge2Res.isError, undefined, JSON.stringify(merge2Res));
     await waitFor(async () => {
       const r = await store.loadRun(run2Id);
-      return (
-        r.assertions?.[0]?.status === "passed" &&
-        Object.values(r.members).every((m) => m.state !== "working")
-      );
+      if (r.assertions?.[0]?.status !== "passed") {
+        return false;
+      }
+      const statusRes = await host.executeTool(SWARM_TOOL, { action: "status" });
+      const members = (statusRes.details as { members?: Array<{ state: string }> })?.members ?? [];
+      return members.length > 0 && members.every((m) => m.state !== "working");
     });
-    await host.executeTool(SWARM_TOOL, { action: "done", summary: "Mission 2 complete" });
+    const done2Res = await doneOnceAllParked(host, "Mission 2 complete");
+    assert.equal(done2Res.isError, undefined, JSON.stringify(done2Res));
     assert.deepEqual(
       host.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)).sort(),
       [...STANDBY_SWARM_TOOLS].sort(),
@@ -8780,8 +8857,23 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     assert.equal((await store.loadRun(liveRunId)).status, "active");
     assert.equal(host.ctx.model?.id, "claude-opus-4-6");
     assert.equal(host.pi.getThinkingLevel(), "high");
-    await host.executeTool(SWARM_TOOL, { action: "merge", name: "live-dev" });
-    await host.executeTool(SWARM_TOOL, { action: "done", summary: "Resumed & completed" });
+    const mergeLiveRes = await (async () => {
+      const deadline = Date.now() + 15_000;
+      while (true) {
+        const res = await host.executeTool(SWARM_TOOL, { action: "merge", name: "live-dev" });
+        if (!res.isError) return res;
+        if (!/MEMBER_NOT_WAITING/i.test(String(res.content?.[0]?.text ?? "")) || Date.now() >= deadline) {
+          assert.fail(`Expected merge of @live-dev to succeed, got: ${JSON.stringify(res)}`);
+        }
+        await new Promise((r) => setTimeout(r, 20));
+      }
+    })();
+    assert.equal(mergeLiveRes.isError, undefined);
+    const doneLiveRes = await host.executeTool(SWARM_TOOL, {
+      action: "done",
+      summary: "Resumed & completed",
+    });
+    assert.equal(doneLiveRes.isError, undefined, JSON.stringify(doneLiveRes));
     await host.runCommand("swarm", "teardown");
 
     // In standby: empty-prefix completions include `exit`
