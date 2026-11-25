@@ -72,10 +72,23 @@ Instead of locking work into a rigid upfront DAG or letting agents drift off obj
 │  5. Peer-to-Peer Warm Loop @validator ↔ @author direct fixes on the board │
 │                            waking the SAME warm waiting handle (0 cold    │
 │                            starts; SWARM_MAX_BOARD_HOPS = 24 cap)         │
-│  6. Land, Retire & Close   swarm{action:"merge"} → swarm{action:"kill"}   │
-│                            → swarm{action:"done", summary} (idle tools)   │
+│  6. Land, Retire & Standby swarm{action:"merge"} → swarm{action:"kill"}   │
+│                            → swarm{action:"done", summary}                │
+│                            (retires specialists; @orchestrator stays on   │
+│                             standby until user runs /swarm exit)          │
 └───────────────────────────────────────────────────────────────────────────┘
 ```
+
+### Persistent Swarm Orchestrator Mode & `/swarm exit` / 常驻编排官模式与显式退出
+
+- **Entering Persistent Orchestrator Mode / 如何进入**: Confirming and launching a run (`/swarm <goal>`, `/swarm direct <goal>`, `/swarm-direct <goal>`) or resuming a run (`/swarm resume`) as the owning session activates sticky session-level **Persistent Swarm Orchestrator Mode** (persisted in the session focus entry across `/reload`, `/tree`, and compaction). Entering via `/swarm direct` or `/swarm-direct` sets `autoConfirmDefault: true` so subsequent standby proposals also auto-confirm; entering via `/swarm <goal>` keeps `autoConfirmDefault: false`. Read-only observer sessions inspecting a run owned by another live session never enter the mode.
+- **Ephemeral Specialists vs Sticky Standby `@orchestrator` / 专家即用即毁与常驻待命**: Completing a run (`swarm{action:"done"}` or `/swarm done`) retires all worker and validator sessions, cleans up validator scratch directories, removes clean idle isolated worktrees when `autoTeardownOnComplete` is enabled (or when confirmed at the interactive `/swarm done` prompt, or later via `/swarm teardown`), and emits the Mission Complete card, while `@orchestrator` remains on duty in `"standby"` mode—retaining `orchestratorModel` + reasoning effort and the 5 `STANDBY_SWARM_TOOLS` (`swarm`, `read_board`, `swarm_question`, `swarm_questionnaire`, `propose_swarm_plan`).
+- **What `@orchestrator` Will and Will Not Do in Standby / 待命职责与写入保护**:
+  - **Will do**: Answer read-only codebase, architecture, test, and prior-run questions directly using `read`, `grep`, `find`, `ls`, read-only `bash` (`git status`, `git diff`, `rg`, `npm test`, etc.), `swarm{action:"status"}`, and `read_board` without starting a new run.
+  - **Will NOT do**: Edit files or mutate repository state directly. Across **all** Orchestrator Mode states (`drafting`, `active`, `paused`, and `standby`), `write`, `edit`, and `powershell` are blocked directly by exact tool-name check, while common mutating `bash` commands (`git add`, `git commit`, `git merge`, `git push`, `rm`, `mv`, `cp`, `sed -i`, file redirects, package installs) are rejected by **best-effort pattern matching** (`isReadOnlyValidationCommand`). This best-effort pattern-matching `bash` rule exists to stop `@orchestrator` from editing by habit—not to confine it or act as a complete sandbox. `@orchestrator` never exits the mode on its own.
+- **Follow-Up Coding Tasks in Plain Chat / 后续任务无缝流转**: Send follow-up feature requests, bug fixes, or refactors in plain chat without typing `/swarm` again. `@orchestrator` automatically runs read-only recon (carrying forward prior `.pi/swarm/runs/<run-id>/library/` notes), asks 0 or 1–3 high-leverage questions via `swarm_questionnaire` (skipped when `autoConfirmDefault: true`), and calls `propose_swarm_plan` to launch the next Swarm run. Cancelling a proposal or draft in standby returns to `"standby"` rather than dropping out of Orchestrator Mode.
+- **Exiting Orchestrator Mode (`/swarm exit`) / 如何退出**: Only explicit user actions exit the mode: `/swarm exit` (alias `/swarm leave`), **Swarm Hub → `✗ Exit Swarm Orchestrator Mode (/swarm exit)`**, `/swarm focus none`, or `/swarm cancel` when abandoning a live run. `/swarm exit` refuses while a live (`active`/`paused`) run is attached unless `--force` is supplied (`/swarm exit --force` pauses and releases ownership of the run with all worktrees and branches intact so it stays resumable via `/swarm resume`). Exiting restores `idle` tools (`swarm` only), restores the in-memory pre-swarm host model & thinking level, re-enables direct editing, and persists `orchestratorMode: false` so `/reload` stays exited.
+- **Manual `git commit` / `git push` (`!<command>`) / 手动提交与推送**: Neither workers nor `@orchestrator` are allowed to run `git push` (and `@orchestrator` cannot run manual `git commit` or `git merge` via `bash`). To push or commit by hand while staying in Orchestrator Mode, prefix the shell command with `!` in the Pi prompt (e.g. `!git push`, `!git status`, `!git commit -m "..."` — user `!` commands execute through Pi's `user_bash` pipeline and never hit the model `tool_call` guard), or run `/swarm exit` first.
 
 ### 核心特性 / Key Capabilities
 
@@ -233,13 +246,14 @@ Only **`/swarm`** and **`/swarm-direct`** are registered on Pi.
 | `/swarm steer <member> <message>` | Steer a working member mid-turn or wake a parked member with new user direction | **No** |
 | `/swarm merge <member>` | Land a member's clean `share` worktree or `branch` clone onto `baseBranch` (`autoRebase` + `--no-ff`) | **No** |
 | `/swarm kill <member> [--force] [reason]` | Permanently kill a member and remove its clean worktree (`--force` overrides dirty guard) | **No** |
-| `/swarm done [summary]` | Complete the active run, dispose warm handles, silence watchdog & restore `idle` tools | **No** |
+| `/swarm done [--force] [summary]` | Complete the active run, retire ephemeral workers/validators & keep `@orchestrator` in `standby` (`--force` force-closes unfinished Mission gates) | **No** |
+| `/swarm exit [--force]` <br> `/swarm leave [--force]` | Exit Persistent Swarm Orchestrator Mode, restoring `idle` tools, pre-swarm host model & direct editing (`--force` pauses & detaches a live run cleanly so it stays resumable) | **No** |
 | `/swarm pause [reason]` | Pause member launches and board wakeups | **No** |
 | `/swarm resume [run-id] [--continue\|-c] [--quiet\|-q] [guidance]` | Zero-turn unpause (same focused session) OR Droid-style **Cross-Session Mission Resume** (auto-discovers active/paused runs, restores `orchestratorModel`, wakes Orchestrator cleanly) | No (same session / `--quiet`) · Yes (cross-session / guided) |
-| `/swarm cancel` | Cancel active draft (restores tools) or abandon focused run (preserves worktrees & `.pi/swarm/runs/`) | **No** |
+| `/swarm cancel` | Cancel active draft (restores underlying running/standby/idle state) or abandon focused live run (exits Orchestrator Mode, preserving worktrees & `.pi/swarm/runs/`) | **No** |
 | `/swarm teardown [--force] [--delete-branches]` | Safely remove clean idle worktrees while preserving `.pi/swarm/runs/` audit & board logs | **No** |
 | `/swarm runs` | List all runs in `.pi/swarm/runs/` with status, active/waiting counts & board head | **No** |
-| `/swarm focus [run-id\|none]` | Switch or detach session-local run focus without hijacking other Pi sessions | **No** |
+| `/swarm focus [run-id\|none]` | Switch session-local run focus without hijacking other Pi sessions (`none` detaches focus & exits Orchestrator Mode) | **No** |
 | `/swarm settings` | View or edit 3-role models, `keepWorkersWarm`, `validatorEnabled`, watchdog, concurrency & git options | **No** |
 | `/swarm help` | Print concise command reference | **No** |
 
