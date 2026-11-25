@@ -6565,6 +6565,51 @@ describe("Persistent Orchestrator standby UX in SwarmHubView & dashboard-widget 
           assert.match(plain, /\/swarm exit/);
         }
 
+        // Suppresses standby cue when draftActive: true on a completed run (both compact & expanded)
+        state.draftActive = true;
+        state.expanded = false;
+        for (const w of [40, 80, 120] as const) {
+          const draftCompactLines = widget.render(w);
+          assertAllLinesFit(
+            draftCompactLines,
+            w,
+            `widget-completed-draft-compact@${rows}x${w}`,
+          );
+          const draftCompactPlain = stripTerminalSequences(
+            draftCompactLines.join("\n"),
+          );
+          assert.match(draftCompactPlain, /Swarm Draft/);
+          assert.doesNotMatch(
+            draftCompactPlain,
+            /Standby/i,
+            "Completed compact widget must suppress standby cue while drafting",
+          );
+        }
+        state.expanded = true;
+        for (const w of [40, 80, 120] as const) {
+          const draftExpandedLines = widget.render(w);
+          assertAllLinesFit(
+            draftExpandedLines,
+            w,
+            `widget-completed-draft-expanded@${rows}x${w}`,
+          );
+          const draftExpandedPlain = stripTerminalSequences(
+            draftExpandedLines.join("\n"),
+          );
+          assert.match(draftExpandedPlain, /Swarm Draft/);
+          assert.doesNotMatch(
+            draftExpandedPlain,
+            /Standby/i,
+            "Completed expanded widget must suppress standby cue while drafting",
+          );
+          assert.doesNotMatch(
+            draftExpandedPlain,
+            /\/swarm exit/,
+            "Completed expanded footer must suppress /swarm exit while drafting",
+          );
+        }
+        state.draftActive = false;
+
         // Clearing orchestratorStandby collapses completed compact run back to 1 line without standby cue
         state.expanded = false;
         state.orchestratorStandby = false;
@@ -6618,6 +6663,13 @@ describe("Persistent Orchestrator standby UX in SwarmHubView & dashboard-widget 
     });
     assert.match(completedMd, /Orchestrator Mode:\*\* Persistent Orchestrator Standby/);
     assert.match(completedMd, /\/swarm exit/);
+
+    const completedDraftMd = formatZeroTurnStatusDashboard(completedSnap, {
+      draftActive: true,
+      orchestratorStandby: true,
+      now: fixedNow,
+    });
+    assert.doesNotMatch(completedDraftMd, /Persistent Orchestrator Standby/);
   });
 });
 

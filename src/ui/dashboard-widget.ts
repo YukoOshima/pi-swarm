@@ -782,7 +782,7 @@ export class SwarmDashboardComponent implements Component {
     if (width < 58) {
       const right = this.theme.fg("dim", `Board:#${snapshot.boardHead}`);
       lines.push(fitLine(joinColumns(left, right, width), width));
-      if (this.state.orchestratorStandby) {
+      if (this.state.orchestratorStandby && !this.state.draftActive) {
         lines.push(...this.renderStandbyBanner(width));
       }
       return lines;
@@ -810,7 +810,7 @@ export class SwarmDashboardComponent implements Component {
     metaParts.push(this.theme.fg("dim", "Alt+W expand · Alt+S panel"));
     const right = metaParts.join(this.theme.fg("dim", " · "));
     lines.push(fitLine(joinColumns(left, right, width), width));
-    if (this.state.orchestratorStandby) {
+    if (this.state.orchestratorStandby && !this.state.draftActive) {
       lines.push(...this.renderStandbyBanner(width));
     }
     return lines;
@@ -1001,8 +1001,11 @@ export class SwarmDashboardComponent implements Component {
       (run.status !== "active" || this.state.draftMode === "tweak")
     ) {
       body.push(...this.renderDraftBanner(innerWidth));
-    }
-    if (isTerminalRunStatus(run.status) && this.state.orchestratorStandby) {
+    } else if (
+      isTerminalRunStatus(run.status) &&
+      this.state.orchestratorStandby &&
+      !this.state.draftActive
+    ) {
       body.push(this.renderExpandedStandbyLine(innerWidth));
     }
 
@@ -1407,7 +1410,9 @@ export class SwarmDashboardComponent implements Component {
       this.theme.bold(`🐝 ${titleText} · ${run.id}`),
     );
     const standbyFooter =
-      isTerminalRunStatus(run.status) && Boolean(this.state.orchestratorStandby);
+      isTerminalRunStatus(run.status) &&
+      Boolean(this.state.orchestratorStandby) &&
+      !this.state.draftActive;
     const footer = this.theme.fg(
       "dim",
       standbyFooter
@@ -1649,7 +1654,11 @@ export function formatZeroTurnStatusDashboard(
     out.push(
       `- **Status:** ⏳ 0 working — awaiting @${ORCHESTRATOR_NAME} next step`,
     );
-  } else if (isTerminalRunStatus(run.status) && options?.orchestratorStandby) {
+  } else if (
+    isTerminalRunStatus(run.status) &&
+    options?.orchestratorStandby &&
+    !options?.draftActive
+  ) {
     out.push(
       `- **Orchestrator Mode:** Persistent Orchestrator Standby (\`@${ORCHESTRATOR_NAME}\` on duty — run \`/swarm exit\` to leave)`,
     );
