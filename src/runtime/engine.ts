@@ -1145,7 +1145,6 @@ export class SwarmEngine implements ISwarmEngine {
   private readonly concurrencyGate: ConcurrencyGate;
 
   private stallTimer: ReturnType<typeof setTimeout> | null = null;
-  private stallNoticePostedAtHead: number | null = null;
   private lastStallAlertHead: number | null = null;
   private lastMonitorNudgeSeq: number | null = null;
   private humanInputAwaited = false;
@@ -1263,7 +1262,6 @@ export class SwarmEngine implements ISwarmEngine {
       this.cachedBoard = [];
       this.cachedEvents = [];
       this.runDonePosted = false;
-      this.stallNoticePostedAtHead = null;
       this.lastStallAlertHead = null;
       this.lastMonitorNudgeSeq = null;
       this.humanInputAwaited = false;
@@ -1325,7 +1323,6 @@ export class SwarmEngine implements ISwarmEngine {
     this.cachedEvents = events;
     this.runDonePosted = run.status === "completed" || run.status === "abandoned";
     if (!isSameRun) {
-      this.stallNoticePostedAtHead = null;
       this.lastStallAlertHead = null;
       this.lastMonitorNudgeSeq = null;
       this.humanInputAwaited = false;
@@ -1639,7 +1636,6 @@ export class SwarmEngine implements ISwarmEngine {
       actor: ORCHESTRATOR_NAME,
     });
     this.runDonePosted = false;
-    this.stallNoticePostedAtHead = null;
     this.lastStallAlertHead = null;
     this.lastMonitorNudgeSeq = null;
     this.humanInputAwaited = false;
@@ -2395,7 +2391,6 @@ export class SwarmEngine implements ISwarmEngine {
     this.recordBoardMessageInCache(normalizedMsg);
     this.cancelStallWatchdog();
     void this.cancelActiveMonitor("Swarm activity resumed");
-    this.stallNoticePostedAtHead = null;
     this.lastStallAlertHead = null;
     this.lastMonitorNudgeSeq = null;
 
@@ -3548,7 +3543,6 @@ export class SwarmEngine implements ISwarmEngine {
     const isLiveWorking = Boolean(live?.handle) && live!.handle!.getState() === "working";
 
     if (isLiveWorking && live?.handle) {
-      this.stallNoticePostedAtHead = null;
       this.lastStallAlertHead = null;
       if (mode === "followUp") {
         await live.handle.followUp(trimmedMsg);
@@ -6601,7 +6595,6 @@ export class SwarmEngine implements ISwarmEngine {
       live.handle = handle;
       live.spawning = false;
       live.turnActive = true;
-      this.stallNoticePostedAtHead = null;
       this.lastStallAlertHead = null;
 
       const resolvedModel = handle.getModel();
@@ -6854,7 +6847,6 @@ export class SwarmEngine implements ISwarmEngine {
 
       this.emitEngineEvent("snapshot_changed", `Woke @${memberName}`, { memberName });
 
-      this.stallNoticePostedAtHead = null;
       this.lastStallAlertHead = null;
       live.turnActive = true;
       live.lastWaitRequest = undefined;
@@ -7182,7 +7174,6 @@ export class SwarmEngine implements ISwarmEngine {
         live.launchAbort = undefined;
       }
 
-      this.stallNoticePostedAtHead = null;
       this.lastStallAlertHead = null;
       this.emitEngineEvent("snapshot_changed", `Revived @${memberName}`, { memberName });
 
@@ -8477,10 +8468,7 @@ export class SwarmEngine implements ISwarmEngine {
     if (this.getWorkingOrPendingMemberNames().length > 0) {
       return;
     }
-    if (
-      this.stallNoticePostedAtHead === run.boardHead ||
-      this.lastStallAlertHead === run.boardHead
-    ) {
+    if (this.lastStallAlertHead === run.boardHead) {
       return;
     }
 
@@ -8516,7 +8504,6 @@ export class SwarmEngine implements ISwarmEngine {
       !run ||
       run.status !== "active" ||
       run.boardHead !== armedHead ||
-      this.stallNoticePostedAtHead === armedHead ||
       this.lastStallAlertHead === armedHead
     ) {
       return;
@@ -8549,7 +8536,6 @@ export class SwarmEngine implements ISwarmEngine {
         Boolean(this.orchestratorWait) ||
         this.cachedRun?.status !== "active" ||
         this.cachedRun.boardHead !== armedHead ||
-        this.stallNoticePostedAtHead === armedHead ||
         this.lastStallAlertHead === armedHead ||
         this.getWorkingOrPendingMemberNames().length > 0
       ) {
@@ -8577,7 +8563,17 @@ export class SwarmEngine implements ISwarmEngine {
       : "";
     const text = `@${ORCHESTRATOR_NAME} [stall] ${escalationNote}Swarm has been idle for ${seconds}s with 0 working members (board #${armedHead}). Roster: ${rosterSummary}. Latest posts: ${latestSeqs}. Wake a member, spawn next phase, or call swarm{action:"done"}.`;
 
-    await this.emitStallMessage(runId, armedHead, timeoutMs, text, [ORCHESTRATOR_NAME], "deterministic");
+    const posted = await this.emitStallMessage(
+      runId,
+      armedHead,
+      timeoutMs,
+      text,
+      [ORCHESTRATOR_NAME],
+      "deterministic",
+    );
+    if (!posted && this.getWorkingOrPendingMemberNames().length === 0) {
+      this.maybeArmStallWatchdog();
+    }
   }
 
   private async emitStallMessage(
@@ -8597,7 +8593,6 @@ export class SwarmEngine implements ISwarmEngine {
       this.activeRunId !== runId ||
       this.cachedRun?.status !== "active" ||
       this.cachedRun.boardHead !== armedHead ||
-      this.stallNoticePostedAtHead === armedHead ||
       this.lastStallAlertHead === armedHead ||
       Boolean(this.orchestratorWait) ||
       this.boardWaiters.size > 0 ||
@@ -8626,7 +8621,6 @@ export class SwarmEngine implements ISwarmEngine {
         lowerMentions.includes(ALL_MENTION_NAME);
 
       if (hitsOrchestrator) {
-        this.stallNoticePostedAtHead = stallMsg.seq;
         this.lastStallAlertHead = stallMsg.seq;
         this.lastMonitorNudgeSeq = null;
       } else {
@@ -8680,7 +8674,6 @@ export class SwarmEngine implements ISwarmEngine {
       this.notifyWaitersOnMessage(stallMsg);
       return stallMsg;
     } catch {
-      this.lastStallAlertHead = armedHead;
       return null;
     }
   }
@@ -8956,7 +8949,6 @@ export class SwarmEngine implements ISwarmEngine {
         if (!isMonitorCheckStillValid()) {
           return "cancelled";
         }
-        this.stallNoticePostedAtHead = armedHead;
         this.lastStallAlertHead = armedHead;
         this.lastMonitorNudgeSeq = null;
         return "handled";

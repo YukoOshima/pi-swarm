@@ -11568,6 +11568,50 @@ describe("AGY Stop-Hook Race Lock & Anti-Noise Monitor Hygiene (VAL-AGY-001, VAL
         await engine.dispose();
       }
     }
+
+    // C. Transient store.postBoardMessage failure during emitStallMessage does NOT poison lastStallAlertHead;
+    //    subsequent healthy tick on the same head delivers the alert once and then suppresses duplicates!
+    {
+      const { engine, store } = await createTestHarness({
+        stallWatchdogEnabled: true,
+        stallMonitorMode: "deterministic",
+        stallTimeoutMs: 25,
+      });
+      const stallEvents: SwarmEngineEvent[] = [];
+      engine.subscribe((e) => {
+        if (e.type === "stall_detected") stallEvents.push(e);
+      });
+      const origPost = store.postBoardMessage.bind(store);
+      let failFirstMonitorPost = true;
+      let transientMonitorErrors = 0;
+      store.postBoardMessage = async (runId, input) => {
+        if (input.fromRole === "monitor" && failFirstMonitorPost) {
+          failFirstMonitorPost = false;
+          transientMonitorErrors += 1;
+          throw new Error("transient disk EIO during stall post");
+        }
+        return origPost(runId, input);
+      };
+
+      try {
+        await engine.addMembers({ name: "retry-stall-w", brief: "Park quietly" });
+        await waitUntil(
+          () => transientMonitorErrors === 1 && stallEvents.length >= 1,
+          1500,
+        );
+        assert.equal(transientMonitorErrors, 1);
+        assert.equal(stallEvents.length, 1);
+        await delay(90);
+        assert.equal(
+          stallEvents.length,
+          1,
+          "Once healthy stall post succeeds, watermark suppresses duplicates on unchanged boardHead",
+        );
+      } finally {
+        store.postBoardMessage = origPost;
+        await engine.dispose();
+      }
+    }
   });
 });
 
