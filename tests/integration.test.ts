@@ -26,7 +26,9 @@ import {
   POST_MESSAGE_TOOL,
   PROPOSE_SWARM_PLAN_TOOL,
   READ_BOARD_TOOL,
+  STANDBY_SWARM_TOOLS,
   SWARM_BOARD_FILE,
+  SWARM_CONTRACT_CUSTOM_TYPE,
   SWARM_CORE_TOOLS,
   SWARM_DIR,
   SWARM_EVENTS_FILE,
@@ -59,7 +61,7 @@ import {
   parseSwarmCommand,
   parseSwarmGoalLaunchOptions,
 } from "../src/index.js";
-import { SwarmEngine } from "../src/runtime/index.js";
+import { SwarmEngine, getValidatorScratchDir } from "../src/runtime/index.js";
 import { SwarmStore, WorktreeManager } from "../src/store/index.js";
 import {
   type AgentTurnResult,
@@ -1268,7 +1270,7 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     }
     assert.equal(await pathExists(authorWorktreePath), false, "Killed share worktree should be removed");
 
-    // Complete run via swarm{action:"done"} -> restores "idle" tool profile & emits ZERO extra wakeup turns!
+    // Complete run via swarm{action:"done"} -> transitions to "standby" tool profile & emits ZERO extra wakeup turns!
     const wakeupsBeforeDone = harness.sentMessages.filter(
       (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
     ).length;
@@ -1294,11 +1296,12 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       'swarm{action:"done"} must emit 0 SWARM_WAKEUP_CUSTOM_TYPE follow-up turns',
     );
 
-    const idleTools = harness.pi.getActiveTools();
-    assert.ok(idleTools.includes(IDLE_SWARM_TOOLS[0]));
-    assert.ok(!idleTools.includes(POST_MESSAGE_TOOL));
-    assert.ok(!idleTools.includes(READ_BOARD_TOOL));
-    assert.ok(!idleTools.includes(SWARM_WAIT_TOOL));
+    const standbyTools = harness.pi.getActiveTools();
+    for (const toolName of STANDBY_SWARM_TOOLS) {
+      assert.ok(standbyTools.includes(toolName), `Expected standby tool ${toolName} after done`);
+    }
+    assert.ok(!standbyTools.includes(POST_MESSAGE_TOOL));
+    assert.ok(!standbyTools.includes(SWARM_WAIT_TOOL));
 
     // 7. Verify disk artifacts (`board.jsonl`, `ROSTER.md`, `state.json`, `events.jsonl` zero duplicates, clean git status)
     const runDir = path.join(repoDir, SWARM_DIR, SWARM_RUNS_DIR, runId);
@@ -4079,14 +4082,14 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     );
     assert.equal(host.sentMessages.length - msgsBeforeAliases, 6);
 
-    // Complete run -> restores Orchestrator write/edit/powershell to allowed
+    // Complete run -> Orchestrator stays in Persistent Standby Mode so write/edit/powershell stay blocked until explicit exit/cancel
     await host.executeTool(SWARM_TOOL, {
       action: "done",
       summary: "Completed run 1",
     });
-    assert.equal(await checkToolCall(host, "write"), undefined);
-    assert.equal(await checkToolCall(host, "edit"), undefined);
-    assert.equal(await checkToolCall(host, "powershell"), undefined);
+    assert.equal((await checkToolCall(host, "write"))?.block, true);
+    assert.equal((await checkToolCall(host, "edit"))?.block, true);
+    assert.equal((await checkToolCall(host, "powershell"))?.block, true);
 
     // Launch run 2 and `/swarm cancel` -> also restores write/edit/powershell to allowed, and preserves existing session name!
     await host.runCommand("swarm-direct", "Second mission to cancel");
@@ -4664,7 +4667,7 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     const wt1Path = run1BeforeDone.members["auth-dev"]!.cwd;
     assert.equal(await pathExists(wt1Path), true);
 
-    // B. Tool-initiated `swarm{action:"done"}` emits Rich Mission Complete Card with `/swarm teardown` & restores pre-swarm model!
+    // B. Tool-initiated `swarm{action:"done"}` emits Rich Mission Complete Card with `/swarm teardown` & retains sticky orchestratorModel in standby!
     const confirmsBeforeToolDone = host.confirmCalls.length;
     await host.executeTool(SWARM_TOOL, {
       action: "done",
@@ -4677,13 +4680,13 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     );
     assert.equal(
       host.ctx.model?.id,
-      "claude-sonnet-4-5",
-      "Tool-initiated done must restore pre-swarm host model",
+      "claude-opus-4-6",
+      "Tool-initiated done must retain sticky orchestratorModel in standby",
     );
     assert.equal(
       host.pi.getThinkingLevel(),
-      "medium",
-      "Tool-initiated done must restore pre-swarm thinking level",
+      "high",
+      "Tool-initiated done must retain sticky orchestratorThinkingLevel in standby",
     );
     const toolDoneCard = host.sentMessages
       .filter(
@@ -4745,8 +4748,8 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       false,
       "Confirmed teardown prompt on /swarm done must remove the clean merged worktree",
     );
-    assert.equal(host.ctx.model?.id, "claude-sonnet-4-5");
-    assert.equal(host.pi.getThinkingLevel(), "medium");
+    assert.equal(host.ctx.model?.id, "claude-opus-4-6");
+    assert.equal(host.pi.getThinkingLevel(), "high");
     const cmdDoneCard = host.sentMessages
       .filter(
         (m) =>
@@ -7668,6 +7671,1206 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       m1AfterReset?.sealed,
       true,
       "Resetting a passed assertion must unseal its milestone in store.updateRun",
+    );
+
+    await host.emit("session_shutdown", { reason: "quit" });
+  });
+
+  it("25. VAL-LIFE-001: retains sticky Orchestrator standby state, model & cache-stable standby prompt across tool done, /swarm done, run_finished event, reload/tree/compaction, and isolates observers", async () => {
+    const repoDir = await createTempGitRepo("val-life-001");
+    tempDirs.push(repoDir);
+    const store = new SwarmStore(repoDir);
+
+    const handles = new Map<string, ReturnType<typeof createMockPersistentMemberHandle>>();
+    const makeTransport = (): ISwarmTransport => ({
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        const tracker = createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async () => {
+            if (request.role === "worker" && request.workspace === "share") {
+              await writeFile(
+                path.join(request.cwd, "src", `${request.name}.ts`),
+                `export const ${request.name.replace(/-/g, "_")} = 1;\n`,
+                "utf8",
+              );
+              await git(request.cwd, ["add", "."]);
+              await git(request.cwd, ["commit", "-m", `feat: ${request.name}`]);
+            }
+            return {
+              agentId: request.agentId,
+              name: request.name,
+              role: request.role,
+              outcome: "waiting",
+              summary: "Ready",
+              tokens: 300,
+              cost: 0.003,
+            };
+          },
+        });
+        handles.set(`${request.runId}:${request.name}`, tracker);
+        return tracker.handle;
+      },
+    });
+
+    const host = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-val-life-001",
+      initialHostModel: DEFAULT_TEST_MODELS[1], // anthropic/claude-sonnet-4-5 (:medium)
+    });
+    createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        orchestratorModel: "anthropic/claude-opus-4-6",
+        orchestratorThinkingLevel: "high",
+        autoTeardownOnComplete: true,
+        stallWatchdogEnabled: false,
+      }),
+    })(host.pi);
+    await host.emit("session_start", { reason: "startup" });
+    assert.equal(host.ctx.model?.id, "claude-sonnet-4-5");
+    assert.equal(host.pi.getThinkingLevel(), "medium");
+
+    // Foreign observer session attached to live run must NEVER enter orchestratorMode or get standby tools/prompts
+    const observer = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-val-life-001-observer",
+    });
+    createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        orchestratorModel: "anthropic/claude-opus-4-6",
+        orchestratorThinkingLevel: "high",
+        stallWatchdogEnabled: false,
+      }),
+    })(observer.pi);
+    await observer.emit("session_start", { reason: "startup" });
+
+    // --- Path 1: Tool `swarm{action:"done"}` ---
+    await host.runCommand("swarm-direct", "Ship M1 parser with validator");
+    const plan1 = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Run1 Tool Done",
+      objective: "Verify tool done standby retention",
+      strategy: "Share worker + validator",
+      acceptance_criteria: "Merged & verified",
+      base_branch: "main",
+      commands: [{ name: "test", command: "npm test" }],
+      boundaries: ["Keep src/ isolated"],
+      initial_members: [
+        { name: "w1", role: "worker", workspace: "share", brief: "Add w1" },
+        { name: "v1", role: "validator", workspace: "inherit", brief: "Audit w1" },
+      ],
+    });
+    const run1Id: string = plan1.details.runId;
+    await waitFor(async () => {
+      const r = await store.loadRun(run1Id);
+      return r.members.w1?.state === "waiting" && r.members.v1?.state === "waiting";
+    });
+
+    // Observer focuses live run 1 while owner is active
+    await observer.runCommand("swarm", `focus ${run1Id}`);
+    assert.deepEqual(
+      observer.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)),
+      [...IDLE_SWARM_TOOLS],
+    );
+
+    const scratch1 = getValidatorScratchDir(run1Id, "v1");
+    assert.equal(await pathExists(scratch1), true, "Validator scratch dir must exist while live");
+    const wt1 = (await store.loadRun(run1Id)).members.w1!.cwd;
+    assert.equal(await pathExists(wt1), true);
+    await host.executeTool(SWARM_TOOL, { action: "merge", name: "w1" });
+
+    const wakeupsBefore1 = host.sentMessages.filter(
+      (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
+    ).length;
+    await host.executeTool(SWARM_TOOL, {
+      action: "done",
+      summary: "Run 1 shipped cleanly",
+    });
+    await host.emit("agent_settled", { aborted: false });
+
+    // Members, worktree & validator scratch retired; Mission Complete card emitted once; 0 extra turns
+    assert.equal(handles.get(`${run1Id}:w1`)?.killed, true);
+    assert.equal(handles.get(`${run1Id}:v1`)?.killed, true);
+    assert.equal(await pathExists(wt1), false, "Merged worktree retired on complete");
+    assert.equal(await pathExists(scratch1), false, "Validator scratch dir retired on complete");
+    assert.equal(
+      host.sentMessages.filter(
+        (m) =>
+          m.message.customType === SWARM_STATUS_CUSTOM_TYPE &&
+          (m.message.details as { runId?: string; missionCompleteCard?: boolean } | undefined)
+            ?.runId === run1Id &&
+          (m.message.details as { missionCompleteCard?: boolean } | undefined)
+            ?.missionCompleteCard === true,
+      ).length,
+      1,
+      "Mission Complete card must be emitted exactly once",
+    );
+    assert.equal(
+      host.sentMessages.filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE).length,
+      wakeupsBefore1,
+      "Zero extra wakeup turns after done",
+    );
+
+    // Active tools = STANDBY_SWARM_TOOLS + host tools; model & thinking retained!
+    assert.deepEqual(
+      host.pi.getActiveTools().sort(),
+      ["read", "bash", "edit", "write", "grep", "find", "ls", ...STANDBY_SWARM_TOOLS].sort(),
+    );
+    assert.equal(host.ctx.model?.id, "claude-opus-4-6");
+    assert.equal(host.pi.getThinkingLevel(), "high");
+
+    // Status line & `/swarm status` show standby cue
+    assert.match(
+      String(host.statusHistory[host.statusHistory.length - 1]?.text ?? ""),
+      /@orchestrator standby \(\/swarm exit\)/,
+    );
+    await host.runCommand("swarm", "status");
+    const statusMd = String(
+      host.sentMessages[host.sentMessages.length - 1]?.message.content ?? "",
+    );
+    assert.match(statusMd, /Persistent Orchestrator Standby.*\/swarm exit/i);
+
+    // Standby prompt injected identically across two consecutive turns in BOTH sections & fallback paths
+    const sectionsTurn1: Record<string, string> = { swarm_state: "stale" };
+    await host.emit("before_agent_start", {
+      messageType: "user",
+      prompt: "Explain Run 1 architecture",
+      systemPromptOptions: { sections: sectionsTurn1 },
+    });
+    assert.equal(sectionsTurn1.swarm_state, undefined);
+    assert.ok(sectionsTurn1.swarm);
+    assert.match(sectionsTurn1.swarm!, /Persistent Orchestrator — Standby Mode/);
+    assert.match(sectionsTurn1.swarm!, new RegExp(run1Id));
+    assert.match(sectionsTurn1.swarm!, /autoConfirmDefault: true/);
+
+    const sectionsTurn2: Record<string, string> = {};
+    await host.emit("before_agent_start", {
+      messageType: "user",
+      prompt: "Any follow-up notes?",
+      systemPromptOptions: { sections: sectionsTurn2 },
+    });
+    assert.equal(
+      sectionsTurn2.swarm,
+      sectionsTurn1.swarm,
+      "Standby prompt section must be byte-for-byte identical across consecutive turns",
+    );
+
+    const fallbackTurn = (
+      await host.emit("before_agent_start", {
+        messageType: "user",
+        prompt: "Fallback harness check",
+      })
+    ).find((r) => r !== undefined) as
+      | { message?: { customType?: string; content?: string; display?: boolean } }
+      | undefined;
+    assert.equal(fallbackTurn?.message?.customType, SWARM_CONTRACT_CUSTOM_TYPE);
+    assert.equal(fallbackTurn?.message?.display, false);
+    assert.equal(fallbackTurn?.message?.content, sectionsTurn1.swarm);
+
+    // Observer still never entered orchestratorMode, is not write-blocked, and gets no standby prompt
+    const obsSections: Record<string, string> = {};
+    await observer.emit("before_agent_start", {
+      messageType: "user",
+      prompt: "Check observer prompt",
+      systemPromptOptions: { sections: obsSections },
+    });
+    assert.equal(obsSections.swarm, undefined);
+    assert.deepEqual(
+      observer.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)),
+      [...IDLE_SWARM_TOOLS],
+    );
+
+    // --- Path 2: `/swarm done` ---
+    const plan2 = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Run2 Command Done",
+      objective: "Verify /swarm done standby retention",
+      strategy: "Single validator",
+      acceptance_criteria: "Done via command",
+      base_branch: "main",
+      initial_members: [
+        { name: "v2", role: "validator", workspace: "inherit", brief: "Audit" },
+      ],
+    });
+    const run2Id: string = plan2.details.runId;
+    await waitFor(async () => (await store.loadRun(run2Id)).members.v2?.state === "waiting");
+    const scratch2 = getValidatorScratchDir(run2Id, "v2");
+    assert.equal(await pathExists(scratch2), true);
+
+    await host.runCommand("swarm", "done Command summary");
+    assert.equal(handles.get(`${run2Id}:v2`)?.killed, true);
+    assert.equal(await pathExists(scratch2), false);
+    assert.deepEqual(
+      host.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)).sort(),
+      [...STANDBY_SWARM_TOOLS].sort(),
+    );
+    assert.equal(host.ctx.model?.id, "claude-opus-4-6");
+    assert.equal(host.pi.getThinkingLevel(), "high");
+
+    // --- Path 3: Direct engine `run_finished` event ---
+    const origComplete = SwarmEngine.prototype.completeRun;
+    let capturedEngine: SwarmEngine | undefined;
+    SwarmEngine.prototype.completeRun = async function (this: SwarmEngine, opts) {
+      capturedEngine = this;
+      return origComplete.call(this, opts);
+    };
+    let run3Id = "";
+    try {
+      const plan3 = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+        title: "Run3 Event Done",
+        objective: "Verify run_finished event standby retention",
+        strategy: "Validator check",
+        acceptance_criteria: "Done via engine event",
+        base_branch: "main",
+        initial_members: [
+          { name: "v3", role: "validator", workspace: "inherit", brief: "Audit" },
+        ],
+      });
+      run3Id = plan3.details.runId;
+      await waitFor(async () => (await store.loadRun(run3Id)).members.v3?.state === "waiting");
+      // Grab active engine instance via status command and complete directly on SwarmEngine
+      const engineInstance = capturedEngine ?? undefined;
+      assert.ok(run3Id);
+      // Invoke real engine.completeRun bypassing toolEngineProxy & /swarm done
+      const statusBefore = host.sentMessages.length;
+      if (engineInstance) {
+        await origComplete.call(engineInstance, {
+          summary: "Completed directly via engine event",
+          callerRole: "human",
+          actor: "human",
+          sessionId: "sess-val-life-001",
+        });
+      } else {
+        // Fallback capture if completeRun wasn't called on this instance yet: intercept getSnapshot
+        let engRef: SwarmEngine | undefined;
+        const origSnap = SwarmEngine.prototype.getSnapshot;
+        SwarmEngine.prototype.getSnapshot = function (this: SwarmEngine) {
+          engRef = this;
+          return origSnap.call(this);
+        };
+        try {
+          await host.executeTool(SWARM_TOOL, { action: "status" });
+        } finally {
+          SwarmEngine.prototype.getSnapshot = origSnap;
+        }
+        assert.ok(engRef);
+        await origComplete.call(engRef!, {
+          summary: "Completed directly via engine event",
+          callerRole: "human",
+          actor: "human",
+          sessionId: "sess-val-life-001",
+        });
+      }
+      await waitFor(
+        () =>
+          host.sentMessages.slice(statusBefore).some(
+            (m) =>
+              m.message.customType === SWARM_STATUS_CUSTOM_TYPE &&
+              (m.message.details as { runId?: string; missionCompleteCard?: boolean } | undefined)
+                ?.runId === run3Id,
+          ),
+      );
+      assert.deepEqual(
+        host.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)).sort(),
+        [...STANDBY_SWARM_TOOLS].sort(),
+      );
+      assert.equal(host.ctx.model?.id, "claude-opus-4-6");
+      assert.equal(host.pi.getThinkingLevel(), "high");
+    } finally {
+      SwarmEngine.prototype.completeRun = origComplete;
+    }
+
+    // --- Rehydration across compaction, reload, session_tree, `{runId: null, orchestratorMode: true}`, and `/swarm exit` ---
+    host.branch.push({
+      type: "compaction",
+      id: "compact-1",
+      parentId: null,
+      timestamp: new Date().toISOString(),
+      summary: "Compacted standby history",
+    } as any);
+    await host.emit("session_compact", { willRetry: false });
+    assert.deepEqual(
+      host.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)).sort(),
+      [...STANDBY_SWARM_TOOLS].sort(),
+    );
+
+    const standbyBranchSnapshot = [...host.branch];
+
+    // Reload in a brand-new host harness sharing the branch: stays in standby with autoConfirmDefault: true!
+    const reloadedHost = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-val-life-001",
+      initialHostModel: DEFAULT_TEST_MODELS[1],
+    });
+    reloadedHost.branch.push(...standbyBranchSnapshot);
+    createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        orchestratorModel: "anthropic/claude-opus-4-6",
+        orchestratorThinkingLevel: "high",
+        stallWatchdogEnabled: false,
+      }),
+    })(reloadedHost.pi);
+    await reloadedHost.emit("session_start", { reason: "reload" });
+    assert.deepEqual(
+      reloadedHost.pi
+        .getActiveTools()
+        .filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any))
+        .sort(),
+      [...STANDBY_SWARM_TOOLS].sort(),
+    );
+    assert.equal(reloadedHost.ctx.model?.id, "claude-opus-4-6");
+    const reloadSecs: Record<string, string> = {};
+    await reloadedHost.emit("before_agent_start", {
+      messageType: "user",
+      prompt: "Check autoConfirmDefault after reload",
+      systemPromptOptions: { sections: reloadSecs },
+    });
+    assert.match(String(reloadSecs.swarm), /autoConfirmDefault: true/);
+
+    // Original `host` still holds in-memory `preSwarmHostModel`: `/swarm exit` restores sonnet:medium & persists exit!
+    await host.runCommand("swarm", "exit");
+    assert.equal(host.ctx.model?.id, "claude-sonnet-4-5");
+    assert.equal(host.pi.getThinkingLevel(), "medium");
+    assert.deepEqual(
+      host.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)),
+      [...IDLE_SWARM_TOOLS],
+    );
+    const exitedBranchSnapshot = [...host.branch];
+
+    // `session_tree` switching back to `standbyBranchSnapshot` restores standby; switching back to `exitedBranchSnapshot` stays exited!
+    host.branch.length = 0;
+    host.branch.push(...standbyBranchSnapshot);
+    await host.emit("session_tree", {});
+    assert.deepEqual(
+      host.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)).sort(),
+      [...STANDBY_SWARM_TOOLS].sort(),
+    );
+
+    host.branch.length = 0;
+    host.branch.push(...exitedBranchSnapshot);
+    await host.emit("session_tree", {});
+    assert.deepEqual(
+      host.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)),
+      [...IDLE_SWARM_TOOLS],
+    );
+
+    // `{ runId: null, orchestratorMode: true, autoConfirmDefault: true }` focus entry rehydrates standby cleanly!
+    const nullRunStandbyHost = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-null-run-standby",
+    });
+    nullRunStandbyHost.pi.appendEntry(SWARM_FOCUS_ENTRY, {
+      version: 2,
+      runId: null,
+      sessionId: "sess-null-run-standby",
+      orchestratorMode: true,
+      autoConfirmDefault: true,
+    });
+    createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: false,
+      }),
+    })(nullRunStandbyHost.pi);
+    await nullRunStandbyHost.emit("session_start", { reason: "startup" });
+    assert.deepEqual(
+      nullRunStandbyHost.pi
+        .getActiveTools()
+        .filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any))
+        .sort(),
+      [...STANDBY_SWARM_TOOLS].sort(),
+    );
+
+    await nullRunStandbyHost.emit("session_shutdown", { reason: "quit" });
+    await reloadedHost.emit("session_shutdown", { reason: "quit" });
+    await observer.emit("session_shutdown", { reason: "quit" });
+    await host.emit("session_shutdown", { reason: "quit" });
+  });
+
+  it("26. VAL-LIFE-002: enforces hard Orchestrator write/edit/powershell and mutating-bash guard across drafting, active, paused, and standby while allowing read-only bash, observers, and !commands", async () => {
+    const repoDir = await createTempGitRepo("val-life-002");
+    tempDirs.push(repoDir);
+
+    const makeTransport = (): ISwarmTransport => ({
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        return createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async () => ({
+            agentId: request.agentId,
+            name: request.name,
+            role: request.role,
+            outcome: "waiting",
+            summary: "Parked",
+            tokens: 50,
+            cost: 0.001,
+          }),
+        }).handle;
+      },
+    });
+
+    const host = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-val-life-002-owner",
+    });
+    createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: false,
+      }),
+    })(host.pi);
+    await host.emit("session_start", { reason: "startup" });
+
+    const callToolHook = async (
+      h: MockHarness,
+      toolName: string,
+      input: Record<string, unknown> = {},
+    ): Promise<{ block?: boolean; reason?: string } | undefined> => {
+      const results = await h.emit("tool_call", {
+        type: "tool_call",
+        toolCallId: `tc-${toolName}`,
+        toolName,
+        input,
+      });
+      return results.find((r) => r !== undefined);
+    };
+
+    const mutatingCommands = [
+      'git commit -m "direct commit"',
+      "git add src/index.ts",
+      "git push origin main",
+      "git merge feature-branch",
+      "rm README.md",
+      "mv README.md OLD.md",
+      "cp README.md COPY.md",
+      "sed -i '' 's/a/b/' README.md",
+      "echo 'hack' > src/hacked.ts",
+      "npm install left-pad",
+    ];
+    const readOnlyCommands = [
+      "git status --short",
+      "git diff HEAD",
+      "rg createPiSwarmExtension src/",
+      "ls -la src",
+      "npm test",
+    ];
+
+    // 1. Pre-mode drafting: write/edit/powershell blocked; bash keeps main's behaviour; cancel returns to idle cleanly
+    await host.runCommand("swarm", "Initial recon draft");
+    assert.equal((await callToolHook(host, "write", { path: "a.ts", content: "" }))?.block, true);
+    assert.equal(await callToolHook(host, "bash", { command: "git status" }), undefined);
+    assert.equal(await callToolHook(host, "bash", { command: "mkdir tmp-check" }), undefined);
+    await host.runCommand("swarm", "cancel");
+    assert.equal(await callToolHook(host, "write", { path: "a.ts", content: "" }), undefined);
+
+    const assertAllOrchestratorGuardsEnforced = async (phaseLabel: string) => {
+      for (const toolName of ["write", "edit", "powershell"]) {
+        const res = await callToolHook(host, toolName, {});
+        assert.equal(res?.block, true, `${toolName} must be blocked in ${phaseLabel}`);
+        assert.match(String(res?.reason), /Delegate/i);
+        assert.match(String(res?.reason), /\/swarm exit/);
+      }
+      for (const cmd of mutatingCommands) {
+        const res = await callToolHook(host, "bash", { command: cmd });
+        assert.equal(res?.block, true, `Mutating bash "${cmd}" must be blocked in ${phaseLabel}`);
+        assert.match(String(res?.reason), /Delegate/i);
+        assert.match(String(res?.reason), /\/swarm exit/);
+        assert.match(String(res?.reason), /!<command>|git push/i);
+      }
+      for (const cmd of readOnlyCommands) {
+        const res = await callToolHook(host, "bash", { command: cmd });
+        assert.equal(
+          res,
+          undefined,
+          `Read-only bash "${cmd}" must stay allowed in ${phaseLabel}`,
+        );
+      }
+    };
+
+    // 2. Active `running` state
+    await host.runCommand("swarm-direct", "Guard verification mission");
+    const planRes = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Guard Run",
+      objective: "Verify write & bash guards across states",
+      strategy: "Single worker",
+      acceptance_criteria: "Guards hold",
+      base_branch: "main",
+      initial_members: [
+        { name: "guard-w", role: "worker", workspace: "inherit", brief: "Stand by" },
+      ],
+    });
+    const runId: string = planRes.details.runId;
+    await assertAllOrchestratorGuardsEnforced("active running");
+
+    // Observer session focusing the live run is NEVER blocked on write/edit/powershell or mutating bash!
+    const observer = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-val-life-002-observer",
+    });
+    createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: false,
+      }),
+    })(observer.pi);
+    await observer.emit("session_start", { reason: "startup" });
+    await observer.runCommand("swarm", `focus ${runId}`);
+    assert.equal(await callToolHook(observer, "write", { path: "x.ts", content: "" }), undefined);
+    assert.equal(await callToolHook(observer, "edit", { path: "x.ts" }), undefined);
+    assert.equal(
+      await callToolHook(observer, "bash", { command: 'git commit -m "observer"' }),
+      undefined,
+    );
+
+    // 3. `paused` state (was unguarded on main; now strictly guarded!)
+    await host.runCommand("swarm", "pause Checking paused write guard");
+    await assertAllOrchestratorGuardsEnforced("paused");
+    await host.runCommand("swarm", "resume --quiet");
+
+    // 4. `standby` state after `done`
+    await host.executeTool(SWARM_TOOL, { action: "done", summary: "Guard run done" });
+    await assertAllOrchestratorGuardsEnforced("standby");
+
+    // 5. `drafting` state while already in Persistent Orchestrator Mode
+    await host.runCommand("swarm", "Follow-up draft while mode is active");
+    await assertAllOrchestratorGuardsEnforced("drafting-in-orchestrator-mode");
+    await host.runCommand("swarm", "cancel"); // cancels draft -> back to standby, still guarded!
+    await assertAllOrchestratorGuardsEnforced("standby-after-draft-cancel");
+
+    // 6. User-typed `!command` in `input` hook continues cleanly without blocking
+    const bangRes = await host.emit("input", {
+      source: "interactive",
+      text: "!git push origin main",
+    });
+    assert.deepEqual(bangRes, [{ action: "continue" }]);
+
+    // 7. `/swarm exit` restores direct editing & mutating bash immediately
+    await host.runCommand("swarm", "exit");
+    assert.equal(await callToolHook(host, "write", { path: "x.ts", content: "ok" }), undefined);
+    assert.equal(
+      await callToolHook(host, "bash", { command: 'git commit -m "manual"' }),
+      undefined,
+    );
+
+    await observer.emit("session_shutdown", { reason: "quit" });
+    await host.emit("session_shutdown", { reason: "quit" });
+  });
+
+  it("27. VAL-LIFE-003: executes seamless multi-mission follow-up runs from Standby mode (interactive vs direct autoConfirm, contract review bounce, cancel/refine safety, prior run preservation, and zero standby auto-continuation)", async () => {
+    const repoDir = await createTempGitRepo("val-life-003");
+    tempDirs.push(repoDir);
+    const store = new SwarmStore(repoDir);
+
+    const makeTransport = (): ISwarmTransport => ({
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        return createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async () => {
+            if (request.role === "worker" && request.workspace === "share") {
+              await writeFile(
+                path.join(request.cwd, "src", `${request.name}.ts`),
+                `export const ${request.name.replace(/-/g, "_")} = true;\n`,
+                "utf8",
+              );
+              await git(request.cwd, ["add", "."]);
+              await git(request.cwd, ["commit", "-m", `feat: ${request.name}`]);
+              await request.engineApi?.manageMission?.({
+                op: "write_library",
+                libraryTopic: "architecture",
+                libraryContent: `\nNotes from ${request.name}\n`,
+                libraryAppend: true,
+              });
+              await request.engineApi?.postMessage({
+                channel: DEFAULT_CHANNEL,
+                kind: "done",
+                text: `@orchestrator [done] Shipped ${request.name}`,
+                featureId: "feat-1",
+                verificationEvidence: "npm test exited 0 (1/1 passed)",
+              });
+            } else if (request.role === "validator") {
+              await request.engineApi?.manageMission?.({
+                op: "verify_assertion",
+                assertionId: "VAL-M-001",
+                assertionStatus: "passed",
+                evidence: "Verified implementation and tests exit 0.",
+              });
+              await request.engineApi?.postMessage({
+                channel: DEFAULT_CHANNEL,
+                kind: "done",
+                text: "@orchestrator [done] PASS",
+              });
+            }
+            return {
+              agentId: request.agentId,
+              name: request.name,
+              role: request.role,
+              outcome: "waiting",
+              summary: "Done",
+              tokens: 200,
+              cost: 0.002,
+            };
+          },
+        }).handle;
+      },
+    });
+
+    let nextModalAction: "confirm" | "cancel" | "continue" = "confirm";
+    let modalCalls = 0;
+    let bounceNextFirstPass = false;
+    let reviewCalls = 0;
+
+    // --- Part A: Interactive `/swarm <goal>` (`autoConfirmDefault === false`) ---
+    const host = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-val-life-003-interactive",
+    });
+    createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: false,
+      }),
+      contractReviewer: async () => {
+        reviewCalls += 1;
+        if (bounceNextFirstPass) {
+          bounceNextFirstPass = false;
+          return {
+            approved: false,
+            summary: "Add concrete test command evidence",
+            findings: [
+              {
+                severity: "blocking",
+                category: "ambiguous_criteria",
+                message: "Specify exact npm test command in evidence_required.",
+              },
+            ],
+          };
+        }
+        return { approved: true, summary: "Approved", findings: [] };
+      },
+      questionnaireUI: {
+        askQuestion: async () => ({ cancelled: false, answer: "yes", isCustom: false }),
+        askQuestionnaire: async () => ({
+          cancelled: false,
+          answers: { scope: "Minimal" },
+          items: [{ id: "scope", question: "Scope?", answer: "Minimal", isCustom: false }],
+        }),
+        confirmProposal: async (_ctx, plan) => {
+          modalCalls += 1;
+          return {
+            action: nextModalAction,
+            validatorEnabled: plan.validatorEnabled,
+            maxConcurrency: plan.maxConcurrency,
+          };
+        },
+      },
+    })(host.pi);
+    await host.emit("session_start", { reason: "startup" });
+
+    // Launch Run 1 via interactive `/swarm <goal>`
+    await host.runCommand("swarm", "Deliver Mission 1");
+    const makeValidPlan = (title: string, workerName: string) => ({
+      title,
+      objective: `Deliver ${title}`,
+      strategy: "Worker -> merge -> validator -> done",
+      acceptance_criteria: "npm test exits 0",
+      base_branch: "main",
+      assertions: [
+        {
+          id: "VAL-M-001",
+          title: `${title} verified`,
+          description: `${workerName}.ts exported cleanly`,
+          evidence_required: "npm test exit 0",
+        },
+      ],
+      features: [
+        {
+          id: "feat-1",
+          title: `Implement ${workerName}`,
+          description: `Create src/${workerName}.ts`,
+          milestone: "m1",
+          files_owned: [`src/${workerName}.ts`],
+          fulfills: ["VAL-M-001"],
+        },
+      ],
+      commands: [{ name: "test", command: "npm test" }],
+      initial_members: [
+        { name: workerName, role: "worker", workspace: "share", brief: `Build ${workerName}` },
+      ],
+    });
+
+    const run1Plan = await host.executeTool(
+      PROPOSE_SWARM_PLAN_TOOL,
+      makeValidPlan("Mission One", "m1-worker"),
+    );
+    assert.equal(run1Plan.isError, undefined);
+    assert.equal(modalCalls, 1, "Interactive /swarm must open confirmation modal");
+    const run1Id: string = run1Plan.details.runId;
+
+    await waitFor(async () => (await store.loadRun(run1Id)).members["m1-worker"]?.state === "waiting");
+    await host.executeTool(SWARM_TOOL, { action: "merge", name: "m1-worker" });
+    // Auto-spawned @validator verifies VAL-M-001 -> wait until VAL-M-001 is passed
+    await waitFor(async () => {
+      const r = await store.loadRun(run1Id);
+      return (
+        r.assertions?.[0]?.status === "passed" &&
+        Object.values(r.members).every((m) => m.state !== "working")
+      );
+    });
+    await host.executeTool(SWARM_TOOL, { action: "done", summary: "Mission 1 complete" });
+
+    // Verify Sisyphus goal auto-continuation does NOT fire in standby!
+    const wakeupsInStandbyBefore = host.sentMessages.filter(
+      (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
+    ).length;
+    host.setIdle(true);
+    await host.emit("turn_end", {
+      message: { role: "assistant", content: [{ type: "text", text: "Read-only answer." }] },
+    });
+    await host.emit("agent_settled", { aborted: false });
+    assert.equal(
+      host.sentMessages.filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE).length,
+      wakeupsInStandbyBefore,
+      "Goal auto-continuation must never fire in standby",
+    );
+
+    // Plain-chat follow-up in standby (no `/swarm`, `currentDraft === null`):
+    // 1) Optional questionnaire works with no draft
+    const qRes = await host.executeTool(SWARM_QUESTIONNAIRE_TOOL, {
+      questions: [{ id: "scope", question: "Scope?", options: ["Minimal (Recommended)", "Full"] }],
+    });
+    assert.equal(qRes.isError, undefined);
+
+    // 2) Modal Cancel from standby stays in standby!
+    nextModalAction = "cancel";
+    const cancelRes = await host.executeTool(
+      PROPOSE_SWARM_PLAN_TOOL,
+      makeValidPlan("Cancelled Followup", "cancel-w"),
+    );
+    assert.equal(cancelRes.details.outcome, "cancelled");
+    assert.deepEqual(
+      host.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)).sort(),
+      [...STANDBY_SWARM_TOOLS].sort(),
+    );
+
+    // 3) Modal "continue" (refine) creates draft, and `/swarm cancel` returns to standby!
+    nextModalAction = "continue";
+    const refineRes = await host.executeTool(
+      PROPOSE_SWARM_PLAN_TOOL,
+      makeValidPlan("Refined Followup", "refine-w"),
+    );
+    assert.equal(refineRes.details.outcome, "continue");
+    await host.runCommand("swarm", "cancel");
+    assert.deepEqual(
+      host.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)).sort(),
+      [...STANDBY_SWARM_TOOLS].sort(),
+    );
+
+    // 4) Adversarial Contract Review bounces Pass 1 once, then Pass 2 opens modal (`autoConfirmDefault: false`) and launches Run 2!
+    bounceNextFirstPass = true;
+    nextModalAction = "confirm";
+    const modalsBeforeRun2 = modalCalls;
+    const bounceRes = await host.executeTool(
+      PROPOSE_SWARM_PLAN_TOOL,
+      makeValidPlan("Mission Two", "m2-worker"),
+    );
+    assert.equal(bounceRes.details.outcome, "contract_review_changes_requested");
+    assert.equal(modalCalls, modalsBeforeRun2, "Pass-1 review bounce must precede modal");
+
+    const run2Plan = await host.executeTool(
+      PROPOSE_SWARM_PLAN_TOOL,
+      makeValidPlan("Mission Two", "m2-worker"),
+    );
+    assert.equal(run2Plan.isError, undefined);
+    assert.equal(modalCalls, modalsBeforeRun2 + 1, "Pass 2 must open modal when entered via /swarm");
+    const run2Id: string = run2Plan.details.runId;
+    assert.notEqual(run2Id, run1Id);
+    assert.deepEqual(
+      host.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)).sort(),
+      [...SWARM_CORE_TOOLS].sort(),
+    );
+
+    // Completed Run 1 is released and its on-disk artifacts & library notes remain intact!
+    const run1AfterRun2Start = await store.loadRun(run1Id);
+    assert.equal(run1AfterRun2Start.status, "completed");
+    assert.equal(run1AfterRun2Start.ownerPid, 0);
+    const run1Arch = await readFile(
+      path.join(repoDir, SWARM_DIR, SWARM_RUNS_DIR, run1Id, SWARM_LIBRARY_DIR, "architecture.md"),
+      "utf8",
+    );
+    assert.match(run1Arch, /Notes from m1-worker/);
+
+    // Complete Run 2 -> back to standby with Run 2 as priorRun!
+    await waitFor(async () => (await store.loadRun(run2Id)).members["m2-worker"]?.state === "waiting");
+    await host.executeTool(SWARM_TOOL, { action: "merge", name: "m2-worker" });
+    await waitFor(async () => {
+      const r = await store.loadRun(run2Id);
+      return (
+        r.assertions?.[0]?.status === "passed" &&
+        Object.values(r.members).every((m) => m.state !== "working")
+      );
+    });
+    await host.executeTool(SWARM_TOOL, { action: "done", summary: "Mission 2 complete" });
+    assert.deepEqual(
+      host.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)).sort(),
+      [...STANDBY_SWARM_TOOLS].sort(),
+    );
+    const afterRun2Sections: Record<string, string> = {};
+    await host.emit("before_agent_start", {
+      messageType: "user",
+      prompt: "Status after Run 2",
+      systemPromptOptions: { sections: afterRun2Sections },
+    });
+    assert.match(String(afterRun2Sections.swarm), new RegExp(run2Id));
+
+    // --- Part B: `/swarm direct` entry (`autoConfirmDefault === true`) auto-confirms follow-up standby proposals ---
+    let directModalCalls = 0;
+    const directHost = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-val-life-003-direct",
+    });
+    createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: false,
+      }),
+      questionnaireUI: {
+        askQuestion: async () => ({ cancelled: false, answer: "ok", isCustom: false }),
+        askQuestionnaire: async () => ({ cancelled: false, answers: {}, items: [] }),
+        confirmProposal: async (_ctx, plan) => {
+          directModalCalls += 1;
+          return {
+            action: "confirm",
+            validatorEnabled: plan.validatorEnabled,
+            maxConcurrency: plan.maxConcurrency,
+          };
+        },
+      },
+    })(directHost.pi);
+    await directHost.emit("session_start", { reason: "startup" });
+
+    await directHost.runCommand("swarm", "direct Fast mission A");
+    const directA = await directHost.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Direct A",
+      objective: "Fast A",
+      strategy: "No initial workers",
+      acceptance_criteria: "Done",
+      base_branch: "main",
+    });
+    assert.equal(directA.details.autoConfirmed, true);
+    assert.equal(directModalCalls, 0);
+    await directHost.executeTool(SWARM_TOOL, { action: "done", summary: "Direct A done" });
+
+    // Follow-up proposal in standby with NO draft auto-confirms without modal!
+    const directB = await directHost.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Direct B",
+      objective: "Fast B from standby",
+      strategy: "No initial workers",
+      acceptance_criteria: "Done",
+      base_branch: "main",
+    });
+    assert.equal(directB.details.autoConfirmed, true);
+    assert.equal(directModalCalls, 0, "Standby follow-up after /swarm direct must auto-confirm");
+    await directHost.executeTool(SWARM_TOOL, { action: "done", summary: "Direct B done" });
+
+    await directHost.emit("session_shutdown", { reason: "quit" });
+    await host.emit("session_shutdown", { reason: "quit" });
+  });
+
+  it("28. VAL-EXIT-001: enforces explicit user-only /swarm exit & /swarm leave with live-run guard, --force pause/detach, Hub exit action, cancel/focus semantics, and 21-subcommand invariant", async () => {
+    // 1. Exact 21 SWARM_SUBCOMMANDS invariant & strict `exit` / `leave` parser routing
+    assert.equal(SWARM_SUBCOMMANDS.length, 21);
+    assert.deepEqual(
+      SWARM_SUBCOMMANDS.map((c) => c.name),
+      [
+        "direct",
+        "tweak",
+        "status",
+        "board",
+        "graph",
+        "tasks",
+        "ui",
+        "models",
+        "model",
+        "steer",
+        "merge",
+        "kill",
+        "done",
+        "pause",
+        "resume",
+        "cancel",
+        "teardown",
+        "runs",
+        "focus",
+        "settings",
+        "help",
+      ],
+    );
+    assert.deepEqual(parseSwarmCommand("exit"), { kind: "exit", rest: "" });
+    assert.deepEqual(parseSwarmCommand("leave"), { kind: "exit", rest: "" });
+    assert.deepEqual(parseSwarmCommand("exit --force"), { kind: "exit", rest: "--force" });
+    assert.deepEqual(parseSwarmCommand("leave --force"), { kind: "exit", rest: "--force" });
+    assert.deepEqual(parseSwarmCommand("exit now please"), {
+      kind: "goal",
+      rest: "exit now please",
+    });
+    assert.deepEqual(parseSwarmCommand("leave the auth module untouched"), {
+      kind: "goal",
+      rest: "leave the auth module untouched",
+    });
+    assert.deepEqual(parseSwarmCommand("exit -f"), { kind: "goal", rest: "exit -f" });
+    assert.deepEqual(parseSwarmCommand("exit --force extra"), {
+      kind: "goal",
+      rest: "exit --force extra",
+    });
+    assert.deepEqual(parseSwarmCommand("-- exit"), { kind: "goal", rest: "exit" });
+
+    const repoDir = await createTempGitRepo("val-exit-001");
+    tempDirs.push(repoDir);
+    const store = new SwarmStore(repoDir);
+
+    const makeTransport = (): ISwarmTransport => ({
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        return createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async () => {
+            if (request.role === "worker" && request.workspace === "share") {
+              await writeFile(
+                path.join(request.cwd, "src", `${request.name}.ts`),
+                "export const wip = true;\n",
+                "utf8",
+              );
+              await git(request.cwd, ["add", "."]);
+              await git(request.cwd, ["commit", "-m", `wip: ${request.name}`]);
+            }
+            return {
+              agentId: request.agentId,
+              name: request.name,
+              role: request.role,
+              outcome: "waiting",
+              summary: "Parked",
+              tokens: 80,
+              cost: 0.001,
+            };
+          },
+        }).handle;
+      },
+    });
+
+    const host = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-val-exit-001",
+      initialHostModel: DEFAULT_TEST_MODELS[1], // claude-sonnet-4-5 (:medium)
+    });
+    createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        orchestratorModel: "anthropic/claude-opus-4-6",
+        orchestratorThinkingLevel: "high",
+        stallWatchdogEnabled: false,
+      }),
+    })(host.pi);
+    await host.emit("session_start", { reason: "startup" });
+
+    // Help & completions include `/swarm exit` and `--force`
+    await host.runCommand("swarm", "help");
+    const helpMd = String(host.sentMessages[host.sentMessages.length - 1]?.message.content ?? "");
+    assert.match(helpMd, /\/swarm exit/);
+    assert.match(helpMd, /!<command>/);
+    const swarmCmd = host.commands.get("swarm")!;
+    const exComp = (await swarmCmd.getArgumentCompletions?.("ex")) as Array<{ value: string }> | null;
+    assert.deepEqual((exComp ?? []).map((c) => c.value), ["exit"]);
+    assert.equal(await swarmCmd.getArgumentCompletions?.("exit"), null);
+    const exitForceComp = (await swarmCmd.getArgumentCompletions?.("exit --f")) as Array<{
+      value: string;
+    }> | null;
+    assert.deepEqual((exitForceComp ?? []).map((c) => c.value), ["exit --force"]);
+    const leaveForceComp = (await swarmCmd.getArgumentCompletions?.("leave ")) as Array<{
+      value: string;
+    }> | null;
+    assert.deepEqual((leaveForceComp ?? []).map((c) => c.value), ["leave --force"]);
+
+    // 2. Launch live run with isolated share worktree -> `/swarm exit` WITHOUT `--force` refuses & changes NOTHING!
+    await host.runCommand("swarm-direct", "Build live feature");
+    const livePlan = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Live Run Exit Guard",
+      objective: "Protect live run from accidental exit",
+      strategy: "Share worker",
+      acceptance_criteria: "Protected",
+      base_branch: "main",
+      initial_members: [
+        { name: "live-dev", role: "worker", workspace: "share", brief: "Create branch commit" },
+      ],
+    });
+    const liveRunId: string = livePlan.details.runId;
+    await waitFor(async () => (await store.loadRun(liveRunId)).members["live-dev"]?.state === "waiting");
+    const liveMember = (await store.loadRun(liveRunId)).members["live-dev"]!;
+    const liveWtPath = liveMember.cwd;
+    const liveBranch = liveMember.branch!;
+    assert.equal(await pathExists(liveWtPath), true);
+
+    await host.runCommand("swarm", "exit");
+    const afterRefused = await store.loadRun(liveRunId);
+    assert.equal(afterRefused.status, "active", "/swarm exit without --force must not pause or abandon");
+    assert.equal(afterRefused.ownerSessionId, "sess-val-exit-001");
+    assert.equal(afterRefused.ownerPid, process.pid);
+    assert.equal(host.ctx.model?.id, "claude-opus-4-6");
+    assert.equal(host.pi.getThinkingLevel(), "high");
+    assert.deepEqual(
+      host.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)).sort(),
+      [...SWARM_CORE_TOOLS].sort(),
+    );
+    const writeBlockedStill = (
+      await host.emit("tool_call", {
+        type: "tool_call",
+        toolCallId: "tc-w1",
+        toolName: "write",
+        input: {},
+      })
+    ).find((r) => r !== undefined) as { block?: boolean } | undefined;
+    assert.equal(writeBlockedStill?.block, true);
+
+    // 3. `/swarm exit --force` pauses & releases ownership (resumable, worktrees & branches intact!), restores idle + preSwarmModel + direct editing, and persists exit!
+    await host.runCommand("swarm", "exit --force");
+    const afterForceExit = await store.loadRun(liveRunId);
+    assert.equal(afterForceExit.status, "paused", "--force must pause, NEVER abandon");
+    assert.equal(afterForceExit.ownerSessionId, "");
+    assert.equal(afterForceExit.ownerPid, 0);
+    assert.equal(await pathExists(liveWtPath), true, "--force exit must preserve worktree");
+    const branchesOut = await git(repoDir, ["branch", "--list", liveBranch]);
+    assert.match(branchesOut, new RegExp(liveBranch.replace(/\//g, "\\/")));
+    assert.equal(host.ctx.model?.id, "claude-sonnet-4-5");
+    assert.equal(host.pi.getThinkingLevel(), "medium");
+    assert.deepEqual(
+      host.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)),
+      [...IDLE_SWARM_TOOLS],
+    );
+    const writeAfterExit = (
+      await host.emit("tool_call", {
+        type: "tool_call",
+        toolCallId: "tc-w2",
+        toolName: "write",
+        input: {},
+      })
+    ).find((r) => r !== undefined);
+    assert.equal(writeAfterExit, undefined);
+
+    // Reload after exit does NOT re-enter standby!
+    await host.emit("session_start", { reason: "reload" });
+    assert.deepEqual(
+      host.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)),
+      [...IDLE_SWARM_TOOLS],
+    );
+
+    // 4. `/swarm resume` resumes the paused detached run & re-enters Persistent Orchestrator Mode!
+    await host.runCommand("swarm", `resume ${liveRunId} --quiet`);
+    assert.equal((await store.loadRun(liveRunId)).status, "active");
+    assert.equal(host.ctx.model?.id, "claude-opus-4-6");
+    assert.equal(host.pi.getThinkingLevel(), "high");
+    await host.executeTool(SWARM_TOOL, { action: "merge", name: "live-dev" });
+    await host.executeTool(SWARM_TOOL, { action: "done", summary: "Resumed & completed" });
+    await host.runCommand("swarm", "teardown");
+
+    // In standby: empty-prefix completions include `exit`
+    const standbyAllComp = (await swarmCmd.getArgumentCompletions?.("")) as Array<{
+      value: string;
+    }> | null;
+    assert.ok((standbyAllComp ?? []).some((c) => c.value === "exit"));
+
+    // 5. `/swarm cancel` on draft in standby returns to standby; `/swarm cancel` with nothing to cancel stays in standby & points to `/swarm exit`!
+    await host.runCommand("swarm", "Draft to cancel in standby");
+    await host.runCommand("swarm", "cancel");
+    assert.deepEqual(
+      host.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)).sort(),
+      [...STANDBY_SWARM_TOOLS].sort(),
+    );
+
+    const notifsBeforeEmptyCancel = host.notifications.length;
+    await host.runCommand("swarm", "cancel");
+    const emptyCancelNotifs = host.notifications.slice(notifsBeforeEmptyCancel);
+    assert.ok(emptyCancelNotifs.some((n) => /\/swarm exit/.test(n.message)));
+    assert.deepEqual(
+      host.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)).sort(),
+      [...STANDBY_SWARM_TOOLS].sort(),
+    );
+
+    // 6. `/swarm exit now please` is routed as a goal (starts drafting), NOT exit!
+    const userMsgsBeforeProse = host.sentUserMessages.length;
+    await host.runCommand("swarm", "exit now please");
+    assert.equal(host.sentUserMessages.length, userMsgsBeforeProse + 1);
+    assert.match(String(host.sentUserMessages[host.sentUserMessages.length - 1]?.content), /exit now please/);
+    await host.runCommand("swarm", "cancel"); // back to standby
+
+    // 7. Hub `{ kind: "exit" }` action exits Orchestrator Mode cleanly!
+    const uiCustom = host.ctx.ui as unknown as {
+      custom?: (factory: unknown) => Promise<unknown>;
+    };
+    uiCustom.custom = async () => ({ kind: "exit" });
+    await host.runCommand("swarm", "");
+    delete uiCustom.custom;
+    assert.deepEqual(
+      host.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)),
+      [...IDLE_SWARM_TOOLS],
+    );
+    assert.equal(host.ctx.model?.id, "claude-sonnet-4-5");
+    assert.equal(host.pi.getThinkingLevel(), "medium");
+
+    // 8. `/swarm leave` and `/swarm focus none` also exit Orchestrator Mode & restore model/tools!
+    await host.runCommand("swarm-direct", "Test /swarm leave & focus none");
+    await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Leave Test",
+      objective: "Verify /swarm leave",
+      strategy: "No workers",
+      acceptance_criteria: "Done",
+      base_branch: "main",
+    });
+    await host.executeTool(SWARM_TOOL, { action: "done", summary: "Done for leave" });
+    assert.equal(host.ctx.model?.id, "claude-opus-4-6");
+    await host.runCommand("swarm", "leave");
+    assert.equal(host.ctx.model?.id, "claude-sonnet-4-5");
+    assert.deepEqual(
+      host.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)),
+      [...IDLE_SWARM_TOOLS],
+    );
+
+    await host.runCommand("swarm-direct", "Test focus none");
+    await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Focus None Test",
+      objective: "Verify /swarm focus none",
+      strategy: "No workers",
+      acceptance_criteria: "Detached",
+      base_branch: "main",
+    });
+    assert.equal(host.ctx.model?.id, "claude-opus-4-6");
+    await host.runCommand("swarm", "focus none");
+    assert.equal(host.ctx.model?.id, "claude-sonnet-4-5");
+    assert.deepEqual(
+      host.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)),
+      [...IDLE_SWARM_TOOLS],
+    );
+
+    // 9. Confirm no model-callable `swarm` action can turn off Orchestrator Mode
+    await host.runCommand("swarm-direct", "Model cannot exit mode");
+    await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "No LLM Exit",
+      objective: "Ensure LLM cannot self-exit",
+      strategy: "No workers",
+      acceptance_criteria: "Stays in standby",
+      base_branch: "main",
+    });
+    await host.executeTool(SWARM_TOOL, { action: "done", summary: "Completed" });
+    const illegalExit = await host.executeTool(SWARM_TOOL, { action: "exit" as any });
+    assert.equal(illegalExit.isError, true);
+    assert.deepEqual(
+      host.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)).sort(),
+      [...STANDBY_SWARM_TOOLS].sort(),
     );
 
     await host.emit("session_shutdown", { reason: "quit" });
