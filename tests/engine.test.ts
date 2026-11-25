@@ -428,6 +428,13 @@ class MockSwarmStore implements ISwarmStore {
     if (patch.lastReadSeq !== undefined) m.lastReadSeq = patch.lastReadSeq;
     if (patch.lastPostSeq !== undefined) m.lastPostSeq = patch.lastPostSeq;
     if (patch.lastPostTime !== undefined) m.lastPostTime = patch.lastPostTime;
+    if (patch.lastParkBlockedSeq !== undefined) {
+      if (patch.lastParkBlockedSeq === null) {
+        delete m.lastParkBlockedSeq;
+      } else {
+        m.lastParkBlockedSeq = patch.lastParkBlockedSeq;
+      }
+    }
     if (patch.parkedOn !== undefined) {
       m.parkedOn = patch.parkedOn === null ? undefined : patch.parkedOn;
     }
@@ -10668,6 +10675,942 @@ describe("Droid-style Persistent Mission Orchestrator standby & mid-mission prom
       assert.equal(buildOrchestratorStaticSection(engine.getSnapshot()), staticSec);
     } finally {
       await engine.dispose();
+    }
+  });
+});
+
+describe("AGY Stop-Hook Race Lock & Anti-Noise Monitor Hygiene (VAL-AGY-001, VAL-AGY-002)", () => {
+  const dummyCtx = {} as ExtensionToolContext;
+
+  it("VAL-AGY-001: blocks member swarm_wait on unread matching messages, records & persists lastParkBlockedSeq in status/store, and parks cleanly once caught up", async () => {
+    const { engine, store, transport } = await createTestHarness({
+      stallWatchdogEnabled: false,
+    });
+    try {
+      await engine.manageChannel({ action: "create", name: "ops", topic: "Ops" });
+      await engine.manageChannel({ action: "create", name: "other", topic: "Other" });
+
+      await engine.addMembers({
+        name: "worker",
+        n: 2,
+        brief: "Build sharded slices",
+        channels: ["main", "ops"],
+      });
+      await engine.addMembers({
+        name: "audit",
+        role: "validator",
+        brief: "Validate outputs",
+      });
+      await waitUntil(() => engine.getSnapshot().workingMemberNames.length === 0);
+
+      const workerBridge = transport.handles.get("worker-1")!.request.engineApi!;
+      const recordedWaits: Array<{ since: number; mentionsOnly: boolean }> = [];
+      const workerTools = createMemberScopedTools(workerBridge, {
+        name: "worker-1",
+        role: "worker",
+        runId: "run-dyn",
+        onWaitRecorded: (w) => recordedWaits.push(w),
+      });
+      const workerWait = workerTools.find((t) => t.name === SWARM_WAIT_TOOL)!;
+      const workerRead = workerTools.find((t) => t.name === READ_BOARD_TOOL)!;
+      const workerSwarm = workerTools.find((t) => t.name === SWARM_TOOL)!;
+
+      const baseHead = engine.getSnapshot().boardHead;
+
+      // 1. Self post, unrelated @worker-2 post, unsubscribed #other channel mention, and @#main do NOT block mentions_only:true
+      await workerBridge.postMessage({ text: "Progress note from worker-1" });
+      await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        text: "@worker-2 only for worker-2",
+      });
+      await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        channel: "other",
+        text: "@#other unsubscribed channel broadcast",
+      });
+      await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        text: "Unmentioned #main chatter",
+      });
+      await store.postBoardMessage("run-dyn", {
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        text: "Raw main channelMention entry",
+        channelMentions: ["main"],
+      });
+      await waitUntil(() => engine.getSnapshot().workingMemberNames.length === 0);
+
+      const cleanOut1 = (await workerWait.execute(
+        "tc-clean-1",
+        { since: baseHead },
+        undefined,
+        undefined,
+        dummyCtx,
+      )) as unknown as {
+        terminate?: boolean;
+        details: { parked: boolean; blockedBySeq?: number };
+      };
+      assert.equal(cleanOut1.terminate, true);
+      assert.equal(cleanOut1.details.parked, true);
+      assert.equal(recordedWaits.length, 1);
+      assert.equal(
+        engine.getSnapshot().run!.members["worker-1"]!.lastParkBlockedSeq,
+        undefined,
+      );
+
+      // 2. Real mid-turn Stop-Hook race: while worker-1 is working, direct @mention (case-insensitive)
+      //    arrives -> swarm_wait blocks park, preserves lastReadSeq, and records lastParkBlockedSeq!
+      let enteredMidTurn!: () => void;
+      const enteredMidTurnP = new Promise<void>((r) => {
+        enteredMidTurn = r;
+      });
+      let releaseMidTurn!: () => void;
+      const midTurnGate = new Promise<void>((r) => {
+        releaseMidTurn = r;
+      });
+      transport.onMember("worker-1", async () => {
+        enteredMidTurn();
+        await midTurnGate;
+        return { outcome: "waiting", summary: "parked after handling mid-turn post" };
+      });
+      const wakeKick = await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        text: "@worker-1 start phase 2",
+      });
+      await enteredMidTurnP;
+
+      const checkpointA = wakeKick.seq;
+      const lastReadBeforeBlock =
+        engine.getSnapshot().run!.members["worker-1"]!.lastReadSeq;
+      const directMsg = await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        text: "@WORKER-1 hold on — update schema before parking",
+      });
+
+      const blockedDirect = (await workerWait.execute(
+        "tc-block-direct",
+        { since: checkpointA },
+        undefined,
+        undefined,
+        dummyCtx,
+      )) as unknown as {
+        content: Array<{ text: string }>;
+        terminate?: boolean;
+        details: {
+          member: string;
+          since: number;
+          mentionsOnly: boolean;
+          parked: boolean;
+          blockedBySeq?: number;
+          unreadSeqs?: number[];
+        };
+      };
+      assert.equal(blockedDirect.terminate, undefined);
+      assert.equal(blockedDirect.details.parked, false);
+      assert.equal(blockedDirect.details.blockedBySeq, directMsg.seq);
+      assert.deepEqual(blockedDirect.details.unreadSeqs, [directMsg.seq]);
+      assert.equal(recordedWaits.length, 1, "onWaitRecorded must NOT fire when blocked");
+      assert.match(
+        blockedDirect.content[0]!.text,
+        new RegExp(
+          `^\\[board\\] New message\\(s\\) arrived since #${checkpointA} \\(head #${directMsg.seq}\\): #${directMsg.seq}.*Call read_board\\{since: ${checkpointA}\\} before calling swarm_wait again\\.$`,
+        ),
+      );
+      assert.equal(
+        engine.getSnapshot().run!.members["worker-1"]!.lastReadSeq,
+        lastReadBeforeBlock,
+        "swarm_wait peek must not advance lastReadSeq before read_board is called",
+      );
+      assert.equal(
+        engine.getSnapshot().run!.members["worker-1"]!.lastParkBlockedSeq,
+        directMsg.seq,
+      );
+      assert.equal(
+        (await store.loadRun("run-dyn")).members["worker-1"]!.lastParkBlockedSeq,
+        directMsg.seq,
+      );
+
+      // Release mid-turn and restore instant waiting handler for subsequent checks
+      transport.onMember("worker-1", async () => ({
+        outcome: "waiting",
+        summary: "ok",
+      }));
+      releaseMidTurn();
+      await waitUntil(() => engine.getSnapshot().workingMemberNames.length === 0);
+
+      // Status visibility (both member swarm{action:"status"} and orchestrator status)
+      const statusRes = await workerSwarm.execute(
+        "tc-status",
+        { action: "status" },
+        undefined,
+        undefined,
+        dummyCtx,
+      );
+      const statusText = (statusRes.content[0] as { text: string }).text;
+      const statusDetails = statusRes.details as {
+        members: Array<{ name: string; lastParkBlockedSeq?: number }>;
+      };
+      assert.match(statusText, new RegExp(`@worker-1 .*lastParkBlockedSeq=#${directMsg.seq}`));
+      assert.equal(
+        statusDetails.members.find((m) => m.name === "worker-1")?.lastParkBlockedSeq,
+        directMsg.seq,
+      );
+
+      // 3. @groupPrefix, @all, and @#ops channel broadcast each block swarm_wait when unread
+      const checkpointB = engine.getSnapshot().boardHead;
+      const prefixMsg = await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        text: "@worker group broadcast",
+      });
+      const allMsg = await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        text: "@all global sync",
+      });
+      const opsBroadcast = await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        channel: "ops",
+        text: "@#ops channel-wide heads up",
+      });
+      await waitUntil(() => engine.getSnapshot().workingMemberNames.length === 0);
+
+      const blockedMulti = (await workerWait.execute(
+        "tc-block-multi",
+        { since: checkpointB },
+        undefined,
+        undefined,
+        dummyCtx,
+      )) as unknown as {
+        terminate?: boolean;
+        details: { parked: boolean; blockedBySeq?: number; unreadSeqs?: number[] };
+      };
+      assert.equal(blockedMulti.terminate, undefined);
+      assert.equal(blockedMulti.details.parked, false);
+      assert.equal(blockedMulti.details.blockedBySeq, opsBroadcast.seq);
+      assert.deepEqual(blockedMulti.details.unreadSeqs, [
+        prefixMsg.seq,
+        allMsg.seq,
+        opsBroadcast.seq,
+      ]);
+      assert.equal(
+        engine.getSnapshot().run!.members["worker-1"]!.lastParkBlockedSeq,
+        opsBroadcast.seq,
+      );
+
+      // 4. mentions_only: false blocks on unmentioned posts in subscribed channels (#ops/#main), ignoring #other & self
+      const checkpointC = engine.getSnapshot().boardHead;
+      await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        channel: "other",
+        text: "Unmentioned in #other",
+      });
+      await workerBridge.postMessage({
+        channel: "ops",
+        text: "Self post in #ops",
+      });
+      const opsUnmentioned = await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        channel: "ops",
+        text: "Unmentioned #ops note",
+      });
+      await waitUntil(() => engine.getSnapshot().workingMemberNames.length === 0);
+
+      const blockedAllMsgs = (await workerWait.execute(
+        "tc-block-all",
+        { since: checkpointC, mentions_only: false },
+        undefined,
+        undefined,
+        dummyCtx,
+      )) as unknown as {
+        terminate?: boolean;
+        details: { parked: boolean; blockedBySeq?: number; unreadSeqs?: number[] };
+      };
+      assert.equal(blockedAllMsgs.terminate, undefined);
+      assert.equal(blockedAllMsgs.details.parked, false);
+      assert.equal(blockedAllMsgs.details.blockedBySeq, opsUnmentioned.seq);
+      assert.deepEqual(blockedAllMsgs.details.unreadSeqs, [opsUnmentioned.seq]);
+
+      // 5. Validator role also blocks on unread @audit mention, and parks cleanly once read_board catches up
+      const auditBridge = transport.handles.get("audit")!.request.engineApi!;
+      let auditParkedCount = 0;
+      const auditTools = createMemberScopedTools(auditBridge, {
+        name: "audit",
+        role: "validator",
+        runId: "run-dyn",
+        onWaitRecorded: () => {
+          auditParkedCount += 1;
+        },
+      });
+      const auditWait = auditTools.find((t) => t.name === SWARM_WAIT_TOOL)!;
+      const beforeAuditMsg = engine.getSnapshot().boardHead;
+      const toAudit = await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        text: "@audit please verify new commit",
+      });
+      await waitUntil(() => engine.getSnapshot().workingMemberNames.length === 0);
+
+      const auditBlocked = (await auditWait.execute(
+        "tc-audit-block",
+        { since: beforeAuditMsg },
+        undefined,
+        undefined,
+        dummyCtx,
+      )) as unknown as { terminate?: boolean; details: { parked: boolean; blockedBySeq?: number } };
+      assert.equal(auditBlocked.terminate, undefined);
+      assert.equal(auditBlocked.details.parked, false);
+      assert.equal(auditBlocked.details.blockedBySeq, toAudit.seq);
+      assert.equal(auditParkedCount, 0);
+      assert.equal(
+        engine.getSnapshot().run!.members["audit"]!.lastParkBlockedSeq,
+        toAudit.seq,
+      );
+
+      // Catch up via read_board and park cleanly with updated since
+      const readCatchup = await workerRead.execute(
+        "tc-read-catchup",
+        { since: checkpointA },
+        undefined,
+        undefined,
+        dummyCtx,
+      );
+      const latestHead = (readCatchup.details as { head: number }).head;
+      const cleanAfterCatchup = (await workerWait.execute(
+        "tc-clean-after",
+        { since: latestHead },
+        undefined,
+        undefined,
+        dummyCtx,
+      )) as unknown as { terminate?: boolean; details: { parked: boolean } };
+      assert.equal(cleanAfterCatchup.terminate, true);
+      assert.equal(cleanAfterCatchup.details.parked, true);
+      assert.equal(recordedWaits.length, 2);
+
+      // 6. Cross-channel wake routing parity on REAL SwarmEngine bridge:
+      //    direct/group/all/@#ops posted inside unsubscribed #other MUST block swarm_wait, while archived @#legacy does not!
+      await engine.manageChannel({ action: "create", name: "legacy", topic: "Legacy" });
+      await engine.manageChannel({ action: "join", name: "legacy", member: "worker-1" });
+      await engine.manageChannel({ action: "archive", name: "legacy" });
+
+      const crossBase = engine.getSnapshot().boardHead;
+      await store.postBoardMessage("run-dyn", {
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        channel: "other",
+        text: "@#legacy archived broadcast should be ignored",
+        channelMentions: ["legacy"],
+      });
+      await engine.attachRun("run-dyn");
+      const waitsBeforeArchivedCheck = recordedWaits.length;
+      const archivedClean = (await workerWait.execute(
+        "tc-archived-clean",
+        { since: crossBase },
+        undefined,
+        undefined,
+        dummyCtx,
+      )) as unknown as { terminate?: boolean; details: { parked: boolean } };
+      assert.equal(archivedClean.terminate, true);
+      assert.equal(archivedClean.details.parked, true);
+      assert.equal(recordedWaits.length, waitsBeforeArchivedCheck + 1);
+
+      const crossStart = engine.getSnapshot().boardHead;
+      const crossDirect = await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        channel: "other",
+        text: "@worker-1 cross-channel direct mention from #other",
+      });
+      const crossGroup = await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        channel: "other",
+        text: "@worker cross-channel group mention from #other",
+      });
+      const crossAll = await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        channel: "other",
+        text: "@all cross-channel global notice from #other",
+      });
+      const crossOpsBroadcast = await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        channel: "other",
+        text: "@#ops cross-channel broadcast from #other",
+      });
+      await waitUntil(() => engine.getSnapshot().workingMemberNames.length === 0);
+
+      const crossBlocked = (await workerWait.execute(
+        "tc-cross-blocked",
+        { since: crossStart },
+        undefined,
+        undefined,
+        dummyCtx,
+      )) as unknown as {
+        content: Array<{ text: string }>;
+        terminate?: boolean;
+        details: { parked: boolean; blockedBySeq?: number; unreadSeqs?: number[] };
+      };
+      assert.equal(crossBlocked.terminate, undefined);
+      assert.equal(crossBlocked.details.parked, false);
+      assert.equal(crossBlocked.details.blockedBySeq, crossOpsBroadcast.seq);
+      assert.deepEqual(crossBlocked.details.unreadSeqs, [
+        crossDirect.seq,
+        crossGroup.seq,
+        crossAll.seq,
+        crossOpsBroadcast.seq,
+      ]);
+      assert.match(
+        crossBlocked.content[0]!.text,
+        /read_board\{since: \d+, channel: "\*"\}/,
+      );
+
+      // 7. Long board pagination (>121 unread posts on real bridge):
+      //    (a) 130 unread posts where ONLY #130 mentions worker-1 -> blocks with blockedBySeq = #130
+      const longBaseA = engine.getSnapshot().boardHead;
+      for (let i = 1; i <= 129; i += 1) {
+        await engine.postMessage({
+          from: ORCHESTRATOR_NAME,
+          fromRole: "orchestrator",
+          text: `Background chatter line ${i}`,
+        });
+      }
+      const tailMatchOnly = await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        text: "@worker-1 tail mention at 130th unread post",
+      });
+      await waitUntil(() => engine.getSnapshot().workingMemberNames.length === 0);
+
+      const waitsBeforeLongA = recordedWaits.length;
+      const longBlockedA = (await workerWait.execute(
+        "tc-long-a",
+        { since: longBaseA },
+        undefined,
+        undefined,
+        dummyCtx,
+      )) as unknown as {
+        terminate?: boolean;
+        details: { parked: boolean; blockedBySeq?: number; unreadSeqs?: number[] };
+      };
+      assert.equal(longBlockedA.terminate, undefined);
+      assert.equal(longBlockedA.details.parked, false);
+      assert.equal(recordedWaits.length, waitsBeforeLongA);
+      assert.equal(longBlockedA.details.blockedBySeq, tailMatchOnly.seq);
+      assert.deepEqual(longBlockedA.details.unreadSeqs, [tailMatchOnly.seq]);
+      assert.equal(
+        engine.getSnapshot().run!.members["worker-1"]!.lastParkBlockedSeq,
+        tailMatchOnly.seq,
+      );
+
+      //    (b) 130 unread posts where BOTH #1 and #130 match -> collects across all pages & sets blockedBySeq = #130
+      const longBaseB = engine.getSnapshot().boardHead;
+      const headMatch = await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        text: "@worker-1 early match #1",
+      });
+      for (let i = 2; i <= 129; i += 1) {
+        await engine.postMessage({
+          from: ORCHESTRATOR_NAME,
+          fromRole: "orchestrator",
+          text: `More background chatter ${i}`,
+        });
+      }
+      const tailMatchBoth = await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        text: "@worker-1 late match #130",
+      });
+      await waitUntil(() => engine.getSnapshot().workingMemberNames.length === 0);
+
+      const longBlockedB = (await workerWait.execute(
+        "tc-long-b",
+        { since: longBaseB },
+        undefined,
+        undefined,
+        dummyCtx,
+      )) as unknown as {
+        terminate?: boolean;
+        details: { parked: boolean; blockedBySeq?: number; unreadSeqs?: number[] };
+      };
+      assert.equal(longBlockedB.terminate, undefined);
+      assert.equal(longBlockedB.details.parked, false);
+      assert.equal(longBlockedB.details.blockedBySeq, tailMatchBoth.seq);
+      assert.deepEqual(longBlockedB.details.unreadSeqs, [
+        headMatch.seq,
+        tailMatchBoth.seq,
+      ]);
+      assert.equal(
+        engine.getSnapshot().run!.members["worker-1"]!.lastParkBlockedSeq,
+        tailMatchBoth.seq,
+      );
+
+      // 8. Stub bridge compatibility + readBoard failure returns non-terminating error + stuck-cursor guard
+      const stubTools = createMemberScopedTools(
+        {
+          postMessage: async () => {
+            throw new Error("unused");
+          },
+          readBoard: async () => ({ messages: [], head: 0 }),
+          getStatus: async () => ({
+            runId: "r-stub",
+            title: "stub",
+            status: "active",
+            baseBranch: "main",
+            boardHead: 0,
+            members: [],
+            channels: [],
+          }),
+          listModels: async () => [],
+          addHelper: async () => [],
+          killHelper: async () => {},
+          switchModel: async () => ({ targetName: "stub", model: "m" }),
+          manageChannel: async () => ({ action: "list", summary: "ok" }),
+        },
+        { name: "stub", role: "worker", runId: "r-stub" },
+      );
+      const stubWaitRes = (await stubTools
+        .find((t) => t.name === SWARM_WAIT_TOOL)!
+        .execute("tc-stub", { since: 0 }, undefined, undefined, dummyCtx)) as unknown as {
+        terminate?: boolean;
+        details: { parked: boolean };
+      };
+      assert.equal(stubWaitRes.terminate, true);
+      assert.equal(stubWaitRes.details.parked, true);
+
+      let errWaitRecorded = false;
+      let errPageCalls = 0;
+      const failingWaitTools = createMemberScopedTools(
+        {
+          postMessage: async () => {
+            throw new Error("unused");
+          },
+          readBoard: async () => {
+            errPageCalls += 1;
+            if (errPageCalls === 1) {
+              return {
+                messages: [
+                  {
+                    seq: 1,
+                    runId: "r-err",
+                    channel: "main",
+                    from: ORCHESTRATOR_NAME,
+                    fromRole: "orchestrator",
+                    text: "unmentioned",
+                    mentions: [],
+                    channelMentions: [],
+                    kind: "chat",
+                    timestamp: new Date().toISOString(),
+                  },
+                ],
+                head: 50,
+              };
+            }
+            throw new Error("board disk EIO");
+          },
+          getStatus: async () => ({
+            runId: "r-err",
+            title: "err",
+            status: "active",
+            baseBranch: "main",
+            boardHead: 50,
+            members: [],
+            channels: [],
+          }),
+          listModels: async () => [],
+          addHelper: async () => [],
+          killHelper: async () => {},
+          switchModel: async () => ({ targetName: "err-w", model: "m" }),
+          manageChannel: async () => ({ action: "list", summary: "ok" }),
+        },
+        {
+          name: "err-w",
+          role: "worker",
+          runId: "r-err",
+          onWaitRecorded: () => {
+            errWaitRecorded = true;
+          },
+        },
+      );
+      const errWaitRes = (await failingWaitTools
+        .find((t) => t.name === SWARM_WAIT_TOOL)!
+        .execute("tc-err-wait", { since: 0 }, undefined, undefined, dummyCtx)) as unknown as {
+        isError?: boolean;
+        terminate?: boolean;
+        content: Array<{ text: string }>;
+        details: { parked: boolean; error?: string };
+      };
+      assert.equal(errWaitRes.isError, true);
+      assert.equal(errWaitRes.terminate, undefined);
+      assert.equal(errWaitRes.details.parked, false);
+      assert.equal(errWaitRecorded, false, "readBoard failure must NOT park or call onWaitRecorded");
+      assert.match(errWaitRes.content[0]!.text, /board disk EIO/);
+    } finally {
+      await engine.dispose();
+    }
+
+    // 7. Real SwarmStore disk persistence + backward compatibility with legacy state.json without lastParkBlockedSeq
+    const storeRoot = nextTestScratchRoot("store-park-blocked");
+    await mkdir(storeRoot, { recursive: true });
+    const diskStore = new SwarmStore(storeRoot);
+    const created = await diskStore.createRun({
+      id: "run-park-persist",
+      title: "Persist lastParkBlockedSeq",
+      objective: "Verify disk round-trip and legacy load",
+      baseBranch: "main",
+      ownerSessionId: "sess-persist",
+    });
+    await diskStore.addMember(created.id, {
+      name: "w-disk",
+      agentId: "w-disk-1",
+      role: "worker",
+      parentName: ORCHESTRATOR_NAME,
+      brief: "Test",
+      workspace: "inherit",
+      cwd: storeRoot,
+    });
+    await diskStore.updateMember(created.id, "w-disk", {
+      lastParkBlockedSeq: 9,
+    });
+    const reloadedStore = new SwarmStore(storeRoot);
+    const reloaded = await reloadedStore.loadRun(created.id);
+    assert.equal(reloaded.members["w-disk"]?.lastParkBlockedSeq, 9);
+
+    // Strip field & test legacy state.json + malformed field normalization
+    const statePath = path.join(diskStore.getRunDir(created.id), "state.json");
+    const rawJson = JSON.parse(await readFile(statePath, "utf8")) as {
+      members: Record<string, Record<string, unknown>>;
+    };
+    delete rawJson.members["w-disk"]!.lastParkBlockedSeq;
+    await writeFile(statePath, JSON.stringify(rawJson, null, 2), "utf8");
+    const legacyLoaded = await new SwarmStore(storeRoot).loadRun(created.id);
+    assert.equal(legacyLoaded.members["w-disk"]?.lastParkBlockedSeq, undefined);
+
+    rawJson.members["w-disk"]!.lastParkBlockedSeq = -7;
+    await writeFile(statePath, JSON.stringify(rawJson, null, 2), "utf8");
+    const malformedLoaded = await new SwarmStore(storeRoot).loadRun(created.id);
+    assert.equal(malformedLoaded.members["w-disk"]?.lastParkBlockedSeq, undefined);
+  });
+
+  it("VAL-AGY-002 (part 1): warns about live orphaned child helpers on both member-scoped and orchestrator swarm{action:'kill'} without cascading", async () => {
+    const { engine, transport } = await createTestHarness({
+      stallWatchdogEnabled: false,
+    });
+    try {
+      await engine.addMembers({
+        name: "lead",
+        workspace: "inherit",
+        brief: "Coordinate helpers",
+      });
+      await waitUntil(() => engine.getSnapshot().workingMemberNames.length === 0);
+
+      const leadBridge = transport.handles.get("lead")!.request.engineApi!;
+      const leadTools = createMemberScopedTools(leadBridge, {
+        name: "lead",
+        role: "worker",
+        runId: "run-dyn",
+      });
+      const leadSwarm = leadTools.find((t) => t.name === SWARM_TOOL)!;
+
+      await leadSwarm.execute(
+        "tc-add-c1",
+        { action: "add", name: "child-1", brief: "Helper 1" },
+        undefined,
+        undefined,
+        dummyCtx,
+      );
+      await leadSwarm.execute(
+        "tc-add-c2",
+        { action: "add", name: "child-2", brief: "Helper 2" },
+        undefined,
+        undefined,
+        dummyCtx,
+      );
+      await waitUntil(() => engine.getSnapshot().workingMemberNames.length === 0);
+
+      // child-1 spawns grandchild-1
+      const child1Bridge = transport.handles.get("child-1")!.request.engineApi!;
+      await child1Bridge.addHelper({
+        name: "grandchild-1",
+        brief: "Sub-helper under child-1",
+      });
+      await waitUntil(() => engine.getSnapshot().workingMemberNames.length === 0);
+
+      // Killing child-2 (0 children) -> clean output without Warning
+      const killLeafRes = await leadSwarm.execute(
+        "tc-kill-leaf",
+        { action: "kill", name: "child-2" },
+        undefined,
+        undefined,
+        dummyCtx,
+      );
+      const killLeafText = (killLeafRes.content[0] as { text: string }).text;
+      assert.equal(killLeafText, "Killed helper @child-2.");
+      assert.deepEqual(
+        (killLeafRes.details as { orphanedHelpers?: string[] }).orphanedHelpers,
+        [],
+      );
+
+      // Member-scoped kill of child-1 -> warns about live @grandchild-1 and leaves @grandchild-1 alive
+      const killChild1Res = await leadSwarm.execute(
+        "tc-kill-c1",
+        { action: "kill", name: "child-1" },
+        undefined,
+        undefined,
+        dummyCtx,
+      );
+      const killChild1Text = (killChild1Res.content[0] as { text: string }).text;
+      assert.match(
+        killChild1Text,
+        /Warning: @child-1 still has live child helper\(s\): @grandchild-1 — kill or reassign them before done\./,
+      );
+      assert.deepEqual(
+        (killChild1Res.details as { orphanedHelpers?: string[] }).orphanedHelpers,
+        ["grandchild-1"],
+      );
+      assert.notEqual(
+        engine.getSnapshot().run!.members["grandchild-1"]!.state,
+        "killed",
+        "killMember must remain non-cascading",
+      );
+
+      // Add live child-3 under lead; orchestrator kills lead -> warns ONLY about live @child-3 (not already-killed @child-1/@child-2)
+      await leadSwarm.execute(
+        "tc-add-c3",
+        { action: "add", name: "child-3", brief: "Active helper 3" },
+        undefined,
+        undefined,
+        dummyCtx,
+      );
+      await waitUntil(() => engine.getSnapshot().workingMemberNames.length === 0);
+
+      const orchSwarm = createSwarmTools({ engine }).find(
+        (t) => t.name === SWARM_TOOL,
+      )!;
+      const killLeadRes = await orchSwarm.execute(
+        "tc-kill-lead",
+        { action: "kill", name: "lead", reason: "Retiring lead" },
+        undefined,
+        undefined,
+        dummyCtx,
+      );
+      const killLeadText = (killLeadRes.content[0] as { text: string }).text;
+      assert.match(
+        killLeadText,
+        /Killed @lead \(Retiring lead\)\.\nWarning: @lead still has live child helper\(s\): @child-3 — kill or reassign them before done\./,
+      );
+      assert.ok(!killLeadText.includes("@child-1"));
+      assert.ok(!killLeadText.includes("@child-2"));
+      assert.deepEqual(
+        (killLeadRes.details as { orphanedHelpers?: string[] }).orphanedHelpers,
+        ["child-3"],
+      );
+      assert.notEqual(
+        engine.getSnapshot().run!.members["child-3"]!.state,
+        "killed",
+      );
+    } finally {
+      await engine.dispose();
+    }
+  });
+
+  it("VAL-AGY-002 (part 2): suppresses duplicate stall alerts on unchanged boardHead and pauses/resumes stall watchdog via setHumanInputAwaited", async () => {
+    // A. Unchanged boardHead stall suppression across repeated re-arm triggers, resetting once boardHead advances
+    {
+      const { engine } = await createTestHarness({
+        stallWatchdogEnabled: true,
+        stallMonitorMode: "deterministic",
+        stallTimeoutMs: 25,
+      });
+      const stallEvents: SwarmEngineEvent[] = [];
+      engine.subscribe((e) => {
+        if (e.type === "stall_detected") stallEvents.push(e);
+      });
+
+      try {
+        await engine.addMembers({ name: "idle-a", brief: "Park quietly" });
+        await engine.addMembers({ name: "idle-b", brief: "Park quietly too" });
+        await waitUntil(() => stallEvents.length >= 1, 1500);
+        assert.equal(stallEvents.length, 1);
+
+        const stalledHead = engine.getSnapshot().boardHead;
+        // Trigger multiple watchdog re-arm paths without moving boardHead
+        engine.clearOrchestratorWait("noop");
+        await engine.stopMember("idle-b", { reason: "Pause one worker" });
+        await engine.killMember("idle-b", { reason: "Retire idle-b" });
+        await engine.attachRun("run-dyn");
+
+        await delay(110);
+        assert.equal(
+          engine.getSnapshot().boardHead,
+          stalledHead,
+          "boardHead stayed unchanged",
+        );
+        assert.equal(
+          stallEvents.length,
+          1,
+          "Must not spam duplicate stall alerts on unchanged boardHead",
+        );
+
+        // Advancing boardHead resets lastStallAlertHead so a subsequent stall alerts once
+        await engine.postMessage({
+          from: ORCHESTRATOR_NAME,
+          fromRole: "orchestrator",
+          text: "New phase check without waking idle-a",
+        });
+        await waitUntil(() => stallEvents.length >= 2, 1500);
+        assert.equal(stallEvents.length, 2);
+        await delay(90);
+        assert.equal(stallEvents.length, 2);
+      } finally {
+        await engine.dispose();
+      }
+    }
+
+    // B. setHumanInputAwaited(true) suppresses/cancels stall watchdog (deterministic & in-flight LLM monitor) and re-arms on false
+    {
+      let releaseMonitor!: () => void;
+      let monitorSpawned = false;
+      const { engine, transport } = await createTestHarness({
+        stallWatchdogEnabled: true,
+        stallMonitorMode: "llm",
+        stallTimeoutMs: 25,
+      });
+      const origSpawn = transport.spawnMember.bind(transport);
+      transport.spawnMember = async (req: SpawnMemberRequest) => {
+        if (req.isMonitor) {
+          monitorSpawned = true;
+          const turnPromise = (async (): Promise<AgentTurnResult> => {
+            await new Promise<void>((r) => {
+              releaseMonitor = r;
+            });
+            return {
+              agentId: req.agentId,
+              name: req.name,
+              role: req.role,
+              outcome: "waiting",
+              summary: "done",
+              tokens: 5,
+              cost: 0,
+            };
+          })();
+          return {
+            agentId: req.agentId,
+            name: req.name,
+            role: req.role,
+            getState: () => "waiting",
+            getModel: () => req.modelOverride,
+            getThinkingLevel: () => req.thinkingLevel,
+            getConversationMessages: () => [],
+            wake: async () => turnPromise,
+            steer: async () => {},
+            followUp: async () => {},
+            switchModel: async (m, t) => ({ model: m, thinkingLevel: t }),
+            abort: async () => {},
+            kill: async () => {
+              releaseMonitor?.();
+            },
+            currentTurn: turnPromise,
+          };
+        }
+        return origSpawn(req);
+      };
+
+      const stallEvents: SwarmEngineEvent[] = [];
+      engine.subscribe((e) => {
+        if (e.type === "stall_detected") stallEvents.push(e);
+      });
+
+      try {
+        // Hold watchdog while [NEEDS_HUMAN] awaits user response before any stall fires
+        engine.setHumanInputAwaited(true);
+        await engine.addMembers({ name: "await-w", brief: "Park while human thinks" });
+        await waitUntil(
+          () => engine.getSnapshot().run?.members["await-w"]?.state === "waiting",
+        );
+
+        await delay(100);
+        assert.equal(monitorSpawned, false);
+        assert.equal(
+          stallEvents.length,
+          0,
+          "Stall watchdog must stay silent while setHumanInputAwaited(true)",
+        );
+
+        // Clearing human-input wait re-arms watchdog -> LLM monitor spawns; cancelling mid-flight via setHumanInputAwaited(true) suppresses fallback!
+        engine.setHumanInputAwaited(false);
+        await waitUntil(() => monitorSpawned && Boolean(releaseMonitor), 1500);
+        engine.setHumanInputAwaited(true);
+        await delay(80);
+        assert.equal(
+          stallEvents.length,
+          0,
+          "setHumanInputAwaited(true) mid-monitor must cancel monitor without fallback stall post",
+        );
+
+        // Finally clear setHumanInputAwaited(false) and let monitor fall back deterministically -> fires 1 stall alert!
+        transport.spawnMember = origSpawn;
+        engine.setHumanInputAwaited(false);
+        await waitUntil(() => stallEvents.length >= 1, 1500);
+        assert.equal(stallEvents.length, 1);
+      } finally {
+        releaseMonitor?.();
+        await engine.dispose();
+      }
+    }
+
+    // C. Transient store.postBoardMessage failure during emitStallMessage does NOT poison lastStallAlertHead;
+    //    subsequent healthy tick on the same head delivers the alert once and then suppresses duplicates!
+    {
+      const { engine, store } = await createTestHarness({
+        stallWatchdogEnabled: true,
+        stallMonitorMode: "deterministic",
+        stallTimeoutMs: 25,
+      });
+      const stallEvents: SwarmEngineEvent[] = [];
+      engine.subscribe((e) => {
+        if (e.type === "stall_detected") stallEvents.push(e);
+      });
+      const origPost = store.postBoardMessage.bind(store);
+      let failFirstMonitorPost = true;
+      let transientMonitorErrors = 0;
+      store.postBoardMessage = async (runId, input) => {
+        if (input.fromRole === "monitor" && failFirstMonitorPost) {
+          failFirstMonitorPost = false;
+          transientMonitorErrors += 1;
+          throw new Error("transient disk EIO during stall post");
+        }
+        return origPost(runId, input);
+      };
+
+      try {
+        await engine.addMembers({ name: "retry-stall-w", brief: "Park quietly" });
+        await waitUntil(
+          () => transientMonitorErrors === 1 && stallEvents.length >= 1,
+          1500,
+        );
+        assert.equal(transientMonitorErrors, 1);
+        assert.equal(stallEvents.length, 1);
+        await delay(90);
+        assert.equal(
+          stallEvents.length,
+          1,
+          "Once healthy stall post succeeds, watermark suppresses duplicates on unchanged boardHead",
+        );
+      } finally {
+        store.postBoardMessage = origPost;
+        await engine.dispose();
+      }
     }
   });
 });

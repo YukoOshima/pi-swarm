@@ -1028,6 +1028,16 @@ function backfillRunState(state: SwarmRunState): SwarmRunState {
         delete member.llmTurns;
       }
     }
+    if (rawMember.lastParkBlockedSeq !== undefined) {
+      const normalizedParkBlocked = normalizeOptionalNonNegativeInt(
+        rawMember.lastParkBlockedSeq,
+      );
+      if (normalizedParkBlocked !== undefined) {
+        member.lastParkBlockedSeq = normalizedParkBlocked;
+      } else {
+        delete member.lastParkBlockedSeq;
+      }
+    }
     if (rawMember.turnStartedAt !== undefined) {
       const normalizedTurnStartedAt = normalizeOptionalNonEmptyString(
         rawMember.turnStartedAt,
@@ -2622,6 +2632,17 @@ export class SwarmStore implements ISwarmStore {
       }
       if (patch.lastPostTime !== undefined) {
         record.lastPostTime = patch.lastPostTime;
+      }
+      if (patch.lastParkBlockedSeq === null) {
+        delete record.lastParkBlockedSeq;
+      } else if (
+        patch.lastParkBlockedSeq !== undefined &&
+        Number.isFinite(patch.lastParkBlockedSeq)
+      ) {
+        record.lastParkBlockedSeq = Math.max(
+          0,
+          Math.floor(patch.lastParkBlockedSeq),
+        );
       }
       if (patch.parkedOn === null) {
         delete record.parkedOn;
