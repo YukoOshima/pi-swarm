@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import {
   type AgentSession,
@@ -1067,15 +1067,31 @@ class ScriptedTransport implements ISwarmTransport {
   }
 }
 
+const PROCESS_TEST_SCRATCH_BASE = mkdtempSync(
+  path.join(os.tmpdir(), `pi-swarm-engine-test-${process.pid}-`),
+);
+let testScratchSeq = 0;
+
+function nextTestScratchRoot(prefix = "harness"): string {
+  testScratchSeq += 1;
+  return path.join(PROCESS_TEST_SCRATCH_BASE, `${prefix}-${testScratchSeq}`);
+}
+
+after(async () => {
+  await rm(PROCESS_TEST_SCRATCH_BASE, { recursive: true, force: true }).catch(() => {});
+});
+
 async function createTestHarness(settings?: Partial<SwarmSettings>) {
   const store = new MockSwarmStore();
   const worktree = new MockWorktreeManager();
   const transport = new ScriptedTransport();
+  const scratchRoot = nextTestScratchRoot();
   let idCounter = 0;
   const engine = new SwarmEngine({
     store,
     worktree,
     transport,
+    scratchRoot,
     settings: {
       stallWatchdogEnabled: false, // opt-in explicitly in watchdog tests
       ...settings,
@@ -1095,7 +1111,7 @@ async function createTestHarness(settings?: Partial<SwarmSettings>) {
     keepWorkersWarm: true,
   });
   await engine.startRun(run.id);
-  return { store, worktree, transport, engine, run };
+  return { store, worktree, transport, engine, run, scratchRoot };
 }
 
 // ============================================================================
@@ -2382,6 +2398,7 @@ describe("SwarmEngine — Verifier Regression Fixes", () => {
       store,
       worktree,
       transport,
+      scratchRoot: nextTestScratchRoot("reg1"),
       settings: { stallWatchdogEnabled: false },
     });
 
@@ -2513,6 +2530,7 @@ describe("SwarmEngine — Verifier Regression Fixes", () => {
       store,
       worktree,
       transport: delayedTransport,
+      scratchRoot: nextTestScratchRoot("cancel"),
       settings: { stallWatchdogEnabled: false },
     });
 
@@ -3898,6 +3916,7 @@ describe("SwarmEngine — v0.3.1 Hardening & Optimizations", () => {
           store,
           worktree: new MockWorktreeManager(),
           transport: new ScriptedTransport(),
+          scratchRoot: nextTestScratchRoot("fresh"),
           settings: { stallWatchdogEnabled: false },
         });
         try {
@@ -3976,6 +3995,7 @@ describe("SwarmEngine — v0.3.1 Hardening & Optimizations", () => {
         store,
         worktree,
         transport,
+        scratchRoot: nextTestScratchRoot("cold-switch"),
         settings: { stallWatchdogEnabled: false, keepWorkersWarm: false },
       });
       const run = await store.createRun({
@@ -4792,6 +4812,7 @@ describe("SwarmEngine & Runtime — v0.3.7 Fixes", () => {
         store,
         worktree,
         transport,
+        scratchRoot: nextTestScratchRoot("cold-wake"),
         settings: { stallWatchdogEnabled: false, keepWorkersWarm: false },
       });
       const run = await store.createRun({
@@ -5667,6 +5688,7 @@ describe("SwarmEngine & Runtime — v0.3.7 Fixes", () => {
       store,
       worktree,
       transport,
+      scratchRoot: nextTestScratchRoot("v040-prop"),
       getSettings: () => currentSettings,
     });
 
@@ -6724,6 +6746,7 @@ describe("SwarmEngine & Runtime — v0.6.0 Diagnostics & Self-Correcting Guards"
       store: coldStore,
       worktree: coldWorktree,
       transport: coldTransport,
+      scratchRoot: nextTestScratchRoot("cold-silent"),
       settings: { stallWatchdogEnabled: false, keepWorkersWarm: false },
     });
     try {
@@ -9215,6 +9238,7 @@ describe("SwarmEngine & Runtime — v0.9.0 Gap Closure", () => {
       store,
       worktree,
       transport,
+      scratchRoot: nextTestScratchRoot("gap2"),
       settings: { stallWatchdogEnabled: false, maxConcurrency: 4 },
     });
 
@@ -9778,6 +9802,7 @@ describe("SwarmEngine & Runtime — v0.9.0 Gap Closure", () => {
       store: realStore,
       worktree,
       transport,
+      scratchRoot: nextTestScratchRoot("gap6"),
       settings: { stallWatchdogEnabled: false },
     });
 
@@ -10172,7 +10197,7 @@ describe("Validator Isolated Scratch Sandbox & Safety-Filter-Safe Member Naming"
     assert.equal(findSafetySensitiveMemberSegment("probe-2"), undefined);
     assert.equal(findSafetySensitiveMemberSegment("hackathon"), undefined);
 
-    const { engine, transport, run } = await createTestHarness();
+    const { engine, transport, run, scratchRoot } = await createTestHarness();
     try {
       // 1. Safety-sensitive handles rejected with actionable suggestion
       for (const badName of ["attack", "attack-1", "db-exploit", "hack2"]) {
@@ -10195,7 +10220,7 @@ describe("Validator Isolated Scratch Sandbox & Safety-Filter-Safe Member Naming"
 
       const valSpawn = transport.spawns.find((s) => s.name === "probe-val");
       assert.ok(valSpawn?.scratchDir, "Validator SpawnMemberRequest must include scratchDir");
-      assert.equal(valSpawn!.scratchDir, getValidatorScratchDir(run.id, "probe-val"));
+      assert.equal(valSpawn!.scratchDir, getValidatorScratchDir(run.id, "probe-val", scratchRoot));
       assert.equal(existsSync(valSpawn!.scratchDir!), true);
       assert.ok(valSpawn!.systemPrompt.includes(valSpawn!.scratchDir!));
       assert.ok(valSpawn!.systemPrompt.includes("STRICTLY READ-ONLY"));
@@ -10247,7 +10272,7 @@ describe("Validator Isolated Scratch Sandbox & Safety-Filter-Safe Member Naming"
       await waitUntil(() => engine.getSnapshot().workingMemberNames.length === 0);
 
       // Verify run scratch root is also cleaned on completeRun
-      const runScratchRoot = getRunValidatorScratchRoot(run.id);
+      const runScratchRoot = getRunValidatorScratchRoot(run.id, scratchRoot);
       await mkdir(path.join(runScratchRoot, "leftover"), { recursive: true });
       await engine.killMember("mitigate-csrf", { force: true, reason: "cleanup test" });
       await engine.manageMission({
@@ -10271,6 +10296,217 @@ describe("Validator Isolated Scratch Sandbox & Safety-Filter-Safe Member Naming"
       assert.equal(existsSync(runScratchRoot), false, "completeRun must clean run scratch root");
     } finally {
       await engine.dispose();
+    }
+  });
+
+  it("isolates concurrent harnesses sharing fixed runId across all 3 compute & 3 delete sites while preserving os.tmpdir() production default (VAL-SCRATCH-001)", async () => {
+    const harnessA = await createTestHarness();
+    const harnessB = await createTestHarness();
+    const harnessCold = await createTestHarness({ keepWorkersWarm: false });
+
+    const defaultStore = new MockSwarmStore();
+    const defaultWorktree = new MockWorktreeManager();
+    const defaultTransport = new ScriptedTransport();
+    const defaultEngine = new SwarmEngine({
+      store: defaultStore,
+      worktree: defaultWorktree,
+      transport: defaultTransport,
+      settings: { stallWatchdogEnabled: false },
+    });
+    const uniqueDefaultRunId = `run_prod_default_${process.pid}_${Date.now()}_${Math.random()
+      .toString(36)
+      .slice(2, 8)}`;
+    const expectedDefaultRunRoot = path.join(
+      path.resolve(os.tmpdir()),
+      "pi-swarm-validator",
+      uniqueDefaultRunId,
+    );
+
+    try {
+      assert.equal(harnessA.run.id, "run-dyn");
+      assert.equal(harnessB.run.id, "run-dyn");
+      assert.notEqual(harnessA.scratchRoot, harnessB.scratchRoot);
+
+      // 1. Overlapping harnesses with identical runId ("run-dyn") provision disjoint scratch directories
+      await Promise.all([
+        harnessA.engine.addMembers({
+          name: "probe-val",
+          role: "validator",
+          brief: "Audit A",
+        }),
+        harnessB.engine.addMembers({
+          name: "probe-val",
+          role: "validator",
+          brief: "Audit B",
+        }),
+      ]);
+      await waitUntil(
+        () =>
+          harnessA.engine.getSnapshot().workingMemberNames.length === 0 &&
+          harnessB.engine.getSnapshot().workingMemberNames.length === 0,
+      );
+
+      const spawnA = harnessA.transport.spawns.find((s) => s.name === "probe-val")!;
+      const spawnB = harnessB.transport.spawns.find((s) => s.name === "probe-val")!;
+      assert.equal(
+        spawnA.scratchDir,
+        getValidatorScratchDir("run-dyn", "probe-val", harnessA.scratchRoot),
+      );
+      assert.equal(
+        spawnB.scratchDir,
+        getValidatorScratchDir("run-dyn", "probe-val", harnessB.scratchRoot),
+      );
+      assert.equal(existsSync(spawnA.scratchDir!), true);
+      assert.equal(existsSync(spawnB.scratchDir!), true);
+
+      const artifactB = path.join(spawnB.scratchDir!, "keep-alive.txt");
+      await writeFile(path.join(spawnA.scratchDir!, "temp-a.txt"), "A", "utf8");
+      await writeFile(artifactB, "B", "utf8");
+
+      // Delete site 1: killMember on harnessA cleans only harnessA's validator scratchDir
+      await harnessA.engine.killMember("probe-val", { reason: "retire A1" });
+      assert.equal(existsSync(spawnA.scratchDir!), false);
+      assert.equal(existsSync(artifactB), true, "harnessA killMember must not touch harnessB scratchDir");
+
+      // Delete site 3: teardown on harnessA cleans only harnessA's run scratch root
+      await harnessA.engine.addMembers({
+        name: "probe-val-2",
+        role: "validator",
+        brief: "Audit A2",
+      });
+      await waitUntil(() => harnessA.engine.getSnapshot().workingMemberNames.length === 0);
+      const runRootA = getRunValidatorScratchRoot("run-dyn", harnessA.scratchRoot);
+      assert.equal(existsSync(runRootA), true);
+      await harnessA.engine.teardown({ runId: "run-dyn", force: true });
+      assert.equal(existsSync(runRootA), false, "teardown must clean harnessA run scratch root");
+      assert.equal(existsSync(artifactB), true, "harnessA teardown must not touch harnessB scratchDir");
+
+      // Delete site 2: completeRun on harnessA cleans only harnessA's run scratch root
+      await mkdir(path.join(runRootA, "leftover"), { recursive: true });
+      await harnessA.engine.killMember("probe-val-2", { reason: "retire A2" });
+      await harnessA.engine.completeRun({ summary: "Done A", callerRole: "orchestrator" });
+      assert.equal(existsSync(runRootA), false, "completeRun must clean harnessA run scratch root");
+      assert.equal(existsSync(artifactB), true, "harnessA completeRun must not touch harnessB scratchDir");
+
+      // Compute site 2: wakeWaitingMember recreates and injects harnessB's overridden scratchDir
+      await rm(spawnB.scratchDir!, { recursive: true, force: true });
+      assert.equal(existsSync(spawnB.scratchDir!), false);
+      await harnessB.engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        text: "@probe-val re-audit after fix",
+      });
+      await waitUntil(
+        () =>
+          (harnessB.transport.handles.get("probe-val")?.wakePrompts.length ?? 0) >= 1 &&
+          harnessB.engine.getSnapshot().workingMemberNames.length === 0,
+      );
+      assert.equal(existsSync(spawnB.scratchDir!), true, "wakeWaitingMember must recreate overridden scratchDir");
+      assert.ok(
+        harnessB.transport.handles.get("probe-val")!.wakePrompts[0]!.includes(spawnB.scratchDir!),
+        "Wake prompt must reference overridden scratchDir",
+      );
+
+      // Compute site 3: reviveMemberWithPendingWakes recreates and injects overridden scratchDir
+      let coldTurns = 0;
+      harnessCold.transport.onMember("probe-val", async () => {
+        coldTurns += 1;
+        return { outcome: "stopped", summary: `cold turn ${coldTurns}` };
+      });
+      await harnessCold.engine.addMembers({
+        name: "probe-val",
+        role: "validator",
+        brief: "Cold validator",
+      });
+      await waitUntil(
+        () =>
+          coldTurns === 1 &&
+          harnessCold.engine.getSnapshot().run?.members["probe-val"]?.state === "stopped",
+      );
+      const expectedColdScratch = getValidatorScratchDir(
+        "run-dyn",
+        "probe-val",
+        harnessCold.scratchRoot,
+      );
+      await rm(expectedColdScratch, { recursive: true, force: true });
+      assert.equal(existsSync(expectedColdScratch), false);
+
+      await harnessCold.engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        text: "@probe-val revive and re-check",
+      });
+      await waitUntil(
+        () =>
+          coldTurns === 2 &&
+          harnessCold.engine.getSnapshot().run?.members["probe-val"]?.state === "stopped",
+      );
+      assert.equal(
+        existsSync(expectedColdScratch),
+        true,
+        "reviveMemberWithPendingWakes must recreate overridden scratchDir",
+      );
+      assert.equal(harnessCold.transport.spawns.length, 2);
+      assert.equal(harnessCold.transport.spawns[1]!.scratchDir, expectedColdScratch);
+      assert.ok(harnessCold.transport.spawns[1]!.systemPrompt.includes(expectedColdScratch));
+      assert.ok(harnessCold.transport.spawns[1]!.initialPrompt.includes(expectedColdScratch));
+
+      // 2. Production default (no scratchRoot override) still uses <os.tmpdir()>/pi-swarm-validator/<runId>/<member>
+      assert.equal(getRunValidatorScratchRoot(uniqueDefaultRunId), expectedDefaultRunRoot);
+      assert.equal(getRunValidatorScratchRoot(uniqueDefaultRunId, "   "), expectedDefaultRunRoot);
+
+      await defaultStore.createRun({
+        id: uniqueDefaultRunId,
+        title: "Default Scratch Root Check",
+        objective: "Verify unchanged os.tmpdir() default",
+        baseBranch: "main",
+        ownerSessionId: "sess-default",
+        validatorEnabled: true,
+      });
+      await defaultEngine.startRun(uniqueDefaultRunId);
+
+      await defaultEngine.addMembers({
+        name: "val-default-1",
+        role: "validator",
+        brief: "Default scratch check 1",
+      });
+      await waitUntil(() => defaultEngine.getSnapshot().workingMemberNames.length === 0);
+
+      const defaultSpawn1 = defaultTransport.spawns.find((s) => s.name === "val-default-1")!;
+      const expectedDefaultMember1 = path.join(expectedDefaultRunRoot, "val-default-1");
+      assert.equal(defaultSpawn1.scratchDir, expectedDefaultMember1);
+      assert.equal(existsSync(expectedDefaultMember1), true);
+
+      await defaultEngine.killMember("val-default-1", { reason: "done 1" });
+      assert.equal(existsSync(expectedDefaultMember1), false, "killMember cleans default scratchDir");
+
+      await defaultEngine.addMembers({
+        name: "val-default-2",
+        role: "validator",
+        brief: "Default scratch check 2",
+      });
+      await waitUntil(() => defaultEngine.getSnapshot().workingMemberNames.length === 0);
+      assert.equal(existsSync(path.join(expectedDefaultRunRoot, "val-default-2")), true);
+
+      await defaultEngine.teardown({ runId: uniqueDefaultRunId, force: true });
+      assert.equal(existsSync(expectedDefaultRunRoot), false, "teardown cleans default run scratch root");
+
+      await mkdir(path.join(expectedDefaultRunRoot, "leftover"), { recursive: true });
+      await defaultEngine.killMember("val-default-2", { reason: "done 2" });
+      await defaultEngine.completeRun({ summary: "Default complete", callerRole: "orchestrator" });
+      assert.equal(
+        existsSync(expectedDefaultRunRoot),
+        false,
+        "completeRun cleans default run scratch root",
+      );
+    } finally {
+      await Promise.all([
+        harnessA.engine.dispose(),
+        harnessB.engine.dispose(),
+        harnessCold.engine.dispose(),
+        defaultEngine.dispose(),
+      ]);
+      await rm(expectedDefaultRunRoot, { recursive: true, force: true }).catch(() => {});
     }
   });
 });

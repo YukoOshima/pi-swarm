@@ -553,16 +553,21 @@ function sanitizeScratchSegment(raw: string): string {
   return clean.slice(0, 64) || "default";
 }
 
+function resolveScratchTmpRoot(tmpRoot?: string): string {
+  const trimmed = tmpRoot?.trim();
+  return path.resolve(trimmed || os.tmpdir());
+}
+
 /**
- * Returns the run-scoped root directory under `os.tmpdir()` holding isolated
- * scratch directories for `role: "validator"` sessions in `runId`.
+ * Returns the run-scoped root directory under `tmpRoot` (defaulting to `os.tmpdir()`)
+ * holding isolated scratch directories for `role: "validator"` sessions in `runId`.
  */
 export function getRunValidatorScratchRoot(
   runId: string,
   tmpRoot: string = os.tmpdir(),
 ): string {
   return path.join(
-    path.resolve(tmpRoot),
+    resolveScratchTmpRoot(tmpRoot),
     "pi-swarm-validator",
     sanitizeScratchSegment(runId),
   );
