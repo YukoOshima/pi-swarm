@@ -9891,10 +9891,23 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       assert.equal((await store.loadRun(run3Id)).status, "completed");
       await host.runCommand("swarm", "exit");
 
-      await host.runCommand("swarm-direct", "Fresh session after exit");
+      // 4. Regression (#43a): Passive inspect via `/swarm focus <completedRunId>` after `/swarm exit`
+      //    (both in-memory AND across reload) MUST NOT re-enable carryover into Run 4!
+      await host.runCommand("swarm", `focus ${run3Id}`);
+      assert.deepEqual(
+        host.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)),
+        [...IDLE_SWARM_TOOLS],
+      );
+      await host.emit("session_start", { reason: "reload" });
+      assert.deepEqual(
+        host.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)),
+        [...IDLE_SWARM_TOOLS],
+      );
+
+      await host.runCommand("swarm-direct", "Fresh session after exit + passive focus");
       const plan4 = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
         title: "Mission 4 Fresh",
-        objective: "Fresh start after /swarm exit",
+        objective: "Fresh start after /swarm exit and passive focus",
         strategy: "Fresh",
         acceptance_criteria: "Starter library",
         base_branch: "main",
@@ -9914,9 +9927,208 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       assert.equal(
         await store.readLibraryTopic(run4Id, "environment"),
         "# Environment\n\n",
-        "After explicit /swarm exit, a new run starts with clean starter library",
+        "After explicit /swarm exit + passive /swarm focus on completed run, a new run MUST NOT inherit pre-exit library",
       );
+
+      // Seed Run 4's own architecture note and enter Standby on `host`
+      await host.executeTool(SWARM_TOOL, {
+        action: "mission",
+        mission_op: "write_library",
+        library_topic: "architecture",
+        library_content: "- Run 4 own standby lineage note.\n",
+        library_append: true,
+      });
+      const run4ArchOwn = await store.readLibraryTopic(run4Id, "architecture");
       await host.runCommand("swarm", "done --force Mission 4 complete");
+      assert.equal((await store.loadRun(run4Id)).status, "completed");
+
+      // 5. Regression (#43b): Focusing a foreign OR unowned completed run during Standby MUST NOT
+      //    replace this session's real carryover source in memory OR reseed it across reload/tree!
+      const foreignCompletedRun = await store.createRun({
+        title: "Foreign Completed Run",
+        objective: "Foreign session library",
+        strategy: "Foreign",
+        acceptanceCriteria: "Done",
+        baseBranch: "main",
+        ownerSessionId: "sess-foreign-other",
+        ownerPid: 0,
+      });
+      await store.writeLibraryTopic(
+        foreignCompletedRun.id,
+        "architecture",
+        "# Architecture\n\n- FOREIGN_SECRET_ARCH\n",
+      );
+      await store.writeLibraryTopic(
+        foreignCompletedRun.id,
+        "environment",
+        "# Environment\n\n- FOREIGN_PORT_9999\n",
+      );
+      await store.updateRun(foreignCompletedRun.id, {
+        status: "completed",
+        actor: "human",
+      });
+
+      const unownedCompletedRun = await store.createRun({
+        title: "Unowned Completed Run",
+        objective: "Unowned library",
+        strategy: "Unowned",
+        acceptanceCriteria: "Done",
+        baseBranch: "main",
+        ownerSessionId: "sess-temp-before-detach",
+        ownerPid: 0,
+      });
+      await store.writeLibraryTopic(
+        unownedCompletedRun.id,
+        "architecture",
+        "# Architecture\n\n- UNOWNED_SECRET_ARCH\n",
+      );
+      await store.writeLibraryTopic(
+        unownedCompletedRun.id,
+        "environment",
+        "# Environment\n\n- UNOWNED_PORT_8888\n",
+      );
+      await store.updateRun(unownedCompletedRun.id, {
+        status: "completed",
+        ownerSessionId: "",
+        ownerPid: 0,
+        actor: "human",
+      });
+
+      // (5a) In-memory Standby: focus foreign completed run AND unowned completed run, then launch Run 5
+      await host.runCommand("swarm", `focus ${foreignCompletedRun.id}`);
+      await host.runCommand("swarm", `focus ${unownedCompletedRun.id}`);
+      const plan5 = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+        title: "Mission 5 Own Lineage",
+        objective: "Must inherit Run 4, never foreign/unowned",
+        strategy: "Standby follow-up",
+        acceptance_criteria: "Own lineage preserved",
+        base_branch: "main",
+        assertions: [{ id: "VAL-LIB-005", title: "Lib 5", description: "Lib 5" }],
+        features: [
+          {
+            id: "lib-feat-5",
+            title: "Lib feat 5",
+            description: "Own lineage",
+            milestone: "M1",
+            fulfills: ["VAL-LIB-005"],
+          },
+        ],
+      });
+      assert.equal(plan5.isError, undefined, JSON.stringify(plan5));
+      const run5Id: string = plan5.details.runId;
+      assert.equal(
+        await store.readLibraryTopic(run5Id, "architecture"),
+        run4ArchOwn,
+        "Standby launch after focusing foreign/unowned completed runs must inherit own Run 4 library",
+      );
+      assert.equal(
+        await store.readLibraryTopic(run5Id, "environment"),
+        "# Environment\n\n",
+        "Focused foreign/unowned completed run environment must never leak",
+      );
+
+      await host.executeTool(SWARM_TOOL, {
+        action: "mission",
+        mission_op: "write_library",
+        library_topic: "architecture",
+        library_content: "- Run 5 lineage preserved across reload.\n",
+        library_append: true,
+      });
+      const run5ArchOwn = await store.readLibraryTopic(run5Id, "architecture");
+      await host.runCommand("swarm", "done --force Mission 5 complete");
+
+      // (5b) Across reload & session_tree while focused on unowned completed run during Standby:
+      await host.runCommand("swarm", `focus ${unownedCompletedRun.id}`);
+      const branchFocusedUnowned = [...host.branch];
+      const reloadedStandby = createMockPiHarness(repoDir, {
+        mode: "tui",
+        sessionId: "sess-val-synth-002",
+      });
+      reloadedStandby.branch.push(...branchFocusedUnowned);
+      createPiSwarmExtension({
+        transportFactory: makeTransport,
+        settingsLoader: async () => ({
+          ...DEFAULT_SWARM_SETTINGS,
+          stallWatchdogEnabled: false,
+        }),
+      })(reloadedStandby.pi);
+      await reloadedStandby.emit("session_start", { reason: "reload" });
+      await reloadedStandby.emit("session_tree", {});
+
+      const plan6 = await reloadedStandby.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+        title: "Mission 6 After Reload On Unowned Focus",
+        objective: "Must inherit Run 5 across reload, never unowned",
+        strategy: "Standby follow-up",
+        acceptance_criteria: "Own lineage after reload",
+        base_branch: "main",
+        assertions: [{ id: "VAL-LIB-006", title: "Lib 6", description: "Lib 6" }],
+        features: [
+          {
+            id: "lib-feat-6",
+            title: "Lib feat 6",
+            description: "Own lineage after reload",
+            milestone: "M1",
+            fulfills: ["VAL-LIB-006"],
+          },
+        ],
+      });
+      assert.equal(plan6.isError, undefined, JSON.stringify(plan6));
+      const run6Id: string = plan6.details.runId;
+      assert.equal(
+        await store.readLibraryTopic(run6Id, "architecture"),
+        run5ArchOwn,
+        "Reload while focused on unowned completed run must preserve own Run 5 standby lineage",
+      );
+      assert.equal(await store.readLibraryTopic(run6Id, "environment"), "# Environment\n\n");
+      await reloadedStandby.runCommand("swarm", "done --force Mission 6 complete");
+
+      // (5c) Null-lineage Standby session focusing unowned completed run + reload starts clean (never reseeds unowned)
+      const emptyStandby = createMockPiHarness(repoDir, {
+        mode: "tui",
+        sessionId: "sess-empty-standby-lib",
+      });
+      emptyStandby.pi.appendEntry(SWARM_FOCUS_ENTRY, {
+        version: 2,
+        runId: null,
+        sessionId: "sess-empty-standby-lib",
+        orchestratorMode: true,
+        autoConfirmDefault: true,
+      });
+      createPiSwarmExtension({
+        transportFactory: makeTransport,
+        settingsLoader: async () => ({
+          ...DEFAULT_SWARM_SETTINGS,
+          stallWatchdogEnabled: false,
+        }),
+      })(emptyStandby.pi);
+      await emptyStandby.emit("session_start", { reason: "startup" });
+      await emptyStandby.runCommand("swarm", `focus ${unownedCompletedRun.id}`);
+      await emptyStandby.emit("session_start", { reason: "reload" });
+      const plan7 = await emptyStandby.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+        title: "Mission 7 Empty Standby",
+        objective: "Must not reseed from unowned completed run",
+        strategy: "Standby",
+        acceptance_criteria: "Clean starter",
+        base_branch: "main",
+        assertions: [{ id: "VAL-LIB-007", title: "Lib 7", description: "Lib 7" }],
+        features: [
+          {
+            id: "lib-feat-7",
+            title: "Lib feat 7",
+            description: "Clean starter",
+            milestone: "M1",
+            fulfills: ["VAL-LIB-007"],
+          },
+        ],
+      });
+      assert.equal(plan7.isError, undefined, JSON.stringify(plan7));
+      const run7Id: string = plan7.details.runId;
+      assert.equal(await store.readLibraryTopic(run7Id, "architecture"), "# Architecture\n\n");
+      assert.equal(await store.readLibraryTopic(run7Id, "environment"), "# Environment\n\n");
+
+      await emptyStandby.runCommand("swarm", "done --force Mission 7 complete");
+      await emptyStandby.emit("session_shutdown", { reason: "quit" });
+      await reloadedStandby.emit("session_shutdown", { reason: "quit" });
       await host.emit("session_shutdown", { reason: "quit" });
     } finally {
       if (origSetHuman) {

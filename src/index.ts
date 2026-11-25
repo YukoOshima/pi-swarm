@@ -3618,6 +3618,91 @@ export function createPiSwarmExtension(
       return run.ownerSessionId === sid;
     }
 
+    function rehydrateStandbyLineageCandidates(
+      ctx: Pick<ExtensionContext, "sessionManager"> | undefined,
+      currentSessionId: string,
+    ): string[] {
+      if (!ctx?.sessionManager || !currentSessionId) {
+        return [];
+      }
+      const branch = ctx.sessionManager.getBranch();
+      const candidates: string[] = [];
+      const seen = new Set<string>();
+      for (let i = branch.length - 1; i >= 0; i--) {
+        const entry = branch[i];
+        if (
+          !entry ||
+          entry.type !== "custom" ||
+          entry.customType !== SWARM_FOCUS_ENTRY
+        ) {
+          continue;
+        }
+        const data = entry.data as Partial<SwarmFocusEntry> | undefined;
+        if (
+          !data ||
+          typeof data !== "object" ||
+          data.version !== SWARM_FOCUS_VERSION
+        ) {
+          break;
+        }
+        const entrySessionId =
+          typeof data.sessionId === "string" ? data.sessionId.trim() : "";
+        if (!entrySessionId || entrySessionId !== currentSessionId) {
+          continue;
+        }
+        if (data.orchestratorMode === false) {
+          break;
+        }
+        const reason =
+          typeof data.reason === "string" ? data.reason.trim() : "";
+        if (reason === "user_focus") {
+          continue;
+        }
+        const runId =
+          typeof data.runId === "string" && data.runId.trim().length > 0
+            ? data.runId.trim()
+            : null;
+        if (runId && !seen.has(runId)) {
+          seen.add(runId);
+          candidates.push(runId);
+        }
+      }
+      return candidates;
+    }
+
+    async function resolveStandbyLineageCompletedRunId(
+      store: ISwarmStore,
+      ctx: Pick<ExtensionContext, "sessionManager"> | undefined,
+      sessionId: string,
+    ): Promise<string | null> {
+      if (!orchestratorMode || !sessionId) {
+        return null;
+      }
+      const orderedIds: string[] = [];
+      if (lastCompletedRunId) {
+        orderedIds.push(lastCompletedRunId);
+      }
+      for (const branchRunId of rehydrateStandbyLineageCandidates(
+        ctx,
+        sessionId,
+      )) {
+        if (!orderedIds.includes(branchRunId)) {
+          orderedIds.push(branchRunId);
+        }
+      }
+      for (const candidateId of orderedIds) {
+        const candidate = await store.loadRun(candidateId).catch(() => null);
+        if (
+          candidate?.status === "completed" &&
+          Boolean(candidate.ownerSessionId) &&
+          candidate.ownerSessionId === sessionId
+        ) {
+          return candidate.id;
+        }
+      }
+      return null;
+    }
+
     function persistCurrentFocus(
       runId: string | null,
       sessionId: string,
@@ -4680,15 +4765,28 @@ export function createPiSwarmExtension(
           activatedRunIds.delete(ev.runId);
           resetGoalContinuation(ev.runId);
         }
-        if (ev.snapshot.run && isCurrentSessionOwner(ev.snapshot.run, lastCtx)) {
+        const currentSidOnFinish = getCurrentSessionId(lastCtx);
+        if (
+          ev.snapshot.run &&
+          Boolean(ev.snapshot.run.ownerSessionId) &&
+          ev.snapshot.run.ownerSessionId === currentSidOnFinish
+        ) {
           lastCompletedRunId = ev.snapshot.run.id;
           if (!orchestratorMode) {
             orchestratorMode = true;
           }
-          if (lastCtx?.sessionManager && rehydrateFocusState(lastCtx).orchestratorMode !== true) {
+          const latestFocus = lastCtx?.sessionManager
+            ? rehydrateFocusState(lastCtx)
+            : undefined;
+          if (
+            lastCtx?.sessionManager &&
+            (latestFocus?.orchestratorMode !== true ||
+              latestFocus.runId !== ev.snapshot.run.id ||
+              latestFocus.reason === "user_focus")
+          ) {
             persistCurrentFocus(
               ev.snapshot.run.id,
-              getCurrentSessionId(lastCtx),
+              currentSidOnFinish,
               "run_finished",
             );
           }
@@ -4997,14 +5095,13 @@ export function createPiSwarmExtension(
         autoConfirmDefault = false;
       }
 
-      if (
-        snapshot.run?.status === "completed" &&
-        (!snapshot.run.ownerSessionId ||
-          snapshot.run.ownerSessionId === currentSessionId)
-      ) {
-        lastCompletedRunId = snapshot.run.id;
-      } else if (!orchestratorMode) {
-        lastCompletedRunId = null;
+      lastCompletedRunId = null;
+      if (orchestratorMode) {
+        lastCompletedRunId = await resolveStandbyLineageCompletedRunId(
+          store,
+          ctx,
+          currentSessionId,
+        );
       }
 
       if ((hasFocusedRun && snapshot.run) || orchestratorMode) {
@@ -5226,9 +5323,14 @@ export function createPiSwarmExtension(
               orchestratorMode = true;
             }
             lastCompletedRunId = completed.id;
+            const latestToolFocus = lastCtx?.sessionManager
+              ? rehydrateFocusState(lastCtx)
+              : undefined;
             if (
               lastCtx?.sessionManager &&
-              rehydrateFocusState(lastCtx).orchestratorMode !== true
+              (latestToolFocus?.orchestratorMode !== true ||
+                latestToolFocus.runId !== completed.id ||
+                latestToolFocus.reason === "user_focus")
             ) {
               persistCurrentFocus(
                 completed.id,
@@ -5593,33 +5695,11 @@ export function createPiSwarmExtension(
         }
       }
 
-      let priorCompletedRunId: string | null = null;
-      if (
-        prevRunBefore?.status === "completed" &&
-        (!prevRunBefore.ownerSessionId ||
-          prevRunBefore.ownerSessionId === ownerSessionId)
-      ) {
-        priorCompletedRunId = prevRunBefore.id;
-      } else if (orchestratorMode && lastCompletedRunId) {
-        const candidate = await store.loadRun(lastCompletedRunId).catch(() => null);
-        if (
-          candidate?.status === "completed" &&
-          (!candidate.ownerSessionId || candidate.ownerSessionId === ownerSessionId)
-        ) {
-          priorCompletedRunId = candidate.id;
-        }
-      } else if (orchestratorMode && ownerSessionId) {
-        const recentCompleted = (await listRunsCached(store, true).catch(() => []))
-          .slice()
-          .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
-          .find(
-            (r) =>
-              r.status === "completed" && r.ownerSessionId === ownerSessionId,
-          );
-        if (recentCompleted) {
-          priorCompletedRunId = recentCompleted.id;
-        }
-      }
+      const priorCompletedRunId = await resolveStandbyLineageCompletedRunId(
+        store,
+        toolCtx,
+        ownerSessionId,
+      );
 
       // 3. Create v2 Swarm run in store (including Mission-Level TDD artifacts when present)
       const initialMilestones =
@@ -7591,7 +7671,12 @@ export function createPiSwarmExtension(
           orchestratorMode = true;
         }
         lastCompletedRunId = completed.id;
-        if (rehydrateFocusState(ctx).orchestratorMode !== true) {
+        const latestDoneFocus = rehydrateFocusState(ctx);
+        if (
+          latestDoneFocus.orchestratorMode !== true ||
+          latestDoneFocus.runId !== completed.id ||
+          latestDoneFocus.reason === "user_focus"
+        ) {
           persistCurrentFocus(completed.id, sessionId, "run_completed");
         }
         purgePendingWakeupsForRun(completed.id);
@@ -9997,6 +10082,9 @@ export function createPiSwarmExtension(
           autoConfirmDefault = focusState.orchestratorMode
             ? Boolean(focusState.autoConfirmDefault)
             : false;
+          if (!orchestratorMode) {
+            lastCompletedRunId = null;
+          }
         }
         const snapAfterFocus = getSnapshotSafe();
         draftController.rehydrate(ctx, {
