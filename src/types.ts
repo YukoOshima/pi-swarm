@@ -1240,7 +1240,11 @@ export interface MemberEngineBridge {
   manageMission?(input: ManageMissionInput): Promise<ManageMissionResult>;
   waitForBoard?(options: WaitForBoardOptions): Promise<WaitForBoardResult>;
   /** Synchronously inspect live member channels & groupPrefix for `swarm_wait` wake matching. */
-  getMemberContext?(): { channels: readonly string[]; groupPrefix?: string };
+  getMemberContext?(): {
+    channels: readonly string[];
+    broadcastChannels?: readonly string[];
+    groupPrefix?: string;
+  };
   /** Record the unread matching `seq` that blocked a `swarm_wait` park attempt. */
   recordParkBlocked?(seq: number): Promise<void>;
 }

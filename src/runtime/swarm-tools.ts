@@ -2990,10 +2990,27 @@ export function createMemberScopedTools(
       ),
     }),
     async execute(_toolCallId, params) {
+      type MemberSwarmWaitDetails = {
+        member: string;
+        since: number;
+        mentionsOnly: boolean;
+        parked: boolean;
+        blockedBySeq?: number;
+        unreadSeqs?: number[];
+        error?: string;
+        errorCode?: string;
+      };
+
       const since = Number.isFinite(params.since) ? Math.max(0, Math.floor(params.since)) : 0;
       const mentionsOnly = params.mentions_only ?? true;
 
-      let liveCtx: { channels: readonly string[]; groupPrefix?: string } | undefined;
+      let liveCtx:
+        | {
+            channels: readonly string[];
+            broadcastChannels?: readonly string[];
+            groupPrefix?: string;
+          }
+        | undefined;
       try {
         liveCtx = bridge.getMemberContext?.();
       } catch {
@@ -3010,53 +3027,58 @@ export function createMemberScopedTools(
         ...rawChannels.map((c) => c.toLowerCase()),
       ]);
       const nonMainSubscribedChannels = new Set<string>(
-        Array.from(subscribedChannels).filter((c) => c !== DEFAULT_CHANNEL),
+        liveCtx?.broadcastChannels
+          ? liveCtx.broadcastChannels
+              .map((c) => c.toLowerCase())
+              .filter((c) => c !== DEFAULT_CHANNEL)
+          : Array.from(subscribedChannels).filter((c) => c !== DEFAULT_CHANNEL),
       );
       const selfLower = member.name.toLowerCase();
       const groupPrefixLower =
         (liveCtx?.groupPrefix ?? member.groupPrefix)?.trim().toLowerCase() ||
         undefined;
 
-      const boardRes = await Promise.resolve(
-        bridge.readBoard({ since, limit: 20, peek: true }),
-      ).catch(() => ({ messages: [] as BoardMessage[], head: since }));
+      const PAGE_SIZE = 20;
+      const matching: BoardMessage[] = [];
+      let cursor = since;
+      let targetHead: number | undefined;
+      let latestHead = since;
 
-      let candidates = Array.isArray(boardRes?.messages) ? boardRes.messages : [];
-      let latestHead =
-        typeof boardRes?.head === "number" && Number.isFinite(boardRes.head)
-          ? boardRes.head
-          : since;
+      try {
+        while (true) {
+          const boardRes = await Promise.resolve(
+            bridge.readBoard({
+              since: cursor,
+              limit: PAGE_SIZE,
+              channel: "*",
+              peek: true,
+            }),
+          );
+          const pageMessages = Array.isArray(boardRes?.messages)
+            ? boardRes.messages
+            : [];
+          const resHead =
+            typeof boardRes?.head === "number" && Number.isFinite(boardRes.head)
+              ? Math.max(0, Math.floor(boardRes.head))
+              : since;
+          if (resHead > latestHead) {
+            latestHead = resHead;
+          }
 
-      let matching = candidates.filter(
-        (msg) =>
-          msg.seq > since &&
-          doesUnreadMessageBlockMemberPark(
-            msg,
-            selfLower,
-            groupPrefixLower,
-            mentionsOnly,
-            subscribedChannels,
-            nonMainSubscribedChannels,
-          ),
-      );
-
-      if (
-        matching.length === 0 &&
-        candidates.length === 20 &&
-        candidates[candidates.length - 1]!.seq < latestHead
-      ) {
-        const pageSince = candidates[candidates.length - 1]!.seq;
-        const moreRes = await Promise.resolve(
-          bridge.readBoard({ since: pageSince, limit: 100, peek: true }),
-        ).catch(() => ({ messages: [] as BoardMessage[], head: latestHead }));
-        if (typeof moreRes?.head === "number" && moreRes.head > latestHead) {
-          latestHead = moreRes.head;
-        }
-        if (Array.isArray(moreRes?.messages) && moreRes.messages.length > 0) {
-          candidates = moreRes.messages;
-          matching = candidates.filter(
-            (msg) =>
-              msg.seq > since &&
+          let maxPageSeq = cursor;
+          for (const msg of pageMessages) {
+            if (
+              !msg ||
+              typeof msg.seq !== "number" ||
+              !Number.isFinite(msg.seq)
+            ) {
+              continue;
+            }
+            if (msg.seq > maxPageSeq) {
+              maxPageSeq = msg.seq;
+            }
+            if (
+              msg.seq > cursor &&
               doesUnreadMessageBlockMemberPark(
                 msg,
                 selfLower,
@@ -3064,9 +3086,48 @@ export function createMemberScopedTools(
                 mentionsOnly,
                 subscribedChannels,
                 nonMainSubscribedChannels,
-              ),
-          );
+              )
+            ) {
+              matching.push(msg);
+            }
+          }
+
+          if (targetHead === undefined) {
+            targetHead = Math.max(resHead, maxPageSeq);
+          }
+
+          if (
+            pageMessages.length === 0 ||
+            maxPageSeq <= cursor ||
+            maxPageSeq >= targetHead
+          ) {
+            break;
+          }
+          cursor = maxPageSeq;
         }
+      } catch (err) {
+        const rawErr = err instanceof Error ? err.message : String(err);
+        const prefix = isSwarmProtocolError(err)
+          ? `[SwarmProtocolError:${err.code}] ${err.message}`
+          : `Error: ${rawErr}`;
+        const errDetails: MemberSwarmWaitDetails = {
+          member: member.name,
+          since,
+          mentionsOnly,
+          parked: false,
+          error: rawErr,
+          ...(isSwarmProtocolError(err) ? { errorCode: err.code } : {}),
+        };
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `${prefix} (failed to verify unread board messages before swarm_wait; retry read_board{since: ${since}} before calling swarm_wait again).`,
+            },
+          ],
+          details: errDetails,
+        };
       }
 
       if (matching.length > 0) {
@@ -3084,14 +3145,14 @@ export function createMemberScopedTools(
           .join(", ");
         const overflow =
           matching.length > 6 ? `, +${matching.length - 6} more` : "";
-        const blockedDetails: {
-          member: string;
-          since: number;
-          mentionsOnly: boolean;
-          parked: boolean;
-          blockedBySeq?: number;
-          unreadSeqs?: number[];
-        } = {
+        const hasCrossChannelMatch = matching.some(
+          (m) =>
+            !subscribedChannels.has((m.channel || DEFAULT_CHANNEL).toLowerCase()),
+        );
+        const readArgs = hasCrossChannelMatch
+          ? `since: ${since}, channel: "*"`
+          : `since: ${since}`;
+        const blockedDetails: MemberSwarmWaitDetails = {
           member: member.name,
           since,
           mentionsOnly,
@@ -3103,7 +3164,7 @@ export function createMemberScopedTools(
           content: [
             {
               type: "text",
-              text: `[board] New message(s) arrived since #${since} (head #${head}): ${preview}${overflow}. Call read_board{since: ${since}} before calling swarm_wait again.`,
+              text: `[board] New message(s) arrived since #${since} (head #${head}): ${preview}${overflow}. Call read_board{${readArgs}} before calling swarm_wait again.`,
             },
           ],
           details: blockedDetails,
@@ -3111,14 +3172,7 @@ export function createMemberScopedTools(
       }
 
       member.onWaitRecorded?.({ since, mentionsOnly });
-      const parkedDetails: {
-        member: string;
-        since: number;
-        mentionsOnly: boolean;
-        parked: boolean;
-        blockedBySeq?: number;
-        unreadSeqs?: number[];
-      } = {
+      const parkedDetails: MemberSwarmWaitDetails = {
         member: member.name,
         since,
         mentionsOnly,

@@ -10995,7 +10995,167 @@ describe("AGY Stop-Hook Race Lock & Anti-Noise Monitor Hygiene (VAL-AGY-001, VAL
       assert.equal(cleanAfterCatchup.details.parked, true);
       assert.equal(recordedWaits.length, 2);
 
-      // 6. Stub bridge compatibility (no recordParkBlocked / getMemberContext)
+      // 6. Cross-channel wake routing parity on REAL SwarmEngine bridge:
+      //    direct/group/all/@#ops posted inside unsubscribed #other MUST block swarm_wait, while archived @#legacy does not!
+      await engine.manageChannel({ action: "create", name: "legacy", topic: "Legacy" });
+      await engine.manageChannel({ action: "join", name: "legacy", member: "worker-1" });
+      await engine.manageChannel({ action: "archive", name: "legacy" });
+
+      const crossBase = engine.getSnapshot().boardHead;
+      await store.postBoardMessage("run-dyn", {
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        channel: "other",
+        text: "@#legacy archived broadcast should be ignored",
+        channelMentions: ["legacy"],
+      });
+      await engine.attachRun("run-dyn");
+      const waitsBeforeArchivedCheck = recordedWaits.length;
+      const archivedClean = (await workerWait.execute(
+        "tc-archived-clean",
+        { since: crossBase },
+        undefined,
+        undefined,
+        dummyCtx,
+      )) as unknown as { terminate?: boolean; details: { parked: boolean } };
+      assert.equal(archivedClean.terminate, true);
+      assert.equal(archivedClean.details.parked, true);
+      assert.equal(recordedWaits.length, waitsBeforeArchivedCheck + 1);
+
+      const crossStart = engine.getSnapshot().boardHead;
+      const crossDirect = await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        channel: "other",
+        text: "@worker-1 cross-channel direct mention from #other",
+      });
+      const crossGroup = await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        channel: "other",
+        text: "@worker cross-channel group mention from #other",
+      });
+      const crossAll = await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        channel: "other",
+        text: "@all cross-channel global notice from #other",
+      });
+      const crossOpsBroadcast = await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        channel: "other",
+        text: "@#ops cross-channel broadcast from #other",
+      });
+      await waitUntil(() => engine.getSnapshot().workingMemberNames.length === 0);
+
+      const crossBlocked = (await workerWait.execute(
+        "tc-cross-blocked",
+        { since: crossStart },
+        undefined,
+        undefined,
+        dummyCtx,
+      )) as unknown as {
+        content: Array<{ text: string }>;
+        terminate?: boolean;
+        details: { parked: boolean; blockedBySeq?: number; unreadSeqs?: number[] };
+      };
+      assert.equal(crossBlocked.terminate, undefined);
+      assert.equal(crossBlocked.details.parked, false);
+      assert.equal(crossBlocked.details.blockedBySeq, crossOpsBroadcast.seq);
+      assert.deepEqual(crossBlocked.details.unreadSeqs, [
+        crossDirect.seq,
+        crossGroup.seq,
+        crossAll.seq,
+        crossOpsBroadcast.seq,
+      ]);
+      assert.match(
+        crossBlocked.content[0]!.text,
+        /read_board\{since: \d+, channel: "\*"\}/,
+      );
+
+      // 7. Long board pagination (>121 unread posts on real bridge):
+      //    (a) 130 unread posts where ONLY #130 mentions worker-1 -> blocks with blockedBySeq = #130
+      const longBaseA = engine.getSnapshot().boardHead;
+      for (let i = 1; i <= 129; i += 1) {
+        await engine.postMessage({
+          from: ORCHESTRATOR_NAME,
+          fromRole: "orchestrator",
+          text: `Background chatter line ${i}`,
+        });
+      }
+      const tailMatchOnly = await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        text: "@worker-1 tail mention at 130th unread post",
+      });
+      await waitUntil(() => engine.getSnapshot().workingMemberNames.length === 0);
+
+      const waitsBeforeLongA = recordedWaits.length;
+      const longBlockedA = (await workerWait.execute(
+        "tc-long-a",
+        { since: longBaseA },
+        undefined,
+        undefined,
+        dummyCtx,
+      )) as unknown as {
+        terminate?: boolean;
+        details: { parked: boolean; blockedBySeq?: number; unreadSeqs?: number[] };
+      };
+      assert.equal(longBlockedA.terminate, undefined);
+      assert.equal(longBlockedA.details.parked, false);
+      assert.equal(recordedWaits.length, waitsBeforeLongA);
+      assert.equal(longBlockedA.details.blockedBySeq, tailMatchOnly.seq);
+      assert.deepEqual(longBlockedA.details.unreadSeqs, [tailMatchOnly.seq]);
+      assert.equal(
+        engine.getSnapshot().run!.members["worker-1"]!.lastParkBlockedSeq,
+        tailMatchOnly.seq,
+      );
+
+      //    (b) 130 unread posts where BOTH #1 and #130 match -> collects across all pages & sets blockedBySeq = #130
+      const longBaseB = engine.getSnapshot().boardHead;
+      const headMatch = await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        text: "@worker-1 early match #1",
+      });
+      for (let i = 2; i <= 129; i += 1) {
+        await engine.postMessage({
+          from: ORCHESTRATOR_NAME,
+          fromRole: "orchestrator",
+          text: `More background chatter ${i}`,
+        });
+      }
+      const tailMatchBoth = await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        text: "@worker-1 late match #130",
+      });
+      await waitUntil(() => engine.getSnapshot().workingMemberNames.length === 0);
+
+      const longBlockedB = (await workerWait.execute(
+        "tc-long-b",
+        { since: longBaseB },
+        undefined,
+        undefined,
+        dummyCtx,
+      )) as unknown as {
+        terminate?: boolean;
+        details: { parked: boolean; blockedBySeq?: number; unreadSeqs?: number[] };
+      };
+      assert.equal(longBlockedB.terminate, undefined);
+      assert.equal(longBlockedB.details.parked, false);
+      assert.equal(longBlockedB.details.blockedBySeq, tailMatchBoth.seq);
+      assert.deepEqual(longBlockedB.details.unreadSeqs, [
+        headMatch.seq,
+        tailMatchBoth.seq,
+      ]);
+      assert.equal(
+        engine.getSnapshot().run!.members["worker-1"]!.lastParkBlockedSeq,
+        tailMatchBoth.seq,
+      );
+
+      // 8. Stub bridge compatibility + readBoard failure returns non-terminating error + stuck-cursor guard
       const stubTools = createMemberScopedTools(
         {
           postMessage: async () => {
@@ -11027,6 +11187,74 @@ describe("AGY Stop-Hook Race Lock & Anti-Noise Monitor Hygiene (VAL-AGY-001, VAL
       };
       assert.equal(stubWaitRes.terminate, true);
       assert.equal(stubWaitRes.details.parked, true);
+
+      let errWaitRecorded = false;
+      let errPageCalls = 0;
+      const failingWaitTools = createMemberScopedTools(
+        {
+          postMessage: async () => {
+            throw new Error("unused");
+          },
+          readBoard: async () => {
+            errPageCalls += 1;
+            if (errPageCalls === 1) {
+              return {
+                messages: [
+                  {
+                    seq: 1,
+                    runId: "r-err",
+                    channel: "main",
+                    from: ORCHESTRATOR_NAME,
+                    fromRole: "orchestrator",
+                    text: "unmentioned",
+                    mentions: [],
+                    channelMentions: [],
+                    kind: "chat",
+                    timestamp: new Date().toISOString(),
+                  },
+                ],
+                head: 50,
+              };
+            }
+            throw new Error("board disk EIO");
+          },
+          getStatus: async () => ({
+            runId: "r-err",
+            title: "err",
+            status: "active",
+            baseBranch: "main",
+            boardHead: 50,
+            members: [],
+            channels: [],
+          }),
+          listModels: async () => [],
+          addHelper: async () => [],
+          killHelper: async () => {},
+          switchModel: async () => ({ targetName: "err-w", model: "m" }),
+          manageChannel: async () => ({ action: "list", summary: "ok" }),
+        },
+        {
+          name: "err-w",
+          role: "worker",
+          runId: "r-err",
+          onWaitRecorded: () => {
+            errWaitRecorded = true;
+          },
+        },
+      );
+      const errWaitRes = (await failingWaitTools
+        .find((t) => t.name === SWARM_WAIT_TOOL)!
+        .execute("tc-err-wait", { since: 0 }, undefined, undefined, dummyCtx)) as unknown as {
+        isError?: boolean;
+        terminate?: boolean;
+        content: Array<{ text: string }>;
+        details: { parked: boolean; error?: string };
+      };
+      assert.equal(errWaitRes.isError, true);
+      assert.equal(errWaitRes.terminate, undefined);
+      assert.equal(errWaitRes.details.parked, false);
+      assert.equal(errWaitRecorded, false, "readBoard failure must NOT park or call onWaitRecorded");
+      assert.match(errWaitRes.content[0]!.text, /board disk EIO/);
     } finally {
       await engine.dispose();
     }

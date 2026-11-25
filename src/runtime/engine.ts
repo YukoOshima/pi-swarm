@@ -9320,9 +9320,22 @@ export class SwarmEngine implements ISwarmEngine {
       },
 
       getMemberContext: () => {
-        const current = getOwnMember(this.cachedRun, member.name) ?? member;
+        const run = this.cachedRun;
+        const current = getOwnMember(run, member.name) ?? member;
+        const broadcastChannels = run
+          ? Object.values(run.channels)
+              .filter(
+                (ch) =>
+                  ch.name !== DEFAULT_CHANNEL &&
+                  !ch.archived &&
+                  (current.channels.includes(ch.name) ||
+                    ch.subscribers.includes(current.name)),
+              )
+              .map((ch) => ch.name)
+          : current.channels.filter((ch) => ch !== DEFAULT_CHANNEL);
         return {
           channels: current.channels,
+          broadcastChannels,
           ...(current.groupPrefix ? { groupPrefix: current.groupPrefix } : {}),
         };
       },
