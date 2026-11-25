@@ -1078,6 +1078,8 @@ interface LiveMember {
   turnStartedAt?: string;
   /** Monotonic last read sequence observed via readBoard/turn completion (survives cache refreshes). */
   lastReadSeq?: number;
+  /** Latest unread matching sequence that blocked a `swarm_wait` park attempt (survives cache refreshes). */
+  lastParkBlockedSeq?: number;
 }
 
 interface BoardWaiter {
@@ -1144,7 +1146,9 @@ export class SwarmEngine implements ISwarmEngine {
 
   private stallTimer: ReturnType<typeof setTimeout> | null = null;
   private stallNoticePostedAtHead: number | null = null;
+  private lastStallAlertHead: number | null = null;
   private lastMonitorNudgeSeq: number | null = null;
+  private humanInputAwaited = false;
   private monitorRunning = false;
   private activeMonitorHandle?: PersistentAgentHandle;
   private activeMonitorAbort?: AbortController;
@@ -1260,7 +1264,9 @@ export class SwarmEngine implements ISwarmEngine {
       this.cachedEvents = [];
       this.runDonePosted = false;
       this.stallNoticePostedAtHead = null;
+      this.lastStallAlertHead = null;
       this.lastMonitorNudgeSeq = null;
+      this.humanInputAwaited = false;
       this.boardHopCount = 0;
       this.hopCapAlerted = false;
       this.monitorTokens = 0;
@@ -1320,7 +1326,9 @@ export class SwarmEngine implements ISwarmEngine {
     this.runDonePosted = run.status === "completed" || run.status === "abandoned";
     if (!isSameRun) {
       this.stallNoticePostedAtHead = null;
+      this.lastStallAlertHead = null;
       this.lastMonitorNudgeSeq = null;
+      this.humanInputAwaited = false;
       this.boardHopCount = 0;
       this.hopCapAlerted = false;
     }
@@ -1338,6 +1346,7 @@ export class SwarmEngine implements ISwarmEngine {
     }
 
     if (isSameRun && (run.status === "completed" || run.status === "abandoned")) {
+      this.humanInputAwaited = false;
       this.cancelStallWatchdog();
       await this.cancelActiveMonitor(`Swarm run ${run.status}`);
       this.clearOrchestratorWait(`Swarm run ${run.status}.`);
@@ -1631,7 +1640,9 @@ export class SwarmEngine implements ISwarmEngine {
     });
     this.runDonePosted = false;
     this.stallNoticePostedAtHead = null;
+    this.lastStallAlertHead = null;
     this.lastMonitorNudgeSeq = null;
+    this.humanInputAwaited = false;
     this.boardHopCount = 0;
     this.hopCapAlerted = false;
     this.concurrencyGate.resume();
@@ -1672,6 +1683,7 @@ export class SwarmEngine implements ISwarmEngine {
 
     // Silence watchdog immediately and prevent any further spawns, posts, or wakeups
     this.runDonePosted = true;
+    this.humanInputAwaited = false;
     this.concurrencyGate.pause();
     this.cancelStallWatchdog();
     await this.cancelActiveMonitor("Run completed");
@@ -2384,8 +2396,12 @@ export class SwarmEngine implements ISwarmEngine {
     this.cancelStallWatchdog();
     void this.cancelActiveMonitor("Swarm activity resumed");
     this.stallNoticePostedAtHead = null;
+    this.lastStallAlertHead = null;
     this.lastMonitorNudgeSeq = null;
 
+    if (normalizedMsg.fromRole === "human") {
+      this.humanInputAwaited = false;
+    }
     if (normalizedMsg.fromRole === "orchestrator" || normalizedMsg.fromRole === "human") {
       this.boardHopCount = 0;
       this.hopCapAlerted = false;
@@ -2556,6 +2572,23 @@ export class SwarmEngine implements ISwarmEngine {
     }
     this.orchestratorWait = null;
     this.maybeArmStallWatchdog();
+  }
+
+  setHumanInputAwaited(waiting: boolean): void {
+    const next = Boolean(waiting);
+    if (this.humanInputAwaited === next) {
+      if (next) {
+        this.cancelStallWatchdog();
+      }
+      return;
+    }
+    this.humanInputAwaited = next;
+    if (next) {
+      this.cancelStallWatchdog();
+      void this.cancelActiveMonitor("Awaiting human input ([NEEDS_HUMAN])");
+    } else {
+      this.maybeArmStallWatchdog();
+    }
   }
 
   async parkOrchestratorWait(
@@ -3515,6 +3548,8 @@ export class SwarmEngine implements ISwarmEngine {
     const isLiveWorking = Boolean(live?.handle) && live!.handle!.getState() === "working";
 
     if (isLiveWorking && live?.handle) {
+      this.stallNoticePostedAtHead = null;
+      this.lastStallAlertHead = null;
       if (mode === "followUp") {
         await live.handle.followUp(trimmedMsg);
         return { delivery: "followUp" };
@@ -6566,6 +6601,8 @@ export class SwarmEngine implements ISwarmEngine {
       live.handle = handle;
       live.spawning = false;
       live.turnActive = true;
+      this.stallNoticePostedAtHead = null;
+      this.lastStallAlertHead = null;
 
       const resolvedModel = handle.getModel();
       if (resolvedModel) {
@@ -6817,6 +6854,8 @@ export class SwarmEngine implements ISwarmEngine {
 
       this.emitEngineEvent("snapshot_changed", `Woke @${memberName}`, { memberName });
 
+      this.stallNoticePostedAtHead = null;
+      this.lastStallAlertHead = null;
       live.turnActive = true;
       live.lastWaitRequest = undefined;
       live.turnStartPostSeq = member.lastPostSeq ?? 0;
@@ -7143,6 +7182,8 @@ export class SwarmEngine implements ISwarmEngine {
         live.launchAbort = undefined;
       }
 
+      this.stallNoticePostedAtHead = null;
+      this.lastStallAlertHead = null;
       this.emitEngineEvent("snapshot_changed", `Revived @${memberName}`, { memberName });
 
       const result = await handle.currentTurn;
@@ -7601,6 +7642,18 @@ export class SwarmEngine implements ISwarmEngine {
 
       if (live) {
         live.pendingSelfModelSwitch = undefined;
+        if (waitReq && live.pendingWakes.length > 0) {
+          const readFloor = Math.min(waitReq.since, live.lastReadSeq ?? 0);
+          if (readFloor > 0) {
+            live.pendingWakes = live.pendingWakes.filter((w) => {
+              if (w.seq <= readFloor) {
+                live.deliveredSeqs.add(w.seq);
+                return false;
+              }
+              return true;
+            });
+          }
+        }
       }
 
       // Check for unread non-mention messages if the member explicitly called swarm_wait{mentions_only:false}
@@ -8399,7 +8452,7 @@ export class SwarmEngine implements ISwarmEngine {
 
   private maybeArmStallWatchdog(): void {
     this.cancelStallWatchdog();
-    if (this.disposed || this.runDonePosted) {
+    if (this.disposed || this.runDonePosted || this.humanInputAwaited) {
       return;
     }
     const settings = this.getEffectiveSettings();
@@ -8424,7 +8477,10 @@ export class SwarmEngine implements ISwarmEngine {
     if (this.getWorkingOrPendingMemberNames().length > 0) {
       return;
     }
-    if (this.stallNoticePostedAtHead === run.boardHead) {
+    if (
+      this.stallNoticePostedAtHead === run.boardHead ||
+      this.lastStallAlertHead === run.boardHead
+    ) {
       return;
     }
 
@@ -8447,6 +8503,7 @@ export class SwarmEngine implements ISwarmEngine {
     if (
       this.disposed ||
       this.runDonePosted ||
+      this.humanInputAwaited ||
       this.activeRunId !== runId ||
       this.boardWaiters.size > 0 ||
       Boolean(this.orchestratorWait) ||
@@ -8455,7 +8512,13 @@ export class SwarmEngine implements ISwarmEngine {
       return;
     }
     const run = this.cachedRun;
-    if (!run || run.status !== "active" || run.boardHead !== armedHead) {
+    if (
+      !run ||
+      run.status !== "active" ||
+      run.boardHead !== armedHead ||
+      this.stallNoticePostedAtHead === armedHead ||
+      this.lastStallAlertHead === armedHead
+    ) {
       return;
     }
     if (this.getWorkingOrPendingMemberNames().length > 0) {
@@ -8480,11 +8543,14 @@ export class SwarmEngine implements ISwarmEngine {
       if (
         this.disposed ||
         this.runDonePosted ||
+        this.humanInputAwaited ||
         this.activeRunId !== runId ||
         this.boardWaiters.size > 0 ||
         Boolean(this.orchestratorWait) ||
         this.cachedRun?.status !== "active" ||
         this.cachedRun.boardHead !== armedHead ||
+        this.stallNoticePostedAtHead === armedHead ||
+        this.lastStallAlertHead === armedHead ||
         this.getWorkingOrPendingMemberNames().length > 0
       ) {
         return;
@@ -8527,9 +8593,12 @@ export class SwarmEngine implements ISwarmEngine {
       abortSignal?.aborted ||
       this.disposed ||
       this.runDonePosted ||
+      this.humanInputAwaited ||
       this.activeRunId !== runId ||
       this.cachedRun?.status !== "active" ||
       this.cachedRun.boardHead !== armedHead ||
+      this.stallNoticePostedAtHead === armedHead ||
+      this.lastStallAlertHead === armedHead ||
       Boolean(this.orchestratorWait) ||
       this.boardWaiters.size > 0 ||
       this.getWorkingOrPendingMemberNames().length > 0
@@ -8558,6 +8627,7 @@ export class SwarmEngine implements ISwarmEngine {
 
       if (hitsOrchestrator) {
         this.stallNoticePostedAtHead = stallMsg.seq;
+        this.lastStallAlertHead = stallMsg.seq;
         this.lastMonitorNudgeSeq = null;
       } else {
         this.lastMonitorNudgeSeq = stallMsg.seq;
@@ -8610,6 +8680,7 @@ export class SwarmEngine implements ISwarmEngine {
       this.notifyWaitersOnMessage(stallMsg);
       return stallMsg;
     } catch {
+      this.lastStallAlertHead = armedHead;
       return null;
     }
   }
@@ -8629,6 +8700,7 @@ export class SwarmEngine implements ISwarmEngine {
       !abort.signal.aborted &&
       !this.disposed &&
       !this.runDonePosted &&
+      !this.humanInputAwaited &&
       this.activeRunId === run.id &&
       this.cachedRun?.status === "active" &&
       this.cachedRun.boardHead === armedHead &&
@@ -8885,6 +8957,7 @@ export class SwarmEngine implements ISwarmEngine {
           return "cancelled";
         }
         this.stallNoticePostedAtHead = armedHead;
+        this.lastStallAlertHead = armedHead;
         this.lastMonitorNudgeSeq = null;
         return "handled";
       }
@@ -9120,6 +9193,7 @@ export class SwarmEngine implements ISwarmEngine {
         };
         const res = await this.readBoard(effectiveOptions);
         const isUnfilteredFeedRead =
+          !options?.peek &&
           !options?.seqs &&
           !options?.search &&
           (!normalizedChannel || normalizedChannel === "*") &&
@@ -9244,6 +9318,38 @@ export class SwarmEngine implements ISwarmEngine {
           callerRole: latest.role,
         });
       },
+
+      getMemberContext: () => {
+        const current = getOwnMember(this.cachedRun, member.name) ?? member;
+        return {
+          channels: current.channels,
+          ...(current.groupPrefix ? { groupPrefix: current.groupPrefix } : {}),
+        };
+      },
+
+      recordParkBlocked: async (seq: number) => {
+        if (!Number.isFinite(seq) || seq < 0) {
+          return;
+        }
+        const normalizedSeq = Math.max(0, Math.floor(seq));
+        const current = assertBridgeActive();
+        const live = this.liveMembers.get(current.name);
+        if (live) {
+          live.lastParkBlockedSeq = Math.max(
+            live.lastParkBlockedSeq ?? 0,
+            normalizedSeq,
+          );
+        }
+        const updated = await this.store.updateMember(runId, current.name, {
+          lastParkBlockedSeq: normalizedSeq,
+        });
+        await this.refreshCache(updated);
+        this.emitEngineEvent(
+          "snapshot_changed",
+          `@${current.name} swarm_wait blocked by unread #${normalizedSeq}`,
+          { memberName: current.name, seq: normalizedSeq },
+        );
+      },
     };
   }
 
@@ -9315,6 +9421,9 @@ export class SwarmEngine implements ISwarmEngine {
           currentActivity: m.currentActivity,
           lastPostSeq: m.lastPostSeq,
           lastPostTime: m.lastPostTime,
+          ...(m.lastParkBlockedSeq !== undefined
+            ? { lastParkBlockedSeq: m.lastParkBlockedSeq }
+            : {}),
           turns: m.turns,
           ...(m.llmTurns !== undefined ? { llmTurns: m.llmTurns } : {}),
           ...(m.turnStartedAt !== undefined ? { turnStartedAt: m.turnStartedAt } : {}),
@@ -9405,6 +9514,13 @@ export class SwarmEngine implements ISwarmEngine {
         const preserveTurnStartedAt =
           isWorking && live.turnStartedAt ? live.turnStartedAt : m.turnStartedAt;
         const preserveLastReadSeq = Math.max(m.lastReadSeq, live.lastReadSeq ?? 0);
+        const preserveParkBlockedSeq = Math.max(
+          m.lastParkBlockedSeq ?? -1,
+          live.lastParkBlockedSeq ?? -1,
+        );
+        const parkBlockedChanged =
+          preserveParkBlockedSeq >= 0 &&
+          preserveParkBlockedSeq !== m.lastParkBlockedSeq;
         const preserveBreakdown = maxTokenBreakdown(m.tokenBreakdown, live.liveTokenBreakdown);
         const breakdownAdvanced = Boolean(
           live.liveTokenBreakdown &&
@@ -9419,6 +9535,7 @@ export class SwarmEngine implements ISwarmEngine {
           llmTurnsChanged ||
           preserveTurnStartedAt !== m.turnStartedAt ||
           preserveLastReadSeq !== m.lastReadSeq ||
+          parkBlockedChanged ||
           breakdownAdvanced
         ) {
           mergedMembers[name] = {
@@ -9433,6 +9550,9 @@ export class SwarmEngine implements ISwarmEngine {
               ? { turnStartedAt: preserveTurnStartedAt }
               : {}),
             lastReadSeq: preserveLastReadSeq,
+            ...(parkBlockedChanged
+              ? { lastParkBlockedSeq: preserveParkBlockedSeq }
+              : {}),
             ...(breakdownAdvanced ? { tokenBreakdown: preserveBreakdown } : {}),
           };
         }

@@ -11,6 +11,7 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import { type Static, type TSchema, Type } from "typebox";
 import {
+  ALL_MENTION_NAME,
   ASSERTION_STATUSES,
   DEFAULT_CHANNEL,
   FEATURE_STATUSES,
@@ -733,13 +734,17 @@ export function formatRosterStatusText(status: SwarmRosterStatus): string {
         : "";
       const model = m.model ? ` model=${m.model}` : "";
       const lastPost = m.lastPostSeq ? ` lastPost=#${m.lastPostSeq}` : "";
+      const parkBlocked =
+        m.lastParkBlockedSeq !== undefined
+          ? ` lastParkBlockedSeq=#${m.lastParkBlockedSeq}`
+          : "";
       const info = m.currentActivity
         ? ` — ${m.currentActivity}`
         : m.parkedOn
           ? ` — ${m.parkedOn}`
           : "";
       lines.push(
-        `- @${m.name} (${m.role}) [${m.state}] ws=${ws}${cwd}${merged} parent=@${m.parentName}${model} turns=${m.turns}${lastPost}${info}`,
+        `- @${m.name} (${m.role}) [${m.state}] ws=${ws}${cwd}${merged} parent=@${m.parentName}${model} turns=${m.turns}${lastPost}${parkBlocked}${info}`,
       );
     }
   }
@@ -771,6 +776,9 @@ function snapshotToRosterStatus(snapshot: SwarmSnapshot): SwarmRosterStatus | nu
       currentActivity: m.currentActivity,
       lastPostSeq: m.lastPostSeq,
       lastPostTime: m.lastPostTime,
+      ...(m.lastParkBlockedSeq !== undefined
+        ? { lastParkBlockedSeq: m.lastParkBlockedSeq }
+        : {}),
       turns: m.turns,
       ...(m.llmTurns !== undefined ? { llmTurns: m.llmTurns } : {}),
       ...(m.turnStartedAt !== undefined ? { turnStartedAt: m.turnStartedAt } : {}),
@@ -1863,6 +1871,18 @@ function renderSwarmWaitResult(
     );
   }
 
+  if (details?.parked === false && typeof details.blockedBySeq === "number") {
+    const memberLabel =
+      typeof details.member === "string" ? `@${details.member} ` : "";
+    const sinceLabel =
+      typeof details.since === "number" ? `, since #${details.since}` : "";
+    return new Text(
+      `🔔 ${theme.fg("warning", `Park blocked ${memberLabel}(unread up to #${details.blockedBySeq}${sinceLabel})`)}`,
+      0,
+      0,
+    );
+  }
+
   const head =
     details && typeof details.head === "number" ? details.head : "?";
   const wokeBy =
@@ -2142,15 +2162,42 @@ export function createSwarmTool(deps: SwarmToolDeps): ToolDefinition {
                 'name is required for swarm{action:"kill"}.',
               );
             }
+            const runBefore = deps.engine.getSnapshot().run;
+            const targetBefore = runBefore
+              ? (runBefore.members[name] ??
+                  Object.values(runBefore.members).find(
+                    (m) => m.name.toLowerCase() === name.toLowerCase(),
+                  ))
+              : undefined;
+            const canonicalTarget = targetBefore?.name ?? name;
             await deps.engine.killMember(name, {
               reason: params.reason,
               force: params.force,
               callerName,
               callerRole,
             });
+            const latestRun = deps.engine.getSnapshot().run ?? runBefore;
+            const orderedMembers = latestRun
+              ? [
+                  ...latestRun.memberOrder
+                    .map((n) => latestRun.members[n])
+                    .filter((m): m is SwarmMemberRecord => Boolean(m)),
+                  ...Object.values(latestRun.members).filter(
+                    (m) => !latestRun.memberOrder.includes(m.name),
+                  ),
+                ]
+              : [];
+            const orphanedHelpers = collectLiveOrphanedHelpers(
+              orderedMembers,
+              canonicalTarget,
+            );
+            const orphanWarning = formatOrphanedHelpersWarning(
+              canonicalTarget,
+              orphanedHelpers,
+            );
             return okResult(
-              `Killed @${name}${params.reason ? ` (${params.reason})` : ""}.`,
-              { name, killed: true },
+              `Killed @${canonicalTarget}${params.reason ? ` (${params.reason})` : ""}.${orphanWarning}`,
+              { name: canonicalTarget, killed: true, orphanedHelpers },
             );
           }
 
@@ -2672,10 +2719,79 @@ export interface MemberScopedToolContext {
   role: SwarmMemberRole;
   runId: string;
   defaultChannel?: string;
+  channels?: readonly string[];
+  groupPrefix?: string;
   /** Invoked when a member calls `swarm_wait` so transport/engine can record `since` & `mentionsOnly`. */
   onWaitRecorded?: (wait: { since: number; mentionsOnly: boolean }) => void;
   /** Invoked when a working member schedules a deferred self model switch. */
   onSelfModelSwitchScheduled?: () => void;
+}
+
+function collectLiveOrphanedHelpers(
+  members: ReadonlyArray<{ name: string; parentName: string; state: string }>,
+  targetName: string,
+): string[] {
+  const targetLower = targetName.toLowerCase();
+  return members
+    .filter(
+      (m) =>
+        m.state !== "killed" &&
+        m.name.toLowerCase() !== targetLower &&
+        m.parentName.toLowerCase() === targetLower,
+    )
+    .map((m) => m.name);
+}
+
+function formatOrphanedHelpersWarning(
+  targetName: string,
+  orphanedHelpers: readonly string[],
+): string {
+  if (orphanedHelpers.length === 0) {
+    return "";
+  }
+  const handles = orphanedHelpers.map((h) => `@${h}`).join(", ");
+  return `\nWarning: @${targetName} still has live child helper(s): ${handles} — kill or reassign them before done.`;
+}
+
+function doesUnreadMessageBlockMemberPark(
+  msg: BoardMessage,
+  selfLower: string,
+  groupPrefixLower: string | undefined,
+  mentionsOnly: boolean,
+  subscribedChannels: ReadonlySet<string>,
+  nonMainSubscribedChannels: ReadonlySet<string>,
+): boolean {
+  if (!msg || typeof msg.seq !== "number" || !Number.isFinite(msg.seq)) {
+    return false;
+  }
+  if ((msg.from ?? "").toLowerCase() === selfLower) {
+    return false;
+  }
+  const msgChannelLower = (msg.channel || DEFAULT_CHANNEL).toLowerCase();
+  if (!mentionsOnly) {
+    return subscribedChannels.has(msgChannelLower);
+  }
+  const mentionsLower = Array.isArray(msg.mentions)
+    ? msg.mentions.map((m) => m.toLowerCase())
+    : [];
+  if (
+    mentionsLower.includes(selfLower) ||
+    mentionsLower.includes(ALL_MENTION_NAME) ||
+    (groupPrefixLower !== undefined && mentionsLower.includes(groupPrefixLower))
+  ) {
+    return true;
+  }
+  const chMentionsLower = Array.isArray(msg.channelMentions)
+    ? msg.channelMentions.map((c) => c.toLowerCase())
+    : [];
+  if (
+    chMentionsLower.some(
+      (ch) => ch !== DEFAULT_CHANNEL && nonMainSubscribedChannels.has(ch),
+    )
+  ) {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -2876,7 +2992,138 @@ export function createMemberScopedTools(
     async execute(_toolCallId, params) {
       const since = Number.isFinite(params.since) ? Math.max(0, Math.floor(params.since)) : 0;
       const mentionsOnly = params.mentions_only ?? true;
+
+      let liveCtx: { channels: readonly string[]; groupPrefix?: string } | undefined;
+      try {
+        liveCtx = bridge.getMemberContext?.();
+      } catch {
+        liveCtx = undefined;
+      }
+      const rawChannels =
+        liveCtx?.channels ??
+        member.channels ??
+        (member.defaultChannel
+          ? [member.defaultChannel, DEFAULT_CHANNEL]
+          : [DEFAULT_CHANNEL]);
+      const subscribedChannels = new Set<string>([
+        DEFAULT_CHANNEL,
+        ...rawChannels.map((c) => c.toLowerCase()),
+      ]);
+      const nonMainSubscribedChannels = new Set<string>(
+        Array.from(subscribedChannels).filter((c) => c !== DEFAULT_CHANNEL),
+      );
+      const selfLower = member.name.toLowerCase();
+      const groupPrefixLower =
+        (liveCtx?.groupPrefix ?? member.groupPrefix)?.trim().toLowerCase() ||
+        undefined;
+
+      const boardRes = await Promise.resolve(
+        bridge.readBoard({ since, limit: 20, peek: true }),
+      ).catch(() => ({ messages: [] as BoardMessage[], head: since }));
+
+      let candidates = Array.isArray(boardRes?.messages) ? boardRes.messages : [];
+      let latestHead =
+        typeof boardRes?.head === "number" && Number.isFinite(boardRes.head)
+          ? boardRes.head
+          : since;
+
+      let matching = candidates.filter(
+        (msg) =>
+          msg.seq > since &&
+          doesUnreadMessageBlockMemberPark(
+            msg,
+            selfLower,
+            groupPrefixLower,
+            mentionsOnly,
+            subscribedChannels,
+            nonMainSubscribedChannels,
+          ),
+      );
+
+      if (
+        matching.length === 0 &&
+        candidates.length === 20 &&
+        candidates[candidates.length - 1]!.seq < latestHead
+      ) {
+        const pageSince = candidates[candidates.length - 1]!.seq;
+        const moreRes = await Promise.resolve(
+          bridge.readBoard({ since: pageSince, limit: 100, peek: true }),
+        ).catch(() => ({ messages: [] as BoardMessage[], head: latestHead }));
+        if (typeof moreRes?.head === "number" && moreRes.head > latestHead) {
+          latestHead = moreRes.head;
+        }
+        if (Array.isArray(moreRes?.messages) && moreRes.messages.length > 0) {
+          candidates = moreRes.messages;
+          matching = candidates.filter(
+            (msg) =>
+              msg.seq > since &&
+              doesUnreadMessageBlockMemberPark(
+                msg,
+                selfLower,
+                groupPrefixLower,
+                mentionsOnly,
+                subscribedChannels,
+                nonMainSubscribedChannels,
+              ),
+          );
+        }
+      }
+
+      if (matching.length > 0) {
+        const unreadSeqs = Array.from(new Set(matching.map((m) => m.seq))).sort(
+          (a, b) => a - b,
+        );
+        const maxMatchingSeq = unreadSeqs[unreadSeqs.length - 1]!;
+        const head = Math.max(latestHead, maxMatchingSeq);
+        await Promise.resolve(
+          bridge.recordParkBlocked?.(maxMatchingSeq),
+        ).catch(() => {});
+        const preview = matching
+          .slice(0, 6)
+          .map((m) => `#${m.seq} (${m.from} in #${m.channel || DEFAULT_CHANNEL})`)
+          .join(", ");
+        const overflow =
+          matching.length > 6 ? `, +${matching.length - 6} more` : "";
+        const blockedDetails: {
+          member: string;
+          since: number;
+          mentionsOnly: boolean;
+          parked: boolean;
+          blockedBySeq?: number;
+          unreadSeqs?: number[];
+        } = {
+          member: member.name,
+          since,
+          mentionsOnly,
+          parked: false,
+          blockedBySeq: maxMatchingSeq,
+          unreadSeqs,
+        };
+        return {
+          content: [
+            {
+              type: "text",
+              text: `[board] New message(s) arrived since #${since} (head #${head}): ${preview}${overflow}. Call read_board{since: ${since}} before calling swarm_wait again.`,
+            },
+          ],
+          details: blockedDetails,
+        };
+      }
+
       member.onWaitRecorded?.({ since, mentionsOnly });
+      const parkedDetails: {
+        member: string;
+        since: number;
+        mentionsOnly: boolean;
+        parked: boolean;
+        blockedBySeq?: number;
+        unreadSeqs?: number[];
+      } = {
+        member: member.name,
+        since,
+        mentionsOnly,
+        parked: true,
+      };
       return {
         content: [
           {
@@ -2884,12 +3131,7 @@ export function createMemberScopedTools(
             text: `Parking @${member.name} in warm waiting state (since #${since}, mentions_only=${mentionsOnly}).`,
           },
         ],
-        details: {
-          member: member.name,
-          since,
-          mentionsOnly,
-          parked: true,
-        },
+        details: parkedDetails,
         terminate: true,
       };
     },
@@ -3218,7 +3460,25 @@ export function createMemberScopedTools(
               );
             }
             await bridge.killHelper(name, params.reason, params.force);
-            return okResult(`Killed helper @${name}.`, { name, killed: true });
+            const statusAfter = await Promise.resolve(bridge.getStatus?.()).catch(
+              () => undefined,
+            );
+            const canonicalTarget =
+              statusAfter?.members.find(
+                (m) => m.name.toLowerCase() === name.toLowerCase(),
+              )?.name ?? name;
+            const orphanedHelpers = statusAfter
+              ? collectLiveOrphanedHelpers(statusAfter.members, canonicalTarget)
+              : [];
+            const orphanWarning = formatOrphanedHelpersWarning(
+              canonicalTarget,
+              orphanedHelpers,
+            );
+            return okResult(`Killed helper @${canonicalTarget}.${orphanWarning}`, {
+              name: canonicalTarget,
+              killed: true,
+              orphanedHelpers,
+            });
           }
 
           case "channel": {

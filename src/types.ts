@@ -153,6 +153,8 @@ export interface SwarmMemberRecord {
   lastReadSeq: number;
   lastPostSeq?: number;
   lastPostTime?: string;
+  /** Highest unread matching board seq that blocked a `swarm_wait` park attempt (AGY Stop-Hook race lock). */
+  lastParkBlockedSeq?: number;
   /** Brief hint of what the member is waiting on or its last completion summary. */
   parkedOn?: string;
   turns: number;
@@ -229,6 +231,8 @@ export interface ReadBoardOptions {
   channel?: string;
   memberChannels?: readonly string[];
   search?: string;
+  /** When true, inspect unread messages without advancing member `lastReadSeq`. */
+  peek?: boolean;
 }
 
 export interface ReadBoardResult {
@@ -761,6 +765,7 @@ export interface MemberUpdateInput {
   lastReadSeq?: number;
   lastPostSeq?: number;
   lastPostTime?: string;
+  lastParkBlockedSeq?: number | null;
   parkedOn?: string | null;
   turns?: number;
   llmTurns?: number;
@@ -1061,6 +1066,7 @@ export interface SwarmMemberStatusEntry {
   currentActivity?: string;
   lastPostSeq?: number;
   lastPostTime?: string;
+  lastParkBlockedSeq?: number;
   turns: number;
   /** Real assistant/LLM turns counted from turn_end events (distinct from wakeups in `turns`). */
   llmTurns?: number;
@@ -1233,6 +1239,10 @@ export interface MemberEngineBridge {
   manageChannel(input: ManageChannelInput): Promise<ManageChannelResult>;
   manageMission?(input: ManageMissionInput): Promise<ManageMissionResult>;
   waitForBoard?(options: WaitForBoardOptions): Promise<WaitForBoardResult>;
+  /** Synchronously inspect live member channels & groupPrefix for `swarm_wait` wake matching. */
+  getMemberContext?(): { channels: readonly string[]; groupPrefix?: string };
+  /** Record the unread matching `seq` that blocked a `swarm_wait` park attempt. */
+  recordParkBlocked?(seq: number): Promise<void>;
 }
 
 export interface SpawnMemberRequest {
@@ -1457,6 +1467,7 @@ export interface ISwarmEngine {
     options: ParkOrchestratorWaitOptions,
   ): Promise<ParkOrchestratorWaitResult>;
   clearOrchestratorWait(reason?: string): void;
+  setHumanInputAwaited?(waiting: boolean): void;
   switchModel(options: SwitchModelOptions): Promise<SwitchModelResult>;
   propagateRoleModel?(
     options: PropagateRoleModelOptions,
