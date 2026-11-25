@@ -2,11 +2,15 @@ import {
   DEFAULT_CHANNEL,
   ORCHESTRATOR_NAME,
   POST_MESSAGE_TOOL,
+  PROPOSE_SWARM_PLAN_TOOL,
   READ_BOARD_TOOL,
+  STANDBY_SWARM_TOOLS,
   SWARM_DIR,
   SWARM_FEATURES_FILE,
   SWARM_LIBRARY_DIR,
   SWARM_MISSION_FILE,
+  SWARM_QUESTIONNAIRE_TOOL,
+  SWARM_QUESTION_TOOL,
   SWARM_RUNS_DIR,
   SWARM_SERVICES_FILE,
   SWARM_TOOL,
@@ -321,6 +325,25 @@ export interface OrchestratorLiveStateOptions {
   humanSteeringText?: string;
 }
 
+export interface OrchestratorStandbyOptions {
+  /** Optional most recently completed Swarm run used to carry forward `.pi/swarm/runs/<runId>/library/`, commands, services, boundaries, and summary context. */
+  priorRun?: Pick<
+    SwarmRunState,
+    | "id"
+    | "title"
+    | "objective"
+    | "baseBranch"
+    | "completionSummary"
+    | "commands"
+    | "services"
+    | "boundaries"
+  > | null;
+  /** True when Persistent Orchestrator Mode defaults to `autoConfirm: true` (e.g. entered via `/swarm direct`). */
+  autoConfirmDefault?: boolean;
+  /** Optional 3-role model configuration override when `snapshot` is omitted. */
+  roleModels?: SwarmRoleModels;
+}
+
 function buildOrchestratorPlaybookCore(validatorEnabled: boolean): string {
   const nextPeerExample = validatorEnabled
     ? `\`@validator [done] commit=<sha> workspace=<cwd> summary=...\` so author -> validator runs zero-hop without waking \`@${ORCHESTRATOR_NAME}\` in between, or \`@${ORCHESTRATOR_NAME} [done] ...\` when no downstream peer exists`
@@ -333,11 +356,12 @@ function buildOrchestratorPlaybookCore(validatorEnabled: boolean): string {
   return [
     "# Pi Swarm Orchestrator Playbook (Antigravity Swarm)",
     "",
-    "## 1. Do Not Do the Technical Work Yourself",
-    `- Delegate ALL technical work (codebase research, scaffolding, coding, integration, builds/tests, verification) to named swarm members via \`${SWARM_TOOL}{action:"add"}\` — never edit repository files directly from Orchestrator (dirtying \`baseBranch\` breaks worktree merges).`,
-    `- Your job is orchestration: right-size the swarm, write high-signal briefs, read \`#seq\` board reports, judge quality and completeness, merge isolated worktrees/clones (\`${SWARM_TOOL}{action:"merge"}\`), verify post-merge integration on \`baseBranch\`, retire finished workers (\`${SWARM_TOOL}{action:"kill"}\`), and adapt seamlessly whenever the user redirects you.`,
+    "## 1. Do Not Do the Technical Work Yourself (Ephemeral Specialists, Permanent `@orchestrator`)",
+    `- **Persistent Orchestrator Lifecycle**: Workers (\`role:"worker"\`) and Validators (\`role:"validator"\`) are **ephemeral** per-mission specialists that are retired and destroyed (along with isolated worktrees and scratch directories) when finished (\`${SWARM_TOOL}{action:"kill"}\` / \`${SWARM_TOOL}{action:"done"}\`). By contrast, \`@${ORCHESTRATOR_NAME}\` (you) stays **permanently on duty** across subsequent user tasks — transitioning to \`"standby"\` mode after \`done\` until the user explicitly exits via \`/swarm exit\` (never attempt to exit Orchestrator Mode yourself).`,
+    `- **Never Self-Implement**: Delegate ALL technical work (codebase research, scaffolding, coding, integration, builds/tests, verification) to named swarm members via \`${SWARM_TOOL}{action:"add"}\` — never edit repository files or run mutating \`bash\`/\`write\`/\`edit\`/\`powershell\` commands directly from Orchestrator (hard-blocked by protocol guard because dirtying \`baseBranch\` breaks worktree merges).`,
+    `- Your job is orchestration: right-size the swarm, write high-signal briefs, read \`#seq\` board reports, judge quality and completeness, merge isolated worktrees/clones (\`${SWARM_TOOL}{action:"merge"}\`), verify post-merge integration on \`baseBranch\`, retire finished workers (\`${SWARM_TOOL}{action:"kill"}\`), preserve reusable insights in \`${SWARM_LIBRARY_DIR}/\`, and adapt seamlessly whenever the user redirects you.`,
     "",
-    "## 2. Right-Sizing, Dynamic Phased Collaboration & Mid-Flight User Redirection",
+    "## 2. Right-Sizing, Dynamic Phased Collaboration & Mid-Mission Scope Propagation",
     rightSizingRule,
     "- Adapt wave-by-wave instead of locking into a rigid upfront DAG:",
     "  1. **Discovery**: Spawn read-only researchers/scouts first when unknowns exist → inspect their `#seq` reports.",
@@ -347,13 +371,14 @@ function buildOrchestratorPlaybookCore(validatorEnabled: boolean): string {
       ? [
           "  4. **Independent Read-Only Validation (with Isolated Scratch Sandbox)**: Spawn independent `role:\"validator\"` members (~1 validator per 2–4 authors) to audit code, diffs, tests, and runtime behavior inside each author's worktree `cwd`. Each `role:\"validator\"` automatically gets a dedicated OS temp scratch directory (`scratchDir`) where `write`/`edit` and explicit-path `mkdir`/`cp`/`mv`/`rm`/output redirections work for temporary builds (`--target-dir`), synthetic fixtures, and mutation/negative-case checks while repository and worktree files stay strictly read-only — NEVER spawn `role:\"worker\"` members as pseudo-validators just to write temporary test files, and NEVER let authors self-certify!",
           "  5. **Peer-to-Peer Bug Closure**: Let `@validator` and `@author` resolve defects directly on the board (`@author` <-> `@validator`) without waking `@orchestrator` on intermediate bounces.",
-          `  6. **Land & Complete**: Merge verified \`share\`/\`branch\` worktrees via \`${SWARM_TOOL}{action:"merge"}\`, run a **post-merge integration check on \`baseBranch\`** (wake \`@validator\` or an \`inherit\` verifier to run full \`typecheck\`/tests on merged \`baseBranch\`) BEFORE calling \`done\`, kill finished members via \`${SWARM_TOOL}{action:"kill"}\`, and close the run cleanly via \`${SWARM_TOOL}{action:"done", summary}\`.`,
+          `  6. **Land & Complete**: Merge verified \`share\`/\`branch\` worktrees via \`${SWARM_TOOL}{action:"merge"}\`, run a **post-merge integration check on \`baseBranch\`** (wake \`@validator\` or an \`inherit\` verifier to run full \`typecheck\`/tests on merged \`baseBranch\`) BEFORE calling \`done\`, kill finished members via \`${SWARM_TOOL}{action:"kill"}\`, and close the run cleanly via \`${SWARM_TOOL}{action:"done", summary}\` (which retires ephemeral members and returns \`@${ORCHESTRATOR_NAME}\` to Persistent Standby Mode).`,
         ]
       : [
-          `  4. **Land & Complete**: Merge \`share\`/\`branch\` worktrees via \`${SWARM_TOOL}{action:"merge"}\`, run a **post-merge integration check on \`baseBranch\`** (via an \`inherit\` check worker running full \`typecheck\`/tests on merged \`baseBranch\`) BEFORE calling \`done\`, kill finished members via \`${SWARM_TOOL}{action:"kill"}\`, and close the run cleanly via \`${SWARM_TOOL}{action:"done", summary}\`.`,
+          `  4. **Land & Complete**: Merge \`share\`/\`branch\` worktrees via \`${SWARM_TOOL}{action:"merge"}\`, run a **post-merge integration check on \`baseBranch\`** (via an \`inherit\` check worker running full \`typecheck\`/tests on merged \`baseBranch\`) BEFORE calling \`done\`, kill finished members via \`${SWARM_TOOL}{action:"kill"}\`, and close the run cleanly via \`${SWARM_TOOL}{action:"done", summary}\` (which retires ephemeral members and returns \`@${ORCHESTRATOR_NAME}\` to Persistent Standby Mode).`,
         ]),
-    "- **Dynamic User Redirection**: Calling `swarm_wait` ends your turn cleanly so the user can message you at any time while workers run. When the user sends a new instruction or change of direction mid-flight:",
-    `  - Use \`${SWARM_TOOL}{action:"steer", name, message, mode?}\` to redirect a working or parked member immediately (or \`post_message\` with \`@all\` / \`@name\` for parked members), \`${SWARM_TOOL}{action:"stop"/"kill"}\` to halt obsolete work, \`${SWARM_TOOL}{action:"title", objective, strategy, acceptance_criteria}\` to update the run goal/plan, and \`${SWARM_TOOL}{action:"add"}\` for new work, then call \`${SWARM_WAIT_TOOL}\` again.`,
+    "- **Droid Mid-Mission Scope Propagation & User Redirection**: Calling `swarm_wait` ends your turn cleanly so the user can message you at any time while workers run. When the user sends a mid-mission requirement change, scope expansion, or new direction:",
+    `  - **1. Sync Shared Mission Truth FIRST (Droid Shared-Truth Rule)**: Never implement changes yourself and never bolt untracked scope onto workers. Propagate scope changes through the live contract FIRST via \`${SWARM_TOOL}{action:"title", objective, strategy, acceptance_criteria}\` (when goal/strategy shifts) and \`${SWARM_TOOL}{action:"mission"}\`: \`upsert_assertions\`/\`remove_assertion\` for \`VAL-*\` assertions, \`upsert_features\`/\`update_feature\` for 100% \`fulfills\` coverage and disjoint \`filesOwned\` (**never** add new features into an already \`[sealed]\` milestone — append a follow-up milestone instead), \`set_manifest\` for \`commands\`/\`services\`/\`boundaries\`, and \`write_library\` (\`library_append:true\`) to record updated \`architecture\`/\`environment\`/\`testing\` decisions.`,
+    `  - **2. Propagate to Active & Parked Members**: Use \`${SWARM_TOOL}{action:"steer", name, message, mode?}\` to redirect working or parked members immediately (or \`${POST_MESSAGE_TOOL}\` with \`@all\` / \`@name\` for parked members), \`${SWARM_TOOL}{action:"stop"/"kill"}\` to halt obsolete work, and \`${SWARM_TOOL}{action:"mission", mission_op:"dispatch_ready"}\` or \`${SWARM_TOOL}{action:"add"}\` for new slices (waking \`@validator\` if already-audited code changed), then call \`${SWARM_WAIT_TOOL}\` again.`,
     "",
     "## 3. Mandatory 4-Part Brief Contract, Zero-Copy `#seq` & `@mention` Discipline",
     `- **4-Part Brief Contract**: Every \`${SWARM_TOOL}{action:"add"}\` brief you write MUST explicitly state all four parts:`,
@@ -376,7 +401,7 @@ function buildOrchestratorPlaybookCore(validatorEnabled: boolean): string {
     "- **3-Role Models**: `orchestrator` (host session), `worker` (default for `role:\"worker\"`), `validator` (default for `role:\"validator\"`).",
     "",
     "## 6. Dynamic Mission Goal Engine & Contract Evolution",
-    `- **Deterministic Queue Dispatch & Living Contract**: Dispatch DAG-ready pending features with disjoint \`filesOwned\` onto fresh isolated \`share\` worktrees via \`${SWARM_TOOL}{action:"mission", mission_op:"dispatch_ready", max_dispatch?}\` (auto-runs any configured \`init\` command in each new worktree), or spawn specialized workers via \`${SWARM_TOOL}{action:"add"}\`. Evolve the contract and queue dynamically via \`upsert_assertions\`, \`upsert_features\` (\`prepend:true\` for urgent fixes), \`remove_assertion\`, \`set_manifest\` (\`commands\`, \`services\` with unique ports & healthchecks, \`boundaries\`), and \`read_library\`/\`write_library\`. Modified \`"passed"\` assertions automatically reset to \`"pending"\` for re-verification.`,
+    `- **Deterministic Queue Dispatch & Living Contract**: Dispatch DAG-ready pending features with disjoint \`filesOwned\` onto fresh isolated \`share\` worktrees via \`${SWARM_TOOL}{action:"mission", mission_op:"dispatch_ready", max_dispatch?}\` (auto-runs any configured \`init\` command in each new worktree), or spawn specialized workers via \`${SWARM_TOOL}{action:"add"}\`. Evolve the contract and queue dynamically via \`upsert_assertions\`, \`upsert_features\` (\`prepend:true\` for urgent fixes), \`remove_assertion\`, \`set_manifest\` (\`commands\`, \`services\` with unique ports & healthchecks, \`boundaries\`), and \`read_library\`/\`write_library\` (carrying reusable \`architecture\`, \`environment\`, and \`testing\` knowledge across waves and into subsequent Standby missions). Modified \`"passed"\` assertions automatically reset to \`"pending"\` for re-verification.`,
     `- **Dual-Layer Milestone Validation & Sealed Milestones**: Merging the final feature of a milestone automatically wakes or spawns \`@validator\` to run Dual-Layer Validation (\`scrutiny\` commands/diffs + \`behavioral\` surface checks, using incremental re-validation after fixes). Once all features and \`VAL-*\` assertions of a milestone pass, it becomes \`[sealed]\`. Place any new or follow-up work into a new milestone (e.g. \`<milestone>-followup\` or \`misc-fixes\`) so zero code bypasses validation.`,
     `- **Zero Open Handoff Tech Debt**: Resolve every worker \`discovered_issue\` and \`incomplete_work\` item via \`upsert_features\` + \`${SWARM_TOOL}{action:"mission", mission_op:"resolve_handoff", handoff_id, resolution:"tracked", tracked_feature_id}\` (or \`resolution:"dismissed"\` ONLY with concrete technical proof >= 20 chars — lazy excuses like \`"low priority"\` or \`"fix later"\` are rejected).`,
     `- **End-of-Mission Hard Gates (No LLM \`force:true\` Bypass)**: \`${SWARM_TOOL}{action:"done"}\` enforces 0 working members, 0 unmerged commits ahead of \`baseBranch\`, 0 incomplete features, 0 open handoff tech-debt items, and 100% \`VAL-*\` assertions \`"passed"\` and claimed by \`"completed"\` features. LLM \`force:true\` on \`done\` is rejected with \`PERMISSION_DENIED\` (only human \`/swarm done --force\` may force-close); for rare justified assertion exceptions, use audited \`${SWARM_TOOL}{action:"mission", mission_op:"override_assertion", assertion_id, justification}\` (>= 30 chars, stamped \`[OVERRIDE]\`).`,
@@ -396,7 +421,8 @@ function buildHumanSteeringSection(humanSteeringText: string): string {
   return [
     "### ⚡ Live User Direction Update",
     `The user just sent a dynamic message while the Swarm is running: "${cleanSteer}".`,
-    `Adjust active/parked workers immediately using \`${SWARM_TOOL}{action:"steer"}\`, \`${SWARM_TOOL}{action:"stop"/"kill"}\`, \`${SWARM_TOOL}{action:"title"}\`, \`${SWARM_TOOL}{action:"mission"}\` (\`upsert_assertions\`/\`upsert_features\`/\`remove_assertion\`/\`set_manifest\`), \`${SWARM_TOOL}{action:"add"}\`, or \`${POST_MESSAGE_TOOL}\`, and report clearly.`,
+    `- **Droid Shared-Truth Rule**: Before resuming or steering workers on changed requirements, sync shared Mission truth FIRST via \`${SWARM_TOOL}{action:"mission"}\` (\`upsert_assertions\` / \`remove_assertion\` for \`assertions\`, \`upsert_features\` / \`update_feature\` for \`features\` — never adding new features into a \`[sealed]\` milestone, \`set_manifest\` for \`commands\` / \`services\` / \`boundaries\`, \`write_library\` with \`library_append:true\` for shared \`library/\` context) and \`${SWARM_TOOL}{action:"title"}\` if the objective or strategy changed!`,
+    `- **Member Propagation**: Never self-implement edits. Adjust active/parked workers immediately using \`${SWARM_TOOL}{action:"steer"}\`, \`${SWARM_TOOL}{action:"stop"/"kill"}\`, \`${SWARM_TOOL}{action:"mission", mission_op:"dispatch_ready"}\`, \`${SWARM_TOOL}{action:"add"}\`, or \`${POST_MESSAGE_TOOL}\`, wake \`@validator\` if already-audited slices changed, and report clearly.`,
   ].join("\n");
 }
 
@@ -766,6 +792,81 @@ export function buildOrchestratorPlaybookSection(
  */
 export function buildOrchestratorContextSummary(snapshot: SwarmSnapshot): string {
   return buildOrchestratorPlaybookSection(snapshot);
+}
+
+/**
+ * Builds the Droid-style Persistent Mission Orchestrator Standby prompt section
+ * injected while `@orchestrator` remains on duty between Swarm runs (`"standby"` profile)
+ * until the user explicitly exits via `/swarm exit`.
+ */
+export function buildOrchestratorStandbySection(
+  snapshot?: SwarmSnapshot | null,
+  options?: OrchestratorStandbyOptions,
+): string {
+  const priorRun =
+    options?.priorRun !== undefined ? options.priorRun : (snapshot?.run ?? null);
+  const roleModels = options?.roleModels ?? snapshot?.roleModels;
+  const autoConfirmDefault = options?.autoConfirmDefault === true;
+
+  const clarificationStep = autoConfirmDefault
+    ? `  2. **Direct Fast-Path (\`autoConfirmDefault: true\`)**: Skip interactive Q&A — do NOT call \`${SWARM_QUESTION_TOOL}\` or \`${SWARM_QUESTIONNAIRE_TOOL}\`; proceed straight from read-only recon to \`${PROPOSE_SWARM_PLAN_TOOL}\` (which auto-confirms after validation and Adversarial Contract Review).`
+    : `  2. **Lean Upfront Clarification (\`AskUser\` — \`${SWARM_QUESTIONNAIRE_TOOL}\` / \`${SWARM_QUESTION_TOOL}\`)**: Ask **0 questions** when the goal and constraints are already clear from the user prompt + repo recon; otherwise ask **at most 1–3 high-leverage trade-off questions** via \`${SWARM_QUESTIONNAIRE_TOOL}\` (or \`${SWARM_QUESTION_TOOL}\`) with the best option placed first and prefixed \`(Recommended)\`.`;
+
+  const standbyCoreLines: string[] = [
+    "# Pi Swarm Persistent Orchestrator — Standby Mode (Droid Mission)",
+    "",
+    "## 1. Ephemeral Specialists, Permanent `@orchestrator` Until `/swarm exit`",
+    `- **Persistent Orchestrator Duty**: You are \`@${ORCHESTRATOR_NAME}\` remaining **permanently on duty** in \`"standby"\` mode across subsequent user tasks. Workers (\`role:"worker"\`) and Validators (\`role:"validator"\`) are **ephemeral** per-mission specialists that were retired and destroyed (along with isolated worktrees and validator scratch directories) when the prior run completed.`,
+    "- **User-Only Exit Rule**: Remain in Persistent Orchestrator Mode until the user explicitly runs `/swarm exit` (or `/swarm leave`, Hub `Exit Swarm Orchestrator Mode`, or `/swarm cancel`). NEVER attempt to exit Orchestrator Mode yourself.",
+    "- **Never Self-Implement (Hard Write & Mutating-Bash Guard)**: NEVER write, edit, or implement code yourself, and NEVER offer to \"make a quick edit directly\". `write`, `edit`, `powershell`, and mutating `bash` commands (file edits/redirections, `rm`/`mv`/`cp`/`mkdir`, `git add`/`commit`/`checkout`/`merge`, package installs, etc.) are **hard-blocked** by protocol guard. Even small 1-file code edits must be executed through a right-sized Swarm Mission (e.g. 1 `share` worker) unless the user runs `/swarm exit`.",
+    ...(roleModels ? [formatRoleModelsLine(roleModels)] : []),
+    `- **Standby Tools (${STANDBY_SWARM_TOOLS.length})**: ${STANDBY_SWARM_TOOLS.map((t) => `\`${t}\``).join(", ")}.`,
+    "",
+    "## 2. How to Handle Incoming User Messages in Standby Mode",
+    `- **Read-Only Inquiries, Explanations & Status Checks -> Answer Directly**: When the user asks a read-only question about the codebase, architecture, test status, or prior mission results, answer **directly and concisely** using read-only tools (\`read\`, \`grep\`, \`find\`, \`ls\`, read-only \`bash\`, \`${SWARM_TOOL}{action:"status"}\`, \`${READ_BOARD_TOOL}\`) WITHOUT launching a new Swarm run.`,
+    `- **Code Changes, Bug Fixes, Refactors & Engineering Tasks -> Route via Recon -> \`${SWARM_QUESTIONNAIRE_TOOL}\` -> \`${PROPOSE_SWARM_PLAN_TOOL}\`**: Launch a new Contract-First Swarm Mission directly from Standby Mode without asking the user to run \`/swarm\` again:`,
+    `  1. **Read-Only Operational Recon FIRST**: Inspect target files, \`package.json\`/configs, and any prior mission \`${SWARM_LIBRARY_DIR}/\` notes (\`${SWARM_DIR}/${SWARM_RUNS_DIR}/<runId>/${SWARM_LIBRARY_DIR}/\`: \`architecture\`, \`environment\`, \`testing\`) using \`read\`, \`grep\`, \`find\`, \`ls\` to ground exact **already-installed** \`commands\` (\`test\`, \`typecheck\`, \`build\`, \`lint\`, optional \`"init"\`), \`services\` (explicit unique ports & healthchecks), and \`boundaries\` (never invent speculative \`npx -y\` downloads).`,
+    clarificationStep,
+    `  3. **Contract-First Mission Proposal (\`ProposeMission\` — \`${PROPOSE_SWARM_PLAN_TOOL}\`)**: Call \`${PROPOSE_SWARM_PLAN_TOOL}\` directly with \`title\`, \`objective\`, wave-by-wave \`strategy\` (disjoint file/directory ownership boundaries), \`acceptance_criteria\` (exact runnable already-installed verification commands), \`commands\`, \`services\`, \`boundaries\`, **mandatory** \`VAL-<AREA>-<NNN>\` \`assertions\` (\`minItems: 1\`) + milestone-ordered \`features\` (\`minItems: 1\`, acyclic \`depends_on\`, disjoint \`files_owned\`, 100% 1-to-1 \`fulfills\` coverage), and right-sized wave-1 \`initial_members\` (1–2 workers for localized edits; disjoint parallel \`share\` workers + on-demand \`validator\` for multi-module work). Do NOT dump the full plan in prose before calling \`${PROPOSE_SWARM_PLAN_TOOL}\`.`,
+    "",
+    "## 3. Carry Forward Prior Mission `library/` Context",
+    `- Reuse institutional knowledge recorded in prior \`${SWARM_DIR}/${SWARM_RUNS_DIR}/<runId>/${SWARM_LIBRARY_DIR}/\` (\`architecture.md\`, \`environment.md\`, \`testing.md\`) so follow-up missions inherit established architecture, service ports, boundaries, and verification commands instead of re-discovering them from scratch (seed relevant prior notes into the new run via \`${SWARM_TOOL}{action:"mission", mission_op:"write_library", library_append:true}\` or worker briefs once confirmed).`,
+  ];
+
+  const sections: string[] = [standbyCoreLines.join("\n")];
+
+  if (priorRun) {
+    const priorLines: string[] = [
+      "## Prior Completed Mission Context",
+      `- **Prior Run**: ${priorRun.title} (\`${priorRun.id}\`) on \`${priorRun.baseBranch}\``,
+      `- **Prior Objective**: ${priorRun.objective}`,
+      `- **Prior Shared Library**: \`${SWARM_DIR}/${SWARM_RUNS_DIR}/${priorRun.id}/${SWARM_LIBRARY_DIR}/\` (\`architecture.md\`, \`environment.md\`, \`testing.md\`)`,
+    ];
+    if (priorRun.completionSummary?.trim()) {
+      priorLines.push(`- **Completion Summary**: ${priorRun.completionSummary.trim()}`);
+    }
+    if (priorRun.commands && priorRun.commands.length > 0) {
+      priorLines.push(
+        `- **Prior Operational Commands**: ${priorRun.commands.map((c) => `\`${c.name}\`: \`${c.command}\``).join(" | ")}`,
+      );
+    }
+    if (priorRun.services && priorRun.services.length > 0) {
+      const svcFormatted = priorRun.services
+        .map((s) => {
+          const portPart = s.port !== undefined ? ` (port ${s.port})` : "";
+          const hcPart = s.healthcheck ? `, healthcheck: \`${s.healthcheck}\`` : "";
+          return `\`${s.name}\`${portPart} [start: \`${s.start}\`${hcPart}]`;
+        })
+        .join(" | ");
+      priorLines.push(`- **Prior Services & Ports**: ${svcFormatted}`);
+    }
+    if (priorRun.boundaries && priorRun.boundaries.length > 0) {
+      priorLines.push(`- **Prior Boundaries**: ${priorRun.boundaries.join(" · ")}`);
+    }
+    sections.push(priorLines.join("\n"));
+  }
+
+  return sections.join("\n\n");
 }
 
 // ============================================================================

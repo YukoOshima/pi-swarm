@@ -82,6 +82,8 @@ export interface DraftingDeps {
     ctx: ExtensionContext,
     signal?: AbortSignal,
   ) => Promise<ContractReviewResult | undefined>;
+  /** Optional default `autoConfirm` resolver consulted by `propose_swarm_plan` when `currentDraft === null` (e.g. sticky `/swarm direct` sessions in Standby Orchestrator mode). */
+  getDefaultAutoConfirm?: (ctx: ExtensionContext) => boolean;
 }
 
 export interface DraftPlanValidationIssue {
@@ -3802,6 +3804,7 @@ export function createProposeSwarmPlanTool(
 
       // Step 2.5: Pre-Modal Adversarial Contract Reviewer (at most 1 automatic rejection bounce per draft;
       // bypassed cleanly when draft.skipContractReview is true, while Step 1 local validation stays active)
+      const ephemeralReviewKey = resolveDraftReviewKey(null, ctx);
       const draftReviewKey = resolveDraftReviewKey(currentDraft, ctx);
       let attachedContractReview: ContractReviewResult | undefined;
       let attachedReviewPass: number | undefined;
@@ -3865,8 +3868,11 @@ export function createProposeSwarmPlanTool(
         }
       }
 
-      // Step 3: Show confirmation modal (or auto-confirm for `/swarm direct`)
-      const autoConfirm = Boolean(currentDraft?.autoConfirm);
+      // Step 3: Show confirmation modal (or auto-confirm for `/swarm direct` / sticky standby direct mode)
+      const autoConfirm =
+        currentDraft !== null
+          ? Boolean(currentDraft.autoConfirm)
+          : Boolean(deps.getDefaultAutoConfirm?.(ctx));
       let outcome: ProposalDialogOutcome;
       if (autoConfirm) {
         outcome = {
@@ -3946,6 +3952,7 @@ export function createProposeSwarmPlanTool(
 
         // Clear draft and swap tool profile to `"running"` (the 4 core Swarm tools)
         reviewPassCounts.delete(draftReviewKey);
+        reviewPassCounts.delete(ephemeralReviewKey);
         draftController.clear("running");
         deps.onDraftChanged?.(null, ctx);
 
@@ -3983,12 +3990,15 @@ export function createProposeSwarmPlanTool(
 
       if (outcome.action === "cancel") {
         reviewPassCounts.delete(draftReviewKey);
+        reviewPassCounts.delete(ephemeralReviewKey);
+        const fallbackCancelProfile =
+          currentDraft?.mode === "tweak" || currentDraft?.targetRunId
+            ? "running"
+            : currentDraft === null && draftController.isStandbyProfileActive()
+              ? "standby"
+              : "idle";
         draftController.clear(
-          deps.onDraftChanged
-            ? undefined
-            : currentDraft?.mode === "tweak" || currentDraft?.targetRunId
-              ? "running"
-              : "idle",
+          deps.onDraftChanged ? undefined : fallbackCancelProfile,
         );
         deps.onDraftChanged?.(null, ctx);
 
@@ -4037,6 +4047,7 @@ export function createProposeSwarmPlanTool(
           baseBranch,
         });
       } else {
+        const priorPassCount = reviewPassCounts.get(draftReviewKey);
         updatedDraft = draftController.start({
           mode: currentDraft?.mode ?? "swarm",
           seed: currentDraft?.seed || validation.objective,
@@ -4049,6 +4060,13 @@ export function createProposeSwarmPlanTool(
             : {}),
           questionnaireEcho: currentDraft?.questionnaireEcho,
         });
+        const nextReviewKey = resolveDraftReviewKey(updatedDraft, ctx);
+        if (nextReviewKey !== draftReviewKey) {
+          reviewPassCounts.delete(draftReviewKey);
+          if (priorPassCount !== undefined) {
+            reviewPassCounts.set(nextReviewKey, priorPassCount);
+          }
+        }
       }
       deps.onDraftChanged?.(updatedDraft, ctx);
 

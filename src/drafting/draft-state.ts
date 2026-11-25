@@ -4,6 +4,7 @@ import {
   DEFAULT_SWARM_SETTINGS,
   DRAFTING_TOOLS,
   IDLE_SWARM_TOOLS,
+  STANDBY_SWARM_TOOLS,
   SWARM_CORE_TOOLS,
   SWARM_DRAFT_ENTRY,
   SWARM_DRAFT_VERSION,
@@ -15,7 +16,7 @@ import type { ActiveSwarmDraft, SwarmDraftMode, SwarmSettings } from "../types.j
 // Types
 // ============================================================================
 
-export type SwarmToolProfileMode = "idle" | "drafting" | "running";
+export type SwarmToolProfileMode = "idle" | "drafting" | "running" | "standby";
 
 /**
  * Branch-local durable Swarm draft state persisted via `pi.appendEntry` (`version: 2`).
@@ -66,7 +67,7 @@ export type DraftPersistenceAPI = Pick<
 // Tool Profile Swap (Idempotent — Preserves Host & Third-Party Tools)
 // ============================================================================
 
-export { IDLE_SWARM_TOOLS };
+export { IDLE_SWARM_TOOLS, STANDBY_SWARM_TOOLS };
 
 export function getSwarmToolsForMode(mode: SwarmToolProfileMode): readonly string[] {
   switch (mode) {
@@ -74,6 +75,8 @@ export function getSwarmToolsForMode(mode: SwarmToolProfileMode): readonly strin
       return DRAFTING_TOOLS;
     case "running":
       return SWARM_CORE_TOOLS;
+    case "standby":
+      return STANDBY_SWARM_TOOLS;
     case "idle":
       return IDLE_SWARM_TOOLS;
   }
@@ -87,6 +90,7 @@ export function getSwarmToolsForMode(mode: SwarmToolProfileMode): readonly strin
  * - `"idle"`     -> `IDLE_SWARM_TOOLS` (`["swarm"]`)
  * - `"drafting"` -> `DRAFTING_TOOLS` (`["swarm_question", "swarm_questionnaire", "propose_swarm_plan"]`)
  * - `"running"`  -> `SWARM_CORE_TOOLS` (`["swarm", "post_message", "read_board", "swarm_wait"]`)
+ * - `"standby"`  -> `STANDBY_SWARM_TOOLS` (`["swarm", "read_board", "swarm_question", "swarm_questionnaire", "propose_swarm_plan"]`)
  *
  * Calls `pi.setActiveTools()` ONLY when the sorted tool membership actually changes,
  * preventing unnecessary LLM prompt-cache invalidation.
@@ -583,9 +587,18 @@ export class DraftStateController {
     return isDraftActive(this.current);
   }
 
+  isStandbyProfileActive(): boolean {
+    const activeSet = new Set(this.pi.getActiveTools());
+    return STANDBY_SWARM_TOOLS.every((tool) => activeSet.has(tool));
+  }
+
   rehydrate(
     ctx: Pick<ExtensionContext, "sessionManager">,
-    options?: { syncToolProfile?: boolean; hasActiveRun?: boolean },
+    options?: {
+      syncToolProfile?: boolean;
+      hasActiveRun?: boolean;
+      hasPersistentOrchestrator?: boolean;
+    },
   ): SwarmDraftState | null {
     this.current = rehydrateDraft(ctx);
     if (options?.syncToolProfile) {
@@ -593,7 +606,9 @@ export class DraftStateController {
         ? "drafting"
         : options.hasActiveRun
           ? "running"
-          : "idle";
+          : options.hasPersistentOrchestrator
+            ? "standby"
+            : "idle";
       applySwarmToolProfile(this.pi, targetMode);
     }
     return this.getDraft();

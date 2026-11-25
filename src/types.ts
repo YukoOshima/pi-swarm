@@ -535,6 +535,8 @@ export interface SwarmFocusEntry {
   runId: string | null;
   sessionId: string;
   reason?: string;
+  orchestratorMode?: boolean;
+  autoConfirmDefault?: boolean;
 }
 
 export interface QuestionOption {

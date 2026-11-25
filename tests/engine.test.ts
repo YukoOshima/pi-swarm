@@ -18,9 +18,13 @@ import {
   findSafetySensitiveMemberSegment,
   ORCHESTRATOR_NAME,
   POST_MESSAGE_TOOL,
+  PROPOSE_SWARM_PLAN_TOOL,
   READ_BOARD_TOOL,
+  STANDBY_SWARM_TOOLS,
   SWARM_CORE_TOOLS,
   SWARM_MAX_BOARD_HOPS,
+  SWARM_QUESTIONNAIRE_TOOL,
+  SWARM_QUESTION_TOOL,
   SWARM_TOOL,
   SWARM_WAIT_TOOL,
 } from "../src/constants.js";
@@ -29,6 +33,7 @@ import {
   buildMemberSystemPrompt,
   buildOrchestratorLiveStateSection,
   buildOrchestratorPlaybookSection,
+  buildOrchestratorStandbySection,
   buildOrchestratorStaticSection,
   ConcurrencyGate,
   createMemberScopedTools,
@@ -10269,4 +10274,146 @@ describe("Validator Isolated Scratch Sandbox & Safety-Filter-Safe Member Naming"
     }
   });
 });
+
+// ============================================================================
+// Droid-Style Persistent Mission Orchestrator Standby & Mid-Mission Prompts (VAL-DROID-001)
+// ============================================================================
+
+describe("Droid-style Persistent Mission Orchestrator standby & mid-mission prompts (VAL-DROID-001)", () => {
+  it("renders buildOrchestratorStandbySection with ephemeral specialist lifecycle, permanent duty until /swarm exit, read-only vs coding triage, and prior library/ carry-forward", async () => {
+    const { engine, store } = await createTestHarness({
+      orchestratorModel: "anthropic/claude-opus-4-6",
+      workerModel: "anthropic/claude-sonnet-4-5",
+      validatorModel: "google/gemini-2.5-pro",
+      stallWatchdogEnabled: false,
+    });
+    try {
+      const priorRun = await store.createRun({
+        title: "Auth Foundation",
+        objective: "Ship OAuth2 PKCE foundation",
+        baseBranch: "main",
+        ownerSessionId: "sess-droid-1",
+        commands: [
+          { name: "typecheck", command: "npm run typecheck" },
+          { name: "test", command: "npm test" },
+        ],
+        services: [
+          {
+            name: "auth-api",
+            start: "npm run dev -- --port 4310",
+            healthcheck: "curl -sf http://127.0.0.1:4310/health",
+            port: 4310,
+          },
+        ],
+        boundaries: ["Never touch legacy-billing/"],
+      });
+      await store.updateRun(priorRun.id, {
+        status: "completed",
+        completionSummary: "All OAuth2 PKCE features merged and verified.",
+      });
+      await engine.attachRun(priorRun.id);
+
+      const snap = engine.getSnapshot();
+      const standbyPrompt = buildOrchestratorStandbySection(snap);
+
+      // 1. Ephemeral workers/validators vs permanent @orchestrator until /swarm exit
+      assert.match(standbyPrompt, /Standby Mode \(Droid Mission\)/);
+      assert.match(standbyPrompt, /ephemeral/i);
+      assert.match(standbyPrompt, /permanently on duty/i);
+      assert.match(standbyPrompt, /\/swarm exit/);
+      assert.match(standbyPrompt, /NEVER attempt to exit Orchestrator Mode yourself/);
+
+      // 2. Hard no-self-implementation & write/mutating-bash guard
+      assert.match(standbyPrompt, /Never Self-Implement/);
+      assert.match(standbyPrompt, /`write`, `edit`, `powershell`/);
+      assert.match(standbyPrompt, /mutating `bash`/);
+
+      // 3. Lists all 5 STANDBY_SWARM_TOOLS & 3-role models
+      for (const tool of STANDBY_SWARM_TOOLS) {
+        assert.ok(
+          standbyPrompt.includes(`\`${tool}\``),
+          `standby prompt must list ${tool}`,
+        );
+      }
+      assert.ok(standbyPrompt.includes("anthropic/claude-opus-4-6"));
+
+      // 4. Read-only inquiry triage vs coding recon -> swarm_questionnaire -> propose_swarm_plan pipeline
+      assert.match(standbyPrompt, /Read-Only Inquiries.*Answer Directly/);
+      assert.match(standbyPrompt, /WITHOUT launching a new Swarm run/);
+      assert.ok(standbyPrompt.includes(SWARM_QUESTIONNAIRE_TOOL));
+      assert.ok(standbyPrompt.includes(SWARM_QUESTION_TOOL));
+      assert.ok(standbyPrompt.includes(PROPOSE_SWARM_PLAN_TOOL));
+      assert.match(standbyPrompt, /\(Recommended\)/);
+
+      // 5. Carries forward prior run library/, summary, commands, services & boundaries
+      assert.ok(standbyPrompt.includes(`.pi/swarm/runs/${priorRun.id}/library/`));
+      assert.ok(
+        standbyPrompt.includes("All OAuth2 PKCE features merged and verified."),
+      );
+      assert.ok(standbyPrompt.includes("npm run typecheck"));
+      assert.ok(standbyPrompt.includes("port 4310"));
+      assert.ok(standbyPrompt.includes("Never touch legacy-billing/"));
+
+      // 6. Honors autoConfirmDefault: true fast-path & works cleanly with zero arguments
+      const directStandby = buildOrchestratorStandbySection(snap, {
+        autoConfirmDefault: true,
+      });
+      assert.match(directStandby, /autoConfirmDefault: true/);
+      assert.match(directStandby, /Skip interactive Q&A/);
+
+      const bareStandby = buildOrchestratorStandbySection();
+      assert.match(bareStandby, /\/swarm exit/);
+      assert.ok(bareStandby.includes(PROPOSE_SWARM_PLAN_TOOL));
+    } finally {
+      await engine.dispose();
+    }
+  });
+
+  it("upgrades mid-mission scope propagation rules in static, playbook, and live human-steering sections while keeping static section cache-stable", async () => {
+    const { engine } = await createTestHarness({
+      stallWatchdogEnabled: false,
+    });
+    try {
+      const snap = engine.getSnapshot();
+      const staticSec = buildOrchestratorStaticSection(snap);
+      const playbookSec = buildOrchestratorPlaybookSection(snap, {
+        humanSteeringText: "Also support refresh-token rotation",
+      });
+      const liveSec = buildOrchestratorLiveStateSection(snap, {
+        humanSteeringText: "Also support refresh-token rotation",
+      });
+
+      for (const sec of [staticSec, playbookSec]) {
+        assert.match(sec, /ephemeral/i);
+        assert.match(sec, /permanently on duty/i);
+        assert.match(sec, /\/swarm exit/);
+        assert.match(sec, /Never Self-Implement/);
+        assert.match(sec, /Droid Mid-Mission Scope Propagation/);
+        assert.match(sec, /Droid Shared-Truth Rule/);
+        assert.match(sec, /\[sealed\]/);
+        assert.match(sec, /write_library/);
+      }
+
+      for (const steered of [playbookSec, liveSec]) {
+        assert.match(steered, /Live User Direction Update/);
+        assert.match(steered, /Droid Shared-Truth Rule/);
+        assert.match(steered, /upsert_assertions/);
+        assert.match(steered, /upsert_features/);
+        assert.match(steered, /\[sealed\]/);
+        assert.match(steered, /write_library/);
+      }
+
+      // Prompt-cache invariant: static section stays identical across board posts
+      await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        text: "Wave 1 checkpoint",
+      });
+      assert.equal(buildOrchestratorStaticSection(engine.getSnapshot()), staticSec);
+    } finally {
+      await engine.dispose();
+    }
+  });
+});
+
 
