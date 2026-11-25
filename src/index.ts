@@ -3315,6 +3315,7 @@ export function createPiSwarmExtension(
     let preSwarmHostModel: PreSwarmHostModelSnapshot | undefined;
     let orchestratorMode = false;
     let autoConfirmDefault = false;
+    let lastCompletedRunId: string | null = null;
     const completedCardEmittedRunIds = new Set<string>();
     const activeDoneFlowRunIds = new Set<string>();
     let runsCache:
@@ -3351,7 +3352,18 @@ export function createPiSwarmExtension(
       }
     >();
 
+    function notifyEngineHumanInputAwaited(
+      waiting: boolean,
+      engineOverride?: ISwarmEngine,
+    ): void {
+      const eng = (engineOverride ?? activeEngine) as
+        | { setHumanInputAwaited?: (v: boolean) => void }
+        | undefined;
+      eng?.setHumanInputAwaited?.(waiting);
+    }
+
     function resetGoalContinuation(runId?: string | null): void {
+      notifyEngineHumanInputAwaited(false);
       if (!runId) {
         goalContinuationByRunId.clear();
         return;
@@ -4669,6 +4681,7 @@ export function createPiSwarmExtension(
           resetGoalContinuation(ev.runId);
         }
         if (ev.snapshot.run && isCurrentSessionOwner(ev.snapshot.run, lastCtx)) {
+          lastCompletedRunId = ev.snapshot.run.id;
           if (!orchestratorMode) {
             orchestratorMode = true;
           }
@@ -4984,6 +4997,16 @@ export function createPiSwarmExtension(
         autoConfirmDefault = false;
       }
 
+      if (
+        snapshot.run?.status === "completed" &&
+        (!snapshot.run.ownerSessionId ||
+          snapshot.run.ownerSessionId === currentSessionId)
+      ) {
+        lastCompletedRunId = snapshot.run.id;
+      } else if (!orchestratorMode) {
+        lastCompletedRunId = null;
+      }
+
       if ((hasFocusedRun && snapshot.run) || orchestratorMode) {
         const runOrch =
           snapshot.run &&
@@ -5061,6 +5084,7 @@ export function createPiSwarmExtension(
       lastObservedAssistantText = undefined;
       activatedRunIds.clear();
       readOnlyAttachRunIds.clear();
+      lastCompletedRunId = null;
       resetGoalContinuation();
       pendingWakeups.length = 0;
       wakeupFlushScheduled = false;
@@ -5170,6 +5194,13 @@ export function createPiSwarmExtension(
             target.clearOrchestratorWait(reason);
           };
         }
+        if (prop === "resume") {
+          return async (...args: Parameters<ISwarmEngine["resume"]>) => {
+            const resumed = await target.resume(...args);
+            notifyEngineHumanInputAwaited(false, target);
+            return resumed;
+          };
+        }
         if (prop === "completeRun") {
           return async (options: Parameters<ISwarmEngine["completeRun"]>[0]) => {
             if (waitArmedTurnIndex !== null && currentTurnIndex > waitArmedTurnIndex) {
@@ -5194,6 +5225,7 @@ export function createPiSwarmExtension(
             if (!orchestratorMode) {
               orchestratorMode = true;
             }
+            lastCompletedRunId = completed.id;
             if (
               lastCtx?.sessionManager &&
               rehydrateFocusState(lastCtx).orchestratorMode !== true
@@ -5547,9 +5579,10 @@ export function createPiSwarmExtension(
 
       // Release previously focused run ownership if switching runs (restored on rollback)
       const prevFocusedRunId = engine.getSnapshot().activeRunId;
+      let prevRunBefore: SwarmRunState | null = null;
       let releasedPrevOwnership = false;
       if (prevFocusedRunId) {
-        const prevRunBefore = await store.loadRun(prevFocusedRunId).catch(() => null);
+        prevRunBefore = await store.loadRun(prevFocusedRunId).catch(() => null);
         if (
           prevRunBefore &&
           prevRunBefore.ownerSessionId === ownerSessionId &&
@@ -5557,6 +5590,34 @@ export function createPiSwarmExtension(
         ) {
           await releaseRunOwnershipIfHeld(store, prevFocusedRunId, ownerSessionId);
           releasedPrevOwnership = true;
+        }
+      }
+
+      let priorCompletedRunId: string | null = null;
+      if (
+        prevRunBefore?.status === "completed" &&
+        (!prevRunBefore.ownerSessionId ||
+          prevRunBefore.ownerSessionId === ownerSessionId)
+      ) {
+        priorCompletedRunId = prevRunBefore.id;
+      } else if (orchestratorMode && lastCompletedRunId) {
+        const candidate = await store.loadRun(lastCompletedRunId).catch(() => null);
+        if (
+          candidate?.status === "completed" &&
+          (!candidate.ownerSessionId || candidate.ownerSessionId === ownerSessionId)
+        ) {
+          priorCompletedRunId = candidate.id;
+        }
+      } else if (orchestratorMode && ownerSessionId) {
+        const recentCompleted = (await listRunsCached(store, true).catch(() => []))
+          .slice()
+          .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+          .find(
+            (r) =>
+              r.status === "completed" && r.ownerSessionId === ownerSessionId,
+          );
+        if (recentCompleted) {
+          priorCompletedRunId = recentCompleted.id;
         }
       }
 
@@ -5586,6 +5647,54 @@ export function createPiSwarmExtension(
         ...(plan.boundaries !== undefined ? { boundaries: plan.boundaries } : {}),
         ...(plan.lastAudit !== undefined ? { lastAudit: plan.lastAudit } : {}),
       });
+
+      // 3b. Droid Standby Library Carry-Over: copy non-starter library/*.md discoveries from prior completed session run
+      if (
+        priorCompletedRunId &&
+        priorCompletedRunId !== createdRun.id &&
+        typeof store.listLibraryTopics === "function" &&
+        typeof store.readLibraryTopic === "function" &&
+        typeof store.writeLibraryTopic === "function"
+      ) {
+        try {
+          const priorTopics = await store.listLibraryTopics(priorCompletedRunId);
+          for (const entry of priorTopics) {
+            const topic = entry?.topic;
+            if (!topic) continue;
+            try {
+              const priorContent = await store.readLibraryTopic(
+                priorCompletedRunId,
+                topic,
+              );
+              if (
+                typeof priorContent !== "string" ||
+                priorContent.trim().length === 0
+              ) {
+                continue;
+              }
+              const starterContent = await store.readLibraryTopic(
+                createdRun.id,
+                topic,
+              );
+              if (
+                typeof starterContent === "string" &&
+                (priorContent === starterContent ||
+                  priorContent.trim() === starterContent.trim())
+              ) {
+                continue;
+              }
+              await store.writeLibraryTopic(createdRun.id, topic, priorContent, {
+                append: false,
+                actor: ORCHESTRATOR_NAME,
+              });
+            } catch {
+              // Best-effort per topic: corrupt/unreadable topic never blocks Run 2 launch
+            }
+          }
+        } catch {
+          // Best-effort carryover: missing/corrupt prior library never blocks launching Run 2
+        }
+      }
 
       // 4. Attach & start the run in SwarmEngine (defer focus entry until initialMembers settle)
       await engine.startRun(createdRun.id, toolCtx);
@@ -5686,8 +5795,15 @@ export function createPiSwarmExtension(
         return undefined;
       }
       const customReviewer = overrides.contractReviewer;
-      if (!customReviewer && !hasLivePiModelRuntime(ctx)) {
-        return undefined;
+      if (!customReviewer) {
+        const isLightweightSingleFeaturePlan =
+          (plan.features?.length ?? 0) <= 1 &&
+          (plan.assertions?.length ?? 0) <= 2 &&
+          (plan.services?.length ?? 0) === 0 &&
+          (plan.commands?.length ?? 0) === 0;
+        if (isLightweightSingleFeaturePlan || !hasLivePiModelRuntime(ctx)) {
+          return undefined;
+        }
       }
 
       const prevWorkingMsg =
@@ -7474,6 +7590,7 @@ export function createPiSwarmExtension(
         if (!orchestratorMode) {
           orchestratorMode = true;
         }
+        lastCompletedRunId = completed.id;
         if (rehydrateFocusState(ctx).orchestratorMode !== true) {
           persistCurrentFocus(completed.id, sessionId, "run_completed");
         }
@@ -7625,6 +7742,7 @@ export function createPiSwarmExtension(
         try {
           await assertFocusedRunOwner(store, snapshot.run.id, ctx);
           const updated = await engine.resume(snapshot.run.id, ctx);
+          notifyEngineHumanInputAwaited(false, engine);
           if (!orchestratorMode) {
             orchestratorMode = true;
             autoConfirmDefault = false;
@@ -7767,6 +7885,7 @@ export function createPiSwarmExtension(
         }
 
         const updated = await engine.resume(targetRun.id, ctx);
+        notifyEngineHumanInputAwaited(false, engine);
         if (!orchestratorMode) {
           orchestratorMode = true;
           autoConfirmDefault = false;
@@ -7974,6 +8093,7 @@ export function createPiSwarmExtension(
 
       orchestratorMode = false;
       autoConfirmDefault = false;
+      lastCompletedRunId = null;
       latestHumanDirection = undefined;
       waitArmedTurnIndex = null;
       activatedRunIds.delete(run.id);
@@ -8118,6 +8238,7 @@ export function createPiSwarmExtension(
     ): Promise<void> {
       orchestratorMode = false;
       autoConfirmDefault = false;
+      lastCompletedRunId = null;
       const prevFocused = engine.getSnapshot().activeRunId;
       if (prevFocused) {
         activatedRunIds.delete(prevFocused);
@@ -8194,6 +8315,7 @@ export function createPiSwarmExtension(
 
       orchestratorMode = false;
       autoConfirmDefault = false;
+      lastCompletedRunId = null;
       latestHumanDirection = undefined;
       waitArmedTurnIndex = null;
       unfinishedFooterCue = undefined;
@@ -10070,6 +10192,7 @@ export function createPiSwarmExtension(
         trimmedText.length > 0 &&
         !shouldSkipInputPreflight(trimmedText)
       ) {
+        notifyEngineHumanInputAwaited(false);
         resetGoalContinuation(activeEngine?.getSnapshot().activeRunId);
         if ((ctx ?? lastCtx)?.isIdle()) {
           userPromptPreflight = true;
@@ -10242,6 +10365,7 @@ export function createPiSwarmExtension(
 
       const assistantText = extractLastAssistantText(event, ctx);
       if (assistantText && /\[NEEDS_HUMAN\]/i.test(assistantText)) {
+        notifyEngineHumanInputAwaited(true);
         const needsHumanMsg = "🐝 Mission awaiting human input";
         if (ctx.hasUI) {
           ctx.ui.notify(needsHumanMsg, "info");

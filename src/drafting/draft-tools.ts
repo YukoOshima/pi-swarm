@@ -422,6 +422,12 @@ export const ProposeSwarmPlanParamsSchema = Type.Object({
         "Optional mission boundaries (reserved port ranges, off-limits directories, external service rules).",
     }),
   ),
+  skip_contract_review: Type.Optional(
+    Type.Boolean({
+      description:
+        "Optional fast-path flag to bypass the adversarial contract reviewer LLM pass for small or focused plans while keeping 0ms local contract validation active.",
+    }),
+  ),
 });
 
 export type SwarmQuestionParams = Static<typeof SwarmQuestionParamsSchema>;
@@ -3803,7 +3809,7 @@ export function createProposeSwarmPlanTool(
       };
 
       // Step 2.5: Pre-Modal Adversarial Contract Reviewer (at most 1 automatic rejection bounce per draft;
-      // bypassed cleanly when draft.skipContractReview is true, while Step 1 local validation stays active)
+      // bypassed cleanly when params.skip_contract_review or draft.skipContractReview is true, while Step 1 local validation stays active)
       const ephemeralReviewKey = resolveDraftReviewKey(null, ctx);
       const draftReviewKey = resolveDraftReviewKey(currentDraft, ctx);
       let attachedContractReview: ContractReviewResult | undefined;
@@ -3812,6 +3818,7 @@ export function createProposeSwarmPlanTool(
         typeof deps.reviewProposedContract === "function" &&
         proposedPlan.assertions &&
         proposedPlan.assertions.length > 0 &&
+        params.skip_contract_review !== true &&
         currentDraft?.skipContractReview !== true &&
         currentDraft?.validatorEnabled !== false &&
         proposedPlan.validatorEnabled !== false

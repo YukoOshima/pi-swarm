@@ -4654,25 +4654,76 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       "handlePlanConfirmed must not flap thinking level when already matching",
     );
 
+    const waitForMembersWaiting = async (
+      runId: string,
+      names: readonly string[],
+    ): Promise<void> => {
+      await waitFor(async () => {
+        const r = await store.loadRun(runId);
+        if (!names.every((n) => r.members[n]?.state === "waiting")) {
+          return false;
+        }
+        const statusRes = await host.executeTool(SWARM_TOOL, { action: "status" });
+        const liveMembers =
+          (
+            statusRes.details as {
+              members?: Array<{ name: string; state: string }>;
+            }
+          )?.members ?? [];
+        return names.every(
+          (n) => liveMembers.find((m) => m.name === n)?.state === "waiting",
+        );
+      });
+    };
+    const mergeOnceParked = async (memberName: string) => {
+      const deadline = Date.now() + 15_000;
+      while (true) {
+        const res = await host.executeTool(SWARM_TOOL, {
+          action: "merge",
+          name: memberName,
+        });
+        if (!res.isError) {
+          return res;
+        }
+        const errText = String(res.content?.[0]?.text ?? "");
+        if (!/MEMBER_NOT_WAITING/i.test(errText) || Date.now() >= deadline) {
+          assert.fail(
+            `Expected merge of @${memberName} to succeed, got: ${JSON.stringify(res)}`,
+          );
+        }
+        await new Promise((r) => setTimeout(r, 20));
+      }
+    };
+    const doneOnceAllParked = async (summary: string) => {
+      const deadline = Date.now() + 15_000;
+      while (true) {
+        const res = await host.executeTool(SWARM_TOOL, { action: "done", summary });
+        if (!res.isError) {
+          return res;
+        }
+        const errText = String(res.content?.[0]?.text ?? "");
+        if (!/still working/i.test(errText) || Date.now() >= deadline) {
+          assert.fail(
+            `Expected swarm done ("${summary}") to succeed, got: ${JSON.stringify(res)}`,
+          );
+        }
+        await new Promise((r) => setTimeout(r, 20));
+      }
+    };
+
     // Wait for worker & validator to finish initial turns, then merge auth-dev (leaving clean merged worktree on disk)
-    await waitFor(async () => {
-      const r = await store.loadRun(run1Id);
-      return (
-        r.members["auth-dev"]?.state === "waiting" &&
-        r.members["auth-val"]?.state === "waiting"
-      );
-    });
-    await host.executeTool(SWARM_TOOL, { action: "merge", name: "auth-dev" });
+    await waitForMembersWaiting(run1Id, ["auth-dev", "auth-val"]);
+    const merge1Res = await mergeOnceParked("auth-dev");
+    assert.equal(merge1Res.isError, undefined, JSON.stringify(merge1Res));
+    await waitForMembersWaiting(run1Id, ["auth-dev", "auth-val"]);
     const run1BeforeDone = await store.loadRun(run1Id);
     const wt1Path = run1BeforeDone.members["auth-dev"]!.cwd;
     assert.equal(await pathExists(wt1Path), true);
 
     // B. Tool-initiated `swarm{action:"done"}` emits Rich Mission Complete Card with `/swarm teardown` & retains sticky orchestratorModel in standby!
     const confirmsBeforeToolDone = host.confirmCalls.length;
-    await host.executeTool(SWARM_TOOL, {
-      action: "done",
-      summary: "Auth module merged and validated",
-    });
+    const done1Res = await doneOnceAllParked("Auth module merged and validated");
+    assert.equal(done1Res.isError, undefined, JSON.stringify(done1Res));
     assert.equal(
       host.confirmCalls.length,
       confirmsBeforeToolDone,
@@ -4728,11 +4779,10 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       ],
     });
     const run2Id: string = plan2.details.runId;
-    await waitFor(async () => {
-      const r = await store.loadRun(run2Id);
-      return r.members["bill-dev"]?.state === "waiting";
-    });
-    await host.executeTool(SWARM_TOOL, { action: "merge", name: "bill-dev" });
+    await waitForMembersWaiting(run2Id, ["bill-dev"]);
+    const merge2Res = await mergeOnceParked("bill-dev");
+    assert.equal(merge2Res.isError, undefined, JSON.stringify(merge2Res));
+    await waitForMembersWaiting(run2Id, ["bill-dev"]);
     const wt2Path = (await store.loadRun(run2Id)).members["bill-dev"]!.cwd;
     assert.equal(await pathExists(wt2Path), true);
 
@@ -9242,5 +9292,646 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     await reloadedStandbyHost.emit("session_shutdown", { reason: "quit" });
     await foreignOwner.emit("session_shutdown", { reason: "quit" });
     await host.emit("session_shutdown", { reason: "quit" });
+  });
+
+  it("30. VAL-SYNTH-001: live ephemeral @contract-reviewer auto-skips on lightweight 1-feature plans, runs on multi-feature/manifest plans, honors skip_contract_review, and preserves overrides.contractReviewer", async () => {
+    const repoDir = await createTempGitRepo("val-synth-001-review-gating");
+    tempDirs.push(repoDir);
+
+    const spawnedReviewRequests: SpawnMemberRequest[] = [];
+    let reviewerKilledCount = 0;
+    const liveSimRuntime = {
+      ...createMockModelRuntime(),
+      stream: () => {
+        throw new Error("Mock transport intercepts before network stream");
+      },
+    } as unknown as ModelRuntime;
+
+    const liveReviewTransport: ISwarmTransport = {
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        if (request.runId === "draft-contract-review") {
+          spawnedReviewRequests.push(request);
+          const tracker = createMockPersistentMemberHandle({
+            request,
+            runInitialTurn: async ({ pushAssistantMessage }) => {
+              const verdict = `<approved/>`;
+              pushAssistantMessage(verdict);
+              return {
+                agentId: request.agentId,
+                name: request.name,
+                role: request.role,
+                outcome: "stopped",
+                summary: verdict,
+                tokens: 120,
+                cost: 0.0012,
+              };
+            },
+          });
+          const origKill = tracker.handle.kill.bind(tracker.handle);
+          tracker.handle.kill = async (reason?: string) => {
+            reviewerKilledCount += 1;
+            return origKill(reason);
+          };
+          return tracker.handle;
+        }
+        const tracker = createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async () => ({
+            agentId: request.agentId,
+            name: request.name,
+            role: request.role,
+            outcome: "waiting",
+            summary: "Parked",
+            tokens: 50,
+            cost: 0.0005,
+          }),
+        });
+        return tracker.handle;
+      },
+    };
+
+    const liveHost = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-val-synth-001-live",
+      modelRuntime: liveSimRuntime,
+    });
+    createPiSwarmExtension({
+      transportFactory: () => liveReviewTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        validatorModel: "openai/gpt-5.2",
+        validatorThinkingLevel: "high",
+        stallWatchdogEnabled: false,
+      }),
+      questionnaireUI: {
+        async askQuestion() {
+          return { cancelled: false, isCustom: false };
+        },
+        async askQuestionnaire() {
+          return { cancelled: false, answers: {}, items: [] };
+        },
+        async confirmProposal(_c, plan) {
+          return {
+            action: "confirm",
+            validatorEnabled: plan.validatorEnabled,
+            maxConcurrency: plan.maxConcurrency,
+          };
+        },
+      },
+    })(liveHost.pi);
+    await liveHost.emit("session_start", { reason: "startup" });
+
+    // 1. Lightweight 1-feature, <=2-assertions, 0-commands, 0-services plan:
+    //    (a) local validation STILL rejects missing fulfills
+    await liveHost.runCommand("swarm-direct", "Quick bugfix");
+    const invalidLeanRes = await liveHost.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Lean Invalid Plan",
+      objective: "Fix parser typo",
+      strategy: "Single worker",
+      acceptance_criteria: "Tests pass",
+      base_branch: "main",
+      assertions: [
+        { id: "VAL-LEAN-001", title: "A1", description: "D1" },
+        { id: "VAL-LEAN-002", title: "A2", description: "D2" },
+      ],
+      features: [
+        {
+          id: "lean-fix",
+          title: "Fix typo",
+          description: "Fix parser",
+          milestone: "M1",
+          files_owned: ["src/parser.ts"],
+          fulfills: ["VAL-LEAN-001"],
+        },
+      ],
+    });
+    assert.equal(invalidLeanRes.isError, true);
+    assert.equal(spawnedReviewRequests.length, 0);
+
+    //    (b) valid lightweight plan auto-skips spawning live @contract-reviewer!
+    const validLeanRes = await liveHost.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Lean Valid Plan",
+      objective: "Fix parser typo",
+      strategy: "Single worker",
+      acceptance_criteria: "Tests pass",
+      base_branch: "main",
+      assertions: [
+        { id: "VAL-LEAN-001", title: "A1", description: "D1" },
+        { id: "VAL-LEAN-002", title: "A2", description: "D2" },
+      ],
+      features: [
+        {
+          id: "lean-fix",
+          title: "Fix typo",
+          description: "Fix parser",
+          milestone: "M1",
+          files_owned: ["src/parser.ts"],
+          fulfills: ["VAL-LEAN-001", "VAL-LEAN-002"],
+        },
+      ],
+    });
+    assert.equal(validLeanRes.isError, undefined, JSON.stringify(validLeanRes));
+    assert.equal(
+      spawnedReviewRequests.length,
+      0,
+      "Lightweight 1-feature/<=2-assertions/0-commands/0-services plan must auto-skip live @contract-reviewer",
+    );
+    await liveHost.runCommand("swarm", "done --force Lean run done");
+
+    // 2. Multi-feature plan (features.length >= 2) from Standby DOES run live @contract-reviewer!
+    const multiFeatRes = await liveHost.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Multi-Feature Plan",
+      objective: "Ship auth and billing",
+      strategy: "Parallel disjoint workers",
+      acceptance_criteria: "All tests pass",
+      base_branch: "main",
+      assertions: [
+        { id: "VAL-MF-001", title: "Auth", description: "Auth works" },
+        { id: "VAL-MF-002", title: "Billing", description: "Billing works" },
+      ],
+      features: [
+        {
+          id: "feat-auth",
+          title: "Auth",
+          description: "Auth impl",
+          milestone: "M1",
+          files_owned: ["src/auth.ts"],
+          fulfills: ["VAL-MF-001"],
+        },
+        {
+          id: "feat-billing",
+          title: "Billing",
+          description: "Billing impl",
+          milestone: "M1",
+          files_owned: ["src/billing.ts"],
+          fulfills: ["VAL-MF-002"],
+        },
+      ],
+    });
+    assert.equal(multiFeatRes.isError, undefined, JSON.stringify(multiFeatRes));
+    assert.equal(
+      spawnedReviewRequests.length,
+      1,
+      "Multi-feature plan must run live ephemeral @contract-reviewer",
+    );
+    assert.equal(reviewerKilledCount, 1);
+    await liveHost.runCommand("swarm", "done --force Multi-feat done");
+
+    // 2b. Single-feature plan with >= 3 assertions OR services.length > 0 STILL runs live @contract-reviewer!
+    const threeAssertionsRes = await liveHost.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Three Assertions Single Feature",
+      objective: "Verify >=3 assertions still runs live reviewer",
+      strategy: "Single worker",
+      acceptance_criteria: "All 3 assertions pass",
+      base_branch: "main",
+      assertions: [
+        { id: "VAL-TA-001", title: "A1", description: "D1" },
+        { id: "VAL-TA-002", title: "A2", description: "D2" },
+        { id: "VAL-TA-003", title: "A3", description: "D3" },
+      ],
+      features: [
+        {
+          id: "feat-ta",
+          title: "TA",
+          description: "Impl",
+          milestone: "M1",
+          files_owned: ["src/ta.ts"],
+          fulfills: ["VAL-TA-001", "VAL-TA-002", "VAL-TA-003"],
+        },
+      ],
+    });
+    assert.equal(threeAssertionsRes.isError, undefined);
+    assert.equal(spawnedReviewRequests.length, 2);
+    assert.equal(reviewerKilledCount, 2);
+    await liveHost.runCommand("swarm", "done --force Three-assertions done");
+
+    const servicePlanRes = await liveHost.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Service Single Feature",
+      objective: "Verify services.length > 0 still runs live reviewer",
+      strategy: "Single worker",
+      acceptance_criteria: "Service healthy",
+      base_branch: "main",
+      assertions: [{ id: "VAL-SV-001", title: "S1", description: "D1" }],
+      features: [
+        {
+          id: "feat-sv",
+          title: "SV",
+          description: "Impl",
+          milestone: "M1",
+          files_owned: ["src/sv.ts"],
+          fulfills: ["VAL-SV-001"],
+        },
+      ],
+      services: [{ name: "api-dev", start: "npm start", port: 4310 }],
+    });
+    assert.equal(servicePlanRes.isError, undefined);
+    assert.equal(spawnedReviewRequests.length, 3);
+    assert.equal(reviewerKilledCount, 3);
+    await liveHost.runCommand("swarm", "done --force Service plan done");
+
+    // 3. Multi-feature plan with explicit skip_contract_review: true bypasses live reviewer while keeping local overlap gate
+    const skipOverlapRes = await liveHost.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Skipped Review Overlap Check",
+      objective: "Verify local overlap check still blocks",
+      strategy: "Parallel workers",
+      acceptance_criteria: "Tests pass",
+      base_branch: "main",
+      skip_contract_review: true,
+      assertions: [
+        { id: "VAL-SK-001", title: "A1", description: "D1" },
+        { id: "VAL-SK-002", title: "A2", description: "D2" },
+      ],
+      features: [
+        {
+          id: "sk-1",
+          title: "SK1",
+          description: "D1",
+          milestone: "M1",
+          files_owned: ["src/overlap.ts"],
+          fulfills: ["VAL-SK-001"],
+        },
+        {
+          id: "sk-2",
+          title: "SK2",
+          description: "D2",
+          milestone: "M1",
+          files_owned: ["src/overlap.ts"],
+          fulfills: ["VAL-SK-002"],
+        },
+      ],
+    });
+    assert.equal(skipOverlapRes.isError, true);
+    assert.equal(spawnedReviewRequests.length, 3);
+
+    const skipMultiOk = await liveHost.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Skipped Review Valid Multi-Feature",
+      objective: "Fast launch",
+      strategy: "Disjoint workers",
+      acceptance_criteria: "Tests pass",
+      base_branch: "main",
+      skip_contract_review: true,
+      assertions: [
+        { id: "VAL-SK-001", title: "A1", description: "D1" },
+        { id: "VAL-SK-002", title: "A2", description: "D2" },
+      ],
+      features: [
+        {
+          id: "sk-1",
+          title: "SK1",
+          description: "D1",
+          milestone: "M1",
+          files_owned: ["src/sk1.ts"],
+          fulfills: ["VAL-SK-001"],
+        },
+        {
+          id: "sk-2",
+          title: "SK2",
+          description: "D2",
+          milestone: "M1",
+          files_owned: ["src/sk2.ts"],
+          fulfills: ["VAL-SK-002"],
+        },
+      ],
+    });
+    assert.equal(skipMultiOk.isError, undefined);
+    assert.equal(
+      spawnedReviewRequests.length,
+      3,
+      "skip_contract_review: true must bypass live reviewer even on multi-feature plans",
+    );
+    await liveHost.runCommand("swarm", "done --force Skip ok done");
+    await liveHost.emit("session_shutdown", { reason: "quit" });
+
+    // 4. When overrides.contractReviewer IS provided, even lightweight 1-feature plans still invoke it!
+    let customHookCalls = 0;
+    const hookHost = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-val-synth-001-hook",
+    });
+    createPiSwarmExtension({
+      transportFactory: () => liveReviewTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: false,
+      }),
+      contractReviewer: async () => {
+        customHookCalls += 1;
+        return { approved: true, summary: "Custom hook ran", findings: [] };
+      },
+    })(hookHost.pi);
+    await hookHost.emit("session_start", { reason: "startup" });
+    await hookHost.runCommand("swarm-direct", "Custom hook check");
+    const hookRes = await hookHost.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Hook Check",
+      objective: "Ensure test hook always runs",
+      strategy: "Single worker",
+      acceptance_criteria: "Tests pass",
+      base_branch: "main",
+      assertions: [{ id: "VAL-HK-001", title: "H1", description: "D1" }],
+      features: [
+        {
+          id: "hk-1",
+          title: "HK1",
+          description: "D1",
+          milestone: "M1",
+          fulfills: ["VAL-HK-001"],
+        },
+      ],
+    });
+    assert.equal(hookRes.isError, undefined);
+    assert.equal(
+      customHookCalls,
+      1,
+      "overrides.contractReviewer must always be invoked even on 1-feature plans",
+    );
+    await hookHost.runCommand("swarm", "done --force Hook done");
+    await hookHost.emit("session_shutdown", { reason: "quit" });
+  });
+
+  it("31. VAL-SYNTH-002: Standby missions automatically carry over non-starter library/*.md knowledge without mutating prior runs, and [NEEDS_HUMAN] toggles setHumanInputAwaited", async () => {
+    const repoDir = await createTempGitRepo("val-synth-002-library-carryover");
+    tempDirs.push(repoDir);
+    const store = new SwarmStore(repoDir);
+
+    const humanInputAwaitedCalls: boolean[] = [];
+    const origSetHuman = (
+      SwarmEngine.prototype as unknown as {
+        setHumanInputAwaited?: (waiting: boolean) => void;
+      }
+    ).setHumanInputAwaited;
+    (
+      SwarmEngine.prototype as unknown as {
+        setHumanInputAwaited?: (waiting: boolean) => void;
+      }
+    ).setHumanInputAwaited = function (this: SwarmEngine, waiting: boolean) {
+      humanInputAwaitedCalls.push(waiting);
+      origSetHuman?.call(this, waiting);
+    };
+
+    try {
+      const makeTransport = (): ISwarmTransport => ({
+        async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+          const tracker = createMockPersistentMemberHandle({
+            request,
+            runInitialTurn: async () => ({
+              agentId: request.agentId,
+              name: request.name,
+              role: request.role,
+              outcome: "waiting",
+              summary: "Parked",
+              tokens: 50,
+              cost: 0.0005,
+            }),
+          });
+          return tracker.handle;
+        },
+      });
+
+      const host = createMockPiHarness(repoDir, {
+        mode: "tui",
+        sessionId: "sess-val-synth-002",
+      });
+      createPiSwarmExtension({
+        transportFactory: makeTransport,
+        settingsLoader: async () => ({
+          ...DEFAULT_SWARM_SETTINGS,
+          stallWatchdogEnabled: false,
+        }),
+      })(host.pi);
+      await host.emit("session_start", { reason: "startup" });
+
+      // 1. Launch Run 1 and record discoveries in library/architecture.md, library/testing.md, and custom library/auth-conventions.md
+      //    (leaving library/environment.md at its default starter template)
+      await host.runCommand("swarm-direct", "Mission 1: discover architecture");
+      const plan1 = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+        title: "Mission 1",
+        objective: "Record library notes",
+        strategy: "Direct",
+        acceptance_criteria: "Library populated",
+        base_branch: "main",
+        assertions: [{ id: "VAL-LIB-001", title: "Lib 1", description: "Lib 1" }],
+        features: [
+          {
+            id: "lib-feat-1",
+            title: "Lib feat 1",
+            description: "Populate library",
+            milestone: "M1",
+            fulfills: ["VAL-LIB-001"],
+          },
+        ],
+      });
+      assert.equal(plan1.isError, undefined);
+      const run1Id: string = plan1.details.runId;
+
+      // Flush kickoff, simulate custom turn start -> [NEEDS_HUMAN] -> setHumanInputAwaited(true) -> input/resume -> false
+      host.setIdle(true);
+      await host.emit("agent_settled", { aborted: false });
+      await host.emit("before_agent_start", {
+        messageType: "custom",
+        systemPromptOptions: { sections: {} },
+      });
+      humanInputAwaitedCalls.length = 0;
+      host.setSessionMessages([
+        makeAssistantMsg("Blocked on API key [NEEDS_HUMAN]"),
+      ]);
+      await host.emit("agent_settled", { aborted: false });
+      assert.deepEqual(
+        humanInputAwaitedCalls,
+        [true],
+        "[NEEDS_HUMAN] on agent_settled must invoke engine.setHumanInputAwaited(true)",
+      );
+
+      humanInputAwaitedCalls.length = 0;
+      await host.emit("input", { source: "interactive", text: "Here is the API key" });
+      assert.equal(
+        humanInputAwaitedCalls.includes(false),
+        true,
+        "Interactive user input must clear setHumanInputAwaited(false)",
+      );
+
+      await host.emit("before_agent_start", {
+        messageType: "user",
+        prompt: "Here is the API key",
+        systemPromptOptions: { sections: {} },
+      });
+      host.setSessionMessages([
+        makeAssistantMsg("Need one more decision [NEEDS_HUMAN]"),
+      ]);
+      humanInputAwaitedCalls.length = 0;
+      await host.emit("agent_settled", { aborted: false });
+      assert.deepEqual(humanInputAwaitedCalls, [true]);
+      host.setSessionMessages([]);
+      humanInputAwaitedCalls.length = 0;
+      await host.runCommand("swarm", "resume --quiet");
+      assert.equal(
+        humanInputAwaitedCalls.includes(false),
+        true,
+        "/swarm resume must clear setHumanInputAwaited(false)",
+      );
+
+      await host.executeTool(SWARM_TOOL, {
+        action: "mission",
+        mission_op: "write_library",
+        library_topic: "architecture",
+        library_content: "- Auth tokens use Ed25519 in `src/auth/jwt.ts`.\n",
+        library_append: true,
+      });
+      await host.executeTool(SWARM_TOOL, {
+        action: "mission",
+        mission_op: "write_library",
+        library_topic: "testing",
+        library_content: "- Run `npm test` sequentially to avoid port contention.\n",
+        library_append: true,
+      });
+      await host.executeTool(SWARM_TOOL, {
+        action: "mission",
+        mission_op: "write_library",
+        library_topic: "auth-conventions",
+        library_content: "# Auth Conventions\n\n- Never log raw bearer tokens.\n",
+        library_append: false,
+      });
+
+      const run1ArchBefore = await store.readLibraryTopic(run1Id, "architecture");
+      const run1EnvBefore = await store.readLibraryTopic(run1Id, "environment");
+      const run1TestBefore = await store.readLibraryTopic(run1Id, "testing");
+      const run1CustomBefore = await store.readLibraryTopic(run1Id, "auth-conventions");
+      assert.equal(run1EnvBefore, "# Environment\n\n");
+
+      // Complete Run 1 -> transitions to Standby mode
+      await host.runCommand("swarm", "done --force Mission 1 complete");
+      assert.equal((await store.loadRun(run1Id)).status, "completed");
+
+      // 2. Launch Run 2 directly from Standby mode -> automatically inherits Run 1's non-starter library/*.md!
+      const plan2 = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+        title: "Mission 2",
+        objective: "Build on Mission 1 knowledge",
+        strategy: "Standby follow-up",
+        acceptance_criteria: "Inherits library",
+        base_branch: "main",
+        assertions: [{ id: "VAL-LIB-002", title: "Lib 2", description: "Lib 2" }],
+        features: [
+          {
+            id: "lib-feat-2",
+            title: "Lib feat 2",
+            description: "Use inherited library",
+            milestone: "M1",
+            fulfills: ["VAL-LIB-002"],
+          },
+        ],
+      });
+      assert.equal(plan2.isError, undefined, JSON.stringify(plan2));
+      const run2Id: string = plan2.details.runId;
+      assert.notEqual(run2Id, run1Id);
+
+      assert.equal(await store.readLibraryTopic(run2Id, "architecture"), run1ArchBefore);
+      assert.equal(await store.readLibraryTopic(run2Id, "testing"), run1TestBefore);
+      assert.equal(await store.readLibraryTopic(run2Id, "auth-conventions"), run1CustomBefore);
+      assert.equal(
+        await store.readLibraryTopic(run2Id, "environment"),
+        "# Environment\n\n",
+        "Untouched starter topic must stay clean without duplicate starter headers",
+      );
+
+      // Appending in Run 2 MUST NOT mutate Run 1's library on disk!
+      await host.executeTool(SWARM_TOOL, {
+        action: "mission",
+        mission_op: "write_library",
+        library_topic: "architecture",
+        library_content: "- Billing webhook verified in Run 2.\n",
+        library_append: true,
+      });
+      assert.equal(
+        await store.readLibraryTopic(run1Id, "architecture"),
+        run1ArchBefore,
+        "Run 1 library/architecture.md must never be mutated by Run 2",
+      );
+      assert.match(
+        String(await store.readLibraryTopic(run2Id, "architecture")),
+        /Billing webhook verified in Run 2/,
+      );
+
+      await host.runCommand("swarm", "done --force Mission 2 complete");
+      assert.equal((await store.loadRun(run2Id)).status, "completed");
+
+      // 3. Missing/deleted prior library directory never blocks launching Run 3 from Standby!
+      await rm(path.join(store.getRunDir(run2Id), SWARM_LIBRARY_DIR), {
+        recursive: true,
+        force: true,
+      });
+      const plan3 = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+        title: "Mission 3",
+        objective: "Resilient launch when prior library missing",
+        strategy: "Standby follow-up",
+        acceptance_criteria: "Launches cleanly",
+        base_branch: "main",
+        assertions: [{ id: "VAL-LIB-003", title: "Lib 3", description: "Lib 3" }],
+        features: [
+          {
+            id: "lib-feat-3",
+            title: "Lib feat 3",
+            description: "Launch cleanly",
+            milestone: "M1",
+            fulfills: ["VAL-LIB-003"],
+          },
+        ],
+      });
+      assert.equal(plan3.isError, undefined, JSON.stringify(plan3));
+      const run3Id: string = plan3.details.runId;
+      assert.equal(await store.readLibraryTopic(run3Id, "architecture"), "# Architecture\n\n");
+
+      // Write a note in Run 3, complete Run 3, then explicitly `/swarm exit` -> Run 4 starts fresh!
+      await host.executeTool(SWARM_TOOL, {
+        action: "mission",
+        mission_op: "write_library",
+        library_topic: "environment",
+        library_content: "- Temp port 4321\n",
+        library_append: true,
+      });
+      await host.runCommand("swarm", "done --force Mission 3 complete");
+      assert.equal((await store.loadRun(run3Id)).status, "completed");
+      await host.runCommand("swarm", "exit");
+
+      await host.runCommand("swarm-direct", "Fresh session after exit");
+      const plan4 = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+        title: "Mission 4 Fresh",
+        objective: "Fresh start after /swarm exit",
+        strategy: "Fresh",
+        acceptance_criteria: "Starter library",
+        base_branch: "main",
+        assertions: [{ id: "VAL-LIB-004", title: "Lib 4", description: "Lib 4" }],
+        features: [
+          {
+            id: "lib-feat-4",
+            title: "Lib feat 4",
+            description: "Fresh starter library",
+            milestone: "M1",
+            fulfills: ["VAL-LIB-004"],
+          },
+        ],
+      });
+      assert.equal(plan4.isError, undefined);
+      const run4Id: string = plan4.details.runId;
+      assert.equal(
+        await store.readLibraryTopic(run4Id, "environment"),
+        "# Environment\n\n",
+        "After explicit /swarm exit, a new run starts with clean starter library",
+      );
+      await host.runCommand("swarm", "done --force Mission 4 complete");
+      await host.emit("session_shutdown", { reason: "quit" });
+    } finally {
+      if (origSetHuman) {
+        (
+          SwarmEngine.prototype as unknown as {
+            setHumanInputAwaited?: (waiting: boolean) => void;
+          }
+        ).setHumanInputAwaited = origSetHuman;
+      } else {
+        delete (
+          SwarmEngine.prototype as unknown as {
+            setHumanInputAwaited?: (waiting: boolean) => void;
+          }
+        ).setHumanInputAwaited;
+      }
+    }
   });
 });

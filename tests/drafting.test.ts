@@ -6884,3 +6884,275 @@ describe("standby-profile-and-droid-prompts: VAL-STANDBY-001 & VAL-STANDBY-002",
   });
 });
 
+// ============================================================================
+// 15. droid-agy-lightweight-planning-and-library-carryover: VAL-SYNTH-001
+// ============================================================================
+
+describe("droid-agy-lightweight-planning-and-library-carryover: VAL-SYNTH-001", () => {
+  it("VAL-SYNTH-001: skip_contract_review flat boolean bypasses reviewProposedContract while keeping all 0ms local contract validations active", async () => {
+    const schemaJson = JSON.stringify(ProposeSwarmPlanParamsSchema);
+    assert.equal(schemaJson.includes("anyOf"), false);
+    assert.equal(schemaJson.includes("oneOf"), false);
+    const skipProp = (
+      ProposeSwarmPlanParamsSchema as unknown as {
+        properties?: Record<string, { type?: string }>;
+      }
+    ).properties?.skip_contract_review;
+    assert.ok(skipProp, "ProposeSwarmPlanParamsSchema must define skip_contract_review");
+    assert.equal(skipProp.type, "boolean");
+
+    const harness = new MockPiHarness();
+    applySwarmToolProfile(harness.api, "standby");
+
+    let reviewCalls = 0;
+    const confirmedPlans: ProposedSwarmPlan[] = [];
+
+    registerDraftingTools(harness.api, {
+      worktree: createMockWorktree({ currentBranch: "main" }),
+      ui: {
+        askQuestion: async () => ({ cancelled: true, isCustom: false }),
+        askQuestionnaire: async () => ({ cancelled: true, answers: {}, items: [] }),
+        confirmProposal: async (_ctx, plan) => ({
+          action: "confirm",
+          validatorEnabled: plan.validatorEnabled,
+          maxConcurrency: plan.maxConcurrency,
+        }),
+      },
+      getSettings: () => ({ ...DEFAULT_SWARM_SETTINGS }),
+      getDefaultAutoConfirm: () => true,
+      reviewProposedContract: async () => {
+        reviewCalls += 1;
+        return {
+          approved: false,
+          summary: "Should not run when skip_contract_review is true",
+          findings: [
+            {
+              severity: "blocking",
+              category: "other",
+              message: "Reviewer invoked unexpectedly",
+            },
+          ],
+        };
+      },
+      onPlanConfirmed: async (plan) => {
+        confirmedPlans.push(plan);
+        return createMockRun(plan);
+      },
+    });
+
+    const ctx = harness.createContext();
+    const proposeTool = harness.registeredTools.get(PROPOSE_SWARM_PLAN_TOOL);
+
+    // 1. Local 0ms validations STILL fire even when skip_contract_review: true!
+    // (a) files_owned overlap
+    const overlapRes = await proposeTool.execute(
+      "tc-skip-overlap",
+      makeSamplePlanParams({
+        skip_contract_review: true,
+        assertions: [
+          { id: "VAL-S-001", title: "A1", description: "D1" },
+          { id: "VAL-S-002", title: "A2", description: "D2" },
+        ],
+        features: [
+          {
+            id: "f1",
+            title: "F1",
+            description: "D1",
+            milestone: "M1",
+            files_owned: ["src/shared.ts"],
+            fulfills: ["VAL-S-001"],
+          },
+          {
+            id: "f2",
+            title: "F2",
+            description: "D2",
+            milestone: "M1",
+            files_owned: ["src/shared.ts"],
+            fulfills: ["VAL-S-002"],
+          },
+        ],
+      }),
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(overlapRes.isError, true);
+    assert.match(overlapRes.content[0].text, /Overlapping files_owned/);
+    assert.equal(reviewCalls, 0);
+
+    // (b) DAG cycle
+    const cycleRes = await proposeTool.execute(
+      "tc-skip-cycle",
+      makeSamplePlanParams({
+        skip_contract_review: true,
+        assertions: [
+          { id: "VAL-S-001", title: "A1", description: "D1" },
+          { id: "VAL-S-002", title: "A2", description: "D2" },
+        ],
+        features: [
+          {
+            id: "f1",
+            title: "F1",
+            description: "D1",
+            milestone: "M1",
+            depends_on: ["f2"],
+            fulfills: ["VAL-S-001"],
+          },
+          {
+            id: "f2",
+            title: "F2",
+            description: "D2",
+            milestone: "M1",
+            depends_on: ["f1"],
+            fulfills: ["VAL-S-002"],
+          },
+        ],
+      }),
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(cycleRes.isError, true);
+    assert.match(cycleRes.content[0].text, /cycle/i);
+
+    // (c) fulfills gap
+    const fulfillsRes = await proposeTool.execute(
+      "tc-skip-fulfills",
+      makeSamplePlanParams({
+        skip_contract_review: true,
+        assertions: [
+          { id: "VAL-S-001", title: "A1", description: "D1" },
+          { id: "VAL-S-002", title: "A2", description: "D2" },
+        ],
+        features: [
+          {
+            id: "f1",
+            title: "F1",
+            description: "D1",
+            milestone: "M1",
+            fulfills: ["VAL-S-001"],
+          },
+        ],
+      }),
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(fulfillsRes.isError, true);
+    assert.match(fulfillsRes.content[0].text, /VAL-S-002/);
+
+    // (d) duplicate service ports
+    const portRes = await proposeTool.execute(
+      "tc-skip-ports",
+      makeSamplePlanParams({
+        skip_contract_review: true,
+        assertions: [{ id: "VAL-S-001", title: "A1", description: "D1" }],
+        features: [
+          {
+            id: "f1",
+            title: "F1",
+            description: "D1",
+            milestone: "M1",
+            fulfills: ["VAL-S-001"],
+          },
+        ],
+        services: [
+          { name: "svc-a", start: "npm start", port: 4100 },
+          { name: "svc-b", start: "npm start", port: 4100 },
+        ],
+      }),
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(portRes.isError, true);
+    assert.match(portRes.content[0].text, /4100/);
+
+    // (e) safety-sensitive initial_members handle
+    const handleRes = await proposeTool.execute(
+      "tc-skip-handle",
+      makeSamplePlanParams({
+        skip_contract_review: true,
+        initial_members: [
+          {
+            name: "exploit-tester",
+            role: "worker",
+            workspace: "share",
+            brief: "Test auth",
+          },
+        ],
+        assertions: [{ id: "VAL-S-001", title: "A1", description: "D1" }],
+        features: [
+          {
+            id: "f1",
+            title: "F1",
+            description: "D1",
+            milestone: "M1",
+            fulfills: ["VAL-S-001"],
+          },
+        ],
+      }),
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(handleRes.isError, true);
+    assert.match(handleRes.content[0].text, /exploit-tester/);
+    assert.equal(reviewCalls, 0);
+
+    // 2. Valid plan with skip_contract_review: true bypasses reviewProposedContract cleanly and confirms
+    const okSkipRes = await proposeTool.execute(
+      "tc-skip-ok",
+      makeSamplePlanParams({
+        skip_contract_review: true,
+        assertions: [{ id: "VAL-S-001", title: "A1", description: "D1" }],
+        features: [
+          {
+            id: "f1",
+            title: "F1",
+            description: "D1",
+            milestone: "M1",
+            files_owned: ["src/f1.ts"],
+            fulfills: ["VAL-S-001"],
+          },
+        ],
+      }),
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(okSkipRes.isError, undefined);
+    assert.equal((okSkipRes.details as ProposeSwarmPlanToolDetails).outcome, "confirmed");
+    assert.equal(reviewCalls, 0);
+    assert.equal(confirmedPlans.length, 1);
+
+    // 3. Omitting skip_contract_review (or false) still runs reviewProposedContract
+    applySwarmToolProfile(harness.api, "standby");
+    const reviewedRes = await proposeTool.execute(
+      "tc-reviewed",
+      makeSamplePlanParams({
+        skip_contract_review: false,
+        assertions: [{ id: "VAL-S-001", title: "A1", description: "D1" }],
+        features: [
+          {
+            id: "f1",
+            title: "F1",
+            description: "D1",
+            milestone: "M1",
+            files_owned: ["src/f1.ts"],
+            fulfills: ["VAL-S-001"],
+          },
+        ],
+      }),
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(
+      (reviewedRes.details as ProposeSwarmPlanToolDetails).outcome,
+      "contract_review_changes_requested",
+    );
+    assert.equal(reviewCalls, 1);
+  });
+});
+
