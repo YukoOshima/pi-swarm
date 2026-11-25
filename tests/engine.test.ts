@@ -10299,10 +10299,18 @@ describe("Validator Isolated Scratch Sandbox & Safety-Filter-Safe Member Naming"
     }
   });
 
-  it("isolates concurrent harnesses sharing fixed runId across all 3 compute & 3 delete sites while preserving os.tmpdir() production default (VAL-SCRATCH-001)", async () => {
+  it("isolates concurrent harnesses sharing fixed runId across all 3 compute & 3 delete sites while preserving os.tmpdir() production default (VAL-SCRATCH-001)", async (t) => {
     const harnessA = await createTestHarness();
     const harnessB = await createTestHarness();
     const harnessCold = await createTestHarness({ keepWorkersWarm: false });
+
+    const realOsTmpRoot = path.resolve(os.tmpdir());
+    const mockedOsTmpRoot = nextTestScratchRoot("mocked-os-tmp");
+    const expectedDefaultRunRoot = path.join(
+      path.resolve(mockedOsTmpRoot),
+      "pi-swarm-validator",
+      "run-dyn",
+    );
 
     const defaultStore = new MockSwarmStore();
     const defaultWorktree = new MockWorktreeManager();
@@ -10313,16 +10321,22 @@ describe("Validator Isolated Scratch Sandbox & Safety-Filter-Safe Member Naming"
       transport: defaultTransport,
       settings: { stallWatchdogEnabled: false },
     });
-    const uniqueDefaultRunId = `run_prod_default_${process.pid}_${Date.now()}_${Math.random()
-      .toString(36)
-      .slice(2, 8)}`;
-    const expectedDefaultRunRoot = path.join(
-      path.resolve(os.tmpdir()),
-      "pi-swarm-validator",
-      uniqueDefaultRunId,
-    );
 
     try {
+      // Pure default-path assertions against real os.tmpdir() BEFORE mocking (zero disk writes under shared os.tmpdir()/pi-swarm-validator)
+      assert.equal(
+        getRunValidatorScratchRoot("run-pure-check"),
+        path.join(realOsTmpRoot, "pi-swarm-validator", "run-pure-check"),
+      );
+      assert.equal(
+        getRunValidatorScratchRoot("run-pure-check", "   "),
+        path.join(realOsTmpRoot, "pi-swarm-validator", "run-pure-check"),
+      );
+      assert.equal(
+        getValidatorScratchDir("run-pure-check", "validator"),
+        path.join(realOsTmpRoot, "pi-swarm-validator", "run-pure-check", "validator"),
+      );
+
       assert.equal(harnessA.run.id, "run-dyn");
       assert.equal(harnessB.run.id, "run-dyn");
       assert.notEqual(harnessA.scratchRoot, harnessB.scratchRoot);
@@ -10451,54 +10465,60 @@ describe("Validator Isolated Scratch Sandbox & Safety-Filter-Safe Member Naming"
       assert.ok(harnessCold.transport.spawns[1]!.systemPrompt.includes(expectedColdScratch));
       assert.ok(harnessCold.transport.spawns[1]!.initialPrompt.includes(expectedColdScratch));
 
-      // 2. Production default (no scratchRoot override) still uses <os.tmpdir()>/pi-swarm-validator/<runId>/<member>
-      assert.equal(getRunValidatorScratchRoot(uniqueDefaultRunId), expectedDefaultRunRoot);
-      assert.equal(getRunValidatorScratchRoot(uniqueDefaultRunId, "   "), expectedDefaultRunRoot);
+      // 2. Production default (no scratchRoot override) resolves os.tmpdir() dynamically without touching shared OS temp dir
+      const tmpMock = t.mock.method(os, "tmpdir", () => mockedOsTmpRoot);
+      try {
+        assert.equal(getRunValidatorScratchRoot("run-dyn"), expectedDefaultRunRoot);
+        assert.equal(getRunValidatorScratchRoot("run-dyn", "   "), expectedDefaultRunRoot);
 
-      await defaultStore.createRun({
-        id: uniqueDefaultRunId,
-        title: "Default Scratch Root Check",
-        objective: "Verify unchanged os.tmpdir() default",
-        baseBranch: "main",
-        ownerSessionId: "sess-default",
-        validatorEnabled: true,
-      });
-      await defaultEngine.startRun(uniqueDefaultRunId);
+        await defaultStore.createRun({
+          id: "run-dyn",
+          title: "Default Scratch Root Check",
+          objective: "Verify unchanged os.tmpdir() default",
+          baseBranch: "main",
+          ownerSessionId: "sess-default",
+          validatorEnabled: true,
+        });
+        await defaultEngine.startRun("run-dyn");
 
-      await defaultEngine.addMembers({
-        name: "val-default-1",
-        role: "validator",
-        brief: "Default scratch check 1",
-      });
-      await waitUntil(() => defaultEngine.getSnapshot().workingMemberNames.length === 0);
+        await defaultEngine.addMembers({
+          name: "val-default-1",
+          role: "validator",
+          brief: "Default scratch check 1",
+        });
+        await waitUntil(() => defaultEngine.getSnapshot().workingMemberNames.length === 0);
 
-      const defaultSpawn1 = defaultTransport.spawns.find((s) => s.name === "val-default-1")!;
-      const expectedDefaultMember1 = path.join(expectedDefaultRunRoot, "val-default-1");
-      assert.equal(defaultSpawn1.scratchDir, expectedDefaultMember1);
-      assert.equal(existsSync(expectedDefaultMember1), true);
+        const defaultSpawn1 = defaultTransport.spawns.find((s) => s.name === "val-default-1")!;
+        const expectedDefaultMember1 = path.join(expectedDefaultRunRoot, "val-default-1");
+        assert.equal(defaultSpawn1.scratchDir, expectedDefaultMember1);
+        assert.equal(existsSync(expectedDefaultMember1), true);
 
-      await defaultEngine.killMember("val-default-1", { reason: "done 1" });
-      assert.equal(existsSync(expectedDefaultMember1), false, "killMember cleans default scratchDir");
+        await defaultEngine.killMember("val-default-1", { reason: "done 1" });
+        assert.equal(existsSync(expectedDefaultMember1), false, "killMember cleans default scratchDir");
 
-      await defaultEngine.addMembers({
-        name: "val-default-2",
-        role: "validator",
-        brief: "Default scratch check 2",
-      });
-      await waitUntil(() => defaultEngine.getSnapshot().workingMemberNames.length === 0);
-      assert.equal(existsSync(path.join(expectedDefaultRunRoot, "val-default-2")), true);
+        await defaultEngine.addMembers({
+          name: "val-default-2",
+          role: "validator",
+          brief: "Default scratch check 2",
+        });
+        await waitUntil(() => defaultEngine.getSnapshot().workingMemberNames.length === 0);
+        assert.equal(existsSync(path.join(expectedDefaultRunRoot, "val-default-2")), true);
 
-      await defaultEngine.teardown({ runId: uniqueDefaultRunId, force: true });
-      assert.equal(existsSync(expectedDefaultRunRoot), false, "teardown cleans default run scratch root");
+        await defaultEngine.teardown({ runId: "run-dyn", force: true });
+        assert.equal(existsSync(expectedDefaultRunRoot), false, "teardown cleans default run scratch root");
 
-      await mkdir(path.join(expectedDefaultRunRoot, "leftover"), { recursive: true });
-      await defaultEngine.killMember("val-default-2", { reason: "done 2" });
-      await defaultEngine.completeRun({ summary: "Default complete", callerRole: "orchestrator" });
-      assert.equal(
-        existsSync(expectedDefaultRunRoot),
-        false,
-        "completeRun cleans default run scratch root",
-      );
+        await mkdir(path.join(expectedDefaultRunRoot, "leftover"), { recursive: true });
+        await defaultEngine.killMember("val-default-2", { reason: "done 2" });
+        await defaultEngine.completeRun({ summary: "Default complete", callerRole: "orchestrator" });
+        assert.equal(
+          existsSync(expectedDefaultRunRoot),
+          false,
+          "completeRun cleans default run scratch root",
+        );
+      } finally {
+        tmpMock.mock.restore();
+      }
+      assert.equal(path.resolve(os.tmpdir()), realOsTmpRoot);
     } finally {
       await Promise.all([
         harnessA.engine.dispose(),
