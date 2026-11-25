@@ -1102,6 +1102,11 @@ export interface SwarmEngineDeps {
   getSettings?: () => SwarmSettings;
   now?: () => number;
   generateAgentId?: (name: string) => string;
+  /**
+   * Optional base temporary directory for isolated validator scratch directories
+   * (`<scratchRoot>/pi-swarm-validator/<runId>/<member>`). Defaults to `os.tmpdir()`.
+   */
+  scratchRoot?: string;
 }
 
 /**
@@ -1123,6 +1128,7 @@ export class SwarmEngine implements ISwarmEngine {
   private readonly getSettingsFn?: () => SwarmSettings;
   private readonly nowFn: () => number;
   private readonly generateAgentIdFn: (name: string) => string;
+  private readonly scratchRoot?: string;
 
   private activeRunId: string | null = null;
   private cachedRun: SwarmRunState | null = null;
@@ -1168,6 +1174,7 @@ export class SwarmEngine implements ISwarmEngine {
     this.generateAgentIdFn =
       deps.generateAgentId ??
       ((name: string) => `${name}-${randomBytes(3).toString("hex")}`);
+    this.scratchRoot = deps.scratchRoot?.trim() || undefined;
 
     const initialSettings = this.getEffectiveSettings();
     this.rateLimitBreaker = new RateLimitBreaker({
@@ -1179,6 +1186,14 @@ export class SwarmEngine implements ISwarmEngine {
       initialSettings.maxConcurrency,
       this.rateLimitBreaker,
     );
+  }
+
+  private getRunScratchRoot(runId: string): string {
+    return getRunValidatorScratchRoot(runId, this.scratchRoot);
+  }
+
+  private getMemberScratchDir(runId: string, memberName: string): string {
+    return getValidatorScratchDir(runId, memberName, this.scratchRoot);
   }
 
   // --------------------------------------------------------------------------
@@ -1727,7 +1742,7 @@ export class SwarmEngine implements ISwarmEngine {
         sessionId: options.sessionId,
       });
     }
-    await rm(getRunValidatorScratchRoot(run.id), {
+    await rm(this.getRunScratchRoot(run.id), {
       recursive: true,
       force: true,
     }).catch(() => {});
@@ -3720,7 +3735,7 @@ export class SwarmEngine implements ISwarmEngine {
     }
 
     if (member.role === "validator") {
-      await rm(getValidatorScratchDir(run.id, member.name), {
+      await rm(this.getMemberScratchDir(run.id, member.name), {
         recursive: true,
         force: true,
       }).catch(() => {});
@@ -6281,7 +6296,7 @@ export class SwarmEngine implements ISwarmEngine {
     });
 
     if (!isLiveRun || force) {
-      await rm(getRunValidatorScratchRoot(run.id), {
+      await rm(this.getRunScratchRoot(run.id), {
         recursive: true,
         force: true,
       }).catch(() => {});
@@ -6491,7 +6506,7 @@ export class SwarmEngine implements ISwarmEngine {
 
       const validatorScratchDir =
         member.role === "validator"
-          ? getValidatorScratchDir(runId, member.name)
+          ? this.getMemberScratchDir(runId, member.name)
           : undefined;
       if (validatorScratchDir) {
         await mkdir(validatorScratchDir, { recursive: true }).catch(() => {});
@@ -6714,7 +6729,7 @@ export class SwarmEngine implements ISwarmEngine {
       const maxSeq = batch.reduce((acc, m) => Math.max(acc, m.seq), member.lastReadSeq);
       const wakeScratchDir =
         member.role === "validator"
-          ? getValidatorScratchDir(runId, member.name)
+          ? this.getMemberScratchDir(runId, member.name)
           : undefined;
       if (wakeScratchDir) {
         await mkdir(wakeScratchDir, { recursive: true }).catch(() => {});
@@ -6954,7 +6969,7 @@ export class SwarmEngine implements ISwarmEngine {
       const maxSeq = batch.reduce((acc, m) => Math.max(acc, m.seq), member.lastReadSeq);
       const reviveScratchDir =
         member.role === "validator"
-          ? getValidatorScratchDir(runId, member.name)
+          ? this.getMemberScratchDir(runId, member.name)
           : undefined;
       if (reviveScratchDir) {
         await mkdir(reviveScratchDir, { recursive: true }).catch(() => {});
