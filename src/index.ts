@@ -1720,6 +1720,8 @@ function createEmptySnapshot(
 interface RehydratedFocusState {
   hasEntry: boolean;
   runId: string | null;
+  sessionId?: string;
+  reason?: string;
   orchestratorMode?: boolean;
   autoConfirmDefault?: boolean;
 }
@@ -1741,9 +1743,19 @@ function rehydrateFocusState(
       typeof data.runId === "string" && data.runId.trim().length > 0
         ? data.runId.trim()
         : null;
+    const sessionId =
+      typeof data.sessionId === "string" && data.sessionId.trim().length > 0
+        ? data.sessionId.trim()
+        : undefined;
+    const reason =
+      typeof data.reason === "string" && data.reason.trim().length > 0
+        ? data.reason.trim()
+        : undefined;
     return {
       hasEntry: true,
       runId,
+      ...(sessionId !== undefined ? { sessionId } : {}),
+      ...(reason !== undefined ? { reason } : {}),
       ...(typeof data.orchestratorMode === "boolean"
         ? { orchestratorMode: data.orchestratorMode }
         : {}),
@@ -3580,6 +3592,20 @@ export function createPiSwarmExtension(
       return Boolean(run && (run.status === "active" || run.status === "paused"));
     }
 
+    function isOwnedLiveRun(
+      run: SwarmRunState | null | undefined,
+      ctx?: ExtensionContext,
+    ): boolean {
+      if (!run || !isRunningProfileRun(run)) {
+        return false;
+      }
+      const sid = getCurrentSessionId(ctx);
+      if (!sid || !run.ownerSessionId) {
+        return false;
+      }
+      return run.ownerSessionId === sid;
+    }
+
     function persistCurrentFocus(
       runId: string | null,
       sessionId: string,
@@ -3599,7 +3625,7 @@ export function createPiSwarmExtension(
         return "drafting";
       }
       const run = (snapshotOverride ?? getSnapshotSafe()).run;
-      if (isRunningProfileRun(run) && isCurrentSessionOwner(run, ctx)) {
+      if (isOwnedLiveRun(run, ctx)) {
         return "running";
       }
       if (orchestratorMode) {
@@ -3620,10 +3646,11 @@ export function createPiSwarmExtension(
       ctx?: ExtensionContext,
     ): string {
       const attachedRun = snapshot.run;
+      const currentSid = getCurrentSessionId(ctx ?? lastCtx);
       const priorRun =
         attachedRun &&
         attachedRun.status === "completed" &&
-        isCurrentSessionOwner(attachedRun, ctx ?? lastCtx)
+        (!attachedRun.ownerSessionId || attachedRun.ownerSessionId === currentSid)
           ? attachedRun
           : null;
       return buildOrchestratorStandbySection(snapshot, {
@@ -3649,10 +3676,7 @@ export function createPiSwarmExtension(
         return;
       }
       const snapshot = getSnapshotSafe();
-      if (
-        isRunningProfileRun(snapshot.run) &&
-        isCurrentSessionOwner(snapshot.run, options?.ctx)
-      ) {
+      if (isOwnedLiveRun(snapshot.run, options?.ctx)) {
         activeRunSections.swarm = buildOrchestratorStaticSection(snapshot);
         activeRunSections.swarm_state = enrichLiveStateWithMissionSync(
           buildOrchestratorLiveStateSection(snapshot, {
@@ -4892,7 +4916,6 @@ export function createPiSwarmExtension(
       const startReason = sessionStartReason;
       const allowSamePidFork = startReason === "fork";
       let priorLiveMemberNames = new Set<string>();
-      let canOwnFocusedRun = false;
       if (focusedRunId) {
         try {
           const loadedRun = await store.loadRun(focusedRunId);
@@ -4904,8 +4927,18 @@ export function createPiSwarmExtension(
           const canOwn =
             isCurrentSessionOwner(loadedRun, ctx) ||
             (allowSamePidFork && loadedRun.ownerPid === process.pid);
-          canOwnFocusedRun = canOwn;
-          if (canOwn) {
+          const shouldClaimOnRehydrate =
+            canOwn &&
+            (allowSamePidFork ||
+              (Boolean(loadedRun.ownerSessionId) &&
+                loadedRun.ownerSessionId === currentSessionId) ||
+              (loadedRun.status === "active" &&
+                focusState.orchestratorMode !== false) ||
+              (loadedRun.status === "paused" &&
+                startReason === "resume" &&
+                focusState.orchestratorMode !== false &&
+                focusState.reason !== "user_focus"));
+          if (shouldClaimOnRehydrate) {
             await claimRunOwnershipIfAvailable(
               store,
               engine,
@@ -4928,23 +4961,24 @@ export function createPiSwarmExtension(
       sessionStartReason = undefined;
       const snapshot = engine.getSnapshot();
 
-      const hasFocusedRun =
-        isRunningProfileRun(snapshot.run) && isCurrentSessionOwner(snapshot.run, ctx);
+      const hasFocusedRun = isOwnedLiveRun(snapshot.run, ctx);
+      const isOwnFocusEntry = Boolean(
+        focusState.hasEntry &&
+          focusState.sessionId &&
+          focusState.sessionId === currentSessionId,
+      );
 
-      if (focusState.orchestratorMode !== undefined) {
-        if (
-          focusState.orchestratorMode &&
-          !(focusedRunId && snapshot.run && !canOwnFocusedRun)
-        ) {
-          orchestratorMode = true;
-          autoConfirmDefault = Boolean(focusState.autoConfirmDefault);
-        } else {
-          orchestratorMode = false;
-          autoConfirmDefault = false;
-        }
+      if (isOwnFocusEntry && focusState.orchestratorMode !== undefined) {
+        orchestratorMode = focusState.orchestratorMode;
+        autoConfirmDefault = focusState.orchestratorMode
+          ? Boolean(focusState.autoConfirmDefault)
+          : false;
       } else if (hasFocusedRun) {
         orchestratorMode = true;
-        autoConfirmDefault = false;
+        autoConfirmDefault =
+          allowSamePidFork && focusState.orchestratorMode
+            ? Boolean(focusState.autoConfirmDefault)
+            : false;
       } else {
         orchestratorMode = false;
         autoConfirmDefault = false;
@@ -4952,7 +4986,10 @@ export function createPiSwarmExtension(
 
       if ((hasFocusedRun && snapshot.run) || orchestratorMode) {
         const runOrch =
-          snapshot.run && canOwnFocusedRun
+          snapshot.run &&
+          (hasFocusedRun ||
+            (snapshot.run.status === "completed" &&
+              snapshot.run.ownerSessionId === currentSessionId))
             ? snapshot.run.roleModels?.orchestrator
             : undefined;
         const hasRunOrchModel = Boolean(runOrch?.model?.trim());
@@ -7712,7 +7749,9 @@ export function createPiSwarmExtension(
         const currentSid = getCurrentSessionId(ctx);
         assertOwnerSession(targetRun, currentSid);
         const wasAlreadyFocusedAndOwned =
-          snapshot.activeRunId === targetRun.id && isCurrentSessionOwner(targetRun, ctx);
+          snapshot.activeRunId === targetRun.id &&
+          isOwnedLiveRun(targetRun, ctx) &&
+          targetRun.ownerPid === process.pid;
         const wasActivatedInProcess = activatedRunIds.has(targetRun.id);
 
         if (targetRun.ownerSessionId !== currentSid || targetRun.ownerPid !== process.pid) {
@@ -7818,12 +7857,11 @@ export function createPiSwarmExtension(
       // 1. If a planning draft is active, cancel the draft and restore the underlying tool profile
       if (draftController.isActive()) {
         const snapshot = engine.getSnapshot();
-        const nextProfile: SwarmToolProfileMode =
-          isRunningProfileRun(snapshot.run) && isCurrentSessionOwner(snapshot.run, ctx)
-            ? "running"
-            : orchestratorMode
-              ? "standby"
-              : "idle";
+        const nextProfile: SwarmToolProfileMode = isOwnedLiveRun(snapshot.run, ctx)
+          ? "running"
+          : orchestratorMode
+            ? "standby"
+            : "idle";
         draftController.clear(nextProfile);
         syncDraftWidgetState(null);
         syncActiveRunSections({ ctx });
@@ -8109,9 +8147,7 @@ export function createPiSwarmExtension(
       const snapshot = engine.getSnapshot();
       const sessionId = getSessionIdSafe(ctx);
       const run = snapshot.run;
-      const hasLiveOwnedRun = Boolean(
-        run && isRunningProfileRun(run) && isCurrentSessionOwner(run, ctx),
-      );
+      const hasLiveOwnedRun = isOwnedLiveRun(run, ctx);
 
       if (hasLiveOwnedRun && run && !force) {
         const msg = `Cannot exit Persistent Orchestrator Mode while Swarm run \`${run.id}\` ("${run.title}") is ${run.status}. Complete it with \`/swarm done\`, abandon it with \`/swarm cancel\`, or run \`/swarm exit --force\` to pause and detach it cleanly for later \`/swarm resume\`.`;
@@ -8281,6 +8317,12 @@ export function createPiSwarmExtension(
       try {
         const targetRun = await store.loadRun(chosenRunId);
         const canOwn = isCurrentSessionOwner(targetRun, ctx);
+        const shouldClaimOnFocus =
+          canOwn &&
+          (targetRun.status === "active" ||
+            (targetRun.status === "paused" &&
+              Boolean(targetRun.ownerSessionId) &&
+              targetRun.ownerSessionId === sessionId));
         const prevFocused = engine.getSnapshot().activeRunId;
         if (prevFocused && prevFocused !== chosenRunId) {
           activatedRunIds.delete(prevFocused);
@@ -8288,7 +8330,7 @@ export function createPiSwarmExtension(
           purgePendingWakeupsForRun(null);
         }
         let snapshot: SwarmSnapshot;
-        if (canOwn) {
+        if (shouldClaimOnFocus) {
           await claimRunOwnershipIfAvailable(
             store,
             engine,
@@ -8297,22 +8339,25 @@ export function createPiSwarmExtension(
             ctx,
             false,
           );
-          if (isRunningProfileRun(targetRun) && !orchestratorMode) {
-            orchestratorMode = true;
-            autoConfirmDefault = false;
-          }
           snapshot = await attachRunWithOwnershipGuard(engine, chosenRunId, ctx, false);
         } else {
-          snapshot = await attachRunWithOwnershipGuard(engine, chosenRunId, ctx, true);
+          snapshot = await attachRunWithOwnershipGuard(
+            engine,
+            chosenRunId,
+            ctx,
+            !canOwn || isRunningProfileRun(targetRun),
+          );
         }
         persistCurrentFocus(chosenRunId, sessionId, "user_focus");
         applySwarmToolProfile(pi, computeDesiredToolProfile(ctx));
         syncActiveRunSections({ ctx });
         refreshUI(ctx);
 
-        const readOnlyNote = canOwn
-          ? ""
-          : ` (read-only observer; owned by ${targetRun.ownerSessionId || "another session"} PID ${targetRun.ownerPid})`;
+        const readOnlyNote = !canOwn
+          ? ` (read-only observer; owned by ${targetRun.ownerSessionId || "another session"} PID ${targetRun.ownerPid})`
+          : !shouldClaimOnFocus && targetRun.status === "paused"
+            ? " (paused · unowned — run /swarm resume to take over)"
+            : "";
         const statusLabel = snapshot.run?.status ?? "unknown";
         const msg = `Focused Swarm run \`${chosenRunId}\` (${statusLabel})${readOnlyNote}.`;
         if (ctx.hasUI) {
@@ -9712,8 +9757,7 @@ export function createPiSwarmExtension(
       }
 
       const snapshot = getSnapshotSafe();
-      const hasOwnedLiveRun =
-        isRunningProfileRun(snapshot.run) && isCurrentSessionOwner(snapshot.run, ctx);
+      const hasOwnedLiveRun = isOwnedLiveRun(snapshot.run, ctx);
       const isPersistentOrchestratorOwner = orchestratorMode || hasOwnedLiveRun;
 
       if (!isPersistentOrchestratorOwner) {
@@ -9820,26 +9864,22 @@ export function createPiSwarmExtension(
     pi.on("session_compact", (event, ctx) => {
       lastCtx = ctx;
       if (!event.willRetry) {
+        const currentSid = getCurrentSessionId(ctx);
         const focusState = rehydrateFocusState(ctx);
-        if (focusState.hasEntry && focusState.orchestratorMode !== undefined) {
-          const snap = getSnapshotSafe();
-          const isForeignLive =
-            Boolean(snap.run) &&
-            isRunningProfileRun(snap.run) &&
-            !isCurrentSessionOwner(snap.run, ctx);
-          if (!isForeignLive) {
-            orchestratorMode = focusState.orchestratorMode;
-            autoConfirmDefault = focusState.orchestratorMode
-              ? Boolean(focusState.autoConfirmDefault)
-              : false;
-          }
+        if (
+          focusState.hasEntry &&
+          focusState.sessionId === currentSid &&
+          focusState.orchestratorMode !== undefined
+        ) {
+          orchestratorMode = focusState.orchestratorMode;
+          autoConfirmDefault = focusState.orchestratorMode
+            ? Boolean(focusState.autoConfirmDefault)
+            : false;
         }
         const snapAfterFocus = getSnapshotSafe();
         draftController.rehydrate(ctx, {
           syncToolProfile: true,
-          hasActiveRun:
-            isRunningProfileRun(snapAfterFocus.run) &&
-            isCurrentSessionOwner(snapAfterFocus.run, ctx),
+          hasActiveRun: isOwnedLiveRun(snapAfterFocus.run, ctx),
           hasPersistentOrchestrator: orchestratorMode,
         });
         syncDraftWidgetState(draftController.getDraft());
@@ -10079,10 +10119,7 @@ export function createPiSwarmExtension(
           delete event.systemPromptOptions.sections.swarm_state;
         } else {
           const snapshot = getSnapshotSafe();
-          if (
-            isRunningProfileRun(snapshot.run) &&
-            isCurrentSessionOwner(snapshot.run, ctx)
-          ) {
+          if (isOwnedLiveRun(snapshot.run, ctx)) {
             if (snapshot.run?.status === "active") {
               activatedRunIds.add(snapshot.run.id);
             }
@@ -10122,10 +10159,7 @@ export function createPiSwarmExtension(
         sectionContent = buildDraftingSystemOverlay(draft);
       } else {
         const snapshot = getSnapshotSafe();
-        if (
-          isRunningProfileRun(snapshot.run) &&
-          isCurrentSessionOwner(snapshot.run, ctx)
-        ) {
+        if (isOwnedLiveRun(snapshot.run, ctx)) {
           if (snapshot.run?.status === "active") {
             activatedRunIds.add(snapshot.run.id);
           }

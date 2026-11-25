@@ -8973,4 +8973,274 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
 
     await host.emit("session_shutdown", { reason: "quit" });
   });
+
+  it("29. VAL-LIFE-001 & VAL-EXIT-001 (#26 regressions): idle /swarm focus on paused-unowned run stays pure inspection, and standby session viewing foreign-live run retains own mode across reload/tree/compaction without reviving copied entries", async () => {
+    const repoDir = await createTempGitRepo("val-focus-regressions-26");
+    tempDirs.push(repoDir);
+    const store = new SwarmStore(repoDir);
+
+    const makeTransport = (): ISwarmTransport => ({
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        return createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async () => {
+            await new Promise((r) => setTimeout(r, 10));
+            return {
+              agentId: request.agentId,
+              name: request.name,
+              role: request.role,
+              outcome: "waiting",
+              summary: "Parked",
+              tokens: 40,
+              cost: 0.001,
+            };
+          },
+        }).handle;
+      },
+    });
+
+    const host = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-host-26",
+      initialHostModel: DEFAULT_TEST_MODELS[1], // claude-sonnet-4-5 (:medium)
+    });
+    createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        orchestratorModel: "anthropic/claude-opus-4-6",
+        orchestratorThinkingLevel: "high",
+        stallWatchdogEnabled: false,
+      }),
+    })(host.pi);
+    await host.emit("session_start", { reason: "startup" });
+
+    const checkWriteBlocked = async (h: MockHarness): Promise<boolean> => {
+      const res = await h.emit("tool_call", {
+        type: "tool_call",
+        toolCallId: `tc-w-${Date.now()}`,
+        toolName: "write",
+        input: { path: "x.ts", content: "ok" },
+      });
+      return res.some((r) => (r as { block?: boolean } | undefined)?.block === true);
+    };
+
+    // --- Sequence (1): Idle `/swarm focus <paused-unowned-run>` after `/swarm exit --force` ---
+    await host.runCommand("swarm-direct", "Launch run to force-exit");
+    const p1 = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Force Exited Paused Run",
+      objective: "Verify pure inspection from idle",
+      strategy: "No initial workers",
+      acceptance_criteria: "Stays paused & unowned on focus",
+      base_branch: "main",
+    });
+    const pausedRunId: string = p1.details.runId;
+    await host.runCommand("swarm", "exit --force");
+
+    const afterForce = await store.loadRun(pausedRunId);
+    assert.equal(afterForce.status, "paused");
+    assert.equal(afterForce.ownerSessionId, "");
+    assert.equal(afterForce.ownerPid, 0);
+
+    // Pure inspection from idle: `/swarm focus <pausedRunId>` must NOT claim ownership or activate orchestratorMode!
+    await host.runCommand("swarm", `focus ${pausedRunId}`);
+    const afterIdleFocus = await store.loadRun(pausedRunId);
+    assert.equal(afterIdleFocus.status, "paused");
+    assert.equal(afterIdleFocus.ownerSessionId, "", "Pure focus from idle must not claim paused run");
+    assert.equal(afterIdleFocus.ownerPid, 0);
+    assert.deepEqual(
+      host.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)),
+      [...IDLE_SWARM_TOOLS],
+      "Pure focus on paused-unowned run from idle must keep IDLE_SWARM_TOOLS",
+    );
+    assert.equal(await checkWriteBlocked(host), false, "Idle inspection must not block write");
+    const idleFocusSecs: Record<string, string> = {};
+    await host.emit("before_agent_start", {
+      messageType: "user",
+      prompt: "Inspect paused run",
+      systemPromptOptions: { sections: idleFocusSecs },
+    });
+    assert.equal(idleFocusSecs.swarm, undefined);
+
+    // Reload while focused on paused-unowned run from idle ALSO keeps run unowned and mode inactive!
+    await host.emit("session_start", { reason: "reload" });
+    const afterIdleReload = await store.loadRun(pausedRunId);
+    assert.equal(afterIdleReload.ownerSessionId, "");
+    assert.deepEqual(
+      host.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)),
+      [...IDLE_SWARM_TOOLS],
+    );
+    assert.equal(await checkWriteBlocked(host), false);
+
+    // Explicit `/swarm resume` claims ownership, activates the run, and enters Persistent Orchestrator Mode!
+    await host.runCommand("swarm", `resume ${pausedRunId} --quiet`);
+    const afterResume = await store.loadRun(pausedRunId);
+    assert.equal(afterResume.status, "active");
+    assert.equal(afterResume.ownerSessionId, "sess-host-26");
+    await host.executeTool(SWARM_TOOL, { action: "done", summary: "Completed own run" });
+    await host.runCommand("swarm", "exit");
+
+    // --- Sequence (2): Standby session focusing a foreign-live run retains own mode & autoConfirmDefault across reload/tree/compaction ---
+    // Enter standby via `/swarm-direct` (`autoConfirmDefault === true`) and complete own run
+    await host.runCommand("swarm-direct", "Enter direct standby");
+    await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Own Direct Run",
+      objective: "Enter standby with autoConfirmDefault=true",
+      strategy: "No workers",
+      acceptance_criteria: "Done",
+      base_branch: "main",
+    });
+    await host.executeTool(SWARM_TOOL, { action: "done", summary: "Own run finished" });
+    assert.deepEqual(
+      host.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)).sort(),
+      [...STANDBY_SWARM_TOOLS].sort(),
+    );
+
+    // Start a separate live session (`foreignOwner`) owning a live active run
+    const foreignOwner = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-foreign-owner-26",
+    });
+    createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: false,
+      }),
+    })(foreignOwner.pi);
+    await foreignOwner.emit("session_start", { reason: "startup" });
+    await foreignOwner.runCommand("swarm-direct", "Foreign active mission");
+    const foreignPlan = await foreignOwner.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Foreign Live Mission",
+      objective: "Owned by foreignOwner",
+      strategy: "Single parked worker",
+      acceptance_criteria: "Active",
+      base_branch: "main",
+      initial_members: [
+        { name: "foreign-w", role: "worker", workspace: "inherit", brief: "Stay alive" },
+      ],
+    });
+    const foreignRunId: string = foreignPlan.details.runId;
+
+    // Standby `host` focuses `foreignRunId` to inspect it
+    await host.runCommand("swarm", `focus ${foreignRunId}`);
+    assert.deepEqual(
+      host.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)).sort(),
+      [...STANDBY_SWARM_TOOLS].sort(),
+      "Standby session focusing foreign live run must remain in standby",
+    );
+    assert.equal(await checkWriteBlocked(host), true);
+
+    // Reload, session_tree, and compaction on `host` MUST retain `orchestratorMode=true` & `autoConfirmDefault=true`!
+    const hostBranchViewingForeign = [...host.branch];
+    const reloadedStandbyHost = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-host-26",
+      initialHostModel: DEFAULT_TEST_MODELS[1],
+    });
+    reloadedStandbyHost.branch.push(...hostBranchViewingForeign);
+    createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        orchestratorModel: "anthropic/claude-opus-4-6",
+        orchestratorThinkingLevel: "high",
+        stallWatchdogEnabled: false,
+      }),
+    })(reloadedStandbyHost.pi);
+    await reloadedStandbyHost.emit("session_start", { reason: "reload" });
+    assert.deepEqual(
+      reloadedStandbyHost.pi
+        .getActiveTools()
+        .filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any))
+        .sort(),
+      [...STANDBY_SWARM_TOOLS].sort(),
+      "Reload while viewing foreign live run must NOT clear own standby mode",
+    );
+    assert.equal(reloadedStandbyHost.ctx.model?.id, "claude-opus-4-6");
+    assert.equal(await checkWriteBlocked(reloadedStandbyHost), true);
+    const reloadedSecs: Record<string, string> = {};
+    await reloadedStandbyHost.emit("before_agent_start", {
+      messageType: "user",
+      prompt: "Check standby prompt after reload on foreign focus",
+      systemPromptOptions: { sections: reloadedSecs },
+    });
+    assert.match(String(reloadedSecs.swarm), /autoConfirmDefault: true/);
+
+    // `session_tree` and `session_compact` on `reloadedStandbyHost` also preserve own mode & autoConfirmDefault
+    await reloadedStandbyHost.emit("session_tree", {});
+    assert.deepEqual(
+      reloadedStandbyHost.pi
+        .getActiveTools()
+        .filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any))
+        .sort(),
+      [...STANDBY_SWARM_TOOLS].sort(),
+    );
+    await reloadedStandbyHost.emit("session_compact", { willRetry: false });
+    assert.deepEqual(
+      reloadedStandbyHost.pi
+        .getActiveTools()
+        .filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any))
+        .sort(),
+      [...STANDBY_SWARM_TOOLS].sort(),
+    );
+
+    // Foreign run itself remains owned by `foreignOwner`
+    assert.equal((await store.loadRun(foreignRunId)).ownerSessionId, "sess-foreign-owner-26");
+
+    // Fresh observer session stays exempt before & after reload
+    const freshObserver = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-fresh-observer-26",
+    });
+    createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: false,
+      }),
+    })(freshObserver.pi);
+    await freshObserver.emit("session_start", { reason: "startup" });
+    await freshObserver.runCommand("swarm", `focus ${foreignRunId}`);
+    assert.deepEqual(
+      freshObserver.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)),
+      [...IDLE_SWARM_TOOLS],
+    );
+    assert.equal(await checkWriteBlocked(freshObserver), false);
+    await freshObserver.emit("session_start", { reason: "reload" });
+    assert.deepEqual(
+      freshObserver.pi.getActiveTools().filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)),
+      [...IDLE_SWARM_TOOLS],
+    );
+
+    // Different session (`sess-copied-entry-26`) seeded with `host`'s focus entry MUST NOT revive `host`'s mode!
+    const copiedEntrySession = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-copied-entry-26",
+    });
+    copiedEntrySession.branch.push(...hostBranchViewingForeign);
+    createPiSwarmExtension({
+      transportFactory: makeTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: false,
+      }),
+    })(copiedEntrySession.pi);
+    await copiedEntrySession.emit("session_start", { reason: "startup" });
+    assert.deepEqual(
+      copiedEntrySession.pi
+        .getActiveTools()
+        .filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any)),
+      [...IDLE_SWARM_TOOLS],
+      "Copied focus entry from another session must NOT revive standby mode",
+    );
+    assert.equal(await checkWriteBlocked(copiedEntrySession), false);
+
+    await foreignOwner.executeTool(SWARM_TOOL, { action: "done", summary: "Foreign done" });
+    await copiedEntrySession.emit("session_shutdown", { reason: "quit" });
+    await freshObserver.emit("session_shutdown", { reason: "quit" });
+    await reloadedStandbyHost.emit("session_shutdown", { reason: "quit" });
+    await foreignOwner.emit("session_shutdown", { reason: "quit" });
+    await host.emit("session_shutdown", { reason: "quit" });
+  });
 });
