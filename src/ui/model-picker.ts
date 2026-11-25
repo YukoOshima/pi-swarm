@@ -9,6 +9,7 @@ import {
   matchesKey,
   type TUI,
 } from "@earendil-works/pi-tui";
+import { ORCHESTRATOR_NAME } from "../constants.js";
 import {
   isProcessAlive,
   parseModelSpec,
@@ -123,7 +124,8 @@ export type SwarmHubAction =
   | { kind: "done" }
   | { kind: "focus"; runId: string }
   | { kind: "settings" }
-  | { kind: "teardown" };
+  | { kind: "teardown" }
+  | { kind: "exit" };
 
 export interface SwarmHubViewOptions {
   state: ModelPickerSettingsState;
@@ -133,6 +135,7 @@ export interface SwarmHubViewOptions {
   initialScope?: ModelSaveScope;
   currentSessionId?: string;
   activatedRun?: boolean;
+  orchestratorModeActive?: boolean;
   onApplyRole?: SwarmModelPickerViewOptions["onApplyRole"];
   onApplyFallbacks?: SwarmModelPickerViewOptions["onApplyFallbacks"];
   onComplete: (action: SwarmHubAction) => void;
@@ -1822,7 +1825,8 @@ interface HubMenuItem {
     | "pause"
     | "resume"
     | "done"
-    | "teardown";
+    | "teardown"
+    | "exit";
   label: string;
   runId?: string;
 }
@@ -1903,6 +1907,13 @@ export class SwarmHubView implements Component, Focusable {
   private hasActiveOrPausedRun(): boolean {
     const status = this.snapshot.run?.status;
     return status === "active" || status === "paused";
+  }
+
+  private isOrchestratorStandbyActive(): boolean {
+    return (
+      Boolean(this.options.orchestratorModeActive) &&
+      !this.hasActiveOrPausedRun()
+    );
   }
 
   private isGoalInputActive(): boolean {
@@ -2073,6 +2084,12 @@ export class SwarmHubView implements Component, Focusable {
         id: "settings",
         label: "* Runtime Settings (concurrency, watchdog, git)",
       });
+      if (this.options.orchestratorModeActive) {
+        items.push({
+          id: "exit",
+          label: "✗ Exit Swarm Orchestrator Mode (/swarm exit)",
+        });
+      }
     }
     this.menuItems = items;
     if (this.selectedIndex >= items.length) {
@@ -2187,6 +2204,10 @@ export class SwarmHubView implements Component, Focusable {
       case "teardown":
         this.dispose();
         this.options.onComplete({ kind: "teardown" });
+        return;
+      case "exit":
+        this.dispose();
+        this.options.onComplete({ kind: "exit" });
         return;
     }
   }
@@ -2412,6 +2433,27 @@ export class SwarmHubView implements Component, Focusable {
     }
   }
 
+  private renderOrchestratorStandbyCue(innerWidth: number): string {
+    const dot = this.theme.fg("success", "●");
+    const label = this.theme.fg(
+      "accent",
+      this.theme.bold("Persistent Orchestrator: Standby"),
+    );
+    if (innerWidth < 50) {
+      return fitLine(`${dot} ${label}`, innerWidth);
+    }
+    if (innerWidth < 72) {
+      return fitLine(
+        `${dot} ${label} ${this.theme.fg("dim", "(/swarm exit)")}`,
+        innerWidth,
+      );
+    }
+    return fitLine(
+      `${dot} ${label}${this.theme.fg("muted", ` — @${ORCHESTRATOR_NAME} on duty`)} ${this.theme.fg("dim", "(/swarm exit)")}`,
+      innerWidth,
+    );
+  }
+
   private renderPolicyLine(innerWidth: number, allowBareKeys: boolean): string {
     const valEnabled = this.getEffectiveValidatorEnabled();
     const maxConc = this.getEffectiveMaxConcurrency();
@@ -2589,12 +2631,14 @@ export class SwarmHubView implements Component, Focusable {
       });
     }
 
-    // Active run status card (if present) or unfinished Mission notice
+    // Active run status card (if present), unfinished Mission notice, and/or Persistent Orchestrator standby cue
     const run = this.snapshot.run;
     const unfinished = this.getResumableUnfinishedRun();
+    const activeOrPaused = this.hasActiveOrPausedRun();
+    const standbyActive = this.isOrchestratorStandbyActive();
     if (run) {
       const title = sanitizePlainText(run.title || run.objective) || run.id;
-      if (this.hasActiveOrPausedRun()) {
+      if (activeOrPaused) {
         const badge = formatRunStatusBadge(run.status, this.theme);
         const leftHeader = `${this.theme.fg("accent", this.theme.bold(title))} [${badge}]`;
         const rightHeader = this.theme.fg(
@@ -2671,8 +2715,13 @@ export class SwarmHubView implements Component, Focusable {
             innerWidth,
           ),
         );
+        if (standbyActive) {
+          body.push(this.renderOrchestratorStandbyCue(innerWidth));
+        }
       }
-      body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
+      if (!standbyActive || maxInner >= 10) {
+        body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
+      }
     } else if (unfinished) {
       const title = sanitizePlainText(unfinished.title || unfinished.objective || unfinished.id);
       const badge = formatRunStatusBadge(unfinished.status, this.theme);
@@ -2682,13 +2731,24 @@ export class SwarmHubView implements Component, Focusable {
           innerWidth,
         ),
       );
-      body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
+      if (standbyActive) {
+        body.push(this.renderOrchestratorStandbyCue(innerWidth));
+      }
+      if (!standbyActive || maxInner >= 10) {
+        body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
+      }
+    } else if (standbyActive) {
+      body.push(this.renderOrchestratorStandbyCue(innerWidth));
+      if (maxInner >= 10) {
+        body.push(renderHorizontalRule(innerWidth, undefined, this.theme));
+      }
     }
 
-    const activeOrPaused = this.hasActiveOrPausedRun();
-
-    // Mission Models Card (collapses cleanly on <= 14-row inner height terminals)
-    if (maxInner <= 14) {
+    // Mission Models Card (collapses cleanly on <= 14-row inner height terminals, or <= 18 when standby header + run share viewport)
+    if (
+      maxInner <= 14 ||
+      (standbyActive && Boolean(run || unfinished) && maxInner <= 18)
+    ) {
       body.push(
         formatRoleModelsLine(
           buildRoleModelsFromPickerState(this.state),
@@ -2756,7 +2816,11 @@ export class SwarmHubView implements Component, Focusable {
       body.push(renderHorizontalRule(innerWidth, "Goal (optional)", this.theme));
       const renderedInput = this.goalInput.render(innerWidth)[0] ?? "Goal: ";
       body.push(renderedInput);
-      if (maxInner - body.length >= 5) {
+      if (
+        maxInner - body.length >= 5 &&
+        (!standbyActive ||
+          maxInner - (body.length + 2) - 2 >= this.menuItems.length)
+      ) {
         const goalHint =
           innerWidth >= 69
             ? "  [Enter] Clarify & Plan · [Alt+Enter] Direct Launch · [Alt+M] Models"

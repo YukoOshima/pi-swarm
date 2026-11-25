@@ -56,6 +56,7 @@ export interface SwarmWidgetState {
   draftMode?: SwarmDraftMode;
   draftSeed?: string;
   modalDepth: number;
+  orchestratorStandby?: boolean;
 }
 
 export interface SwarmWidgetOptions {
@@ -86,8 +87,14 @@ export interface SwarmShortcutCallbacks {
 export interface StatusDashboardOptions {
   draftActive?: boolean;
   draftSeed?: string;
+  orchestratorStandby?: boolean;
   hostModel?: string;
   now?: () => number;
+}
+
+export interface FormatStatusLineOptions {
+  draftActive?: boolean;
+  orchestratorStandby?: boolean;
 }
 
 export interface BoardViewOptions {
@@ -111,6 +118,9 @@ export function createSwarmWidgetState(
     draftMode: initial?.draftMode,
     draftSeed: initial?.draftSeed,
     modalDepth: initial?.modalDepth ?? 0,
+    ...(initial?.orchestratorStandby !== undefined
+      ? { orchestratorStandby: initial.orchestratorStandby }
+      : {}),
   };
 }
 
@@ -670,6 +680,45 @@ export class SwarmDashboardComponent implements Component {
     return [fitLine(line, width)];
   }
 
+  private renderStandbyBanner(width: number): string[] {
+    if (width < 52) {
+      const compactLine = `${this.theme.fg("success", this.theme.bold("🐝 Orchestrator Standby"))}${this.theme.fg("dim", " · /swarm exit")}`;
+      return [fitLine(compactLine, width)];
+    }
+    const left =
+      width >= 76
+        ? `${this.theme.fg("success", this.theme.bold("🐝 Persistent Orchestrator: Standby"))}${this.theme.fg("muted", ` — @${ORCHESTRATOR_NAME} on duty`)}`
+        : this.theme.fg("success", this.theme.bold("🐝 Persistent Orchestrator: Standby"));
+    const right = this.theme.fg("dim", "/swarm exit");
+    return [fitLine(joinColumns(left, right, width), width)];
+  }
+
+  private renderExpandedStandbyLine(innerWidth: number): string {
+    const dot = this.theme.fg("success", "●");
+    const label = this.theme.fg(
+      "accent",
+      this.theme.bold("Persistent Orchestrator: Standby"),
+    );
+    if (innerWidth < 50) {
+      return fitLine(`${dot} ${label}`, innerWidth);
+    }
+    if (innerWidth < 72) {
+      return fitLine(
+        `${dot} ${label} ${this.theme.fg("dim", "(/swarm exit)")}`,
+        innerWidth,
+      );
+    }
+    if (innerWidth < 96) {
+      return fitLine(
+        `${dot} ${label}${this.theme.fg("muted", ` — @${ORCHESTRATOR_NAME} on duty`)} ${this.theme.fg("dim", "(/swarm exit)")}`,
+        innerWidth,
+      );
+    }
+    const left = `${dot} ${label}${this.theme.fg("muted", ` — @${ORCHESTRATOR_NAME} remains on duty for follow-up tasks`)}`;
+    const right = this.theme.fg("dim", "/swarm exit to leave");
+    return fitLine(joinColumns(left, right, innerWidth), innerWidth);
+  }
+
   private renderWorkingMemberLine(
     member: SwarmMemberRecord,
     width: number,
@@ -733,6 +782,9 @@ export class SwarmDashboardComponent implements Component {
     if (width < 58) {
       const right = this.theme.fg("dim", `Board:#${snapshot.boardHead}`);
       lines.push(fitLine(joinColumns(left, right, width), width));
+      if (this.state.orchestratorStandby) {
+        lines.push(...this.renderStandbyBanner(width));
+      }
       return lines;
     }
 
@@ -758,6 +810,9 @@ export class SwarmDashboardComponent implements Component {
     metaParts.push(this.theme.fg("dim", "Alt+W expand · Alt+S panel"));
     const right = metaParts.join(this.theme.fg("dim", " · "));
     lines.push(fitLine(joinColumns(left, right, width), width));
+    if (this.state.orchestratorStandby) {
+      lines.push(...this.renderStandbyBanner(width));
+    }
     return lines;
   }
 
@@ -946,6 +1001,9 @@ export class SwarmDashboardComponent implements Component {
       (run.status !== "active" || this.state.draftMode === "tweak")
     ) {
       body.push(...this.renderDraftBanner(innerWidth));
+    }
+    if (isTerminalRunStatus(run.status) && this.state.orchestratorStandby) {
+      body.push(this.renderExpandedStandbyLine(innerWidth));
     }
 
     const titleText = sanitizePlainText(run.title || run.objective) || run.id;
@@ -1348,11 +1406,19 @@ export class SwarmDashboardComponent implements Component {
       "accent",
       this.theme.bold(`🐝 ${titleText} · ${run.id}`),
     );
+    const standbyFooter =
+      isTerminalRunStatus(run.status) && Boolean(this.state.orchestratorStandby);
     const footer = this.theme.fg(
       "dim",
-      innerWidth >= 82
-        ? "Alt+W collapse · Alt+S panel · Alt+M models · /swarm board · /swarm graph"
-        : "Alt+W collapse · Alt+S panel · Alt+M models",
+      standbyFooter
+        ? innerWidth >= 82
+          ? "Alt+W collapse · Alt+S panel · Alt+M models · /swarm exit leave standby"
+          : innerWidth >= 46
+            ? "Alt+W collapse · Alt+S panel · /swarm exit"
+            : "Alt+W · Alt+S · /swarm exit"
+        : innerWidth >= 82
+          ? "Alt+W collapse · Alt+S panel · Alt+M models · /swarm board · /swarm graph"
+          : "Alt+W collapse · Alt+S panel · Alt+M models",
     );
 
     return renderBox(body.slice(0, maxInner), width, {
@@ -1371,10 +1437,13 @@ export class SwarmDashboardComponent implements Component {
 
     if (!run) {
       this.syncSpinnerTimer(false);
-      if (!this.state.draftActive) {
-        return [];
+      if (this.state.draftActive) {
+        return this.renderDraftBanner(targetWidth);
       }
-      return this.renderDraftBanner(targetWidth);
+      if (this.state.orchestratorStandby) {
+        return this.renderStandbyBanner(targetWidth);
+      }
+      return [];
     }
 
     const workingMembers = getWorkingMembers(snapshot, run);
@@ -1426,11 +1495,27 @@ export function createSwarmWidget(
 
 export function formatStatusLine(
   snapshot: SwarmSnapshot,
-  draftActive = false,
+  draftActiveOrState: boolean | FormatStatusLineOptions = false,
+  orchestratorStandby = false,
 ): string | undefined {
+  const draftActive =
+    typeof draftActiveOrState === "boolean"
+      ? draftActiveOrState
+      : Boolean(draftActiveOrState?.draftActive);
+  const standby =
+    typeof draftActiveOrState === "boolean"
+      ? Boolean(orchestratorStandby)
+      : Boolean(draftActiveOrState?.orchestratorStandby ?? orchestratorStandby);
+
   const run = snapshot.run;
   if (!run) {
-    return draftActive ? "🐝 swarm:draft" : undefined;
+    if (draftActive) {
+      return "🐝 swarm:draft";
+    }
+    if (standby) {
+      return `🐝 swarm:standby · @${ORCHESTRATOR_NAME} standby (/swarm exit)`;
+    }
+    return undefined;
   }
 
   const workingMembers = getWorkingMembers(snapshot, run);
@@ -1468,6 +1553,8 @@ export function formatStatusLine(
   }
   if (draftActive && run.status !== "active") {
     parts.push("draft");
+  } else if (standby && isTerminalRunStatus(run.status)) {
+    parts.push(`@${ORCHESTRATOR_NAME} standby (/swarm exit)`);
   }
 
   return parts.join(" · ");
@@ -1499,6 +1586,14 @@ export function formatZeroTurnStatusDashboard(
         "",
         `Clarifying requirements & strategy.${seedLine}`,
         "- Continue answering questions in chat or run `/swarm cancel` to discard.",
+      ].join("\n");
+    }
+    if (options?.orchestratorStandby) {
+      return [
+        `### 🐝 Persistent Orchestrator Standby (\`@${ORCHESTRATOR_NAME}\`)`,
+        "",
+        `- **Mode:** Persistent Orchestrator Standby — \`@${ORCHESTRATOR_NAME}\` remains on duty for follow-up tasks.`,
+        "- **Exit:** Run `/swarm exit` (or open `/swarm` -> `Exit Swarm Orchestrator Mode`) to return to direct-edit mode.",
       ].join("\n");
     }
     return "No active Swarm run. Start one with `/swarm <idea>` or `/swarm direct <objective>`.";
@@ -1553,6 +1648,10 @@ export function formatZeroTurnStatusDashboard(
   if (run.status === "active" && workingCount === 0 && waitingCount > 0) {
     out.push(
       `- **Status:** ⏳ 0 working — awaiting @${ORCHESTRATOR_NAME} next step`,
+    );
+  } else if (isTerminalRunStatus(run.status) && options?.orchestratorStandby) {
+    out.push(
+      `- **Orchestrator Mode:** Persistent Orchestrator Standby (\`@${ORCHESTRATOR_NAME}\` on duty — run \`/swarm exit\` to leave)`,
     );
   }
 

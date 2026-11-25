@@ -38,8 +38,10 @@ import {
   SwarmDashboardComponent,
   SwarmHubView,
   type SwarmHubAction,
+  type SwarmHubViewOptions,
   SwarmModelPickerView,
   SwarmOverlayComponent,
+  type SwarmWidgetState,
   type ModelPickerSettingsState,
   bindSwarmShortcuts,
   buildInitialMembersSummaryLines,
@@ -70,6 +72,7 @@ import {
   isModalOpen,
   joinColumns,
   memberStateIcon,
+  openSwarmHub,
   openSwarmOverlay,
   renderBox,
   renderHorizontalRule,
@@ -6273,3 +6276,348 @@ describe("SwarmHubView quick policy toggles & active-run goal composer (VAL-HUB-
     }
   });
 });
+
+// ============================================================================
+// Persistent Orchestrator Standby UX in SwarmHubView & Dashboard (VAL-UI-001)
+// ============================================================================
+
+describe("Persistent Orchestrator standby UX in SwarmHubView & dashboard-widget (VAL-UI-001)", () => {
+  const fixedNow = () => Date.parse("2026-11-20T17:45:00.000Z");
+
+  it("VAL-UI-001: SwarmHubView renders Persistent Orchestrator standby cue and Exit Swarm Orchestrator Mode action only when orchestratorModeActive is true and no run is active/paused", async () => {
+    const theme = createMockTheme();
+    const emptySnap = makeSampleSnapshot({ empty: true });
+    const completedSnap = makeSampleSnapshot({ status: "completed" });
+    const activeSnap = makeSampleSnapshot({ status: "active" });
+    const pausedSnap = makeSampleSnapshot({ status: "paused" });
+
+    const baseState: SwarmHubViewOptions["state"] = {
+      settings: {
+        ...DEFAULT_SWARM_SETTINGS,
+        orchestratorModel: "anthropic/claude-opus-4-6",
+        orchestratorThinkingLevel: "high",
+        fallbackModels: ["anthropic/claude-sonnet-4-5"],
+      },
+      origins: { orchestrator: "global", worker: "host", validator: "host" },
+      hostModel: "openai/gpt-5.4",
+    };
+
+    // 1. Empty snapshot + orchestratorModeActive: true -> standby cue + Exit menu item -> { kind: "exit" }
+    {
+      const tuiHandle = createMockTUI(28, 90);
+      let action: SwarmHubAction | undefined;
+      const hub = new SwarmHubView(tuiHandle.tui, theme, {
+        state: baseState,
+        snapshot: emptySnap,
+        runs: [],
+        availableModels: [],
+        orchestratorModeActive: true,
+        onComplete: (act) => {
+          action = act;
+        },
+      });
+      hub.focused = true;
+
+      try {
+        for (const w of [40, 60, 80, 120] as const) {
+          const lines = hub.render(w);
+          assertAllLinesFit(lines, w, `hub-standby-empty@${w}`);
+          const plain = stripTerminalSequences(lines.join("\n"));
+          assert.match(plain, /Persistent Orchestrator: Standby/);
+          assert.match(plain, /✗ Exit Swarm Orchestrator Mode/);
+          if (w >= 80) {
+            assert.match(plain, /@orchestrator on duty/);
+            assert.match(plain, /✗ Exit Swarm Orchestrator Mode \(\/swarm exit\)/);
+          }
+        }
+
+        // Goal typing is never hijacked by exit/policy keys while idle
+        for (const ch of "exit check") {
+          hub.handleInput(ch);
+        }
+        assert.match(
+          stripTerminalSequences(hub.render(90).join("\n")),
+          /exit check/,
+        );
+
+        // Navigate up once from default item #0 (Start Interactive Swarm) to wrap to last item (Exit Swarm Orchestrator Mode)
+        hub.handleInput("\x1b[A");
+        hub.handleInput("\r");
+        assert.deepEqual(action, { kind: "exit" });
+        assert.equal(tuiHandle.getHardwareCursor(), false);
+      } finally {
+        hub.dispose();
+      }
+    }
+
+    // 2. Completed run + runs history + orchestratorModeActive: true across 12/16/24/28 rows & openSwarmHub wrapper
+    {
+      for (const rows of [12, 16, 24, 28] as const) {
+        const { tui } = createMockTUI(rows, 80);
+        const hub = new SwarmHubView(tui, theme, {
+          state: baseState,
+          snapshot: completedSnap,
+          runs: [
+            {
+              id: completedSnap.run!.id,
+              title: completedSnap.run!.title,
+              objective: completedSnap.run!.objective,
+              baseBranch: "main",
+              status: "completed",
+              memberCount: 4,
+              workingCount: 0,
+              waitingCount: 0,
+              boardHead: 5,
+              ownerSessionId: "sess-1",
+              ownerPid: process.pid,
+              createdAt: "2026-11-20T17:30:00.000Z",
+              updatedAt: "2026-11-20T17:45:00.000Z",
+            },
+          ],
+          availableModels: [],
+          orchestratorModeActive: true,
+          onComplete: () => {},
+        });
+        try {
+          for (const w of [40, 80, 120] as const) {
+            const lines = hub.render(w);
+            assert.ok(
+              lines.length <= rows,
+              `Hub height ${lines.length} must fit ${rows} rows at width ${w}`,
+            );
+            assertAllLinesFit(lines, w, `hub-standby-completed@${rows}x${w}`);
+            const plain = stripTerminalSequences(lines.join("\n"));
+            assert.match(plain, /Persistent Orchestrator: Standby/);
+            if (rows >= 24 && w >= 80) {
+              assert.match(
+                plain,
+                /✗ Exit Swarm Orchestrator Mode \(\/swarm exit\)/,
+              );
+            }
+          }
+        } finally {
+          hub.dispose();
+        }
+      }
+
+      const { tui: customTui } = createMockTUI(28, 90);
+      const customCtx = {
+        mode: "tui",
+        hasUI: true,
+        ui: {
+          theme,
+          async custom<T>(
+            factory: (
+              t: TUI,
+              th: Theme,
+              kb: unknown,
+              done: (res: T) => void,
+            ) => Component & { dispose?(): void },
+          ): Promise<T> {
+            return new Promise<T>((resolve) => {
+              const comp = factory(customTui, theme, {}, resolve);
+              comp.handleInput?.("\x1b[A"); // wrap to Exit Swarm Orchestrator Mode
+              comp.handleInput?.("\r");
+            });
+          },
+        },
+      } as unknown as ExtensionContext;
+
+      const hubOutcome = await openSwarmHub(customCtx, {
+        state: baseState,
+        snapshot: completedSnap,
+        runs: [],
+        availableModels: [],
+        orchestratorModeActive: true,
+      });
+      assert.deepEqual(hubOutcome, { kind: "exit" });
+    }
+
+    // 3. Guard: orchestratorModeActive false/omitted OR active/paused run hides standby cue & exit menu item
+    for (const [label, snap, flag] of [
+      ["idle-default", emptySnap, undefined],
+      ["completed-false", completedSnap, false],
+      ["active-with-flag", activeSnap, true],
+      ["paused-with-flag", pausedSnap, true],
+    ] as const) {
+      const { tui } = createMockTUI(28, 90);
+      const hub = new SwarmHubView(tui, theme, {
+        state: baseState,
+        snapshot: snap,
+        runs: [],
+        availableModels: [],
+        orchestratorModeActive: flag,
+        onComplete: () => {},
+      });
+      try {
+        const plain = stripTerminalSequences(hub.render(90).join("\n"));
+        assert.doesNotMatch(
+          plain,
+          /Persistent Orchestrator: Standby/,
+          `${label} must not show standby cue`,
+        );
+        assert.doesNotMatch(
+          plain,
+          /Exit Swarm Orchestrator Mode/,
+          `${label} must not show Exit Swarm Orchestrator Mode action`,
+        );
+      } finally {
+        hub.dispose();
+      }
+    }
+  });
+
+  it("VAL-UI-001: SwarmWidgetState.orchestratorStandby surfaces standby in status line, compact/expanded dashboard, and zero-turn status within 40/80/120 width bounds", () => {
+    const theme = createMockTheme();
+    const emptySnap = makeSampleSnapshot({ empty: true });
+    const completedSnap = makeSampleSnapshot({ status: "completed" });
+    const activeSnap = makeSampleSnapshot({ status: "active" });
+
+    // 1. createSwarmWidgetState & formatStatusLine
+    const defaultState = createSwarmWidgetState();
+    assert.equal(defaultState.orchestratorStandby, undefined);
+
+    const standbyState: SwarmWidgetState = createSwarmWidgetState({
+      expanded: false,
+      orchestratorStandby: true,
+    });
+    assert.equal(standbyState.orchestratorStandby, true);
+
+    assert.equal(
+      formatStatusLine(emptySnap, false, true),
+      "🐝 swarm:standby · @orchestrator standby (/swarm exit)",
+    );
+    assert.equal(
+      formatStatusLine(emptySnap, standbyState),
+      "🐝 swarm:standby · @orchestrator standby (/swarm exit)",
+    );
+    assert.equal(formatStatusLine(emptySnap, true, true), "🐝 swarm:draft");
+
+    const completedStatus = formatStatusLine(completedSnap, standbyState) ?? "";
+    assert.match(completedStatus, /🐝 swarm:completed #5/);
+    assert.match(completedStatus, /@orchestrator standby \(\/swarm exit\)/);
+
+    const completedNoStandby = formatStatusLine(completedSnap, false, false) ?? "";
+    assert.doesNotMatch(completedNoStandby, /standby/);
+
+    const activeStatus = formatStatusLine(activeSnap, false, true) ?? "";
+    assert.doesNotMatch(
+      activeStatus,
+      /standby/,
+      "Active run status line must not claim post-run standby",
+    );
+
+    // 2. Compact & expanded dashboard after a completed run with orchestratorStandby: true (40 / 80 / 120)
+    for (const rows of [16, 20, 32] as const) {
+      const { tui } = createMockTUI(rows, 120);
+      const state = createSwarmWidgetState({
+        expanded: false,
+        orchestratorStandby: true,
+      });
+      const widget = createSwarmWidget(() => completedSnap, state, {
+        now: fixedNow,
+      })(tui, theme);
+
+      try {
+        // Compact mode after completed run
+        state.expanded = false;
+        for (const w of [40, 80, 120] as const) {
+          const compactLines = widget.render(w);
+          assert.equal(compactLines.length, 2);
+          assertAllLinesFit(
+            compactLines,
+            w,
+            `widget-completed-standby-compact@${rows}x${w}`,
+          );
+          const plain = stripTerminalSequences(compactLines.join("\n"));
+          assert.match(plain, /\[completed\]/);
+          assert.match(plain, /Orchestrator.*Standby/);
+          assert.match(plain, /\/swarm exit/);
+          if (w >= 80) {
+            assert.match(plain, /Persistent Orchestrator: Standby/);
+            assert.match(plain, /@orchestrator on duty/);
+          }
+        }
+
+        // Expanded mode after completed run (strict box borders & height cap)
+        state.expanded = true;
+        for (const w of [40, 80, 120] as const) {
+          const expandedLines = widget.render(w);
+          const maxExpected = Math.min(36, Math.max(8, rows - 7));
+          assert.ok(
+            expandedLines.length <= maxExpected,
+            `Expanded standby height ${expandedLines.length} exceeded ${maxExpected} at ${rows}x${w}`,
+          );
+          assertAllLinesFit(
+            expandedLines,
+            w,
+            `widget-completed-standby-expanded@${rows}x${w}`,
+          );
+          const firstPlain = stripTerminalSequences(expandedLines[0]!);
+          const lastPlain = stripTerminalSequences(
+            expandedLines[expandedLines.length - 1]!,
+          );
+          assert.ok(firstPlain.startsWith("╭") && firstPlain.endsWith("╮"));
+          assert.ok(lastPlain.startsWith("╰") && lastPlain.endsWith("╯"));
+
+          const plain = stripTerminalSequences(expandedLines.join("\n"));
+          assert.match(plain, /Persistent Orchestrator: Standby/);
+          assert.match(plain, /\/swarm exit/);
+        }
+
+        // Clearing orchestratorStandby collapses completed compact run back to 1 line without standby cue
+        state.expanded = false;
+        state.orchestratorStandby = false;
+        const resetLines = widget.render(80);
+        assert.equal(resetLines.length, 1);
+        assert.doesNotMatch(
+          stripTerminalSequences(resetLines.join("\n")),
+          /Standby/,
+        );
+      } finally {
+        widget.dispose();
+      }
+    }
+
+    // 3. Empty snapshot with orchestratorStandby: true renders 1-line standby banner across 40/80/120
+    {
+      const { tui } = createMockTUI(28, 120);
+      const state = createSwarmWidgetState({
+        expanded: false,
+        orchestratorStandby: true,
+      });
+      const widget = createSwarmWidget(() => emptySnap, state, { now: fixedNow })(
+        tui,
+        theme,
+      );
+      try {
+        for (const w of [40, 80, 120] as const) {
+          const lines = widget.render(w);
+          assert.equal(lines.length, 1);
+          assertAllLinesFit(lines, w, `widget-empty-standby@${w}`);
+          const plain = stripTerminalSequences(lines.join("\n"));
+          assert.match(plain, /Orchestrator.*Standby/);
+          assert.match(plain, /\/swarm exit/);
+        }
+      } finally {
+        widget.dispose();
+      }
+    }
+
+    // 4. Zero-turn /swarm status Markdown surfaces Persistent Orchestrator Standby
+    const emptyMd = formatZeroTurnStatusDashboard(emptySnap, {
+      orchestratorStandby: true,
+      now: fixedNow,
+    });
+    assert.match(emptyMd, /Persistent Orchestrator Standby/);
+    assert.match(emptyMd, /\/swarm exit/);
+
+    const completedMd = formatZeroTurnStatusDashboard(completedSnap, {
+      orchestratorStandby: true,
+      now: fixedNow,
+    });
+    assert.match(completedMd, /Orchestrator Mode:\*\* Persistent Orchestrator Standby/);
+    assert.match(completedMd, /\/swarm exit/);
+  });
+});
+
