@@ -7687,6 +7687,7 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
         const tracker = createMockPersistentMemberHandle({
           request,
           runInitialTurn: async () => {
+            await new Promise((r) => setTimeout(r, 15));
             if (request.role === "worker" && request.workspace === "share") {
               await writeFile(
                 path.join(request.cwd, "src", `${request.name}.ts`),
@@ -8091,7 +8092,7 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     await host.emit("session_shutdown", { reason: "quit" });
   });
 
-  it("26. VAL-LIFE-002: enforces hard Orchestrator write/edit/powershell and mutating-bash guard across drafting, active, paused, and standby while allowing read-only bash, observers, and !commands", async () => {
+  it("26. VAL-LIFE-002: enforces Orchestrator write/edit/powershell block and best-effort pattern-matching mutating-bash guard across drafting, active, paused, and standby while allowing read-only bash, observers, and !commands", async () => {
     const repoDir = await createTempGitRepo("val-life-002");
     tempDirs.push(repoDir);
 
@@ -8177,6 +8178,7 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       for (const cmd of mutatingCommands) {
         const res = await callToolHook(host, "bash", { command: cmd });
         assert.equal(res?.block, true, `Mutating bash "${cmd}" must be blocked in ${phaseLabel}`);
+        assert.match(String(res?.reason), /best-effort pattern matching/i);
         assert.match(String(res?.reason), /Delegate/i);
         assert.match(String(res?.reason), /\/swarm exit/);
         assert.match(String(res?.reason), /!<command>|git push/i);
@@ -8271,6 +8273,7 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
         return createMockPersistentMemberHandle({
           request,
           runInitialTurn: async () => {
+            await new Promise((r) => setTimeout(r, 15));
             if (request.role === "worker" && request.workspace === "share") {
               await writeFile(
                 path.join(request.cwd, "src", `${request.name}.ts`),
@@ -8413,7 +8416,8 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     const run1Id: string = run1Plan.details.runId;
 
     await waitFor(async () => (await store.loadRun(run1Id)).members["m1-worker"]?.state === "waiting");
-    await host.executeTool(SWARM_TOOL, { action: "merge", name: "m1-worker" });
+    const merge1Res = await host.executeTool(SWARM_TOOL, { action: "merge", name: "m1-worker" });
+    assert.equal(merge1Res.isError, undefined, JSON.stringify(merge1Res));
     // Auto-spawned @validator verifies VAL-M-001 -> wait until VAL-M-001 is passed
     await waitFor(async () => {
       const r = await store.loadRun(run1Id);
@@ -8507,7 +8511,8 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
 
     // Complete Run 2 -> back to standby with Run 2 as priorRun!
     await waitFor(async () => (await store.loadRun(run2Id)).members["m2-worker"]?.state === "waiting");
-    await host.executeTool(SWARM_TOOL, { action: "merge", name: "m2-worker" });
+    const merge2Res = await host.executeTool(SWARM_TOOL, { action: "merge", name: "m2-worker" });
+    assert.equal(merge2Res.isError, undefined, JSON.stringify(merge2Res));
     await waitFor(async () => {
       const r = await store.loadRun(run2Id);
       return (
@@ -8640,6 +8645,7 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
         return createMockPersistentMemberHandle({
           request,
           runInitialTurn: async () => {
+            await new Promise((r) => setTimeout(r, 15));
             if (request.role === "worker" && request.workspace === "share") {
               await writeFile(
                 path.join(request.cwd, "src", `${request.name}.ts`),

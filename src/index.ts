@@ -282,8 +282,8 @@ const ORCHESTRATOR_WRITE_GUARD_REASON =
 function buildOrchestratorBashGuardReason(detail?: string): string {
   const cleanDetail = detail
     ? detail.replace(/\s+in read-only validator sessions\.?$/i, ".")
-    : "Mutating shell command detected.";
-  return `Orchestrator must not edit repository files directly or run mutating bash commands in Persistent Orchestrator Mode (${cleanDetail}) Read-only inspection/test commands (e.g. git status, git diff, rg, ls, npm test) are allowed. Delegate file edits, builds, and branch commits to an isolated worker via swarm{action:"add", workspace:"share"} (or propose_swarm_plan when in standby/drafting; land worker branches via swarm{action:"merge"}). For operations no Swarm member is allowed to perform (workers cannot run git push or git merge), ask the user to run \`!<command>\` themselves or leave Persistent Orchestrator Mode with \`/swarm exit\`.`;
+    : "Mutating shell command pattern matched.";
+  return `Orchestrator must not edit repository files directly or run mutating bash commands in Persistent Orchestrator Mode (best-effort pattern matching blocked this command: ${cleanDetail}) Read-only inspection/test commands (e.g. git status, git diff, rg, ls, npm test) stay allowed. Delegate file edits, builds, and branch commits to an isolated worker via swarm{action:"add", workspace:"share"} (or propose_swarm_plan when in standby/drafting; land worker branches via swarm{action:"merge"}). For operations no Swarm member is allowed to perform (workers cannot run git push or git merge), ask the user to run \`!<command>\` themselves or leave Persistent Orchestrator Mode with \`/swarm exit\`.`;
 }
 
 const MODEL_ROLES: ReadonlyArray<SwarmModelRole> = [
@@ -2169,7 +2169,7 @@ function buildHelpMarkdown(): string {
     "| `/swarm settings` · `/swarm config` | Configure Mission Models, warm pool, smart LLM monitor, concurrency & git settings |",
     "| `/swarm help` | Print this command reference (zero LLM turn) |",
     "",
-    "**Persistent Orchestrator Mode & Manual Git Commands:** Entering `/swarm` (or `/swarm resume`) keeps `@orchestrator` on duty in `standby` across subsequent coding tasks until you run `/swarm exit` (or Hub `Exit Swarm Orchestrator Mode`). While active, `write`, `edit`, `powershell`, and mutating `bash` are hard-blocked; run manual git operations (`git push`, manual `git commit`) via `!<command>` (e.g. `!git push`) or exit first with `/swarm exit`.",
+    "**Persistent Orchestrator Mode & Manual Git Commands:** Entering `/swarm` (or `/swarm resume`) keeps `@orchestrator` on duty in `standby` across subsequent coding tasks until you run `/swarm exit` (or Hub `Exit Swarm Orchestrator Mode`). While active, `write`, `edit`, and `powershell` are blocked and mutating `bash` commands are filtered by best-effort pattern matching (to prevent habitual direct edits, not as a sandbox); run manual git operations (`git push`, manual `git commit`) via `!<command>` (e.g. `!git push`) or exit first with `/swarm exit`.",
     "**Mid-Flight Redirection & Goal Continuation:** Type any message directly to the Orchestrator while workers run to adjust scope (`swarm{action:\"mission\"}`), or run `/swarm steer <member> <msg>`. Active Goal runs auto-continue until all features & `VAL-*` assertions pass (or `[NEEDS_HUMAN]` is raised).",
     "**TUI Shortcuts:** `Alt+S` / `Ctrl+Shift+S` opens Mission Control / Hub · `Alt+M` / `Ctrl+Shift+M` opens Mission Model Picker · `Alt+W` / `Ctrl+Shift+T` toggles expanded above-editor dashboard · `Esc` collapses expanded dashboard.",
   ].join("\n");
@@ -9726,6 +9726,8 @@ export function createPiSwarmExtension(
         return undefined;
       }
 
+      // Exact block on write/edit/powershell; best-effort pattern-matching guard on bash
+      // (stops habitual orchestrator mutations rather than acting as an OS sandbox).
       if (isEditTool) {
         return {
           block: true,
