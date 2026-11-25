@@ -15,12 +15,15 @@ export {
   buildOrchestratorContextSummary,
   buildOrchestratorLiveStateSection,
   buildOrchestratorPlaybookSection,
+  buildOrchestratorStandbySection,
   buildOrchestratorStaticSection,
   buildWakeupPrompt,
   formatBoardEntryFull,
   formatBoardExcerpt,
   formatBoardExcerptLine,
   type OrchestratorLiveStateOptions,
+  type OrchestratorPlaybookOptions,
+  type OrchestratorStandbyOptions,
 } from "./role-prompts.js";
 
 export {

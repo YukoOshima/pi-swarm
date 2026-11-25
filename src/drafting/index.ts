@@ -7,6 +7,7 @@ export {
   isDraftActive,
   promptExistingDraftConflict,
   rehydrateDraft,
+  STANDBY_SWARM_TOOLS,
   startDraft,
   startOrResolveDraft,
   updateDraft,

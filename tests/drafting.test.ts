@@ -17,6 +17,7 @@ import {
   PROPOSE_SWARM_PLAN_TOOL,
   READ_BOARD_TOOL,
   RESERVED_MEMBER_NAMES,
+  STANDBY_SWARM_TOOLS as CONSTANTS_STANDBY_SWARM_TOOLS,
   SWARM_CORE_TOOLS,
   SWARM_DRAFT_ENTRY,
   SWARM_DRAFT_VERSION,
@@ -45,6 +46,7 @@ import {
   ProposeSwarmPlanParamsSchema,
   registerDraftingTools,
   rehydrateDraft,
+  STANDBY_SWARM_TOOLS,
   startDraft,
   startOrResolveDraft,
   SwarmQuestionnaireItemSchema,
@@ -80,6 +82,7 @@ import {
   type ProposedSwarmPlan,
   type QuestionSpec,
   type QuestionnaireResult,
+  type SwarmFocusEntry,
   type SwarmRunState,
   type SwarmSettings,
 } from "../src/types.js";
@@ -6487,3 +6490,397 @@ describe("drafting-contract-hardening: VAL-CONTRACT-001, VAL-CONTRACT-002, VAL-D
     assert.equal(accepted.valid, true);
   });
 });
+
+// ============================================================================
+// Persistent Standby Orchestrator Profile & Direct Proposal (VAL-STANDBY-001 & VAL-STANDBY-002)
+// ============================================================================
+
+describe("standby-profile-and-droid-prompts: VAL-STANDBY-001 & VAL-STANDBY-002", () => {
+  it("VAL-STANDBY-001: exposes STANDBY_SWARM_TOOLS, 'standby' SwarmToolProfileMode, and hasPersistentOrchestrator in DraftStateController.rehydrate while keeping IDLE/DRAFTING/CORE unchanged", () => {
+    // Exact invariants on tool arrays
+    assert.deepEqual(IDLE_SWARM_TOOLS, [SWARM_TOOL]);
+    assert.deepEqual(DRAFTING_TOOLS, [
+      SWARM_QUESTION_TOOL,
+      SWARM_QUESTIONNAIRE_TOOL,
+      PROPOSE_SWARM_PLAN_TOOL,
+    ]);
+    assert.deepEqual(SWARM_CORE_TOOLS, [
+      SWARM_TOOL,
+      POST_MESSAGE_TOOL,
+      READ_BOARD_TOOL,
+      SWARM_WAIT_TOOL,
+    ]);
+    assert.equal(ALL_SWARM_EXTENSION_TOOLS.length, 7);
+
+    assert.deepEqual(STANDBY_SWARM_TOOLS, CONSTANTS_STANDBY_SWARM_TOOLS);
+    assert.deepEqual(STANDBY_SWARM_TOOLS, [
+      SWARM_TOOL,
+      READ_BOARD_TOOL,
+      SWARM_QUESTION_TOOL,
+      SWARM_QUESTIONNAIRE_TOOL,
+      PROPOSE_SWARM_PLAN_TOOL,
+    ]);
+    assert.deepEqual(getSwarmToolsForMode("standby"), STANDBY_SWARM_TOOLS);
+
+    const hostAndThirdParty = [
+      "read",
+      "bash",
+      "edit",
+      "write",
+      "grep",
+      "find",
+      "ls",
+      "mcp_docs_lookup",
+    ];
+    const harness = new MockPiHarness([...hostAndThirdParty, ...SWARM_CORE_TOOLS]);
+
+    // Transition from "running" -> "standby": keeps swarm & read_board, adds 3 drafting tools, removes post_message & swarm_wait
+    assert.equal(applySwarmToolProfile(harness.api, "standby"), true);
+    assert.equal(harness.setActiveToolsCalls.length, 1);
+    for (const hostTool of hostAndThirdParty) {
+      assert.ok(harness.activeTools.includes(hostTool), `must keep host tool ${hostTool}`);
+    }
+    for (const standbyTool of STANDBY_SWARM_TOOLS) {
+      assert.ok(
+        harness.activeTools.includes(standbyTool),
+        `standby profile must include ${standbyTool}`,
+      );
+    }
+    assert.ok(!harness.activeTools.includes(POST_MESSAGE_TOOL));
+    assert.ok(!harness.activeTools.includes(SWARM_WAIT_TOOL));
+
+    // Idempotent no-op when already in "standby"
+    assert.equal(applySwarmToolProfile(harness.api, "standby"), false);
+    assert.equal(harness.setActiveToolsCalls.length, 1);
+
+    // DraftStateController.rehydrate precedence: drafting > running > standby > idle
+    const controller = new DraftStateController(harness.api);
+    const ctx = harness.createContext();
+
+    // 1. No draft, no active run, hasPersistentOrchestrator: true -> "standby"
+    applySwarmToolProfile(harness.api, "idle");
+    controller.rehydrate(ctx, {
+      syncToolProfile: true,
+      hasActiveRun: false,
+      hasPersistentOrchestrator: true,
+    });
+    assert.equal(controller.isStandbyProfileActive(), true);
+    for (const t of STANDBY_SWARM_TOOLS) {
+      assert.ok(harness.activeTools.includes(t));
+    }
+
+    // 2. hasActiveRun: true wins over hasPersistentOrchestrator: true -> "running"
+    controller.rehydrate(ctx, {
+      syncToolProfile: true,
+      hasActiveRun: true,
+      hasPersistentOrchestrator: true,
+    });
+    assert.equal(controller.isStandbyProfileActive(), false);
+    for (const t of SWARM_CORE_TOOLS) {
+      assert.ok(harness.activeTools.includes(t));
+    }
+    for (const t of DRAFTING_TOOLS) {
+      assert.ok(!harness.activeTools.includes(t));
+    }
+
+    // 3. Active draft wins over both hasActiveRun and hasPersistentOrchestrator -> "drafting"
+    controller.start({ seed: "Follow-up slice" });
+    controller.rehydrate(ctx, {
+      syncToolProfile: true,
+      hasActiveRun: true,
+      hasPersistentOrchestrator: true,
+    });
+    for (const t of DRAFTING_TOOLS) {
+      assert.ok(harness.activeTools.includes(t));
+    }
+    assert.ok(!harness.activeTools.includes(SWARM_TOOL));
+    assert.ok(!harness.activeTools.includes(READ_BOARD_TOOL));
+
+    // 4. Clearing draft and rehydrating with hasPersistentOrchestrator: false -> "idle"
+    controller.clear();
+    controller.rehydrate(ctx, {
+      syncToolProfile: true,
+      hasActiveRun: false,
+      hasPersistentOrchestrator: false,
+    });
+    const activeSwarmInIdle = harness.activeTools.filter((t) =>
+      (ALL_SWARM_EXTENSION_TOOLS as readonly string[]).includes(t),
+    );
+    assert.deepEqual(activeSwarmInIdle, [SWARM_TOOL]);
+  });
+
+  it("VAL-STANDBY-002: executes propose_swarm_plan directly from Standby mode (currentDraft === null), honors getDefaultAutoConfirm, and typed SwarmFocusEntry flags", async () => {
+    const focusEntry: SwarmFocusEntry = {
+      version: 2,
+      runId: null,
+      sessionId: "sess-standby-1",
+      reason: "completed-to-standby",
+      orchestratorMode: true,
+      autoConfirmDefault: true,
+    };
+    assert.equal(focusEntry.orchestratorMode, true);
+    assert.equal(focusEntry.autoConfirmDefault, true);
+
+    const validStandbyParams = (): ProposeSwarmPlanInput =>
+      makeSamplePlanParams({
+        assertions: [
+          {
+            id: "VAL-STANDBY-101",
+            title: "Follow-up endpoint works",
+            description: "GET /healthz returns 200 JSON payload.",
+            evidence_required: "npm test exit 0",
+          },
+        ],
+        features: [
+          {
+            id: "healthz-endpoint",
+            title: "Add /healthz endpoint",
+            description: "Implement /healthz route and unit test.",
+            milestone: "M1: Healthcheck",
+            files_owned: ["src/healthz.ts", "tests/healthz.test.ts"],
+            fulfills: ["VAL-STANDBY-101"],
+          },
+        ],
+        initial_members: [
+          {
+            name: "api-worker",
+            role: "worker",
+            workspace: "share",
+            brief: "Implement src/healthz.ts and tests/healthz.test.ts, run npm test, report @orchestrator.",
+          },
+        ],
+      });
+
+    // Case A: Interactive standby (currentDraft === null, getDefaultAutoConfirm === false)
+    // Exercises swarm_questionnaire -> Pass-1 contract review bounce -> Pass-2 confirm -> Mission #2 fresh Pass-1
+    const harness = new MockPiHarness();
+    applySwarmToolProfile(harness.api, "standby");
+    let defaultAutoConfirm = false;
+    let confirmModalCalls = 0;
+    let reviewCalls = 0;
+    let blockNextReview = true;
+    const confirmedPlans: ProposedSwarmPlan[] = [];
+
+    const controller = registerDraftingTools(harness.api, {
+      worktree: createMockWorktree({ currentBranch: "main" }),
+      ui: {
+        askQuestion: async () => ({
+          cancelled: false,
+          answer: "(Recommended) Keep JSON format",
+          isCustom: false,
+        }),
+        askQuestionnaire: async () => ({
+          cancelled: false,
+          answers: { payload_shape: "(Recommended) Minimal status JSON" },
+          items: [
+            {
+              id: "payload_shape",
+              question: "Which health payload format?",
+              answer: "(Recommended) Minimal status JSON",
+              isCustom: false,
+            },
+          ],
+        }),
+        confirmProposal: async (_ctx, plan) => {
+          confirmModalCalls++;
+          return {
+            action: "confirm",
+            validatorEnabled: plan.validatorEnabled,
+            maxConcurrency: plan.maxConcurrency,
+          };
+        },
+      },
+      getSettings: () => ({ ...DEFAULT_SWARM_SETTINGS, maxConcurrency: 4 }),
+      getDefaultAutoConfirm: () => defaultAutoConfirm,
+      reviewProposedContract: async () => {
+        reviewCalls++;
+        if (blockNextReview) {
+          blockNextReview = false;
+          return {
+            approved: false,
+            summary: "Missing negative status assertion.",
+            findings: [
+              {
+                severity: "blocking",
+                category: "missing_assertion",
+                message: "Cover degraded health check status.",
+              },
+            ],
+          };
+        }
+        return { approved: true, summary: "Contract solid.", findings: [] };
+      },
+      onPlanConfirmed: async (plan) => {
+        confirmedPlans.push(plan);
+        return createMockRun(plan);
+      },
+    });
+
+    const ctx = harness.createContext();
+    assert.equal(controller.getDraft(), null);
+
+    // AskUser works cleanly in standby with currentDraft === null
+    const qRes = await harness.registeredTools
+      .get(SWARM_QUESTIONNAIRE_TOOL)
+      .execute(
+        "tc-standby-q",
+        {
+          questions: [
+            {
+              id: "payload_shape",
+              question: "Which health payload format?",
+              options: [{ label: "(Recommended) Minimal status JSON" }],
+            },
+          ],
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+    assert.equal(qRes.isError, undefined);
+    assert.equal((qRes.details as SwarmQuestionnaireToolDetails).cancelled, false);
+    assert.equal(controller.getDraft(), null);
+
+    const proposeTool = harness.registeredTools.get(PROPOSE_SWARM_PLAN_TOOL);
+
+    // Pass 1 bounces via Adversarial Contract Review without opening modal
+    const bounceRes = await proposeTool.execute(
+      "tc-standby-p1",
+      validStandbyParams(),
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(
+      (bounceRes.details as ProposeSwarmPlanToolDetails).outcome,
+      "contract_review_changes_requested",
+    );
+    assert.equal(confirmModalCalls, 0);
+    assert.equal(reviewCalls, 1);
+
+    // Pass 2 confirms via modal and swaps to "running"
+    const confirmRes = await proposeTool.execute(
+      "tc-standby-p2",
+      validStandbyParams(),
+      undefined,
+      undefined,
+      ctx,
+    );
+    const confirmDetails = confirmRes.details as ProposeSwarmPlanToolDetails;
+    assert.equal(confirmDetails.outcome, "confirmed");
+    assert.equal(confirmDetails.autoConfirmed, false);
+    assert.equal(confirmModalCalls, 1);
+    assert.equal(confirmedPlans.length, 1);
+    for (const coreTool of SWARM_CORE_TOOLS) {
+      assert.ok(harness.activeTools.includes(coreTool));
+    }
+
+    // Simulate run completion returning session to "standby" with sticky getDefaultAutoConfirm = true
+    applySwarmToolProfile(harness.api, "standby");
+    defaultAutoConfirm = true;
+    blockNextReview = true;
+
+    // Mission #2 starts with a fresh Pass-1 review key AND auto-confirms on Pass 2 without opening modal!
+    const m2Bounce = await proposeTool.execute(
+      "tc-standby-m2-p1",
+      validStandbyParams(),
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(
+      (m2Bounce.details as ProposeSwarmPlanToolDetails).outcome,
+      "contract_review_changes_requested",
+    );
+    assert.equal(confirmModalCalls, 1, "must not open modal on review bounce");
+
+    const m2Confirm = await proposeTool.execute(
+      "tc-standby-m2-p2",
+      validStandbyParams(),
+      undefined,
+      undefined,
+      ctx,
+    );
+    const m2Details = m2Confirm.details as ProposeSwarmPlanToolDetails;
+    assert.equal(m2Details.outcome, "confirmed");
+    assert.equal(m2Details.autoConfirmed, true);
+    assert.equal(
+      confirmModalCalls,
+      1,
+      "getDefaultAutoConfirm=true must skip confirmProposal when currentDraft === null",
+    );
+    assert.equal(confirmedPlans.length, 2);
+
+    // Explicit interactive draft (currentDraft !== null with autoConfirm omitted) overrides getDefaultAutoConfirm=true
+    controller.start({ seed: "Interactive override", autoConfirm: false });
+    await proposeTool.execute(
+      "tc-explicit-draft",
+      validStandbyParams(),
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(
+      confirmModalCalls,
+      2,
+      "explicit non-autoConfirm draft must still open confirmProposal even when getDefaultAutoConfirm returns true",
+    );
+  });
+
+  it("VAL-STANDBY-002: cancelling propose_swarm_plan in standalone standby mode preserves STANDBY_SWARM_TOOLS", async () => {
+    const harness = new MockPiHarness();
+    applySwarmToolProfile(harness.api, "standby");
+
+    registerDraftingTools(harness.api, {
+      worktree: createMockWorktree({ currentBranch: "main" }),
+      ui: {
+        askQuestion: async () => ({ cancelled: true, isCustom: false }),
+        askQuestionnaire: async () => ({ cancelled: true, answers: {}, items: [] }),
+        confirmProposal: async () => ({
+          action: "cancel",
+          validatorEnabled: true,
+          maxConcurrency: 4,
+        }),
+      },
+      getSettings: () => ({ ...DEFAULT_SWARM_SETTINGS }),
+      onPlanConfirmed: async (plan) => createMockRun(plan),
+    });
+
+    const ctx = harness.createContext();
+    const res = await harness.registeredTools
+      .get(PROPOSE_SWARM_PLAN_TOOL)
+      .execute(
+        "tc-standby-cancel",
+        makeSamplePlanParams({
+          assertions: [
+            {
+              id: "VAL-C-001",
+              title: "Cancel check",
+              description: "Cancel restores standby tools.",
+            },
+          ],
+          features: [
+            {
+              id: "cancel-feat",
+              title: "Cancel feat",
+              description: "Test cancel.",
+              milestone: "M1",
+              fulfills: ["VAL-C-001"],
+            },
+          ],
+        }),
+        undefined,
+        undefined,
+        ctx,
+      );
+
+    assert.equal((res.details as ProposeSwarmPlanToolDetails).outcome, "cancelled");
+    for (const tool of STANDBY_SWARM_TOOLS) {
+      assert.ok(
+        harness.activeTools.includes(tool),
+        `standby tool ${tool} must remain active after cancelling standby proposal`,
+      );
+    }
+  });
+});
+
