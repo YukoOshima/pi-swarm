@@ -8256,15 +8256,19 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       "npm test",
     ];
 
-    // 1. Pre-mode drafting: write/edit/powershell blocked; bash keeps main's behaviour; cancel returns to idle cleanly
+    // 1. Pre-mode drafting: write/edit/powershell and mutating bash blocked; read-only bash allowed; cancel returns to idle cleanly
     await host.runCommand("swarm", "Initial recon draft");
     assert.equal((await callToolHook(host, "write", { path: "a.ts", content: "" }))?.block, true);
     assert.equal(await callToolHook(host, "bash", { command: "git status" }), undefined);
-    assert.equal(await callToolHook(host, "bash", { command: "mkdir tmp-check" }), undefined);
+    assert.equal((await callToolHook(host, "bash", { command: "mkdir tmp-check" }))?.block, true);
     await host.runCommand("swarm", "cancel");
     assert.equal(await callToolHook(host, "write", { path: "a.ts", content: "" }), undefined);
+    assert.equal(await callToolHook(host, "bash", { command: "mkdir tmp-check" }), undefined);
 
-    const assertAllOrchestratorGuardsEnforced = async (phaseLabel: string) => {
+    const assertAllOrchestratorGuardsEnforced = async (
+      phaseLabel: string,
+      opts?: { blockHeavySuite?: boolean },
+    ) => {
       for (const toolName of ["write", "edit", "powershell"]) {
         const res = await callToolHook(host, toolName, {});
         assert.equal(res?.block, true, `${toolName} must be blocked in ${phaseLabel}`);
@@ -8281,11 +8285,19 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       }
       for (const cmd of readOnlyCommands) {
         const res = await callToolHook(host, "bash", { command: cmd });
-        assert.equal(
-          res,
-          undefined,
-          `Read-only bash "${cmd}" must stay allowed in ${phaseLabel}`,
-        );
+        if (opts?.blockHeavySuite && cmd === "npm test") {
+          assert.equal(
+            res?.block,
+            true,
+            `Heavy suite "${cmd}" must be blocked during drafting (${phaseLabel})`,
+          );
+        } else {
+          assert.equal(
+            res,
+            undefined,
+            `Read-only bash "${cmd}" must stay allowed in ${phaseLabel}`,
+          );
+        }
       }
     };
 
@@ -8336,7 +8348,9 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
 
     // 5. `drafting` state while already in Persistent Orchestrator Mode
     await host.runCommand("swarm", "Follow-up draft while mode is active");
-    await assertAllOrchestratorGuardsEnforced("drafting-in-orchestrator-mode");
+    await assertAllOrchestratorGuardsEnforced("drafting-in-orchestrator-mode", {
+      blockHeavySuite: true,
+    });
     await host.runCommand("swarm", "cancel"); // cancels draft -> back to standby, still guarded!
     await assertAllOrchestratorGuardsEnforced("standby-after-draft-cancel");
 
@@ -10508,6 +10522,131 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       action: "done",
       summary: "Completed v1.0.0 lifecycle test cleanly",
     });
+    await host.emit("session_shutdown", { reason: "quit" });
+  });
+
+  it("34. v1.0.1: Drafting Recon Brake blocks heavy test/lint/build commands, enforces 10-call recon cap with soft nudge at call 5, and preserves benign recon", async () => {
+    const repoDir = await createTempGitRepo("v101-draft-recon-brake");
+    tempDirs.push(repoDir);
+
+    const host = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-v101-recon-brake",
+    });
+    createPiSwarmExtension({
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: false,
+      }),
+    })(host.pi);
+    await host.emit("session_start", { reason: "startup" });
+    await host.runCommand("swarm", "Refactor landing page and open PR");
+
+    // 1. Heavy test/lint/typecheck/Playwright commands are blocked immediately during Drafting
+    for (const heavyCmd of [
+      "cd frontend && pnpm test",
+      "cd frontend && fnm exec --using=v24.22.0 pnpm test",
+      "cd frontend && PLAYWRIGHT_SKIP_WEB_SERVER=1 fnm exec --using=v24.22.0 npx playwright test --list",
+      "cd frontend && (time pnpm typecheck) 2>&1 | tail -8",
+      "cd frontend && pnpm lint && pnpm format",
+    ]) {
+      const blocked = (
+        await host.emit("tool_call", {
+          type: "tool_call",
+          toolCallId: `tc-heavy-${heavyCmd.length}`,
+          toolName: "bash",
+          input: { command: heavyCmd },
+        })
+      ).find(Boolean);
+      assert.equal(
+        blocked?.block,
+        true,
+        `Expected Drafting heavy suite guard to block: ${heavyCmd}`,
+      );
+      assert.match(String(blocked?.reason), /propose_swarm_plan/);
+    }
+
+    // 2. Benign read-only structural recon (including grep for "vitest" in package.json) stays allowed
+    //    and triggers soft <draft_recon_brake> at calls 5..10, then hard-blocks call 11!
+    for (let i = 1; i <= 10; i++) {
+      const callRes = (
+        await host.emit("tool_call", {
+          type: "tool_call",
+          toolCallId: `tc-recon-${i}`,
+          toolName: i % 2 === 0 ? "read" : "bash",
+          input:
+            i % 2 === 0
+              ? { path: "package.json" }
+              : { command: 'grep -n "vitest" package.json || true' },
+        })
+      ).find(Boolean);
+      assert.equal(callRes?.block, undefined, `Recon call #${i} must be allowed`);
+
+      const resultRes = (
+        await host.emit("tool_result", {
+          type: "tool_result",
+          toolCallId: `tc-recon-${i}`,
+          toolName: i % 2 === 0 ? "read" : "bash",
+          input: {},
+          content: [{ type: "text", text: "ok" }],
+          isError: false,
+        })
+      ).find(Boolean);
+      if (i < 5) {
+        assert.equal(resultRes, undefined, `Call #${i} must not inject brake yet`);
+      } else {
+        const appended = (resultRes?.content ?? [])
+          .map((c: { text?: string }) => c.text ?? "")
+          .join("\n");
+        assert.match(appended, /<draft_recon_brake/);
+      }
+    }
+
+    // 3. Call #11 hits the hard recon cap and redirects directly to propose_swarm_plan
+    const capped = (
+      await host.emit("tool_call", {
+        type: "tool_call",
+        toolCallId: "tc-recon-11",
+        toolName: "read",
+        input: { path: "src/components/ui/terminal.tsx" },
+      })
+    ).find(Boolean);
+    assert.equal(capped?.block, true, "Recon call #11 must be hard-blocked at cap 10");
+    assert.match(String(capped?.reason), /recon cap \(10 calls\) reached/);
+
+    // 4. propose_swarm_plan itself is NEVER blocked by the recon cap, and a bounce grants 4 refinement checks
+    const proposeCheck = (
+      await host.emit("tool_call", {
+        type: "tool_call",
+        toolCallId: "tc-propose",
+        toolName: PROPOSE_SWARM_PLAN_TOOL,
+        input: {},
+      })
+    ).find(Boolean);
+    assert.equal(proposeCheck?.block, undefined);
+
+    await host.emit("tool_result", {
+      type: "tool_result",
+      toolCallId: "tc-propose",
+      toolName: PROPOSE_SWARM_PLAN_TOOL,
+      input: {},
+      content: [{ type: "text", text: "continue refining" }],
+      isError: false,
+    });
+    const postBounceRead = (
+      await host.emit("tool_call", {
+        type: "tool_call",
+        toolCallId: "tc-post-bounce",
+        toolName: "read",
+        input: { path: "package.json" },
+      })
+    ).find(Boolean);
+    assert.equal(
+      postBounceRead?.block,
+      undefined,
+      "Refinement after propose_swarm_plan bounce must allow targeted checks",
+    );
+
     await host.emit("session_shutdown", { reason: "quit" });
   });
 });

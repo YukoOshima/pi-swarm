@@ -33,6 +33,7 @@ import {
   DEFAULT_SWARM_SETTINGS,
   MEMBER_NAME_PATTERN,
   ORCHESTRATOR_NAME,
+  PROPOSE_SWARM_PLAN_TOOL,
   SWARM_CONTRACT_CUSTOM_TYPE,
   SWARM_DIR,
   SWARM_FOCUS_ENTRY,
@@ -275,6 +276,53 @@ const ORCHESTRATOR_BLOCKED_EDIT_TOOLS = new Set([
 
 const DRAFTING_WRITE_GUARD_REASON =
   "Swarm Drafting Mode is read-only reconnaissance. Clarify via swarm_questionnaire or call propose_swarm_plan to launch the Swarm.";
+
+const DRAFT_RECON_TOOLS = new Set(["read", "grep", "find", "ls", "bash"]);
+const DRAFT_RECON_SOFT_NUDGE = 5;
+const DRAFT_RECON_HARD_CAP = 10;
+const DRAFT_POST_CLARIFY_BUDGET = 4;
+
+const DRAFT_HEAVY_SUITE_RE =
+  /^(?:(?:npm|pnpm|yarn|bun)(?:\s+(?:(?:-C|--dir|--prefix|--filter|-F)\s+\S+|--(?:dir|prefix|filter)=\S+))*\s+(?:run\s+)?(?:test(?::[\w.-]+)?|typecheck|lint(?::[\w.-]+)?|format(?::[\w.-]+)?|check(?::[\w.-]+)?|build(?::[\w.-]+)?|e2e(?::[\w.-]+)?)|(?:\S*\/)?(?:vitest|jest|rstest|pytest|playwright|eslint|prettier|biome|tsc|webpack|turbopack)|node\s+(?:\S*\/)?node_modules\/\.bin\/(?:vitest|jest|rstest|playwright|eslint|prettier|biome|tsc|webpack|turbopack|next|vite)|(?:next|vite)\s+build|cargo\s+(?:test|build|check|clippy)|go\s+(?:test|build)|(?:mvn|gradle)\s+test|make\s+(?:test|check|build|lint)|node\s+(?:--import\s+\S+\s+)?--test)(?=\s|$|[;&|)])/i;
+
+/**
+ * Detects slow test suites, linters, typecheckers, builds, or browser runners at
+ * shell command position so Swarm Drafting stays fast structural reconnaissance
+ * (while still allowing benign read-only inspection like `grep "vitest" package.json`).
+ */
+export function isDraftingHeavySuiteCommand(command: string): string | null {
+  const trimmed = command.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const clauses = trimmed.split(/(?:&&|\|\||[;|\r\n]+)/);
+  for (const rawClause of clauses) {
+    let clause = rawClause.trim().replace(/^[({\s]+/, "").trim();
+    if (!clause) continue;
+
+    // Strip benign command prefixes (env vars, time, fnm/nvm exec, npx/pnpm exec, etc.)
+    let prev = "";
+    while (clause !== prev) {
+      prev = clause;
+      clause = clause
+        .replace(/^[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s]+)\s+/, "")
+        .replace(/^(?:time|command|env)\s+/, "")
+        .replace(/^nice(?:\s+-n\s+\S+)?\s+/, "")
+        .replace(/^timeout(?:\s+(?:-[a-z]\s+\S+|--[a-z-]+=\S+|\S+))?\s+\S+\s+/, "")
+        .replace(/^fnm\s+exec(?:\s+--using(?:=|\s+)\S+)?\s+/, "")
+        .replace(/^nvm\s+exec(?:\s+\S+)?\s+/, "")
+        .replace(/^(?:volta\s+run|mise\s+exec\s+--|asdf\s+exec)\s+/, "")
+        .replace(/^(?:npx(?:\s+(?:-y|--yes))?|pnpm\s+(?:exec|dlx)|yarn\s+exec|bunx)\s+/, "")
+        .trim();
+    }
+
+    const match = DRAFT_HEAVY_SUITE_RE.exec(clause);
+    if (match) {
+      return match[0];
+    }
+  }
+  return null;
+}
 
 const ORCHESTRATOR_WRITE_GUARD_REASON =
   'Orchestrator must not edit repository files directly in Persistent Orchestrator Mode (doing so bypasses worker ownership and dirties baseBranch). Delegate code/file changes to a worker via swarm{action:"add"} (defaults to workspace:"inherit" in the shared repo on disjoint filesOwned; use workspace:"share" only when concurrent workers must edit overlapping files) or swarm{action:"mission", mission_op:"dispatch_ready"} (or propose_swarm_plan when in standby/drafting, or steer @member via post_message / swarm{action:"steer"}). For operations no Swarm member is allowed to perform (workers cannot run git push or git merge), ask the user to run `!<command>` themselves or leave Persistent Orchestrator Mode with `/swarm exit`.';
@@ -3408,6 +3456,34 @@ export function createPiSwarmExtension(
     let currentTurnIndex = 0;
     let waitArmedTurnIndex: number | null = null;
     let lastObservedAssistantText: string | undefined;
+    let draftReconKey = "";
+    let draftReconCount = 0;
+    let draftClarificationCount = 0;
+
+    function syncDraftReconBucket(): void {
+      const draft = draftController.getDraft();
+      if (!isDraftActive(draft)) {
+        draftReconKey = "";
+        draftReconCount = 0;
+        draftClarificationCount = 0;
+        return;
+      }
+      const nextKey = `${draft.startedAt}:${draft.mode}`;
+      const clarifyCount = Object.keys(draft.questionnaireEcho ?? {}).length;
+      if (nextKey !== draftReconKey) {
+        draftReconKey = nextKey;
+        draftReconCount = 0;
+        draftClarificationCount = clarifyCount;
+      } else if (clarifyCount > draftClarificationCount) {
+        // After the user answers clarifying questions, allow at most DRAFT_POST_CLARIFY_BUDGET
+        // targeted follow-up checks before requiring propose_swarm_plan!
+        draftReconCount = Math.max(
+          draftReconCount,
+          DRAFT_RECON_HARD_CAP - DRAFT_POST_CLARIFY_BUDGET,
+        );
+        draftClarificationCount = clarifyCount;
+      }
+    }
     const activatedRunIds = new Set<string>();
     const readOnlyAttachRunIds = new Set<string>();
     const goalContinuationByRunId = new Map<
@@ -10182,7 +10258,9 @@ export function createPiSwarmExtension(
       const toolLower = event.toolName.toLowerCase();
       const isEditTool = ORCHESTRATOR_BLOCKED_EDIT_TOOLS.has(toolLower);
       const isBashTool = toolLower === "bash";
-      if (!isEditTool && !isBashTool) {
+      const isDrafting = draftController.isActive();
+
+      if (!isDrafting && !isEditTool && !isBashTool) {
         return undefined;
       }
 
@@ -10196,13 +10274,59 @@ export function createPiSwarmExtension(
       const isPersistentOrchestratorOwner =
         orchestratorMode || hasOwnedLiveRun || isGuardedRunOwner;
 
-      if (!isPersistentOrchestratorOwner) {
-        if (draftController.isActive() && isEditTool) {
+      if (isDrafting) {
+        syncDraftReconBucket();
+        if (isEditTool) {
           return {
             block: true,
-            reason: DRAFTING_WRITE_GUARD_REASON,
+            reason: isPersistentOrchestratorOwner
+              ? ORCHESTRATOR_WRITE_GUARD_REASON
+              : DRAFTING_WRITE_GUARD_REASON,
           };
         }
+        if (isBashTool) {
+          const rawDraftCmd =
+            typeof (event.input as { command?: unknown } | undefined)?.command ===
+            "string"
+              ? (event.input as { command: string }).command
+              : "";
+          const roGuard = isReadOnlyValidationCommand(rawDraftCmd);
+          if (!roGuard.allowed) {
+            if (isPersistentOrchestratorOwner) {
+              return {
+                block: true,
+                reason: buildOrchestratorBashGuardReason(roGuard.reason),
+              };
+            }
+            const cleanDraftDetail = roGuard.reason
+              ? roGuard.reason.replace(/\s+in read-only validator sessions\.?$/i, ".")
+              : "Mutating shell command blocked.";
+            return {
+              block: true,
+              reason: `${DRAFTING_WRITE_GUARD_REASON} (${cleanDraftDetail})`,
+            };
+          }
+          const heavySuite = isDraftingHeavySuiteCommand(rawDraftCmd);
+          if (heavySuite) {
+            return {
+              block: true,
+              reason: `Swarm Drafting is fast structural recon only — do NOT run full test suites, linters, typecheckers, or builds (\`${heavySuite}\`) before launch. Inspect package.json/config scripts and delegate baseline test runs to Workers after calling propose_swarm_plan.`,
+            };
+          }
+        }
+        if (DRAFT_RECON_TOOLS.has(toolLower)) {
+          if (draftReconCount >= DRAFT_RECON_HARD_CAP) {
+            return {
+              block: true,
+              reason: `Swarm Drafting recon cap (${DRAFT_RECON_HARD_CAP} calls) reached — STOP running further read/bash recon and call swarm_questionnaire (if a genuine ambiguity remains) or propose_swarm_plan NOW! Deep code tracing and baseline tests belong to Workers after launch, and features/assertions/commands remain dynamically editable mid-mission via swarm{action:"mission"}.`,
+            };
+          }
+          draftReconCount += 1;
+        }
+        return undefined;
+      }
+
+      if (!isPersistentOrchestratorOwner) {
         return undefined;
       }
 
@@ -10228,6 +10352,46 @@ export function createPiSwarmExtension(
         };
       }
       return undefined;
+    });
+
+    pi.on("tool_result", (event, ctx) => {
+      if (ctx) {
+        lastCtx = ctx;
+      }
+      if (!draftController.isActive()) {
+        return undefined;
+      }
+      syncDraftReconBucket();
+      const toolLower = event.toolName.toLowerCase();
+      if (toolLower === PROPOSE_SWARM_PLAN_TOOL) {
+        // If proposal bounced for contract review or interactive "continue", grant a small refinement budget.
+        draftReconCount = Math.min(
+          draftReconCount,
+          DRAFT_RECON_HARD_CAP - DRAFT_POST_CLARIFY_BUDGET,
+        );
+        return undefined;
+      }
+      if (
+        !DRAFT_RECON_TOOLS.has(toolLower) ||
+        draftReconCount < DRAFT_RECON_SOFT_NUDGE
+      ) {
+        return undefined;
+      }
+      const remaining = Math.max(0, DRAFT_RECON_HARD_CAP - draftReconCount);
+      const brakeText =
+        remaining === 0
+          ? `\n\n<draft_recon_brake calls="${draftReconCount}/${DRAFT_RECON_HARD_CAP}">Recon budget exhausted (0 calls remaining). Call swarm_questionnaire or propose_swarm_plan on your VERY NEXT turn — do NOT call read/grep/find/ls/bash again.</draft_recon_brake>`
+          : `\n\n<draft_recon_brake calls="${draftReconCount}/${DRAFT_RECON_HARD_CAP}">Draft recon budget: ${draftReconCount}/${DRAFT_RECON_HARD_CAP} (${remaining} remaining). You already have enough structural context — call swarm_questionnaire (if needed) or propose_swarm_plan NOW instead of deep-reading more files.</draft_recon_brake>`;
+      const nextContent = [
+        ...(Array.isArray(event.content) ? event.content : []),
+        { type: "text" as const, text: brakeText },
+      ];
+      return {
+        content: nextContent,
+        ...(event.structuredContent !== undefined
+          ? { structuredContent: event.structuredContent }
+          : {}),
+      };
     });
 
     pi.on("session_start", async (event, ctx) => {
