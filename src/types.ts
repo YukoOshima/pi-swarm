@@ -494,6 +494,7 @@ export interface InitialMemberProposal {
   brief: string;
   workspace?: SwarmWorkspaceMode;
   channels?: string[];
+  featureId?: string;
 }
 
 export interface ProposedSwarmPlan {
@@ -1140,6 +1141,7 @@ export interface ManageMissionInput {
   libraryContent?: string;
   libraryAppend?: boolean;
   maxDispatch?: number;
+  workspace?: SwarmWorkspaceMode;
   hostContext?: ExtensionContext;
   force?: boolean;
   callerName?: string;
@@ -1274,6 +1276,8 @@ export interface SpawnMemberRequest {
   /** Dedicated isolated OS temp scratch directory granted to live `validator` sessions for temporary build/fixture/mutation checks. */
   scratchDir?: string;
   isMonitor?: boolean;
+  /** Pure read-only ephemeral contract audit mode (exposes only read/grep/find/ls, no bash or Swarm tools). */
+  ephemeralAudit?: boolean;
   hostContext?: ExtensionContext;
   onTelemetry?: (event: AgentTelemetryEvent) => void;
   engineApi?: MemberEngineBridge;

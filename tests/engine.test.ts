@@ -9325,11 +9325,11 @@ describe("SwarmEngine & Runtime — v0.9.0 Gap Closure", () => {
           err instanceof SwarmProtocolError && err.code === "PERMISSION_DENIED",
       );
 
-      // Wave 1 dispatch_ready: dispatches ONLY feat-auth & feat-billing (skips feat-auth-overlap due to parent/child path prefix collision, and skips feat-routes due to unmet dependsOn!)
+      // Wave 1 dispatch_ready (explicit workspace: "share"): dispatches ONLY feat-auth & feat-billing (skips feat-auth-overlap due to parent/child path prefix collision, and skips feat-routes due to unmet dependsOn!)
       const swarmTool = createSwarmTools({ engine }).find((t) => t.name === SWARM_TOOL)!;
       const wave1ToolRes = await swarmTool.execute(
         "tc-dispatch-1",
-        { action: "mission", mission_op: "dispatch_ready" } as any,
+        { action: "mission", mission_op: "dispatch_ready", workspace: "share" } as any,
         undefined,
         undefined,
         {} as unknown as ExtensionToolContext,
@@ -9406,6 +9406,7 @@ describe("SwarmEngine & Runtime — v0.9.0 Gap Closure", () => {
       // Wave 2 with maxDispatch: 1 caps batch size to 1, then next call dispatches the remaining ready feature!
       const wave2a = await engine.manageMission({
         op: "dispatch_ready",
+        workspace: "share",
         maxDispatch: 1,
       });
       assert.deepEqual(wave2a.dispatchedFeatures, ["feat-auth-overlap"]);
@@ -9414,7 +9415,10 @@ describe("SwarmEngine & Runtime — v0.9.0 Gap Closure", () => {
           engine.getSnapshot().run?.members["feat-auth-overlap"]?.state === "waiting",
       );
 
-      const wave2b = await engine.manageMission({ op: "dispatch_ready" });
+      const wave2b = await engine.manageMission({
+        op: "dispatch_ready",
+        workspace: "share",
+      });
       assert.deepEqual(wave2b.dispatchedFeatures, ["feat-routes"]);
       await waitUntil(
         () => engine.getSnapshot().run?.members["feat-routes"]?.state === "waiting",
@@ -9538,7 +9542,7 @@ describe("SwarmEngine & Runtime — v0.9.0 Gap Closure", () => {
       });
 
       // Dispatch & finish feat-login WITHOUT any validator spawned yet
-      await engine.manageMission({ op: "dispatch_ready" });
+      await engine.manageMission({ op: "dispatch_ready", workspace: "share" });
       await waitUntil(
         () => engine.getSnapshot().run?.members["feat-login"]?.state === "waiting",
       );
@@ -9591,7 +9595,7 @@ describe("SwarmEngine & Runtime — v0.9.0 Gap Closure", () => {
           },
         ],
       });
-      await engine.manageMission({ op: "dispatch_ready" });
+      await engine.manageMission({ op: "dispatch_ready", workspace: "share" });
       await waitUntil(
         () =>
           engine.getSnapshot().run?.members["feat-login-fix"]?.state === "waiting",
@@ -9637,7 +9641,7 @@ describe("SwarmEngine & Runtime — v0.9.0 Gap Closure", () => {
           },
         ],
       });
-      await engine.manageMission({ op: "dispatch_ready" });
+      await engine.manageMission({ op: "dispatch_ready", workspace: "share" });
       await waitUntil(
         () =>
           engine.getSnapshot().run?.members["feat-m2-health"]?.state === "waiting",
@@ -11611,6 +11615,846 @@ describe("AGY Stop-Hook Race Lock & Anti-Noise Monitor Hygiene (VAL-AGY-001, VAL
         store.postBoardMessage = origPost;
         await engine.dispose();
       }
+    }
+  });
+});
+
+// ============================================================================
+// v1.0.0 Runtime Engine, Swarm Tools & Transport Hardening Suite
+// ============================================================================
+
+describe("v1.0.0 Runtime Engine, Swarm Tools & Transport Hardening", () => {
+  it("1. defaults dispatch_ready to Antigravity-style workspace:'inherit' (zero Git worktrees), auto-spawns @validator on inherit [done], supports foundational fulfills:[] milestones, and blocks pre-merge milestone sealing", async () => {
+    const { engine, worktree, transport } = await createTestHarness({
+      stallWatchdogEnabled: false,
+      maxConcurrency: 4,
+    });
+    const validatorReviews: string[] = [];
+    transport.onMember("validator*", async ({ request, prompt }) => {
+      validatorReviews.push(prompt);
+      const runSnap = engine.getSnapshot().run;
+      for (const a of runSnap?.assertions ?? []) {
+        if (a.status !== "passed" && prompt.includes(a.id)) {
+          await request.engineApi!.manageMission!({
+            op: "verify_assertion",
+            assertionId: a.id,
+            assertionStatus: "passed",
+            evidence: `Verified ${a.id} on shared baseBranch: 4/4 tests passed`,
+          });
+        }
+      }
+      return { outcome: "waiting", summary: "validated" };
+    });
+
+    try {
+      await engine.manageMission({
+        op: "upsert_assertions",
+        assertions: [
+          { id: "VAL-INH-001", title: "Module A", description: "Module A works" },
+          { id: "VAL-INH-002", title: "Module B", description: "Module B works" },
+          { id: "VAL-PRE-003", title: "Share slice", description: "Share slice works" },
+        ],
+      });
+      await engine.manageMission({
+        op: "upsert_features",
+        features: [
+          {
+            id: "feat-foundation",
+            title: "Foundational config setup",
+            description: "Scaffold shared types",
+            milestone: "m0-foundation",
+            filesOwned: ["src/foundation.ts"],
+            fulfills: [],
+          },
+          {
+            id: "feat-inh-a",
+            title: "Implement A",
+            description: "Implement src/a.ts",
+            milestone: "m1-inherit",
+            filesOwned: ["src/a.ts"],
+            fulfills: ["VAL-INH-001"],
+          },
+          {
+            id: "feat-inh-b",
+            title: "Implement B",
+            description: "Implement src/b.ts",
+            milestone: "m1-inherit",
+            filesOwned: ["src/b.ts"],
+            fulfills: ["VAL-INH-002"],
+          },
+        ],
+      });
+
+      const swarmTool = createSwarmTools({ engine }).find((t) => t.name === SWARM_TOOL)!;
+      const dummyCtx = {} as unknown as ExtensionToolContext;
+
+      // Milestone 0 (foundational fulfills: []) dispatches first and reaches status:"done" when completed!
+      const m0Res = await swarmTool.execute(
+        "tc-m0-dispatch",
+        { action: "mission", mission_op: "dispatch_ready" } as any,
+        undefined,
+        undefined,
+        dummyCtx,
+      );
+      assert.ok(!m0Res.isError);
+      assert.deepEqual((m0Res.details as any).dispatchedFeatures, ["feat-foundation"]);
+      assert.equal(worktree.createdWorktrees.length, 0, "Zero Git worktrees on default inherit");
+      assert.equal(
+        engine.getSnapshot().run?.members["feat-foundation"]?.workspace,
+        "inherit",
+      );
+      await waitUntil(
+        () => engine.getSnapshot().run?.members["feat-foundation"]?.state === "waiting",
+      );
+      await engine.postMessage({
+        from: "feat-foundation",
+        fromRole: "worker",
+        text: "@orchestrator [done] Foundation ready",
+        featureId: "feat-foundation",
+        verificationEvidence: "npx tsc --noEmit -> 0 errors",
+      });
+      assert.equal(
+        engine.getSnapshot().run?.milestones?.find((m) => m.label === "m0-foundation")?.status,
+        "done",
+        "Foundational multi-milestone with fulfills:[] must reach status:'done' when its features complete",
+      );
+
+      // Milestone 1: default dispatch_ready spawns BOTH disjoint inherit workers in parallel with ZERO worktrees!
+      const m1Res = await swarmTool.execute(
+        "tc-m1-dispatch",
+        { action: "mission", mission_op: "dispatch_ready" } as any,
+        undefined,
+        undefined,
+        dummyCtx,
+      );
+      assert.ok(!m1Res.isError);
+      assert.deepEqual((m1Res.details as any).dispatchedFeatures, [
+        "feat-inh-a",
+        "feat-inh-b",
+      ]);
+      assert.equal(worktree.createdWorktrees.length, 0);
+      assert.equal(
+        engine.getSnapshot().run?.members["feat-inh-a"]?.cwd,
+        worktree.repoRoot,
+      );
+      assert.equal(
+        engine.getSnapshot().run?.members["feat-inh-b"]?.cwd,
+        worktree.repoRoot,
+      );
+      await waitUntil(
+        () =>
+          engine.getSnapshot().run?.members["feat-inh-a"]?.state === "waiting" &&
+          engine.getSnapshot().run?.members["feat-inh-b"]?.state === "waiting",
+      );
+
+      // First inherit [done] completes feat-inh-a without spawning validator prematurely
+      await engine.postMessage({
+        from: "feat-inh-a",
+        fromRole: "worker",
+        text: "@orchestrator [done] Implemented src/a.ts",
+        featureId: "feat-inh-a",
+        verificationEvidence: "npm test -- a.test.ts -> 4/4 passed",
+      });
+      assert.equal(
+        engine.getSnapshot().run?.features?.find((f) => f.id === "feat-inh-a")?.status,
+        "completed",
+      );
+      assert.equal(validatorReviews.length, 0);
+
+      // Second inherit [done] completes milestone m1-inherit and AUTO-SPAWNS @validator without mergeMember!
+      await engine.postMessage({
+        from: "feat-inh-b",
+        fromRole: "worker",
+        text: "@orchestrator [done] Implemented src/b.ts",
+        featureId: "feat-inh-b",
+        verificationEvidence: "npm test -- b.test.ts -> 4/4 passed",
+      });
+      await waitUntil(
+        () =>
+          validatorReviews.length === 1 &&
+          engine.getSnapshot().run?.members.validator?.state === "waiting",
+      );
+      assert.match(validatorReviews[0]!, /\[milestone-review\]/);
+      assert.equal(
+        engine.getSnapshot().run?.milestones?.find((m) => m.label === "m1-inherit")?.sealed,
+        true,
+      );
+
+      // Milestone 2 (opt-in share): pre-merge verify_assertion must NOT seal milestone before mergeMember,
+      // and mergeMember wakes @validator for post-merge baseBranch integration check!
+      await engine.manageMission({
+        op: "upsert_features",
+        features: [
+          {
+            id: "feat-share-pre",
+            title: "Opt-in share feature",
+            description: "Isolated share experiment",
+            milestone: "m2-share",
+            filesOwned: ["src/share.ts"],
+            fulfills: ["VAL-PRE-003"],
+          },
+        ],
+      });
+      await engine.manageMission({ op: "dispatch_ready", workspace: "share" });
+      assert.equal(worktree.createdWorktrees.length, 1);
+      await waitUntil(
+        () => engine.getSnapshot().run?.members["feat-share-pre"]?.state === "waiting",
+      );
+
+      // Prematurely mark feature completed (unmerged) & pass VAL-PRE-003 before mergeMember
+      await engine.manageMission({
+        op: "update_feature",
+        featureId: "feat-share-pre",
+        featureStatus: "completed",
+      });
+      await engine.manageMission({
+        op: "verify_assertion",
+        callerRole: "validator",
+        callerName: "validator",
+        assertionId: "VAL-PRE-003",
+        assertionStatus: "passed",
+        evidence: "Checked unmerged branch",
+      });
+      const m2BeforeMerge = engine
+        .getSnapshot()
+        .run?.milestones?.find((m) => m.label === "m2-share");
+      assert.notEqual(
+        m2BeforeMerge?.sealed,
+        true,
+        "Unmerged share feature must never seal milestone before mergeMember",
+      );
+      assert.notEqual(m2BeforeMerge?.status, "done");
+
+      const mergeShare = (await engine.mergeMember("feat-share-pre")) as any;
+      assert.equal(mergeShare.milestoneValidationCues?.[0]?.validatorWoken, "validator");
+      await waitUntil(
+        () =>
+          validatorReviews.length === 2 &&
+          engine.getSnapshot().run?.members.validator?.state === "waiting",
+      );
+      assert.match(validatorReviews[1]!, /Post-Merge Base-Branch Integration Validation/);
+      assert.equal(
+        engine.getSnapshot().run?.milestones?.find((m) => m.label === "m2-share")?.sealed,
+        true,
+      );
+    } finally {
+      await engine.dispose();
+    }
+  });
+
+  it("2. blocks non-human force:true on manageMission, blocks worker privilege escalation in update_feature & postMessage, and anchors [done] detection", async () => {
+    const { engine, transport } = await createTestHarness({
+      stallWatchdogEnabled: false,
+    });
+    let workerABridge: SpawnMemberRequest["engineApi"] | undefined;
+    let workerBBridge: SpawnMemberRequest["engineApi"] | undefined;
+    let helperShareBridge: SpawnMemberRequest["engineApi"] | undefined;
+
+    transport.onMember("worker-a", async ({ request }) => {
+      workerABridge = request.engineApi;
+    });
+    transport.onMember("worker-b", async ({ request }) => {
+      workerBBridge = request.engineApi;
+    });
+    transport.onMember("share-helper", async ({ request }) => {
+      helperShareBridge = request.engineApi;
+    });
+
+    try {
+      await engine.manageMission({
+        op: "upsert_assertions",
+        assertions: [
+          { id: "VAL-SEC-1", title: "Sec 1", description: "Must be validator-verified" },
+        ],
+      });
+      await engine.manageMission({
+        op: "upsert_features",
+        features: [
+          {
+            id: "feat-sec-a",
+            title: "Worker A feature",
+            description: "Owned by worker-a",
+            milestone: "m-sec",
+            assignedMember: "worker-a",
+            status: "in_progress",
+            fulfills: ["VAL-SEC-1"],
+          },
+          {
+            id: "feat-sec-share",
+            title: "Share parent feature",
+            description: "Owned by share-lead",
+            milestone: "m-sec",
+            assignedMember: "share-lead",
+            status: "in_progress",
+            fulfills: ["VAL-SEC-1"],
+          },
+        ],
+      });
+
+      await engine.addMembers({ name: "worker-a", brief: "Work on feat-sec-a" });
+      await engine.addMembers({ name: "worker-b", brief: "Sibling worker" });
+      await engine.addMembers({
+        name: "share-lead",
+        workspace: "share",
+        brief: "Work in share worktree",
+      });
+      await waitUntil(() => engine.getSnapshot().workingMemberNames.length === 0);
+      const shareLeadBridge = transport.handles.get("share-lead")!.request.engineApi!;
+      await shareLeadBridge.addHelper({
+        name: "share-helper",
+        workspace: "inherit",
+        brief: "Helper inside share-lead worktree",
+      });
+      await waitUntil(() => engine.getSnapshot().workingMemberNames.length === 0);
+
+      assert.ok(workerABridge && workerBBridge && helperShareBridge);
+
+      const orchSwarmTool = createSwarmTools({ engine }).find(
+        (t) => t.name === SWARM_TOOL,
+      )!;
+      const workerASwarmTool = createMemberScopedTools(workerABridge, {
+        name: "worker-a",
+        role: "worker",
+        runId: "run-dyn",
+      }).find((t) => t.name === SWARM_TOOL)!;
+      const dummyCtx = {} as unknown as ExtensionToolContext;
+
+      // (a) Orchestrator & Worker force:true on swarm{action:"mission"} and engine.manageMission MUST fail with PERMISSION_DENIED!
+      const orchForceMission = await orchSwarmTool.execute(
+        "tc-orch-force-mission",
+        {
+          action: "mission",
+          mission_op: "verify_assertion",
+          assertion_id: "VAL-SEC-1",
+          assertion_status: "passed",
+          evidence: "Trying to force pass",
+          force: true,
+        } as any,
+        undefined,
+        undefined,
+        dummyCtx,
+      );
+      assert.equal(orchForceMission.isError, true);
+      assert.equal((orchForceMission.details as any)?.errorCode, "PERMISSION_DENIED");
+
+      const workerForceMission = await workerASwarmTool.execute(
+        "tc-worker-force-mission",
+        {
+          action: "mission",
+          mission_op: "status",
+          force: true,
+        } as any,
+        undefined,
+        undefined,
+        dummyCtx,
+      );
+      assert.equal(workerForceMission.isError, true);
+      assert.equal((workerForceMission.details as any)?.errorCode, "PERMISSION_DENIED");
+
+      for (const role of ["orchestrator", "worker", "validator"] as const) {
+        await assert.rejects(
+          () =>
+            engine.manageMission({
+              op: "verify_assertion",
+              assertionId: "VAL-SEC-1",
+              assertionStatus: "passed",
+              evidence: "Forced",
+              force: true,
+              callerRole: role,
+              callerName: role,
+            }),
+          (err: unknown) =>
+            err instanceof SwarmProtocolError && err.code === "PERMISSION_DENIED",
+        );
+      }
+
+      // (b) Worker update_feature blocked from setting completed / cancelled / failed / pending / mergedCommitSha / unassigning
+      for (const badStatus of ["completed", "cancelled", "failed", "pending"] as const) {
+        await assert.rejects(
+          () =>
+            workerABridge!.manageMission!({
+              op: "update_feature",
+              featureId: "feat-sec-a",
+              featureStatus: badStatus,
+            }),
+          (err: unknown) =>
+            err instanceof SwarmProtocolError && err.code === "PERMISSION_DENIED",
+        );
+      }
+      await assert.rejects(
+        () =>
+          workerABridge!.manageMission!({
+            op: "update_feature",
+            featureId: "feat-sec-a",
+            mergedCommitSha: "deadbeef",
+          }),
+        (err: unknown) =>
+          err instanceof SwarmProtocolError && err.code === "PERMISSION_DENIED",
+      );
+      await assert.rejects(
+        () =>
+          workerABridge!.manageMission!({
+            op: "update_feature",
+            featureId: "feat-sec-a",
+            assignedMember: "",
+          }),
+        (err: unknown) =>
+          err instanceof SwarmProtocolError && err.code === "PERMISSION_DENIED",
+      );
+
+      // (c) Mid-sentence "[done]" prose is NOT treated as completion
+      const midSentenceMsg = await workerABridge.postMessage({
+        text: "@orchestrator Before I post [done], should we keep legacy header?",
+        featureId: "feat-sec-a",
+      });
+      assert.ok(midSentenceMsg.seq > 0);
+      assert.equal(
+        engine.getSnapshot().run?.features?.find((f) => f.id === "feat-sec-a")?.status,
+        "in_progress",
+      );
+
+      // (d) Cross-worker [done] feature hijacking is rejected with PERMISSION_DENIED
+      await assert.rejects(
+        () =>
+          workerBBridge!.postMessage({
+            text: "@orchestrator [done] Hijacking worker-a's feature",
+            featureId: "feat-sec-a",
+            verificationEvidence: "npm test -> 1/1 passed",
+          }),
+        (err: unknown) =>
+          err instanceof SwarmProtocolError && err.code === "PERMISSION_DENIED",
+      );
+      assert.equal(
+        engine.getSnapshot().run?.features?.find((f) => f.id === "feat-sec-a")
+          ?.assignedMember,
+        "worker-a",
+      );
+
+      // (e) inherit helper inside a share worker's worktree does NOT prematurely mark feature "completed" before merge
+      await helperShareBridge.postMessage({
+        text: "@share-lead [done] Sub-slice ready inside share worktree",
+        featureId: "feat-sec-share",
+        verificationEvidence: "npm test -> 3/3 passed",
+      });
+      const shareFeatAfterHelper = engine
+        .getSnapshot()
+        .run?.features?.find((f) => f.id === "feat-sec-share")!;
+      assert.equal(shareFeatAfterHelper.status, "in_progress");
+      assert.equal(shareFeatAfterHelper.assignedMember, "share-lead");
+    } finally {
+      await engine.dispose();
+    }
+  });
+
+  it("3. enforces dispatch_ready milestone order, empty filesOwned serialization, glob collisions, partial-batch rollback, and Orchestrator Goal Gate loopholes", async () => {
+    const { engine, worktree } = await createTestHarness({
+      stallWatchdogEnabled: false,
+      maxConcurrency: 4,
+    });
+
+    try {
+      await engine.manageMission({
+        op: "upsert_assertions",
+        assertions: [
+          { id: "VAL-LOOP-1", title: "Only assertion", description: "Must remain >=1" },
+        ],
+      });
+
+      // (a) Non-human cannot remove the last assertion from Validation Contract
+      await assert.rejects(
+        () =>
+          engine.manageMission({
+            op: "remove_assertion",
+            assertionId: "VAL-LOOP-1",
+            callerRole: "orchestrator",
+          }),
+        (err: unknown) =>
+          err instanceof SwarmProtocolError && err.code === "INVALID_INPUT",
+      );
+
+      // (b) dispatch_ready serializes missing filesOwned, respects glob overlap, and gates by earliest incomplete milestone
+      await engine.manageMission({
+        op: "upsert_features",
+        features: [
+          {
+            id: "feat-m1-unbounded",
+            title: "Unbounded M1 feature (no filesOwned)",
+            description: "Omitted filesOwned",
+            milestone: "m1-order",
+            fulfills: ["VAL-LOOP-1"],
+          },
+          {
+            id: "feat-m1-sibling",
+            title: "M1 sibling with owned path",
+            description: "Owns src/only.ts",
+            milestone: "m1-order",
+            filesOwned: ["src/only.ts"],
+            fulfills: ["VAL-LOOP-1"],
+          },
+          {
+            id: "feat-m2-early",
+            title: "M2 feature without dependsOn",
+            description: "Must wait for m1-order to finish",
+            milestone: "m2-order",
+            filesOwned: ["docs/guide.md"],
+            fulfills: ["VAL-LOOP-1"],
+          },
+        ],
+      });
+
+      // Unbounded feat-m1-unbounded overlaps everything -> only 1 feature dispatches, and m2-order does NOT jump ahead!
+      const d1 = await engine.manageMission({ op: "dispatch_ready" });
+      assert.deepEqual(d1.dispatchedFeatures, ["feat-m1-unbounded"]);
+      await waitUntil(() => engine.getSnapshot().workingMemberNames.length === 0);
+
+      // While feat-m1-unbounded is still in_progress, neither feat-m1-sibling nor feat-m2-early can dispatch
+      const dBlocked = await engine.manageMission({ op: "dispatch_ready" });
+      assert.deepEqual(dBlocked.dispatchedFeatures, []);
+
+      // Complete feat-m1-unbounded -> now feat-m1-sibling dispatches (m2-order STILL gated behind m1-order!)
+      await engine.postMessage({
+        from: "feat-m1-unbounded",
+        fromRole: "worker",
+        text: "@orchestrator [done] Finished unbounded M1",
+        featureId: "feat-m1-unbounded",
+        verificationEvidence: "npm test -> 2/2 passed",
+      });
+      const d2 = await engine.manageMission({ op: "dispatch_ready" });
+      assert.deepEqual(d2.dispatchedFeatures, ["feat-m1-sibling"]);
+      await waitUntil(() => engine.getSnapshot().workingMemberNames.length === 0);
+
+      // Complete feat-m1-sibling -> m1-order is complete; add glob-colliding + partial-failure features in m2-order
+      await engine.postMessage({
+        from: "feat-m1-sibling",
+        fromRole: "worker",
+        text: "@orchestrator [done] Finished M1 sibling",
+        featureId: "feat-m1-sibling",
+        verificationEvidence: "npm test -> 2/2 passed",
+      });
+
+      await engine.manageMission({
+        op: "upsert_features",
+        features: [
+          {
+            id: "feat-glob-ts",
+            title: "Glob owner",
+            description: "Owns src/*.ts",
+            milestone: "m2-order",
+            filesOwned: ["src/*.ts"],
+            fulfills: ["VAL-LOOP-1"],
+          },
+          {
+            id: "feat-glob-collide",
+            title: "Collides with src/*.ts",
+            description: "Owns src/index.ts",
+            milestone: "m2-order",
+            filesOwned: ["src/index.ts"],
+            fulfills: ["VAL-LOOP-1"],
+          },
+          {
+            id: "feat-fail-wt",
+            title: "Second share worker simulated failure",
+            description: "Owns scripts/build.mjs",
+            milestone: "m2-order",
+            filesOwned: ["scripts/build.mjs"],
+            fulfills: ["VAL-LOOP-1"],
+          },
+        ],
+      });
+
+      // Simulate mid-batch worktree creation failure on feat-fail-wt after feat-m2-early & feat-glob-ts succeed!
+      worktree.failCreateWorktreeFor = "feat-fail-wt";
+      const partialRes = await engine.manageMission({
+        op: "dispatch_ready",
+        workspace: "share",
+      });
+      worktree.failCreateWorktreeFor = undefined;
+      assert.deepEqual(
+        partialRes.dispatchedFeatures,
+        ["feat-m2-early", "feat-glob-ts"],
+        "feat-glob-collide skipped by glob collision; feat-fail-wt rolled back after mid-batch failure",
+      );
+      assert.match(partialRes.summary, /Partial dispatch warning/);
+      assert.equal(
+        partialRes.features?.find((f) => f.id === "feat-fail-wt")?.status,
+        "pending",
+      );
+      assert.equal(
+        partialRes.features?.find((f) => f.id === "feat-fail-wt")?.assignedMember,
+        undefined,
+      );
+      await waitUntil(() => engine.getSnapshot().workingMemberNames.length === 0);
+
+      // (c) resolve_handoff("tracked") rejects completed and cancelled target features
+      await engine.postMessage({
+        from: "feat-m1-sibling",
+        fromRole: "worker",
+        text: "Note discovered issue",
+        discoveredIssues: ["Edge case in parser"],
+      });
+      const hoId = engine.getSnapshot().run!.handoffItems![0]!.id;
+      await engine.manageMission({
+        op: "update_feature",
+        featureId: "feat-fail-wt",
+        featureStatus: "cancelled",
+      });
+      for (const badTarget of ["feat-m1-sibling", "feat-fail-wt"]) {
+        await assert.rejects(
+          () =>
+            engine.manageMission({
+              op: "resolve_handoff",
+              handoffId: hoId,
+              resolution: "tracked",
+              trackedFeatureId: badTarget,
+            }),
+          (err: unknown) =>
+            err instanceof SwarmProtocolError && err.code === "INVALID_INPUT",
+        );
+      }
+
+      // (d) Direct engine.completeRun({ callerRole: "orchestrator" }) enforces Goal Gates,
+      //     and updateDirection preserves sealed milestones!
+      await assert.rejects(
+        () =>
+          engine.completeRun({
+            summary: "Bypassing swarm tool directly",
+            callerRole: "orchestrator",
+          }),
+        (err: unknown) =>
+          err instanceof SwarmProtocolError && err.code === "INVALID_INPUT",
+      );
+
+      // Seal m1-order by verifying VAL-LOOP-1, then verify updateDirection cannot unseal or drop m1-order
+      await engine.manageMission({
+        op: "verify_assertion",
+        callerRole: "human",
+        assertionId: "VAL-LOOP-1",
+        assertionStatus: "passed",
+        evidence: "Verified VAL-LOOP-1",
+      });
+      assert.equal(
+        engine.getSnapshot().run?.milestones?.find((m) => m.label === "m1-order")?.sealed,
+        true,
+      );
+      const afterDir = await (engine.updateDirection as any)(
+        {
+          milestones: [{ label: "m1-order", status: "in_progress" }],
+        },
+        { callerRole: "orchestrator" },
+      );
+      const preservedM1 = afterDir.milestones.find(
+        (m: any) => m.label === "m1-order",
+      );
+      assert.equal(preservedM1?.sealed, true);
+      assert.equal(preservedM1?.status, "done");
+    } finally {
+      await engine.dispose();
+    }
+  });
+
+  it("4. enforces ephemeralAudit:true tool isolation (4 read-only tools, 0 Swarm tools, no scratchDir), empty-quote & inline-script shell guards, inherit git wipe guard, and broken-.git worktree revival", async () => {
+    // A. Empty-quote, inline-script, worktree relative traversal, and inherit git guards
+    assert.equal(isReadOnlyValidationCommand('r""m -rf src').allowed, false);
+    assert.equal(isReadOnlyValidationCommand("''rm -rf src").allowed, false);
+    assert.equal(isReadOnlyValidationCommand("git c''heckout main").allowed, false);
+    assert.equal(
+      isReadOnlyValidationCommand(`node -e "require('fs').writeFileSync('a.txt','x')"`).allowed,
+      false,
+    );
+    assert.equal(
+      isReadOnlyValidationCommand(`python3 -c "open('a.txt', 'w').write('x')"`).allowed,
+      false,
+    );
+    assert.equal(
+      isReadOnlyValidationCommand(`python -c "import shutil; shutil.rmtree('src')"`).allowed,
+      false,
+    );
+    assert.equal(
+      isReadOnlyValidationCommand(`node -e "console.log(2 + 2)"`).allowed,
+      true,
+    );
+
+    const sampleWt = "/repo/.pi/swarm/worktrees/run-1/wt-worker";
+    assert.equal(
+      isForbiddenWorkerBashCommand("git m\"\"erge feat", "main", sampleWt).allowed,
+      false,
+    );
+    assert.equal(
+      isForbiddenWorkerBashCommand("git c''heckout main", "main", sampleWt).allowed,
+      false,
+    );
+    assert.equal(
+      isForbiddenWorkerBashCommand(
+        "echo '{}' > ../../../runs/run-1/state.json",
+        "main",
+        sampleWt,
+      ).allowed,
+      false,
+    );
+    assert.equal(
+      isForbiddenWorkerBashCommand(
+        "cat ../../../runs/run-1/board.jsonl",
+        "main",
+        sampleWt,
+      ).allowed,
+      false,
+    );
+
+    // Inherit worker destructive git wipe commands blocked while share worker / read-only git commands allowed
+    for (const wipeCmd of [
+      "git reset --hard",
+      "git reset --hard HEAD~1",
+      "git r\"\"eset --hard",
+      "git clean -fd",
+      "git checkout -- .",
+      "git checkout .",
+      "git restore .",
+      "git stash",
+      "git stash push -m wip",
+    ]) {
+      assert.equal(
+        isForbiddenWorkerBashCommand(wipeCmd, "", "/repo", { workspace: "inherit" }).allowed,
+        false,
+        `Expected inherit worker guard to block: ${wipeCmd}`,
+      );
+    }
+    assert.equal(
+      isForbiddenWorkerBashCommand("git status && git stash list", "", "/repo", {
+        workspace: "inherit",
+      }).allowed,
+      true,
+    );
+    assert.equal(
+      isForbiddenWorkerBashCommand("git reset --hard HEAD", "main", sampleWt, {
+        workspace: "share",
+      }).allowed,
+      true,
+    );
+
+    // B. InProcessPiTransport ephemeralAudit: true exposes ONLY ["read", "grep", "find", "ls"] and 0 customTools
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), "pi-swarm-v100-audit-"));
+    try {
+      let capturedTools: unknown;
+      let capturedCustomTools: ToolDefinition[] | undefined;
+      let capturedResourceLoader: any;
+      const scratchCandidate = path.join(tmpDir, "should-not-exist-scratch");
+
+      const realTransport = new InProcessPiTransport({
+        agentDir: tmpDir,
+        createSession: (async (opts: any) => {
+          capturedTools = opts?.tools;
+          capturedCustomTools = opts?.customTools;
+          capturedResourceLoader = opts?.resourceLoader;
+          return {
+            session: {
+              model: opts?.model,
+              sessionManager: opts?.sessionManager,
+              extensionRunner: { hasHandlers: () => false, emit: async () => {} },
+              bindExtensions: async () => {},
+              subscribe: () => () => {},
+              prompt: async () => {},
+              abort: async () => {},
+              dispose: () => {},
+              getSessionStats: () => ({
+                tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+                cost: 0,
+              }),
+            },
+          };
+        }) as any,
+      });
+
+      const handle = await realTransport.spawnMember({
+        agentId: "contract-reviewer-1",
+        name: "contract-reviewer",
+        role: "validator",
+        runId: "run-audit",
+        cwd: tmpDir,
+        workspace: "inherit",
+        parentName: ORCHESTRATOR_NAME,
+        brief: "Audit mission contract",
+        systemPrompt: "Return strict JSON verdict.",
+        initialPrompt: "Review contract.",
+        keepWarm: false,
+        ephemeralAudit: true,
+        scratchDir: scratchCandidate,
+      });
+      await handle.currentTurn;
+
+      assert.deepEqual(capturedTools, ["read", "grep", "find", "ls"]);
+      assert.deepEqual(capturedCustomTools, []);
+      assert.equal(
+        existsSync(scratchCandidate),
+        false,
+        "ephemeralAudit must NOT create validatorScratchDir",
+      );
+      assert.ok(capturedResourceLoader);
+
+      // C. Broken isolated worktree directory missing `.git` is recreated on cold revival
+      const wtDir = path.join(tmpDir, "broken-wt");
+      await mkdir(wtDir, { recursive: true }); // exists on disk WITHOUT `.git`!
+      const store = new MockSwarmStore();
+      store.getWorktreePath = () => wtDir;
+      const worktree = new MockWorktreeManager();
+      const origCreate = worktree.createWorktree.bind(worktree);
+      worktree.createWorktree = async (opts) => {
+        await mkdir(opts.worktreePath, { recursive: true });
+        await writeFile(path.join(opts.worktreePath, ".git"), "gitdir: /fake\n", "utf8");
+        return origCreate(opts);
+      };
+      const scripted = new ScriptedTransport();
+      scripted.onMember("revive-wt", async () => ({
+        outcome: "stopped",
+        summary: "cold turn",
+      }));
+      const engine = new SwarmEngine({
+        store,
+        worktree,
+        transport: scripted,
+        scratchRoot: nextTestScratchRoot("v100-revive"),
+        settings: { keepWorkersWarm: false, stallWatchdogEnabled: false },
+      });
+      try {
+        const r = await store.createRun({
+          id: "run-revive-git",
+          title: "Broken .git Revive",
+          objective: "Recreate broken worktree missing .git",
+          baseBranch: "main",
+          ownerSessionId: "sess-rev",
+        });
+        await engine.startRun(r.id);
+        await engine.addMembers({
+          name: "revive-wt",
+          workspace: "share",
+          brief: "Initial turn",
+        });
+        await waitUntil(
+          () => engine.getSnapshot().run?.members["revive-wt"]?.state === "stopped",
+        );
+        assert.equal(worktree.createdWorktrees.length, 1);
+
+        // Corrupt worktree by deleting `.git` while keeping directory present on disk
+        await rm(path.join(wtDir, ".git"), { force: true });
+        assert.equal(existsSync(wtDir), true);
+        assert.equal(existsSync(path.join(wtDir, ".git")), false);
+
+        await engine.postMessage({
+          from: ORCHESTRATOR_NAME,
+          fromRole: "orchestrator",
+          text: "@revive-wt continue after worktree repair",
+        });
+        await waitUntil(
+          () =>
+            worktree.createdWorktrees.length === 2 &&
+            engine.getSnapshot().run?.members["revive-wt"]?.state === "stopped",
+        );
+        assert.equal(worktree.createdWorktrees[1]!.reuseExistingBranch, true);
+        assert.equal(existsSync(path.join(wtDir, ".git")), true);
+      } finally {
+        await engine.dispose();
+      }
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
     }
   });
 });

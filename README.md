@@ -1,15 +1,22 @@
-# 🐝 pi-swarm (`v0.9.0`)
+# 🐝 pi-swarm (`v1.0.0`)
 
 **`pi-swarm`** is a **Dynamic Mission Goal Engine & Antigravity Swarm** multi-agent orchestration extension for [Pi](https://github.com/earendil-works/pi) (`v1.5.2+`, verified on `v1.6.0`).
 面向 [Pi](https://github.com/earendil-works/pi) (`v1.5.2+`，已验证 `v1.6.0`) 的**动态目标契约引擎与蜂群（Dynamic Mission Goal Engine & Antigravity Swarm）多 Agent 协作与编排扩展**。
 
-Instead of locking work into a rigid upfront DAG or letting agents drift off objective, `pi-swarm` v0.9.0 unites **Closed-Loop Mission-Level TDD (Mandatory `VAL-*` Validation Contracts + Dynamic Feature Queues + Pre-Modal Adversarial Contract Review)**, **Deterministic `dispatch_ready` Queue Execution + Dual-Layer Independent Validation**, **Sisyphus Anti-Premature-Stop Auto-Continuation**, and **Droid Mission-style Model & Effort Configuration + Cross-Session Mission Resume** (`/swarm resume`) with **Antigravity-Swarm-grade dynamic orchestration**: unified floating Mission Hub (`/swarm` with `🔄 Resume Mission`), live `swarm{action:"mission"}` mid-flight scope steering, `services.json` port manifest, shared `library/*.md` knowledge base, audited `[OVERRIDE]` gates, searchable provider-grouped Model Picker (`/swarm models`, `Ctrl+Shift+M`, `Alt+M`), non-blocking `swarm_wait`, disk-persisted member sessions (`SessionManager.create`/`open`), hot model switching, Smart LLM Monitor (`@monitor`), and isolated Git worktrees / clones.
+Instead of locking work into a rigid upfront DAG or letting agents drift off objective, `pi-swarm` v1.0.0 unites **Antigravity-Swarm Shared-Workspace (`workspace: "inherit"`) Parallel Collaboration on Disjoint `filesOwned` Slices** (zero worktree sprawl & zero merge overhead by default, with opt-in `share` / `branch` Git worktrees when overlapping-file isolation is needed), **Closed-Loop Mission-Level TDD (Mandatory `VAL-*` Validation Contracts + Dynamic Feature Queues + Pre-Modal Adversarial Contract Review)**, **Deterministic `dispatch_ready` Queue Execution + Dual-Layer Independent Validation**, **Sisyphus Anti-Premature-Stop Auto-Continuation**, and **Droid Mission-style Model & Effort Configuration + Cross-Session Mission Resume** (`/swarm resume`) with unified floating Mission Hub (`/swarm`, `Alt+S`), live `swarm{action:"mission"}` mid-flight scope steering, `services.json` port manifest, shared `library/*.md` knowledge base with inline `[l]` reader, audited `[OVERRIDE]` gates, searchable provider-grouped Model Picker (`/swarm models`, `Alt+M`), expanded live dashboard (`Alt+W`), non-blocking `swarm_wait`, disk-persisted member sessions (`SessionManager.create`/`open`), hot & queued turn-end model switching, and Smart LLM Monitor (`@monitor`).
+
+### 🆕 v1.0.0 — Antigravity Shared-Workspace Default, Floating Modals & Inline Library Reader / 共享工作区默认协作、全悬浮契约优先面板与知识库内联阅读器
+
+- **`workspace: "inherit"` Shared-Workspace Default & Zero Worktree Sprawl / 默认共享工作区协作（零 Worktree 膨胀）**: Like Antigravity Swarm, parallel workers default to **`workspace: "inherit"`**, collaborating directly in the shared repository root on disjoint `filesOwned` slices with **zero worktree creation sprawl** and **zero `git merge` overhead**. Isolated Git worktrees (`workspace: "share"`) and standalone clones (`workspace: "branch"`) remain available as explicit opt-ins whenever two concurrent tasks must touch overlapping files or run conflicting build state.
+- **Floating `{ overlay: true }` Questionnaires & Contract-First Proposal Modal / 全悬浮问答与契约优先确认浮层**: `swarm_question`, `swarm_questionnaire`, and `propose_swarm_plan` render as centered floating `{ overlay: true }` modals. `propose_swarm_plan` renders a sticky `Features · VAL · Milestones` header plus **Validation Contract (`VAL-*` + `evidenceRequired`)** and **Feature Queue (`filesOwned`, `fulfills`, `dependsOn`)** first at `scrollOffset = 0`, so contract coverage is immediately visible even on `72x20` and `80x24` terminals.
+- **Inline Shared `library/*.md` Reader (`[l]`) & Contract Discoverability / 共享知识库内联阅读与契约透视**: Mission Control Tab `[3]` dynamically reflects `[3] Contract` / `[3] Graph/Contract`, surfaces `[3→v] Contract` cues in the pipeline strip and Mission Hub, loads real `.pi/swarm/runs/<run-id>/library/*.md` topics via `read_library`, and binds **`l`** in Contract view to cycle and read `library/*.md` markdown inline (`Esc` returns to the Contract overview).
+- **80-Column Responsive Dashboard & Safe Keybindings / 80 列响应式仪表盘与安全快捷键**: `Alt+W` expanded dashboard surfaces `[OVERRIDE]` + `overrideJustification` and failed/blocked `VAL-*` assertions alongside active features, preserves `Activity` over `Turns` at `80` columns, keeps `🐝 [completed] <Mission Title>` readable at `80` columns, restricts worktree merge to lowercase **`g`** (never `Shift+G`) and kill to **`K` (`Shift+K`)**, and supports `Alt+1..4` role-tab jumps in `SwarmModelPickerView` even while filtering.
 
 ### 🆕 v0.9.0 — Closed-Loop Contract Discipline, Deterministic Queue & Dual-Layer Validation / 闭环契约铁律、确定性队列调度与双层独立验证
 
 - **Mandatory `VAL-*` + `features` Schema & Pre-Modal Adversarial Contract Reviewer / 强制契约 Schema 与确认前对抗式契约审查**: `ProposeSwarmPlanParamsSchema` enforces required `assertions` and `features` (`minItems: 1`) at Pi tool-schema level so no LLM can omit the contract. Before opening the user confirmation modal, an ephemeral `validatorModel` **Adversarial Contract Reviewer** audits the draft for untestable assertions, missing failure-path coverage, port collisions, and invalid commands—bouncing blocking gaps once automatically (`status: "contract_review_changes_requested"`) before bothering the user.
 - **Zero LLM `force: true` Bypass & Audited `[OVERRIDE]` (`override_assertion`) / 封禁 LLM 强行跳过与可审计豁免机制**: LLM calls to `swarm{action:"done", force:true}` and `swarm{action:"mission", mission_op:"verify_assertion", force:true}` are strictly rejected (`PERMISSION_DENIED`); only human `/swarm done --force` CLI invocations (`callerRole: "human"`) may force-close a run. Genuinely blocked assertions require `swarm{action:"mission", mission_op:"override_assertion"}` with a substantive `>=30`-char `override_justification`, recorded permanently with `[OVERRIDE]` badges across `/swarm status`, `Alt+W`, Mission Control `[v]`, `validation-contract.md`, and the Rich Mission Complete Card.
-- **Deterministic `dispatch_ready` Queue Runner, Worktree Dependency Symlink & `"init"` Hook / 确定性就绪队列派发与工作树依赖秒级就绪**: `swarm{action:"mission", mission_op:"dispatch_ready"}` deterministically selects non-conflicting `"pending"` features whose `depends_on` are `"completed"`, marks them `"in_progress"`, spawns isolated `workspace:"share"` workers with full context briefs, symlinks baseline `node_modules`/`.venv` into new worktrees automatically, and runs the Mission `"init"` command before worker turns begin.
+- **Deterministic `dispatch_ready` Queue Runner, Disjoint `filesOwned` Shared-Workspace Default & `"init"` Hook / 确定性就绪队列派发与共享工作区切片协作**: `swarm{action:"mission", mission_op:"dispatch_ready"}` deterministically selects non-conflicting `"pending"` features whose `depends_on` are `"completed"`, marks them `"in_progress"`, spawns `workspace:"inherit"` workers by default on disjoint `filesOwned` slices (or opt-in `workspace:"share"` worktrees with auto-symlinked `node_modules`/`.venv` when overlapping-file isolation is requested), and runs the Mission `"init"` command before worker turns begin.
 - **Auto-Spawned Dual-Layer (`scrutiny` + `behavioral`) Validator & Incremental Re-Testing / 自动双层独立验证官与增量复测**: Merging the final feature of a milestone automatically spawns or wakes `@validator` (`role:"validator"`) with a 2-layer review brief (**Layer 1 Code Scrutiny** + **Layer 2 Behavioral `VAL-*` Execution**) and incremental re-test scoping (`completedAt` vs `verifiedAt` so fix cycles re-verify affected assertions plus regression smoke checks).
 - **Mandatory Worker `[done]` `verification_evidence` Handoff / Worker 完成强制验证证据交接**: Workers completing feature work with `[done]` on `post_message` must include substantive `handoff.salient_summary` and `handoff.verification_evidence` (`commands_run` or `interactive_checks`), preventing unverified `"trust me, done"` handoffs at runtime.
 - **`services.json` Port Manifest & Shared `.pi/swarm/runs/<run-id>/library/*.md` / 服务端口清单与共享架构知识库**: Declare multi-process `services` (`name`, `start`, `stop`, `healthcheck`, unique `port`, acyclic `depends_on`) persisted to `services.json` and surfaced in **Mission Services & Ports** UI tables; share cross-worker architecture notes and environment quirks via `swarm{action:"mission", mission_op:"write_library"|"read_library"}` stored in `.pi/swarm/runs/<run-id>/library/*.md`.
@@ -63,8 +70,10 @@ Instead of locking work into a rigid upfront DAG or letting agents drift off obj
 │  Tools: swarm · post_message · read_board · swarm_wait                    │
 │                                                                           │
 │  1. Researchers / Scouts   workspace:"inherit"  → post findings (#seq)    │
-│  2. Contract / Scaffold    workspace:"inherit" or "share" → post API (#N) │
-│  3. Parallel Workers       workspace:"share" (or n / tasks[] shards)      │
+│  2. Contract / Scaffold    workspace:"inherit"  → post API (#N)           │
+│  3. Parallel Workers       workspace:"inherit" default on disjoint        │
+│                            filesOwned slices (zero worktree/merge cost;   │
+│                            opt-in "share"/"branch" for overlapping files) │
 │                            + optional fork:"orchestrator|<member>"        │
 │                            + scoped #channels (@#backend, @#ui)           │
 │  4. Independent Validator  role:"validator" (read-only + guarded bash)    │
@@ -72,7 +81,7 @@ Instead of locking work into a rigid upfront DAG or letting agents drift off obj
 │  5. Peer-to-Peer Warm Loop @validator ↔ @author direct fixes on the board │
 │                            waking the SAME warm waiting handle (0 cold    │
 │                            starts; SWARM_MAX_BOARD_HOPS = 24 cap)         │
-│  6. Land, Retire & Standby swarm{action:"merge"} → swarm{action:"kill"}   │
+│  6. Retire & Standby       (optional swarm{action:"merge"} if "share")    │
 │                            → swarm{action:"done", summary}                │
 │                            (retires specialists; @orchestrator stays on   │
 │                             standby until user runs /swarm exit)          │
@@ -98,7 +107,7 @@ Instead of locking work into a rigid upfront DAG or letting agents drift off obj
 - **True Conversation `fork`（真实对话分叉）**：`swarm{action:"add", fork:"<member>|orchestrator"}` 真实继承父成员或主控会话的干净对话历史。
 - **Smart LLM Monitor (`stallMonitorMode: "llm"`)**：全部成员空闲超 `stallTimeoutMs` 时，召唤只读诊断官 `@monitor` 分析板子并精准 `@具体卡点成员`（无问题则 `[noop]`，失败自动退化为确定性 `@orchestrator [stall]`）。
 - **Independent Read-Only Validator（独立只读验证官）**：`role:"validator"` 强制隔离写工具（仅开放 `read`/`grep`/`find`/`ls` 与只读 `bash` 护栏），杜绝作者自审自过。
-- **Share Worktree vs Branch Clone**：`workspace:"share"` 创建共享对象库的 Git worktree，`workspace:"branch"` 创建彻底独立的 `git clone --no-hardlinks`，均支持自动 `autoRebase` 与 `merge`。
+- **Shared-Workspace Default (`workspace:"inherit"`) + Opt-In Worktrees (`share` / `branch`)**：默认在主工作区对互不重叠的 `filesOwned` 切片直接并发协作（零工作树膨胀、零合并摩擦）；当多个任务必须修改同一批文件时，可按需显式开启 `workspace:"share"`（共享 `.git` 对象库的工作树）或 `workspace:"branch"`（独立 `git clone --no-hardlinks`），支持自动 `autoRebase` 与 `merge`。
 
 ---
 
@@ -168,10 +177,10 @@ Merged in order: **`DEFAULT_SWARM_SETTINGS` ← Global (`~/.pi/agent/pi-swarm-se
 
 ### 2) Droid Mission-Style Model Picker & Live Control (`/swarm models`, `/swarm model`)
 
-- **Interactive Model & Reasoning Effort Picker (`/swarm models` or `Ctrl+Shift+M`)**:
-  - **4 Tabs (`Tab` / `Shift+Tab`)**: **`[Orchestrator]`** · **`[Worker]`** · **`[Validator]`** · **`[Fallbacks]`**
+- **Interactive Model & Reasoning Effort Picker (`/swarm models` or `Alt+M`)**:
+  - **4 Tabs (`Tab` / `Shift+Tab` / `Alt+1..4`)**: **`[Orchestrator]`** · **`[Worker]`** · **`[Validator]`** · **`[Fallbacks]`** (`Alt+1..4` jumps tabs directly even when a filter query is typed)
   - **2-Step Selection**: Search provider-grouped models → press `Enter` → select Reasoning Effort (`Default` | `Off` | `Minimal` | `Low` | `Medium` | `High ★` | `Extra high (xhigh)` | `Max`).
-  - **Quick Shortcuts**: `Ctrl+S` toggles Save Scope (`Global ~/.pi/agent` vs `Project .pi/`, automatically unmasking stale project overrides when saving to Global) · `Ctrl+E` cycles effort inline · `Ctrl+X` resets role to `Inherit Host Session Model` · `Space` / `[` / `]` toggles and reorders `fallbackModels` · `Alt+M` / `Ctrl+M` opens inline Model Picker inside Mission Hub (`Enter` launches Direct Swarm cleanly).
+  - **Quick Shortcuts**: `Ctrl+S` toggles Save Scope (`Global ~/.pi/agent` vs `Project .pi/`, automatically unmasking stale project overrides when saving to Global) · `Ctrl+E` cycles effort inline · `Ctrl+X` resets role to `Inherit Host Session Model` · `Space` / `[` / `]` toggles and reorders `fallbackModels` · `Alt+M` / `Ctrl+M` opens inline Model Picker inside Mission Hub (`Enter` launches **Clarify & Plan** interactive drafting; `Alt+Enter` launches **Direct Swarm** fast-path).
 - **Live Propagation (`Running agents switch at their next turn; Inherit applies only to new agents`)**:
   - Changing `worker` or `validator` updates `run.roleModels`, silently updates parked `waiting` / `stopped` members tracking the role default, and queues a turn-end switch for `working` members without disturbing explicit per-member overrides.
 
@@ -220,10 +229,10 @@ Use `swarm{action:"channel", op:"create|list|join|leave|archive", channel, topic
 - `swarm{action:"add", name:"validator", role:"validator", fork:"author", brief:"..."}`: Branches a warm member's conversation history into a new member.
 - `swarm{action:"add", name:"architect", fork:"orchestrator", brief:"..."}`: Branches the host Orchestrator's Pi session history into a new member.
 
-### Workspace Modes (`inherit` vs `share` vs `branch`)
-- **`inherit` (default)**: Runs directly in the shared repository root — ideal for read-only researchers/scouts, validators, or single non-overlapping edits.
-- **`share`**: Provisions a linked Git worktree at `.pi/swarm/worktrees/<run-id>/wt-<member>/` on branch `swarm/<run-short>/<member>` sharing the repository's `.git` object store.
-- **`branch`**: Provisions a **fully isolated standalone `git clone --no-hardlinks`** at `.pi/swarm/worktrees/<run-id>/wt-<member>/` on branch `swarm/<run-short>/<member>`, fetched back automatically on `swarm{action:"merge"}`.
+### Workspace Modes (`inherit` default vs opt-in `share` / `branch`)
+- **`inherit` (default — Antigravity Swarm style)**: Workers, researchers/scouts, and validators collaborate directly in the shared repository root on disjoint `filesOwned` slices — delivering **zero worktree sprawl**, instant shared build/typecheck state, and **zero `git merge` overhead**.
+- **`share` (explicit opt-in)**: Provisions an isolated linked Git worktree at `.pi/swarm/worktrees/<run-id>/wt-<member>/` on branch `swarm/<run-short>/<member>` sharing `.git` objects (auto-symlinking `node_modules`/`.venv`) — opt into this only when concurrent workers must edit overlapping files or isolate conflicting build artifacts.
+- **`branch` (explicit opt-in)**: Provisions a **fully isolated standalone `git clone --no-hardlinks`** at `.pi/swarm/worktrees/<run-id>/wt-<member>/` on branch `swarm/<run-short>/<member>`, fetched back automatically on `swarm{action:"merge"}`.
 
 ---
 
@@ -234,19 +243,20 @@ Only **`/swarm`** and **`/swarm-direct`** are registered on Pi.
 | Command (`命令`) | Description (`说明`) | LLM Turn? |
 | --- | --- | :---: |
 | `/swarm <goal>` | Interactive `pi-goal-x` drafting (`orchestratorModel` → Q&A → plan confirm → Dynamic Swarm) | Yes |
-| `/swarm` (bare) | Open **Swarm Mission Hub** in TUI (`🔄 Resume Mission` when unfinished, Goal composer, `Alt+M` / `Ctrl+M` inline Mission Models picker, previous runs & quick actions) | No (until launched) |
+| `/swarm` (bare) | Open **Swarm Mission Hub** (`Alt+S` when idle: `🔄 Resume Mission`, Goal composer with `Enter` Clarify & Plan vs `Alt+Enter` Direct Swarm, `Alt+M` inline Models picker, Goal `Feat`/`VAL` status & quick actions) | No (until launched) |
 | `/swarm direct <goal>` <br> `/swarm-direct <goal>` | Fast-path: skip Q&A (`autoConfirm: true`), propose plan and launch Dynamic Swarm immediately | Yes |
 | `/swarm tweak [guidance]` | Revise the focused active/paused Mission plan, `VAL-*` contract, features, or spawn additional members (preserves passed `VAL-*` & completed features) | Yes |
 | `/swarm status` <br> `/swarm contract` · `/swarm mission` · `/swarm goal` | Zero-turn dashboard: Mission Features, `VAL-*` Validation Contract, open handoffs, commands/boundaries, 3-role models, roster & recent board | **No** |
 | `/swarm board [limit] [--channel <ch>] [--search <q>]` | Zero-turn shared `#seq` Message Board feed with optional channel & substring filters | **No** |
 | `/swarm graph` | Zero-turn ASCII/Unicode Spawn Tree & Peer `@mention` / `#channel` Interaction Graph | **No** |
-| `/swarm tasks [tab\|contract\|member\|#ch]` <br> `/swarm ui [tab\|contract\|member\|#ch]` | Open the live 4-tab Mission Control Overlay (**Board** / **Members** / **Graph** / **Search**; `/swarm tasks contract` or `[v]` opens **Mission Contract & Features** inspector) | **No** |
+| `/swarm tasks [tab\|contract\|member\|#ch]` <br> `/swarm ui [tab\|contract\|member\|#ch]` <br> `/swarm tasks contract` | Open the live 4-tab Mission Control Overlay (**Board** / **Members** / **Graph/Contract** / **Search**; `/swarm tasks contract` or `[v]` opens **Mission Contract & Features**, and `[l]` reads `library/*.md` inline) | **No** |
 | `/swarm models [role\|--print]` | Open interactive Mission Model Picker (`Orchestrator`/`Worker`/`Validator`/`Fallbacks`), or `--print` Markdown overview | **No** |
-| `/swarm model <target> <model[:thinking]\|default> [thinking] [--global]` | Set role default (propagates to live role-tracking members) OR switch live `@member` | **No** |
+| `/swarm model <target> <model[:thinking]\|default> [thinking] [--global]` | Set role default (propagates to live role-tracking members) OR switch live `@member` (`waiting`, `stopped`, or queued turn-end on `working`) | **No** |
 | `/swarm steer <member> <message>` | Steer a working member mid-turn or wake a parked member with new user direction | **No** |
-| `/swarm merge <member>` | Land a member's clean `share` worktree or `branch` clone onto `baseBranch` (`autoRebase` + `--no-ff`) | **No** |
+| `/swarm stop <member> [reason]` | Interrupt a member's active turn cleanly and mark it `humanStopped` (revivable via `/swarm steer` or `[w]`/`[r]`) | **No** |
+| `/swarm merge <member>` | Land an opt-in `share` worktree or `branch` clone onto `baseBranch` (`autoRebase` + `--no-ff`) | **No** |
 | `/swarm kill <member> [--force] [reason]` | Permanently kill a member and remove its clean worktree (`--force` overrides dirty guard) | **No** |
-| `/swarm done [--force] [summary]` | Complete the active run, retire ephemeral workers/validators & keep `@orchestrator` in `standby` (`--force` force-closes unfinished Mission gates) | **No** |
+| `/swarm done [--force] [summary]` | Complete the active run, retire ephemeral workers/validators & keep `@orchestrator` in `standby` (`--force` human-only override for unfinished Mission gates) | **No** |
 | `/swarm exit [--force]` <br> `/swarm leave [--force]` | Exit Persistent Swarm Orchestrator Mode, restoring `idle` tools, pre-swarm host model & direct editing (`--force` pauses & detaches a live run cleanly so it stays resumable) | **No** |
 | `/swarm pause [reason]` | Pause member launches and board wakeups | **No** |
 | `/swarm resume [run-id] [--continue\|-c] [--quiet\|-q] [guidance]` | Zero-turn unpause (same focused session) OR Droid-style **Cross-Session Mission Resume** (auto-discovers active/paused runs, restores `orchestratorModel`, wakes Orchestrator cleanly) | No (same session / `--quiet`) · Yes (cross-session / guided) |
@@ -259,23 +269,28 @@ Only **`/swarm`** and **`/swarm-direct`** are registered on Pi.
 
 ---
 
-## TUI 快捷键与 4-Tab 浮层 / TUI Shortcuts & 4-Tab Overlay
+## TUI 快捷键与悬浮面板 / TUI Shortcuts & Floating Overlays
 
-### Above-Editor Live Dashboard Widget & Global Shortcuts
-- **`Ctrl+Shift+M`**: Open the interactive **Mission Model & Reasoning Effort Picker**.
-- **`Ctrl+Shift+S`**: Open **Mission Control** (when a run is focused) or **Swarm Mission Hub** (when idle).
-- **`Ctrl+Shift+T`**: Toggle between compact beacon (status badge, `O/W/V` model pills, working/waiting counts, latest board line) and expanded live dashboard.
-- **`Esc`**: Collapse expanded dashboard (automatically suspended while any modal/overlay is open).
+### Global Editor Shortcuts & Above-Editor Live Dashboard
+- **`Alt+S`**: Open **Mission Control** (`4-Tab` overlay when a run is focused) or **Swarm Mission Hub** (when idle).
+- **`Alt+M`**: Open the interactive **Mission Model & Reasoning Effort Picker** (`Alt+1..4` or `Tab`/`Shift+Tab` switches role tabs even with a search filter).
+- **`Alt+W`**: Toggle the above-editor dashboard between compact beacon (status badge, `O/W/V` model pills, `Feat`/`VAL` progress, working/waiting counts, latest board line) and **Expanded Live Dashboard** (Goal Progress with `[OVERRIDE]` & failed `VAL-*` visibility, Roster with live `Activity`, and recent `#seq` board feed).
 
-### `/swarm tasks` (`/swarm ui`) 4-Tab Interactive Mission Control Overlay
-- **`1` / `2` / `3` / `4`** or **`Tab` / `Shift+Tab`**: Switch tabs — **[1] Board** · **[2] Members** · **[3] Graph** · **[4] Search**
+### Swarm Mission Hub (`/swarm` or `Alt+S` when idle)
+- **`Enter`**: Launch **Interactive Swarm (`Clarify & Plan`)** from the Goal input (or trigger the highlighted action when a run is active/paused).
+- **`Alt+Enter`**: Launch **Direct Swarm** fast-path (`autoConfirm: true`, skips upfront Q&A; requires non-empty Goal).
+- **`Alt+M`** / **`Ctrl+M`** (or **`m`** when active/paused): Open inline **Mission Models & Effort Picker**.
+- **`Alt+V`** / **`Alt++`** / **`Alt+-`** (or **`v`** / **`+`** / **`-`** when active/paused): Toggle Independent Validator policy and adjust `maxConcurrency`.
+
+### `/swarm tasks` (`/swarm ui` · `Alt+S`) 4-Tab Interactive Mission Control Overlay
+- **`1` / `2` / `3` / `4`** or **`Tab` / `Shift+Tab`**: Switch tabs — **[1] Board** · **[2] Members** · **[3] Graph/Contract** · **[4] Search**
 - **`M` (`Shift+M`)**: Open **Mission Models Picker** inline (`Orchestrator` / `Worker` / `Validator` / `Fallbacks`) · **`P` (`Shift+P`)**: Pause or Resume Swarm · **`?`**: Toggle Shortcuts Help
-- **`↑` / `↓`** (plus **`j` / `k`** on Board / Graph / Search tabs): Navigate messages or scroll (on Members tab, **`↑` / `↓`** navigates and **`k`** kills the selected member)
-- **Board Tab `[1]`**: **`Enter`** open full scrollable `#seq` post reader (**`↑`/`↓`/`j`/`k`/`PgUp`/`PgDn`** scroll, **`Enter`/`Esc`** back) · **`p`** post a board message (`@mention` / `@#channel`) · **`c`** cycle channel filter (`*` / `#main` / custom channels)
-- **Members Tab `[2]`**: **`w`** wake/message selected member · **`m`** open interactive Member Model & Effort Picker (supports queued turn-end switch on `working` members, keeps 100% history) · **`x`** human-stop member · **`k`** kill member (opens inline **`[y/Enter]`** confirm / **`[f]`** force dirty toggle / **`[n/Esc]`** cancel) · **`g`** merge `share`/`branch` worktree · **`l`** toggle full `brief` + `logTail` view (**`[`/`]`/`PgUp`/`PgDn`** scroll) · **`d`** toggle member details vs scrollable Git diff summary (**`[`/`]`/`PgUp`/`PgDn`** scroll)
-- **Graph Tab `[3]`**: **`v`** toggles between Live Spawn Tree & Peer `@mention` Interaction Graph and the scrollable **Mission Contract & Features** inspector (`Milestones` with `[S]` sealed badges, ordered `Features`, `VAL-*` assertions + `evidence`, open tech-debt handoffs, `Commands & Boundaries`)
+- **`j` / `k`** or **`↑` / `↓`**: Navigate Down / Up across **all 4 tabs** (including Members tab!) · **`[` / `]` / `PgUp` / `PgDn`**: Page-scroll post reader, member logs/diff, and Graph/Contract views
+- **Board Tab `[1]`**: **`Enter`** open full scrollable `#seq` post reader (**`↑`/`↓`/`j`/`k`/`[`/`]`/`PgUp`/`PgDn`** scroll, **`Enter`/`Esc`** back) · **`p`** post a board message (`@mention` / `@#channel`) · **`c`** cycle channel filter (`*` / `#main` / custom channels)
+- **Members Tab `[2]`**: **`w`** steer/wake selected member · **`r`** retry stopped/errored member (prefills rebase guidance on conflicts) · **`m`** switch Member Model & Effort (supports queued turn-end switch on `working` members, keeps 100% history) · **`x`** human-stop member · **`K` (`Shift+K`)** kill member (opens inline **`[y/Enter]`** confirm / **`[f]`** force dirty toggle / **`[n/Esc]`** cancel) · **`g`** (lowercase `g` only) merge opt-in `share`/`branch` worktree · **`Enter` / `l`** toggle full `brief` + `logTail` view · **`d`** toggle Git diff summary
+- **Graph / Contract Tab `[3]`** (`/swarm tasks contract`): **`v`** toggles between Live Spawn Tree & Peer `@mention` Graph and the scrollable **Mission Contract & Features** inspector (`Milestones` with `[S]`, `Features`, `VAL-*` assertions + `[OVERRIDE]`, open handoffs, `Services & Ports`, `Commands & Boundaries`, and real `library/*.md` topics) · **`l`** (in Contract view) cycles/reads shared `.pi/swarm/runs/<run-id>/library/*.md` topics inline (**`Esc`** or cycling past the last topic returns to the full Contract overview)
 - **Search Tab `[4]`**: Live IME substring search across every `#seq` message on the board (**`Enter`** opens full scrollable post reader after finishing query)
-- **`Esc` / `q`**: Close overlay cleanly (unsubscribes engine listener & restores terminal cursor)
+- **`Esc` / `q`**: Close overlay cleanly (or exit inline reader/prompt first; unsubscribes engine listener & restores terminal cursor)
 
 ### Plan Confirmation Modal (`propose_swarm_plan`)
 - **`[` / `]` / `PgUp` / `PgDn`**: Scroll full Mission Contract (`VAL-*` assertions), Feature Queue (`fulfills` & `depends_on`), and Commands & Boundaries preview

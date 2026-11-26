@@ -6,6 +6,7 @@ import path from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { assertOwnerSession, isPrototypeKey, parseModelSpec } from "../store/index.js";
+import { MAX_LIBRARY_TOPIC_BYTES } from "../store/swarm-store.js";
 import {
   ALL_MENTION_NAME,
   ASSERTION_STATUSES,
@@ -111,6 +112,7 @@ import {
   extractSessionMessages,
   getRunValidatorScratchRoot,
   getValidatorScratchDir,
+  isPathInScope,
   resolveRoleModel,
   sanitizeForkSeedMessages,
 } from "./transport.js";
@@ -130,6 +132,10 @@ const CHANNEL_MENTION_RE =
   /(?<![A-Za-z0-9._%+\-@])@#([A-Za-z](?:[A-Za-z0-9-]{0,30}[A-Za-z0-9])?)/g;
 
 const WAIT_TELEMETRY_RE = /^swarm_wait since=#(\d+) mentions_only=(true|false)$/;
+
+/** Anchored `[done]` prefix (start of message, optionally preceded by `@handle` / `@#channel` mentions). */
+const DONE_PREFIX_RE =
+  /^\s*(?:@#?[A-Za-z0-9._-]+\s+)*\[done\](?=\s|$|[:,.;!\])-])/i;
 
 const BOARD_CACHE_LIMIT = 200;
 const EVENT_CACHE_LIMIT = 50;
@@ -394,20 +400,63 @@ function normalizeOwnedPath(raw: string): string | null {
     p = p.slice(2);
   }
   p = p.replace(/^\/+/, "").replace(/\/+/g, "/");
-  if (p === "." || p === "*" || p === "**" || p === "") {
+  if (p === "." || p === "*" || p === "**" || p === "**/*" || p === "") {
     return "";
   }
-  p = p.replace(/\/\*+$/, "").replace(/\/+$/, "");
-  if (p === "." || p === "*" || p === "**") {
+  p = p.replace(/\/\*\*\/\*$/, "").replace(/\/\*+$/, "").replace(/\/+$/, "");
+  if (p === "." || p === "*" || p === "**" || p === "**/*" || p === "") {
     return "";
   }
   return p;
 }
 
+function hasGlobWildcards(p: string): boolean {
+  return p.includes("*") || p.includes("?");
+}
+
+function extractStaticDirPrefix(p: string): string {
+  const segs = p.split("/");
+  const staticSegs: string[] = [];
+  for (const seg of segs) {
+    if (seg.includes("*") || seg.includes("?")) {
+      break;
+    }
+    staticSegs.push(seg);
+  }
+  return staticSegs.join("/");
+}
+
 function singleOwnedPathsCollide(a: string, b: string): boolean {
   if (a === "" || b === "") return true;
   if (a === b) return true;
-  return a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+  const aGlob = hasGlobWildcards(a);
+  const bGlob = hasGlobWildcards(b);
+  if (!aGlob && !bGlob) {
+    return a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+  }
+  if (aGlob && !bGlob) {
+    if (isPathInScope(b, [a])) return true;
+    const prefixA = extractStaticDirPrefix(a);
+    if (prefixA === b || prefixA.startsWith(`${b}/`)) return true;
+    // If `b` can be a directory (no file extension) inside `a`'s glob root
+    if (
+      !path.posix.extname(b) &&
+      (prefixA === "" || b.startsWith(`${prefixA}/`)) &&
+      (a.includes("**") || prefixA === b)
+    ) {
+      return true;
+    }
+    return false;
+  }
+  if (!aGlob && bGlob) {
+    return singleOwnedPathsCollide(b, a);
+  }
+  const prefixA = extractStaticDirPrefix(a);
+  const prefixB = extractStaticDirPrefix(b);
+  if (prefixA === "" || prefixB === "" || prefixA === prefixB) {
+    return true;
+  }
+  return prefixA.startsWith(`${prefixB}/`) || prefixB.startsWith(`${prefixA}/`);
 }
 
 function ownedPathsOverlap(
@@ -430,6 +479,10 @@ function ownedPathsOverlap(
     }
   }
   return false;
+}
+
+function effectiveDispatchOwnedPaths(feat: MissionFeature): readonly string[] {
+  return feat.filesOwned && feat.filesOwned.length > 0 ? feat.filesOwned : ["*"];
 }
 
 function uniqueHandleFromFeatureId(
@@ -508,6 +561,7 @@ function uniqueValidatorHandle(
 function buildFeatureWorkerBrief(
   run: SwarmRunState,
   feat: MissionFeature,
+  workspace: SwarmWorkspaceMode = "inherit",
 ): string {
   const assertionMap = new Map((run.assertions ?? []).map((a) => [a.id, a]));
   const fulfilledDetails = feat.fulfills.map((id) => {
@@ -575,11 +629,19 @@ function buildFeatureWorkerBrief(
   if (feat.verificationSteps && feat.verificationSteps.length > 0) {
     lines.push(`- Feature verification steps: ${feat.verificationSteps.join(" && ")}`);
   }
+  const wsInstruction =
+    workspace === "inherit"
+      ? '- Verify baseline health before editing and implement/verify all changes strictly within your owned files in the shared `inherit` workspace (do NOT touch sibling files or run destructive workspace-wide git commands).'
+      : `- Verify baseline health before editing, implement and verify all changes inside your isolated \`${workspace}\` worktree, and commit cleanly on your branch (\`git status\` clean).`;
+  const doneHeaderExample =
+    workspace === "inherit"
+      ? `@${ORCHESTRATOR_NAME} [done] workspace=<cwd> <concise summary>`
+      : `@${ORCHESTRATOR_NAME} [done] commit=<sha> workspace=<cwd> <concise summary>`;
   lines.push(
-    "- Verify baseline health before editing, implement and verify all changes inside your isolated `share` worktree, and commit cleanly on your branch (`git status` clean).",
+    wsInstruction,
     "",
     "(d) Next-Peer Doorbell & Mandatory Structured Handoff:",
-    `- Report completion via \`${POST_MESSAGE_TOOL}\` starting with \`@${ORCHESTRATOR_NAME} [done] commit=<sha> workspace=<cwd> <concise summary>\` AND pass \`feature_id: "${feat.id}"\`, \`verification_evidence\` (>= 10 chars with exact commands & pass counts), plus any \`discovered_issues\` / \`left_undone\`, then call \`${SWARM_WAIT_TOOL}\`.`,
+    `- Report completion via \`${POST_MESSAGE_TOOL}\` starting with \`${doneHeaderExample}\` AND pass \`feature_id: "${feat.id}"\`, \`verification_evidence\` (>= 10 chars with exact commands & pass counts), plus any \`discovered_issues\` / \`left_undone\`, then call \`${SWARM_WAIT_TOOL}\`.`,
   );
   return lines.join("\n");
 }
@@ -590,6 +652,7 @@ function buildMilestoneValidationBrief(
   mFeatures: readonly MissionFeature[],
   pendingOrFailed: readonly MissionAssertion[],
   alreadyPassed: readonly MissionAssertion[],
+  options?: { postMergeIntegrationCheck?: boolean },
 ): string {
   const nonInitCommands = (run.commands ?? []).filter(
     (c) => c.name.trim().toLowerCase() !== "init",
@@ -609,15 +672,21 @@ function buildMilestoneValidationBrief(
         `${a.id} [${a.status}] (${a.title}${a.evidenceRequired ? ` — required: ${a.evidenceRequired}` : ""})`,
     )
     .join("; ");
-  const isIncremental = alreadyPassed.length > 0;
+  const isPostMergeRecheck =
+    options?.postMergeIntegrationCheck === true &&
+    pendingOrFailed.length === 0 &&
+    alreadyPassed.length > 0;
+  const isIncremental = !isPostMergeRecheck && alreadyPassed.length > 0;
   const svcLine =
     run.services && run.services.length > 0
       ? ` Exercise configured services/ports (${run.services.map((s) => `${s.name}${s.port !== undefined ? `:${s.port}` : ""}${s.healthcheck ? ` [${s.healthcheck}]` : ""}`).join(", ")}).`
       : "";
 
-  const layer2Instruction = isIncremental
-    ? `Layer 2 (Behavioral / Surface — Incremental Re-Validation): ${alreadyPassed.length} assertion(s) in milestone "${milestoneLabel}" already passed (${alreadyPassed.map((a) => a.id).join(", ")}); focus behavioral testing on the remaining unpassed VAL-* assertion(s) (${unpassedDetails}) plus a fast regression check that previously passed assertions still hold.${svcLine}`
-    : `Layer 2 (Behavioral / Surface Validation): Behaviorally test and verify each milestone VAL-* assertion against real execution/outputs: ${unpassedDetails}.${svcLine}`;
+  const layer2Instruction = isPostMergeRecheck
+    ? `Layer 2 (Post-Merge Base-Branch Integration Validation): Assertion(s) (${alreadyPassed.map((a) => a.id).join(", ")}) were verified before the isolated worktree merge landed onto \`${run.baseBranch}\`; re-verify integration health directly on \`${run.baseBranch}\` and update via verify_assertion if any regression is found.${svcLine}`
+    : isIncremental
+      ? `Layer 2 (Behavioral / Surface — Incremental Re-Validation): ${alreadyPassed.length} assertion(s) in milestone "${milestoneLabel}" already passed (${alreadyPassed.map((a) => a.id).join(", ")}); focus behavioral testing on the remaining unpassed VAL-* assertion(s) (${unpassedDetails}) plus a fast regression check that previously passed assertions still hold.${svcLine}`
+      : `Layer 2 (Behavioral / Surface Validation): Behaviorally test and verify each milestone VAL-* assertion against real execution/outputs: ${unpassedDetails}.${svcLine}`;
 
   return [
     `[milestone-review] All features in milestone "${milestoneLabel}" (${mergedFeatureSummary}) are completed and merged onto \`${run.baseBranch}\`. Execute Dual-Layer Milestone Validation now:`,
@@ -761,6 +830,7 @@ function syncMissionMilestones(
   features: readonly MissionFeature[],
   assertions: readonly MissionAssertion[],
   nowIso: string,
+  members?: Readonly<Record<string, SwarmMemberRecord>>,
 ): MilestoneSyncOutcome {
   const milestones: SwarmMilestone[] = (existingMilestones ?? []).map((m) => ({
     ...m,
@@ -787,7 +857,19 @@ function syncMissionMilestones(
     }
 
     const claimedIds = Array.from(new Set(mFeatures.flatMap((f) => f.fulfills)));
-    const allFeaturesCompleted = mFeatures.every((f) => f.status === "completed");
+    const hasUnmergedIsolatedFeature = mFeatures.some((f) => {
+      if (!f.assignedMember || !members) return false;
+      const assigned = Object.hasOwn(members, f.assignedMember)
+        ? members[f.assignedMember]
+        : undefined;
+      if (!assigned || !isIsolatedWorktreeWorkspace(assigned.workspace)) {
+        return false;
+      }
+      return !f.mergedCommitSha && !assigned.mergedCommitSha;
+    });
+    const allFeaturesCompletedAndMerged =
+      mFeatures.every((f) => f.status === "completed") &&
+      !hasUnmergedIsolatedFeature;
     const anyFeatureStarted = mFeatures.some(
       (f) =>
         f.status === "in_progress" ||
@@ -805,7 +887,7 @@ function syncMissionMilestones(
         ? claimedIds.every((id) => assertionById.get(id)?.status === "passed")
         : assertions.length > 0 && assertions.every((a) => a.status === "passed");
 
-    if (allFeaturesCompleted && allClaimedPassed) {
+    if (allFeaturesCompletedAndMerged && allClaimedPassed) {
       const wasSealed = m.sealed === true;
       m.status = "done";
       m.sealed = true;
@@ -813,6 +895,17 @@ function syncMissionMilestones(
       if (!wasSealed) {
         newlySealed.push(m.label);
       }
+      continue;
+    }
+
+    // Foundational milestones with `fulfills: []` in multi-milestone runs (or runs with 0 assertions)
+    // reach `status: "done"` once all their features are completed & merged.
+    if (
+      allFeaturesCompletedAndMerged &&
+      claimedIds.length === 0 &&
+      (milestones.length > 1 || assertions.length === 0)
+    ) {
+      m.status = "done";
       continue;
     }
 
@@ -1165,6 +1258,7 @@ export class SwarmEngine implements ISwarmEngine {
   private attachRunChain: Promise<void> = Promise.resolve();
   private roleModelsChain: Promise<void> = Promise.resolve();
   private missionChain: Promise<void> = Promise.resolve();
+  private repoGitLock: Promise<void> = Promise.resolve();
   private readonly fallbackLibrary = new Map<string, Map<string, string>>();
 
   constructor(deps: SwarmEngineDeps) {
@@ -1416,10 +1510,36 @@ export class SwarmEngine implements ISwarmEngine {
       }
     }
     if (patch.milestones !== undefined) {
+      const assertionById = new Map(
+        (run.assertions ?? []).map((a) => [a.id, a]),
+      );
+      const isStillSealed = (m: SwarmMilestone | undefined): boolean => {
+        if (!m || m.sealed !== true) return false;
+        const mFeatures = (run.features ?? []).filter(
+          (f) => f.milestone === m.label && f.status !== "cancelled",
+        );
+        const claimed = Array.from(new Set(mFeatures.flatMap((f) => f.fulfills)));
+        if (claimed.length > 0) {
+          return claimed.every((id) => assertionById.get(id)?.status === "passed");
+        }
+        return (
+          (run.assertions ?? []).length === 0 ||
+          (run.assertions ?? []).every((a) => a.status === "passed")
+        );
+      };
+
       if (patch.milestones === null) {
-        updatePatch.milestones = null;
+        const preservedSealed =
+          options?.callerRole === "human"
+            ? []
+            : (run.milestones ?? [])
+                .filter((m) => isStillSealed(m))
+                .map((m) => ({ ...m, status: "done" as const, sealed: true }));
+        updatePatch.milestones =
+          preservedSealed.length > 0 ? preservedSealed : null;
       } else {
         const normalized: SwarmMilestone[] = [];
+        const seenLabels = new Set<string>();
         for (const item of patch.milestones) {
           if (!item || typeof item !== "object") {
             throw new SwarmProtocolError(
@@ -1448,14 +1568,13 @@ export class SwarmEngine implements ISwarmEngine {
           const owner =
             typeof item.owner === "string" ? item.owner.trim().replace(/^@/, "") : "";
           const priorMilestone = run.milestones?.find((m) => m.label === label);
-          const keepSealed =
-            item.sealed === true ||
-            (item.sealed === undefined &&
-              priorMilestone?.sealed === true &&
-              item.status === "done");
+          const lockedSealed = isStillSealed(priorMilestone);
+          const keepSealed = lockedSealed || item.sealed === true;
+          const effectiveStatus = lockedSealed ? "done" : item.status;
+          seenLabels.add(label);
           normalized.push({
             label,
-            status: item.status,
+            status: effectiveStatus,
             ...(owner ? { owner } : {}),
             ...(keepSealed
               ? {
@@ -1467,6 +1586,18 @@ export class SwarmEngine implements ISwarmEngine {
                 }
               : {}),
           });
+        }
+        // Preserve any already-sealed milestones omitted from patch.milestones
+        if (options?.callerRole !== "human") {
+          for (const prev of run.milestones ?? []) {
+            if (!seenLabels.has(prev.label) && isStillSealed(prev)) {
+              normalized.push({
+                ...prev,
+                status: "done",
+                sealed: true,
+              });
+            }
+          }
         }
         updatePatch.milestones = normalized;
       }
@@ -1674,6 +1805,9 @@ export class SwarmEngine implements ISwarmEngine {
       } else {
         assertOwnerSession(currentRun, sid);
       }
+    }
+    if (options.callerRole === "orchestrator") {
+      await this.assertMissionGoalGatesForCompletion(currentRun);
     }
     const actor = options.actor ?? ORCHESTRATOR_NAME;
 
@@ -2316,7 +2450,7 @@ export class SwarmEngine implements ISwarmEngine {
     const isWorkerSenderPreCheck =
       input.fromRole === "worker" || senderMember?.role === "worker";
     const isCompletionPostPreCheck =
-      input.kind === "done" || /\[done\]/i.test(text);
+      input.kind === "done" || DONE_PREFIX_RE.test(text);
     let featureId = rawFeatureId;
 
     if (
@@ -2349,6 +2483,24 @@ export class SwarmEngine implements ISwarmEngine {
       }
 
       if (targetFeature && targetFeature.status !== "cancelled") {
+        if (
+          targetFeature.assignedMember &&
+          targetFeature.assignedMember !== workerHandle &&
+          senderMember?.parentName !== targetFeature.assignedMember
+        ) {
+          const assignedOwner = getOwnMember(run, targetFeature.assignedMember);
+          if (!assignedOwner || assignedOwner.state !== "killed") {
+            throw new SwarmProtocolError(
+              "PERMISSION_DENIED",
+              `Worker "@${workerHandle}" cannot report [done] on feature "${targetFeature.id}" assigned to "@${targetFeature.assignedMember}".`,
+              {
+                featureId: targetFeature.id,
+                assignedMember: targetFeature.assignedMember,
+                callerName: workerHandle,
+              },
+            );
+          }
+        }
         const hasUndoneItems = Boolean(leftUndone && leftUndone.length > 0);
         const evidenceLen = verificationEvidence?.trim().length ?? 0;
         if (!hasUndoneItems && evidenceLen < 10) {
@@ -2408,7 +2560,8 @@ export class SwarmEngine implements ISwarmEngine {
     const isWorkerSender =
       normalizedMsg.fromRole === "worker" || senderMember?.role === "worker";
     const isDonePost =
-      normalizedMsg.kind === "done" || /\[done\]/i.test(text);
+      normalizedMsg.kind === "done" || DONE_PREFIX_RE.test(text);
+    const autoCompletedInheritMilestones = new Set<string>();
 
     let latestRun: SwarmRunState;
     if (hasDiscovered || hasUndone || (featureId && isWorkerSender)) {
@@ -2465,38 +2618,58 @@ export class SwarmEngine implements ISwarmEngine {
               const effectiveMemberName = senderMember?.name ?? normalizedMsg.from;
               const freshSender =
                 getOwnMember(fresh, effectiveMemberName) ?? senderMember;
+              const isHelperOfAssigned =
+                Boolean(feat.assignedMember) &&
+                freshSender?.parentName === feat.assignedMember;
+              const canTouchFeature =
+                !feat.assignedMember ||
+                feat.assignedMember === effectiveMemberName ||
+                isHelperOfAssigned;
 
-              if (isDonePost && !hasUndone) {
-                feat.assignedMember = effectiveMemberName;
-                const isInheritOrMerged =
-                  !freshSender ||
-                  freshSender.workspace === "inherit" ||
-                  Boolean(freshSender.mergedCommitSha);
-                if (isInheritOrMerged) {
-                  feat.status = "completed";
-                  if (freshSender?.mergedCommitSha && !feat.mergedCommitSha) {
-                    feat.mergedCommitSha = freshSender.mergedCommitSha;
+              if (canTouchFeature) {
+                const prevStatus = feat.status;
+                if (isDonePost && !hasUndone) {
+                  if (!feat.assignedMember) {
+                    feat.assignedMember = effectiveMemberName;
                   }
-                } else if (feat.status === "pending" || feat.status === "failed") {
-                  feat.status = "in_progress";
-                }
-                feat.updatedAt = nowIso;
-                nextFeatures = orderMissionFeatures(nextFeatures);
-                featuresMutated = true;
-              } else if (isDonePost && hasUndone) {
-                if (!feat.assignedMember) {
+                  const isSharedRepoInherit =
+                    freshSender !== undefined &&
+                    freshSender.workspace === "inherit" &&
+                    path.resolve(freshSender.cwd) ===
+                      path.resolve(this.worktree.repoRoot);
+                  const isInheritOrMerged =
+                    !freshSender ||
+                    isSharedRepoInherit ||
+                    Boolean(freshSender.mergedCommitSha);
+                  if (isInheritOrMerged) {
+                    feat.status = "completed";
+                    if (freshSender?.mergedCommitSha && !feat.mergedCommitSha) {
+                      feat.mergedCommitSha = freshSender.mergedCommitSha;
+                    }
+                    if (prevStatus !== "completed" && feat.milestone) {
+                      autoCompletedInheritMilestones.add(feat.milestone);
+                    }
+                  } else if (feat.status === "pending" || feat.status === "failed") {
+                    feat.status = "in_progress";
+                  }
+                  feat.updatedAt = nowIso;
+                  nextFeatures = orderMissionFeatures(nextFeatures);
+                  featuresMutated = true;
+                } else if (isDonePost && hasUndone) {
+                  if (!feat.assignedMember) {
+                    feat.assignedMember = effectiveMemberName;
+                  }
+                  if (feat.status === "pending") {
+                    feat.status = "in_progress";
+                  }
+                  feat.updatedAt = nowIso;
+                  featuresMutated = true;
+                } else if (!feat.assignedMember && feat.status === "pending") {
                   feat.assignedMember = effectiveMemberName;
-                }
-                if (feat.status === "pending") {
                   feat.status = "in_progress";
+                  feat.updatedAt = nowIso;
+                  featuresMutated = true;
                 }
-                feat.updatedAt = nowIso;
-                featuresMutated = true;
-              } else if (!feat.assignedMember && feat.status === "pending") {
-                feat.assignedMember = effectiveMemberName;
-                feat.status = "in_progress";
-                feat.updatedAt = nowIso;
-                featuresMutated = true;
               }
 
               if (featuresMutated) {
@@ -2505,6 +2678,7 @@ export class SwarmEngine implements ISwarmEngine {
                   nextFeatures,
                   fresh.assertions ?? [],
                   nowIso,
+                  fresh.members,
                 ).milestones;
               }
             }
@@ -2550,6 +2724,14 @@ export class SwarmEngine implements ISwarmEngine {
 
     // Notify blocking `waitForBoard` waiters immediately
     this.notifyWaitersOnMessage(normalizedMsg);
+
+    // Auto-trigger milestone @validator when an inherit feature completion finishes all features of a milestone!
+    if (autoCompletedInheritMilestones.size > 0) {
+      await this.maybeTriggerMilestoneValidation(
+        run.id,
+        autoCompletedInheritMilestones,
+      );
+    }
 
     // Re-arm watchdog if 0 working and no waiter is blocked (and not done)
     this.maybeArmStallWatchdog();
@@ -3835,338 +4017,266 @@ export class SwarmEngine implements ISwarmEngine {
       );
     }
 
-    // 1. Verify member worktree is clean (skip if already removed after kill — branch still exists!)
-    if (member.state !== "killed" && member.cwd && member.cwd !== this.worktree.repoRoot) {
-      const dirty = await this.worktree.isWorktreeDirty(member.cwd);
-      if (dirty) {
-        throw new SwarmProtocolError(
-          "DIRTY_WORKTREE",
-          `Worktree for "@${member.name}" (${member.cwd}) has uncommitted changes. Ask @${member.name} to commit cleanly before merging.`,
-          { memberName: member.name, worktreePath: member.cwd },
-        );
-      }
-    }
-
-    // 2. Verify base checkout is clean and on run.baseBranch
-    const baseCheck = await this.worktree.isBaseCleanOnBranch(run.baseBranch);
-    if (!baseCheck.ok) {
-      if (baseCheck.currentBranch && baseCheck.currentBranch !== run.baseBranch) {
-        throw new SwarmProtocolError(
-          "WRONG_BRANCH",
-          baseCheck.reason ??
-            `Base repository is on "${baseCheck.currentBranch}", expected "${run.baseBranch}".`,
-          { expected: run.baseBranch, actual: baseCheck.currentBranch },
-        );
-      }
-      throw new SwarmProtocolError(
-        "DIRTY_BASE",
-        baseCheck.reason ?? `Base branch "${run.baseBranch}" has uncommitted changes.`,
-        { baseBranch: run.baseBranch },
-      );
-    }
-
-    // 3. Auto-rebase onto baseBranch when enabled and worktree is live
-    const settings = this.getEffectiveSettings();
-    let skipSourceWorktree = false;
-    if (
-      settings.autoRebase &&
-      member.state !== "killed" &&
-      member.cwd &&
-      member.cwd !== this.worktree.repoRoot
-    ) {
-      const rebaseRes = await this.worktree.autoRebase(member.cwd, run.baseBranch);
-      if (rebaseRes.status === "missing_worktree") {
-        // Worktree directory is absent on disk; skip auto-rebase and merge branch ref directly.
-        skipSourceWorktree = true;
-      } else if (rebaseRes.status === "conflict") {
-        const conflictFiles = rebaseRes.conflictFiles ?? [];
-        const fileList = conflictFiles.length > 0 ? conflictFiles.join(", ") : "";
-        const baseMsg = rebaseRes.message
-          ? rebaseRes.message.replace(/\.?\s*$/, ".") +
-            (fileList && !conflictFiles.every((f) => rebaseRes.message!.includes(f))
-              ? ` Conflicting files: ${fileList}.`
-              : "")
-          : `Rebase conflict while rebasing "${member.branch}" onto "${run.baseBranch}".${fileList ? ` Conflicting files: ${fileList}.` : ""}`;
-        const recovery = ` Recovery: wake @${member.name} via post_message to rebase onto "${run.baseBranch}", resolve ${fileList || "the conflicts"} in "${member.cwd}", and re-commit cleanly before retrying merge.`;
-        throw new SwarmProtocolError(
-          "REBASE_CONFLICT",
-          `${baseMsg}${recovery}`,
-          {
-            memberName: member.name,
-            branch: member.branch,
-            worktreePath: member.cwd,
-            conflictFiles,
-          },
-        );
-      } else if (rebaseRes.status === "skipped_dirty") {
-        throw new SwarmProtocolError(
-          "DIRTY_WORKTREE",
-          rebaseRes.message ?? `Worktree for "@${member.name}" is dirty.`,
-          { memberName: member.name },
-        );
-      }
-    }
-
-    // 4. Merge branch into baseBranch
-    const mergeRes = await this.worktree.mergeBranch({
-      baseBranch: run.baseBranch,
-      branch: member.branch,
-      commitMessage:
-        options?.commitMessage ?? `swarm(${member.name}): merge ${member.branch}`,
-      noFf: options?.noFf ?? true,
-      ...(skipSourceWorktree ? {} : { sourceWorktreePath: member.cwd }),
-    });
-
-    const actor = options?.callerName ?? ORCHESTRATOR_NAME;
-    if (mergeRes.strategy === "noop") {
-      const noopSummary = `Merge noop for @${member.name} (${member.branch}): @${member.name} had 0 commits ahead of ${run.baseBranch}.`;
-      await this.store.appendEvent({
-        runId: run.id,
-        type: "member_merged",
-        actor,
-        memberName: member.name,
-        agentId: member.agentId,
-        summary: noopSummary,
-        data: {
-          strategy: "noop",
-          commitsAhead: 0,
-          baseBranch: run.baseBranch,
-          ...(member.branch ? { branch: member.branch } : {}),
-        },
-      });
-      await this.refreshCache();
-      this.emitEngineEvent("snapshot_changed", noopSummary, {
-        memberName: member.name,
-      });
-      return mergeRes;
-    }
-
-    let updated = await this.store.updateMember(run.id, member.name, {
-      mergedCommitSha: mergeRes.mergedCommitSha,
-      actor,
-    });
-
     const completedFeatureIds: string[] = [];
     const touchedMilestones = new Set<string>();
+    const newlyMergedIsolatedMilestones = new Set<string>();
 
-    if (updated.features && updated.features.length > 0) {
-      updated = await this.withMissionLock(async () => {
-        const fresh = await this.store.loadRun(run.id);
-        if (!fresh.features || fresh.features.length === 0) {
-          return fresh;
-        }
-        const nowIso = new Date(this.nowFn()).toISOString();
-        const handoffs = fresh.handoffItems ?? [];
-        let mutated = false;
-        const nextFeatures = fresh.features.map((f) => {
-          if (f.assignedMember !== member.name) {
-            return { ...f };
-          }
-          if (f.status === "in_progress") {
-            const hasOpenLeftUndone = handoffs.some(
-              (h) =>
-                h.resolution === "open" &&
-                h.type === "incomplete_work" &&
-                h.sourceFeatureId === f.id,
-            );
-            const nextStatus: FeatureStatus = hasOpenLeftUndone
-              ? "in_progress"
-              : "completed";
-            if (nextStatus === "completed") {
-              completedFeatureIds.push(f.id);
-            }
-            if (f.milestone) {
-              touchedMilestones.add(f.milestone);
-            }
-            mutated = true;
-            return {
-              ...f,
-              status: nextStatus,
-              mergedCommitSha: mergeRes.mergedCommitSha,
-              updatedAt: nowIso,
-            };
-          }
-          if (f.status === "completed" && !f.mergedCommitSha) {
-            if (f.milestone) {
-              touchedMilestones.add(f.milestone);
-            }
-            mutated = true;
-            return {
-              ...f,
-              mergedCommitSha: mergeRes.mergedCommitSha,
-              updatedAt: nowIso,
-            };
-          }
-          return { ...f };
-        });
-
-        if (!mutated) {
-          return fresh;
-        }
-        const ordered = orderMissionFeatures(nextFeatures);
-        const syncedMilestones = syncMissionMilestones(
-          fresh.milestones,
-          ordered,
-          fresh.assertions ?? [],
-          nowIso,
+    const mergeOutcome = await this.withRepoGitLock(async () => {
+      const freshRun = this.requireActiveRun();
+      const freshMember = this.findMember(freshRun, memberName);
+      if (!freshMember) {
+        throw new SwarmProtocolError("MEMBER_NOT_FOUND", `Member "${memberName}" not found.`);
+      }
+      if (freshMember.workspace === "inherit" || !freshMember.branch) {
+        return null;
+      }
+      const freshLive = this.liveMembers.get(freshMember.name);
+      const freshLiveState = freshLive?.handle?.getState() ?? freshMember.state;
+      if (
+        freshMember.state === "working" ||
+        freshLiveState === "working" ||
+        freshLive?.spawning ||
+        freshLive?.waking ||
+        freshLive?.turnActive ||
+        freshLive?.switchingModel
+      ) {
+        throw new SwarmProtocolError(
+          "MEMBER_NOT_WAITING",
+          `Cannot merge "@${freshMember.name}" while it is still working. Wait until it parks in waiting state.`,
+          { memberName: freshMember.name },
         );
-        const saved = await this.store.updateRun(run.id, {
-          features: ordered,
-          milestones: syncedMilestones.milestones,
-          actor,
-        });
-        await this.store.appendEvent({
-          runId: run.id,
-          type: "mission_updated",
-          actor,
-          memberName: member.name,
-          summary:
-            completedFeatureIds.length > 0
-              ? `Merge @${member.name} auto-completed feature(s): ${completedFeatureIds.join(", ")}`
-              : `Merge @${member.name} stamped mergedCommitSha on assigned feature(s)`,
-          data: {
-            mergedCommitSha: mergeRes.mergedCommitSha,
-            completedFeatureIds,
-            newlySealedMilestones: syncedMilestones.newlySealed,
-          },
-        });
-        return saved;
-      });
-    }
+      }
 
-    await this.refreshCache(updated);
-    this.emitEngineEvent(
-      "snapshot_changed",
-      `Merged @${member.name} (${member.branch}) -> ${mergeRes.mergedCommitSha.slice(0, 12)}`,
-      { memberName: member.name },
-    );
-
-    const milestoneValidationCues: Array<{
-      milestone: string;
-      assertionIds: string[];
-      validatorWoken?: string;
-      validatorSpawned?: string;
-      boardSeq?: number;
-      needsValidatorSpawn?: boolean;
-    }> = [];
-
-    if (updated.validatorEnabled && touchedMilestones.size > 0) {
-      for (const milestoneLabel of touchedMilestones) {
-        const currentRunForVal = this.cachedRun ?? updated;
-        const mFeatures = (currentRunForVal.features ?? []).filter(
-          (f) => f.milestone === milestoneLabel && f.status !== "cancelled",
-        );
-        if (mFeatures.length === 0) continue;
-
-        const allCompletedAndMerged = mFeatures.every((f) => {
-          if (f.status !== "completed") return false;
-          if (!f.assignedMember) return true;
-          const assigned = getOwnMember(currentRunForVal, f.assignedMember);
-          if (!assigned || !isIsolatedWorktreeWorkspace(assigned.workspace)) {
-            return true;
-          }
-          return Boolean(f.mergedCommitSha || assigned.mergedCommitSha);
-        });
-        if (!allCompletedAndMerged) continue;
-
-        const claimedValIds = Array.from(
-          new Set(mFeatures.flatMap((f) => f.fulfills)),
-        );
-        const candidateAssertions =
-          claimedValIds.length > 0
-            ? (currentRunForVal.assertions ?? []).filter((a) => claimedValIds.includes(a.id))
-            : (currentRunForVal.milestones?.length ?? 0) <= 1
-              ? (currentRunForVal.assertions ?? [])
-              : [];
-        const alreadyPassed = candidateAssertions.filter(
-          (a) => a.status === "passed",
-        );
-        const pendingOrFailed = candidateAssertions.filter(
-          (a) => a.status === "pending" || a.status === "failed",
-        );
-        if (pendingOrFailed.length === 0) continue;
-
-        const dualLayerBrief = buildMilestoneValidationBrief(
-          currentRunForVal,
-          milestoneLabel,
-          mFeatures,
-          pendingOrFailed,
-          alreadyPassed,
-        );
-        const assertionIds = pendingOrFailed.map((a) => a.id);
-
-        const orderedValidators = currentRunForVal.memberOrder
-          .map((n) => getOwnMember(currentRunForVal, n))
-          .filter(
-            (m): m is SwarmMemberRecord =>
-              Boolean(
-                m &&
-                  m.role === "validator" &&
-                  m.workspace === "inherit" &&
-                  m.state !== "killed" &&
-                  !m.humanStopped,
-              ),
+      // 1. Verify member worktree is clean (skip if already removed after kill — branch still exists!)
+      if (
+        freshMember.state !== "killed" &&
+        freshMember.cwd &&
+        freshMember.cwd !== this.worktree.repoRoot
+      ) {
+        const dirty = await this.worktree.isWorktreeDirty(freshMember.cwd);
+        if (dirty) {
+          throw new SwarmProtocolError(
+            "DIRTY_WORKTREE",
+            `Worktree for "@${freshMember.name}" (${freshMember.cwd}) has uncommitted changes. Ask @${freshMember.name} to commit cleanly before merging.`,
+            { memberName: freshMember.name, worktreePath: freshMember.cwd },
           );
-
-        const parkableValidator = orderedValidators.find((m) => {
-          if (m.state !== "waiting" && m.state !== "stopped") {
-            return false;
-          }
-          const vLive = this.liveMembers.get(m.name);
-          return (
-            !vLive?.spawning &&
-            !vLive?.waking &&
-            !vLive?.turnActive &&
-            !vLive?.switchingModel &&
-            vLive?.handle?.getState() !== "working"
-          );
-        });
-        const targetExistingValidator = parkableValidator ?? orderedValidators[0];
-
-        if (targetExistingValidator) {
-          const cuePost = await this.postMessage({
-            from: ORCHESTRATOR_NAME,
-            fromRole: "orchestrator",
-            channel: targetExistingValidator.channels[0] ?? DEFAULT_CHANNEL,
-            kind: "review",
-            text: `@${targetExistingValidator.name} ${dualLayerBrief}`,
-          });
-          milestoneValidationCues.push({
-            milestone: milestoneLabel,
-            assertionIds,
-            validatorWoken: targetExistingValidator.name,
-            boardSeq: cuePost.seq,
-          });
-        } else if (!this.disposed && !this.runDonePosted && currentRunForVal.status === "active") {
-          const validatorName = uniqueValidatorHandle(
-            currentRunForVal,
-            this.liveMembers.keys(),
-          );
-          const spawnedValidators = await this.addMembers({
-            name: validatorName,
-            role: "validator",
-            workspace: "inherit",
-            brief: dualLayerBrief,
-            callerName: ORCHESTRATOR_NAME,
-            callerRole: "orchestrator",
-            hostContext: this.hostContext,
-          });
-          const spawnedVal = spawnedValidators[0]!;
-          milestoneValidationCues.push({
-            milestone: milestoneLabel,
-            assertionIds,
-            validatorSpawned: spawnedVal.name,
-            ...(spawnedVal.briefSeq !== undefined ? { boardSeq: spawnedVal.briefSeq } : {}),
-          });
-        } else {
-          milestoneValidationCues.push({
-            milestone: milestoneLabel,
-            assertionIds,
-            needsValidatorSpawn: true,
-          });
         }
       }
+
+      // 2. Verify base checkout is clean and on run.baseBranch
+      const baseCheck = await this.worktree.isBaseCleanOnBranch(freshRun.baseBranch);
+      if (!baseCheck.ok) {
+        if (baseCheck.currentBranch && baseCheck.currentBranch !== freshRun.baseBranch) {
+          throw new SwarmProtocolError(
+            "WRONG_BRANCH",
+            baseCheck.reason ??
+              `Base repository is on "${baseCheck.currentBranch}", expected "${freshRun.baseBranch}".`,
+            { expected: freshRun.baseBranch, actual: baseCheck.currentBranch },
+          );
+        }
+        throw new SwarmProtocolError(
+          "DIRTY_BASE",
+          baseCheck.reason ?? `Base branch "${freshRun.baseBranch}" has uncommitted changes.`,
+          { baseBranch: freshRun.baseBranch },
+        );
+      }
+
+      // 3. Auto-rebase onto baseBranch when enabled and worktree is live
+      const settings = this.getEffectiveSettings();
+      let skipSourceWorktree = false;
+      if (
+        settings.autoRebase &&
+        freshMember.state !== "killed" &&
+        freshMember.cwd &&
+        freshMember.cwd !== this.worktree.repoRoot
+      ) {
+        const rebaseRes = await this.worktree.autoRebase(
+          freshMember.cwd,
+          freshRun.baseBranch,
+        );
+        if (rebaseRes.status === "missing_worktree") {
+          skipSourceWorktree = true;
+        } else if (rebaseRes.status === "conflict") {
+          const conflictFiles = rebaseRes.conflictFiles ?? [];
+          const fileList = conflictFiles.length > 0 ? conflictFiles.join(", ") : "";
+          const baseMsg = rebaseRes.message
+            ? rebaseRes.message.replace(/\.?\s*$/, ".") +
+              (fileList && !conflictFiles.every((f) => rebaseRes.message!.includes(f))
+                ? ` Conflicting files: ${fileList}.`
+                : "")
+            : `Rebase conflict while rebasing "${freshMember.branch}" onto "${freshRun.baseBranch}".${fileList ? ` Conflicting files: ${fileList}.` : ""}`;
+          const recovery = ` Recovery: wake @${freshMember.name} via post_message to rebase onto "${freshRun.baseBranch}", resolve ${fileList || "the conflicts"} in "${freshMember.cwd}", and re-commit cleanly before retrying merge.`;
+          throw new SwarmProtocolError(
+            "REBASE_CONFLICT",
+            `${baseMsg}${recovery}`,
+            {
+              memberName: freshMember.name,
+              branch: freshMember.branch,
+              worktreePath: freshMember.cwd,
+              conflictFiles,
+            },
+          );
+        } else if (rebaseRes.status === "skipped_dirty") {
+          throw new SwarmProtocolError(
+            "DIRTY_WORKTREE",
+            rebaseRes.message ?? `Worktree for "@${freshMember.name}" is dirty.`,
+            { memberName: freshMember.name },
+          );
+        }
+      }
+
+      // 4. Merge branch into baseBranch
+      const mergeRes = await this.worktree.mergeBranch({
+        baseBranch: freshRun.baseBranch,
+        branch: freshMember.branch,
+        commitMessage:
+          options?.commitMessage ??
+          `swarm(${freshMember.name}): merge ${freshMember.branch}`,
+        noFf: options?.noFf ?? true,
+        ...(skipSourceWorktree ? {} : { sourceWorktreePath: freshMember.cwd }),
+      });
+
+      const actor = options?.callerName ?? ORCHESTRATOR_NAME;
+      if (mergeRes.strategy === "noop") {
+        const noopSummary = `Merge noop for @${freshMember.name} (${freshMember.branch}): @${freshMember.name} had 0 commits ahead of ${freshRun.baseBranch}.`;
+        await this.store.appendEvent({
+          runId: freshRun.id,
+          type: "member_merged",
+          actor,
+          memberName: freshMember.name,
+          agentId: freshMember.agentId,
+          summary: noopSummary,
+          data: {
+            strategy: "noop",
+            commitsAhead: 0,
+            baseBranch: freshRun.baseBranch,
+            ...(freshMember.branch ? { branch: freshMember.branch } : {}),
+          },
+        });
+        await this.refreshCache();
+        this.emitEngineEvent("snapshot_changed", noopSummary, {
+          memberName: freshMember.name,
+        });
+        return { noop: true as const, mergeRes };
+      }
+
+      let updated = await this.store.updateMember(freshRun.id, freshMember.name, {
+        mergedCommitSha: mergeRes.mergedCommitSha,
+        actor,
+      });
+
+      if (updated.features && updated.features.length > 0) {
+        updated = await this.withMissionLock(async () => {
+          const fresh = await this.store.loadRun(freshRun.id);
+          if (!fresh.features || fresh.features.length === 0) {
+            return fresh;
+          }
+          const nowIso = new Date(this.nowFn()).toISOString();
+          const handoffs = fresh.handoffItems ?? [];
+          let mutated = false;
+          const nextFeatures = fresh.features.map((f) => {
+            if (f.assignedMember !== freshMember.name) {
+              return { ...f };
+            }
+            if (f.status === "in_progress") {
+              const hasOpenLeftUndone = handoffs.some(
+                (h) =>
+                  h.resolution === "open" &&
+                  h.type === "incomplete_work" &&
+                  h.sourceFeatureId === f.id,
+              );
+              const nextStatus: FeatureStatus = hasOpenLeftUndone
+                ? "in_progress"
+                : "completed";
+              if (nextStatus === "completed") {
+                completedFeatureIds.push(f.id);
+              }
+              if (f.milestone) {
+                touchedMilestones.add(f.milestone);
+                if (!f.mergedCommitSha) {
+                  newlyMergedIsolatedMilestones.add(f.milestone);
+                }
+              }
+              mutated = true;
+              return {
+                ...f,
+                status: nextStatus,
+                mergedCommitSha: mergeRes.mergedCommitSha,
+                updatedAt: nowIso,
+              };
+            }
+            if (f.status === "completed" && !f.mergedCommitSha) {
+              if (f.milestone) {
+                touchedMilestones.add(f.milestone);
+                newlyMergedIsolatedMilestones.add(f.milestone);
+              }
+              mutated = true;
+              return {
+                ...f,
+                mergedCommitSha: mergeRes.mergedCommitSha,
+                updatedAt: nowIso,
+              };
+            }
+            return { ...f };
+          });
+
+          if (!mutated) {
+            return fresh;
+          }
+          const ordered = orderMissionFeatures(nextFeatures);
+          const syncedMilestones = syncMissionMilestones(
+            fresh.milestones,
+            ordered,
+            fresh.assertions ?? [],
+            nowIso,
+            fresh.members,
+          );
+          const saved = await this.store.updateRun(freshRun.id, {
+            features: ordered,
+            milestones: syncedMilestones.milestones,
+            actor,
+          });
+          await this.store.appendEvent({
+            runId: freshRun.id,
+            type: "mission_updated",
+            actor,
+            memberName: freshMember.name,
+            summary:
+              completedFeatureIds.length > 0
+                ? `Merge @${freshMember.name} auto-completed feature(s): ${completedFeatureIds.join(", ")}`
+                : `Merge @${freshMember.name} stamped mergedCommitSha on assigned feature(s)`,
+            data: {
+              mergedCommitSha: mergeRes.mergedCommitSha,
+              completedFeatureIds,
+              newlySealedMilestones: syncedMilestones.newlySealed,
+            },
+          });
+          return saved;
+        });
+      }
+
+      await this.refreshCache(updated);
+      this.emitEngineEvent(
+        "snapshot_changed",
+        `Merged @${freshMember.name} (${freshMember.branch}) -> ${mergeRes.mergedCommitSha.slice(0, 12)}`,
+        { memberName: freshMember.name },
+      );
+      return { noop: false as const, mergeRes, updated };
+    });
+
+    if (!mergeOutcome) {
+      return null;
     }
+    if (mergeOutcome.noop) {
+      return mergeOutcome.mergeRes;
+    }
+
+    const { mergeRes } = mergeOutcome;
+    const milestoneValidationCues = await this.maybeTriggerMilestoneValidation(
+      run.id,
+      touchedMilestones,
+      { postMergeCheckMilestones: newlyMergedIsolatedMilestones },
+    );
 
     if (completedFeatureIds.length === 0 && milestoneValidationCues.length === 0) {
       return mergeRes;
@@ -4177,6 +4287,182 @@ export class SwarmEngine implements ISwarmEngine {
       ...(completedFeatureIds.length > 0 ? { completedFeatureIds } : {}),
       ...(milestoneValidationCues.length > 0 ? { milestoneValidationCues } : {}),
     } as MergeBranchResult;
+  }
+
+  private async maybeTriggerMilestoneValidation(
+    runId: string,
+    touchedMilestones: ReadonlySet<string>,
+    options?: { postMergeCheckMilestones?: ReadonlySet<string> },
+  ): Promise<
+    Array<{
+      milestone: string;
+      assertionIds: string[];
+      validatorWoken?: string;
+      validatorSpawned?: string;
+      boardSeq?: number;
+      needsValidatorSpawn?: boolean;
+    }>
+  > {
+    const milestoneValidationCues: Array<{
+      milestone: string;
+      assertionIds: string[];
+      validatorWoken?: string;
+      validatorSpawned?: string;
+      boardSeq?: number;
+      needsValidatorSpawn?: boolean;
+    }> = [];
+
+    if (
+      touchedMilestones.size === 0 ||
+      this.disposed ||
+      this.runDonePosted ||
+      this.activeRunId !== runId
+    ) {
+      return milestoneValidationCues;
+    }
+
+    const initialRun = this.cachedRun ?? (await this.store.loadRun(runId));
+    if (!initialRun.validatorEnabled) {
+      return milestoneValidationCues;
+    }
+
+    for (const milestoneLabel of touchedMilestones) {
+      const currentRunForVal = this.cachedRun ?? initialRun;
+      if (!currentRunForVal.validatorEnabled) break;
+
+      const mFeatures = (currentRunForVal.features ?? []).filter(
+        (f) => f.milestone === milestoneLabel && f.status !== "cancelled",
+      );
+      if (mFeatures.length === 0) continue;
+
+      const allCompletedAndMerged = mFeatures.every((f) => {
+        if (f.status !== "completed") return false;
+        if (!f.assignedMember) return true;
+        const assigned = getOwnMember(currentRunForVal, f.assignedMember);
+        if (!assigned || !isIsolatedWorktreeWorkspace(assigned.workspace)) {
+          return true;
+        }
+        return Boolean(f.mergedCommitSha || assigned.mergedCommitSha);
+      });
+      if (!allCompletedAndMerged) continue;
+
+      const claimedValIds = Array.from(
+        new Set(mFeatures.flatMap((f) => f.fulfills)),
+      );
+      const candidateAssertions =
+        claimedValIds.length > 0
+          ? (currentRunForVal.assertions ?? []).filter((a) => claimedValIds.includes(a.id))
+          : (currentRunForVal.milestones?.length ?? 0) <= 1
+            ? (currentRunForVal.assertions ?? [])
+            : [];
+      const alreadyPassed = candidateAssertions.filter(
+        (a) => a.status === "passed",
+      );
+      const pendingOrFailed = candidateAssertions.filter(
+        (a) => a.status === "pending" || a.status === "failed",
+      );
+      const preMergePassed =
+        pendingOrFailed.length === 0 &&
+        options?.postMergeCheckMilestones?.has(milestoneLabel)
+          ? alreadyPassed.filter((a) => !a.overridden)
+          : [];
+      if (pendingOrFailed.length === 0 && preMergePassed.length === 0) {
+        continue;
+      }
+
+      const isPostMergeIntegrationCheck =
+        pendingOrFailed.length === 0 && preMergePassed.length > 0;
+      const dualLayerBrief = buildMilestoneValidationBrief(
+        currentRunForVal,
+        milestoneLabel,
+        mFeatures,
+        pendingOrFailed,
+        isPostMergeIntegrationCheck ? preMergePassed : alreadyPassed,
+        { postMergeIntegrationCheck: isPostMergeIntegrationCheck },
+      );
+      const assertionIds = isPostMergeIntegrationCheck
+        ? preMergePassed.map((a) => a.id)
+        : pendingOrFailed.map((a) => a.id);
+
+      const orderedValidators = currentRunForVal.memberOrder
+        .map((n) => getOwnMember(currentRunForVal, n))
+        .filter(
+          (m): m is SwarmMemberRecord =>
+            Boolean(
+              m &&
+                m.role === "validator" &&
+                m.workspace === "inherit" &&
+                m.state !== "killed" &&
+                !m.humanStopped,
+            ),
+        );
+
+      const parkableValidator = orderedValidators.find((m) => {
+        if (m.state !== "waiting" && m.state !== "stopped") {
+          return false;
+        }
+        const vLive = this.liveMembers.get(m.name);
+        return (
+          !vLive?.spawning &&
+          !vLive?.waking &&
+          !vLive?.turnActive &&
+          !vLive?.switchingModel &&
+          vLive?.handle?.getState() !== "working"
+        );
+      });
+      const targetExistingValidator = parkableValidator ?? orderedValidators[0];
+
+      if (targetExistingValidator) {
+        const cuePost = await this.postMessage({
+          from: ORCHESTRATOR_NAME,
+          fromRole: "orchestrator",
+          channel: targetExistingValidator.channels[0] ?? DEFAULT_CHANNEL,
+          kind: "review",
+          text: `@${targetExistingValidator.name} ${dualLayerBrief}`,
+        });
+        milestoneValidationCues.push({
+          milestone: milestoneLabel,
+          assertionIds,
+          validatorWoken: targetExistingValidator.name,
+          boardSeq: cuePost.seq,
+        });
+      } else if (
+        !this.disposed &&
+        !this.runDonePosted &&
+        currentRunForVal.status === "active"
+      ) {
+        const validatorName = uniqueValidatorHandle(
+          currentRunForVal,
+          this.liveMembers.keys(),
+        );
+        const spawnedValidators = await this.addMembers({
+          name: validatorName,
+          role: "validator",
+          workspace: "inherit",
+          brief: dualLayerBrief,
+          callerName: ORCHESTRATOR_NAME,
+          callerRole: "orchestrator",
+          hostContext: this.hostContext,
+        });
+        const spawnedVal = spawnedValidators[0]!;
+        milestoneValidationCues.push({
+          milestone: milestoneLabel,
+          assertionIds,
+          validatorSpawned: spawnedVal.name,
+          ...(spawnedVal.briefSeq !== undefined
+            ? { boardSeq: spawnedVal.briefSeq }
+            : {}),
+        });
+      } else {
+        milestoneValidationCues.push({
+          milestone: milestoneLabel,
+          assertionIds,
+          needsValidatorSpawn: true,
+        });
+      }
+    }
+
+    return milestoneValidationCues;
   }
 
   // --------------------------------------------------------------------------
@@ -4408,6 +4694,18 @@ export class SwarmEngine implements ISwarmEngine {
       input.callerName?.trim().replace(/^@/, "") ||
       (callerRole === "human" ? "human" : ORCHESTRATOR_NAME);
 
+    if (
+      input.force === true &&
+      input.callerRole !== undefined &&
+      input.callerRole !== "human"
+    ) {
+      throw new SwarmProtocolError(
+        "PERMISSION_DENIED",
+        `Role "${input.callerRole}" (@${callerName}) cannot pass force:true on manageMission("${op}"). Only human callers may force-override mission guards.`,
+        { op, callerRole: input.callerRole },
+      );
+    }
+
     if (op === "status") {
       const latest = await this.store.loadRun(run.id);
       await this.refreshCache(latest);
@@ -4489,6 +4787,18 @@ export class SwarmEngine implements ISwarmEngine {
           `Invalid max_dispatch=${String(input.maxDispatch)}; expected positive integer.`,
         );
       }
+      if (
+        input.workspace !== undefined &&
+        input.workspace !== "inherit" &&
+        input.workspace !== "share" &&
+        input.workspace !== "branch"
+      ) {
+        throw new SwarmProtocolError(
+          "INVALID_INPUT",
+          `Invalid workspace="${String(input.workspace)}" for dispatch_ready; expected "inherit", "share", or "branch".`,
+        );
+      }
+      const dispatchWorkspace: SwarmWorkspaceMode = input.workspace ?? "inherit";
       if (input.hostContext) {
         this.hostContext = input.hostContext;
       }
@@ -4517,10 +4827,43 @@ export class SwarmEngine implements ISwarmEngine {
           availableConcurrencySlots,
         );
 
-        const featureById = new Map(features.map((f) => [f.id, f]));
-        const inProgressFeatures = features.filter(
-          (f) => f.status === "in_progress",
+        const orderedMilestoneLabels: string[] = [];
+        const seenMs = new Set<string>();
+        for (const m of state.milestones ?? []) {
+          const lbl = m.label.trim();
+          if (lbl && !seenMs.has(lbl)) {
+            seenMs.add(lbl);
+            orderedMilestoneLabels.push(lbl);
+          }
+        }
+        for (const f of features) {
+          const lbl = f.milestone.trim();
+          if (lbl && !seenMs.has(lbl)) {
+            seenMs.add(lbl);
+            orderedMilestoneLabels.push(lbl);
+          }
+        }
+        const activeMilestoneLabel = orderedMilestoneLabels.find((lbl) =>
+          features.some(
+            (f) =>
+              f.milestone.trim() === lbl &&
+              (f.status === "pending" ||
+                f.status === "in_progress" ||
+                f.status === "failed"),
+          ),
         );
+
+        const featureById = new Map(features.map((f) => [f.id, f]));
+        const activeCollisionFeatures = features.filter((f) => {
+          if (f.status === "in_progress") return true;
+          if (f.status === "failed" && f.assignedMember && !f.mergedCommitSha) {
+            const assigned = getOwnMember(state, f.assignedMember);
+            if (assigned && assigned.state !== "killed") {
+              return true;
+            }
+          }
+          return false;
+        });
         const planned: PlannedDispatch[] = [];
         const reservedHandles = new Set<string>();
 
@@ -4529,6 +4872,12 @@ export class SwarmEngine implements ISwarmEngine {
             break;
           }
           if (feat.status !== "pending") {
+            continue;
+          }
+          if (
+            activeMilestoneLabel &&
+            feat.milestone.trim() !== activeMilestoneLabel
+          ) {
             continue;
           }
           const depsSatisfied = (feat.dependsOn ?? []).every((depId) => {
@@ -4540,14 +4889,18 @@ export class SwarmEngine implements ISwarmEngine {
           if (!depsSatisfied) {
             continue;
           }
-          const collidesWithInProgress = inProgressFeatures.some((active) =>
-            ownedPathsOverlap(feat.filesOwned, active.filesOwned),
+          const featOwned = effectiveDispatchOwnedPaths(feat);
+          const collidesWithActive = activeCollisionFeatures.some((active) =>
+            ownedPathsOverlap(featOwned, effectiveDispatchOwnedPaths(active)),
           );
-          if (collidesWithInProgress) {
+          if (collidesWithActive) {
             continue;
           }
           const collidesWithBatch = planned.some((earlier) =>
-            ownedPathsOverlap(feat.filesOwned, earlier.feature.filesOwned),
+            ownedPathsOverlap(
+              featOwned,
+              effectiveDispatchOwnedPaths(earlier.feature),
+            ),
           );
           if (collidesWithBatch) {
             continue;
@@ -4559,7 +4912,7 @@ export class SwarmEngine implements ISwarmEngine {
             this.liveMembers.keys(),
             reservedHandles,
           );
-          const brief = buildFeatureWorkerBrief(state, feat);
+          const brief = buildFeatureWorkerBrief(state, feat, dispatchWorkspace);
           planned.push({ feature: feat, handleName, brief });
         }
 
@@ -4590,6 +4943,7 @@ export class SwarmEngine implements ISwarmEngine {
           ordered,
           state.assertions ?? [],
           nowIso,
+          state.members,
         );
         const saved = await this.store.updateRun(run.id, {
           features: ordered,
@@ -4614,7 +4968,7 @@ export class SwarmEngine implements ISwarmEngine {
             ? "No pending features remaining in Mission queue."
             : reservation.availableConcurrencySlots <= 0
               ? `No concurrency slots currently available (${reservation.workingCount}/${reservation.state.maxConcurrency} working); call swarm_wait for active workers to finish.`
-              : `0 of ${pendingCount} pending feature(s) are ready right now (blocked on upstream dependsOn or overlapping filesOwned with active in_progress features).`;
+              : `0 of ${pendingCount} pending feature(s) are ready right now (blocked on earlier milestone completion, upstream dependsOn, or overlapping filesOwned with active features).`;
         return {
           op: "dispatch_ready",
           dispatchedFeatures: [],
@@ -4628,13 +4982,14 @@ export class SwarmEngine implements ISwarmEngine {
       const dispatchedFeatures: string[] = [];
       const spawnedMembers: string[] = [];
       const spawnedFeatureSet = new Set<string>();
+      let partialSpawnWarning: string | undefined;
 
       try {
         for (const item of reservation.planned) {
           const added = await this.addMembers({
             name: item.handleName,
             role: "worker",
-            workspace: "share",
+            workspace: dispatchWorkspace,
             brief: item.brief,
             callerName,
             callerRole,
@@ -4671,6 +5026,7 @@ export class SwarmEngine implements ISwarmEngine {
               ordered,
               cur.assertions ?? [],
               nowIso,
+              cur.members,
             );
             const revertedRun = await this.store.updateRun(run.id, {
               features: ordered,
@@ -4680,15 +5036,29 @@ export class SwarmEngine implements ISwarmEngine {
             await this.refreshCache(revertedRun);
           }).catch(() => {});
         }
-        throw err;
+        if (spawnedMembers.length === 0) {
+          throw err;
+        }
+        const errText = err instanceof Error ? err.message : String(err);
+        partialSpawnWarning = `⚠ Partial dispatch warning: spawn stopped after ${spawnedMembers.length} worker(s) (${errText}); reverted ${unspawnedIds.size} unspawned feature(s) to "pending".`;
       }
 
       return this.withMissionLock(async () => {
         const finalState = await this.store.loadRun(run.id);
-        const pairSummary = reservation.planned
+        const succeededPlanned = reservation.planned.filter((p) =>
+          spawnedFeatureSet.has(p.feature.id),
+        );
+        const pairSummary = succeededPlanned
           .map((p, idx) => `${p.feature.id} -> @${spawnedMembers[idx] ?? p.handleName}`)
           .join(", ");
-        const summary = `Dispatched ${dispatchedFeatures.length} ready feature(s) to fresh isolated share worktrees: ${pairSummary}.`;
+        const wsSummary =
+          dispatchWorkspace === "inherit"
+            ? "in shared inherit workspace (zero Git worktrees)"
+            : `to fresh isolated ${dispatchWorkspace} worktrees`;
+        const baseSummary = `Dispatched ${dispatchedFeatures.length} ready feature(s) ${wsSummary}: ${pairSummary}.`;
+        const summary = partialSpawnWarning
+          ? `${baseSummary}\n${partialSpawnWarning}`
+          : baseSummary;
         await this.store.appendEvent({
           runId: run.id,
           type: "mission_updated",
@@ -4696,8 +5066,10 @@ export class SwarmEngine implements ISwarmEngine {
           summary,
           data: {
             op: "dispatch_ready",
+            workspace: dispatchWorkspace,
             dispatchedFeatures,
             spawnedMembers,
+            ...(partialSpawnWarning ? { partialSpawnWarning } : {}),
           },
         });
         await this.refreshCache(finalState);
@@ -4793,7 +5165,7 @@ export class SwarmEngine implements ISwarmEngine {
             ) {
               throw new SwarmProtocolError(
                 "PERMISSION_DENIED",
-                `Cannot set assertion "${id}" directly to "passed" via upsert_assertions while validatorEnabled is ON. Use verify_assertion from an independent read-only validator (or pass force:true).`,
+                `Cannot set assertion "${id}" directly to "passed" via upsert_assertions while validatorEnabled is ON. Use verify_assertion from an independent read-only validator.`,
               );
             }
 
@@ -4873,6 +5245,7 @@ export class SwarmEngine implements ISwarmEngine {
             state.features ?? [],
             nextAssertions,
             nowIso,
+            state.members,
           );
           const updatedRun = await this.store.updateRun(run.id, {
             assertions: nextAssertions,
@@ -4954,6 +5327,13 @@ export class SwarmEngine implements ISwarmEngine {
           }
 
           const nextAssertions = currentAssertions.filter((a) => a.id !== assertionId);
+          if (nextAssertions.length === 0 && callerRole !== "human") {
+            throw new SwarmProtocolError(
+              "INVALID_INPUT",
+              `Cannot remove the last assertion "${assertionId}" from the Validation Contract. A Mission contract must retain at least 1 VAL-* assertion (upsert replacement assertions first).`,
+              { assertionId },
+            );
+          }
           let strippedFeatureIds: string[] = [];
           const nextFeatures = state.features
             ? state.features.map((f) => {
@@ -4974,6 +5354,7 @@ export class SwarmEngine implements ISwarmEngine {
             nextFeatures ?? [],
             nextAssertions,
             nowIso,
+            state.members,
           );
           const updatedRun = await this.store.updateRun(run.id, {
             assertions: nextAssertions,
@@ -5035,7 +5416,7 @@ export class SwarmEngine implements ISwarmEngine {
           ) {
             throw new SwarmProtocolError(
               "PERMISSION_DENIED",
-              `When validatorEnabled is ON, only an independent read-only "validator" (or human, or force:true) may mark assertion "${assertionId}" as "passed". Spawn or wake @validator to verify it.`,
+              `When validatorEnabled is ON, only an independent read-only "validator" (or human) may mark assertion "${assertionId}" as "passed". Spawn or wake @validator to verify it.`,
               { assertionId, callerRole },
             );
           }
@@ -5096,6 +5477,7 @@ export class SwarmEngine implements ISwarmEngine {
             state.features ?? [],
             nextAssertions,
             nowIso,
+            state.members,
           );
 
           // If an assertion explicitly failed, also ensure any milestone claiming it is unsealed & in_progress
@@ -5242,6 +5624,7 @@ export class SwarmEngine implements ISwarmEngine {
             state.features ?? [],
             nextAssertions,
             nowIso,
+            state.members,
           );
           const updatedRun = await this.store.updateRun(run.id, {
             assertions: nextAssertions,
@@ -5372,7 +5755,7 @@ export class SwarmEngine implements ISwarmEngine {
               if (isNewInSealed || isReopenedInSealed) {
                 throw new SwarmProtocolError(
                   "INVALID_INPUT",
-                  `Milestone "${milestone}" is already sealed [sealed]. Place new or follow-up work into a new follow-up milestone (e.g. "${milestone}-followup" or "misc-fixes") so zero code bypasses validation, or pass force:true.`,
+                  `Milestone "${milestone}" is already sealed [sealed]. Place new or follow-up work into a new follow-up milestone (e.g. "${milestone}-followup" or "misc-fixes") so zero code bypasses validation.`,
                   { featureId: id, milestone },
                 );
               }
@@ -5466,6 +5849,7 @@ export class SwarmEngine implements ISwarmEngine {
             orderedFeatures,
             state.assertions ?? [],
             nowIso,
+            state.members,
           );
           const updatedRun = await this.store.updateRun(run.id, {
             features: orderedFeatures,
@@ -5564,6 +5948,37 @@ export class SwarmEngine implements ISwarmEngine {
               : undefined;
 
           if (callerRole === "worker") {
+            if (
+              input.featureStatus !== undefined &&
+              input.featureStatus !== "in_progress"
+            ) {
+              throw new SwarmProtocolError(
+                "PERMISSION_DENIED",
+                `Worker "@${callerName}" may only set feature_status="in_progress" via update_feature (got "${input.featureStatus}"). Report completion via post_message with [done] and verification_evidence instead.`,
+                { featureId, callerName, featureStatus: input.featureStatus },
+              );
+            }
+            if (input.mergedCommitSha !== undefined) {
+              throw new SwarmProtocolError(
+                "PERMISSION_DENIED",
+                `Worker "@${callerName}" cannot set merged_commit_sha on feature "${featureId}".`,
+                { featureId, callerName },
+              );
+            }
+            if (input.assignedMember !== undefined && requestedAssigned === "") {
+              throw new SwarmProtocolError(
+                "PERMISSION_DENIED",
+                `Worker "@${callerName}" cannot unassign feature "${featureId}".`,
+                { featureId, callerName },
+              );
+            }
+            if (target.status === "completed" || target.status === "cancelled") {
+              throw new SwarmProtocolError(
+                "PERMISSION_DENIED",
+                `Worker "@${callerName}" cannot modify ${target.status} feature "${featureId}".`,
+                { featureId, callerName, status: target.status },
+              );
+            }
             const isAssignedToCaller = target.assignedMember === callerName;
             const isClaimingUnassigned =
               !target.assignedMember &&
@@ -5604,7 +6019,7 @@ export class SwarmEngine implements ISwarmEngine {
           ) {
             throw new SwarmProtocolError(
               "INVALID_INPUT",
-              `Milestone "${target.milestone}" is already sealed [sealed]. Create a new follow-up feature in a new milestone (e.g. "${target.milestone}-followup") instead of re-opening "${featureId}", or pass force:true.`,
+              `Milestone "${target.milestone}" is already sealed [sealed]. Create a new follow-up feature in a new milestone (e.g. "${target.milestone}-followup") instead of re-opening "${featureId}".`,
               { featureId, milestone: target.milestone },
             );
           }
@@ -5653,6 +6068,7 @@ export class SwarmEngine implements ISwarmEngine {
             reordered,
             state.assertions ?? [],
             nowIso,
+            state.members,
           );
           const updatedRun = await this.store.updateRun(run.id, {
             features: reordered,
@@ -5720,14 +6136,28 @@ export class SwarmEngine implements ISwarmEngine {
           const justification = input.justification?.trim() || undefined;
 
           if (resolution === "tracked") {
-            if (
-              !trackedFeatureId ||
-              !(state.features ?? []).some((f) => f.id === trackedFeatureId)
-            ) {
+            const targetFeature = trackedFeatureId
+              ? (state.features ?? []).find((f) => f.id === trackedFeatureId)
+              : undefined;
+            if (!trackedFeatureId || !targetFeature) {
               throw new SwarmProtocolError(
                 "INVALID_INPUT",
                 `Resolving handoff "${handoffId}" as "tracked" requires a valid "tracked_feature_id" matching an existing feature in run.features. Add the follow-up feature via upsert_features first.`,
                 { handoffId, trackedFeatureId },
+              );
+            }
+            if (
+              targetFeature.status === "completed" ||
+              targetFeature.status === "cancelled"
+            ) {
+              throw new SwarmProtocolError(
+                "INVALID_INPUT",
+                `Cannot resolve handoff "${handoffId}" as "tracked" against ${targetFeature.status} feature "${trackedFeatureId}". Track open handoff debt against an active ("pending", "in_progress", or "failed") follow-up feature, or use resolution="dismissed" with >=20 chars concrete evidence if already addressed.`,
+                {
+                  handoffId,
+                  trackedFeatureId,
+                  featureStatus: targetFeature.status,
+                },
               );
             }
           } else if (resolution === "dismissed") {
@@ -6079,6 +6509,14 @@ export class SwarmEngine implements ISwarmEngine {
     if (this.store.writeLibraryTopic) {
       return this.store.writeLibraryTopic(runId, topic, content, options);
     }
+    const incomingBytes = Buffer.byteLength(content, "utf8");
+    if (incomingBytes > MAX_LIBRARY_TOPIC_BYTES) {
+      throw new SwarmProtocolError(
+        "INVALID_INPUT",
+        `Library topic "${topic}" content exceeds maximum size of ${MAX_LIBRARY_TOPIC_BYTES} bytes (got ${incomingBytes} bytes).`,
+        { runId, topic, bytes: incomingBytes, maxBytes: MAX_LIBRARY_TOPIC_BYTES },
+      );
+    }
     const map = this.getOrInitFallbackLibrary(runId);
     let nextContent = content;
     if (options?.append) {
@@ -6090,6 +6528,14 @@ export class SwarmEngine implements ISwarmEngine {
       } else {
         nextContent = `${existing}\n${content}`;
       }
+    }
+    const totalBytes = Buffer.byteLength(nextContent, "utf8");
+    if (totalBytes > MAX_LIBRARY_TOPIC_BYTES) {
+      throw new SwarmProtocolError(
+        "INVALID_INPUT",
+        `Library topic "${topic}" exceeds maximum size of ${MAX_LIBRARY_TOPIC_BYTES} bytes after update (got ${totalBytes} bytes).`,
+        { runId, topic, bytes: totalBytes, maxBytes: MAX_LIBRARY_TOPIC_BYTES },
+      );
     }
     map.set(topic, nextContent);
     return {
@@ -6146,11 +6592,13 @@ export class SwarmEngine implements ISwarmEngine {
         outputTail = (outputTail + text).slice(-1200);
       };
 
+      const useProcessGroup = process.platform !== "win32";
       let child: ReturnType<typeof spawn>;
       try {
         child = spawn(command, {
           cwd,
           shell: true,
+          detached: useProcessGroup,
           stdio: ["ignore", "pipe", "pipe"],
           env: process.env,
         });
@@ -6165,19 +6613,27 @@ export class SwarmEngine implements ISwarmEngine {
         return;
       }
 
-      const timer = setTimeout(() => {
-        timedOut = true;
+      const killInitProcessTree = (sig: NodeJS.Signals): void => {
+        if (useProcessGroup && child.pid && child.pid > 0) {
+          try {
+            process.kill(-child.pid, sig);
+            return;
+          } catch {
+            // fall back to child.kill below
+          }
+        }
         try {
-          child.kill("SIGTERM");
+          child.kill(sig);
         } catch {
           // ignore
         }
+      };
+
+      const timer = setTimeout(() => {
+        timedOut = true;
+        killInitProcessTree("SIGTERM");
         const forceKill = setTimeout(() => {
-          try {
-            child.kill("SIGKILL");
-          } catch {
-            // ignore
-          }
+          killInitProcessTree("SIGKILL");
         }, 200);
         forceKill.unref?.();
         finish({
@@ -7037,13 +7493,13 @@ export class SwarmEngine implements ISwarmEngine {
 
       let handle: PersistentAgentHandle;
       try {
-        // Auto-recover missing isolated worktree from existing branch before spawning replacement session
+        // Auto-recover missing or broken (missing `.git`) isolated worktree from existing branch before spawning replacement session
         if (
           isIsolatedWorktreeWorkspace(member.workspace) &&
           member.cwd &&
           member.cwd !== this.worktree.repoRoot &&
           member.branch &&
-          !existsSync(member.cwd)
+          (!existsSync(member.cwd) || !existsSync(path.join(member.cwd, ".git")))
         ) {
           await this.worktree.createWorktree({
             branch: member.branch,
@@ -7938,9 +8394,16 @@ export class SwarmEngine implements ISwarmEngine {
       live.turnActive = false;
     }
     if (isStillValidTurn()) {
+      const assignedInProgress = (updated.features ?? [])
+        .filter((f) => f.assignedMember === memberName && f.status === "in_progress")
+        .map((f) => f.id);
+      const featHint =
+        assignedInProgress.length > 0
+          ? ` (feature ${assignedInProgress.join(", ")} remains in_progress for retry)`
+          : "";
       await this.postMonitorOrchestratorAlert(
         runId,
-        `@${ORCHESTRATOR_NAME} [error] Member ${memberName} encountered an error: ${errorText}. Switch its model or message it to retry.`,
+        `@${ORCHESTRATOR_NAME} [error] Member ${memberName} encountered an error${featHint}: ${errorText}. Switch its model or message it to retry.`,
         "update",
       );
     }
@@ -7995,9 +8458,16 @@ export class SwarmEngine implements ISwarmEngine {
         data: { error: errMsg },
       });
       await this.refreshCache(updated);
+      const assignedInProgress = (updated.features ?? [])
+        .filter((f) => f.assignedMember === memberName && f.status === "in_progress")
+        .map((f) => f.id);
+      const featHint =
+        assignedInProgress.length > 0
+          ? ` (feature ${assignedInProgress.join(", ")} remains in_progress for retry)`
+          : "";
       await this.postMonitorOrchestratorAlert(
         runId,
-        `@${ORCHESTRATOR_NAME} [error] Member ${memberName} failed to launch: ${errMsg}`,
+        `@${ORCHESTRATOR_NAME} [error] Member ${memberName} failed to launch${featHint}: ${errMsg}`,
         "update",
       );
     } catch {
@@ -9146,7 +9616,7 @@ export class SwarmEngine implements ISwarmEngine {
         verificationEvidence,
       }) => {
         const latest = assertBridgeActive();
-        const isDonePost = kind === "done" || /^\s*\[done\]/i.test(text);
+        const isDonePost = kind === "done" || DONE_PREFIX_RE.test(text);
         const knownMembers = this.cachedRun
           ? this.collectKnownMentionHandles(this.cachedRun)
           : undefined;
@@ -9608,6 +10078,139 @@ export class SwarmEngine implements ISwarmEngine {
       return await fn();
     } finally {
       release();
+    }
+  }
+
+  private async withRepoGitLock<T>(fn: () => Promise<T>): Promise<T> {
+    const prev = this.repoGitLock;
+    let release!: () => void;
+    this.repoGitLock = new Promise<void>((r) => {
+      release = r;
+    });
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  private async assertMissionGoalGatesForCompletion(
+    currentRun: SwarmRunState,
+  ): Promise<void> {
+    let snapshot = this.getSnapshot();
+    if (snapshot.workingMemberNames.length > 0) {
+      for (
+        let attempt = 0;
+        attempt < 5 && snapshot.workingMemberNames.length > 0;
+        attempt++
+      ) {
+        await new Promise<void>((resolve) => {
+          const t = setTimeout(resolve, 5);
+          t.unref?.();
+        });
+        snapshot = this.getSnapshot();
+      }
+    }
+
+    // Gate A: Working members
+    if (snapshot.workingMemberNames.length > 0) {
+      throw new SwarmProtocolError(
+        "INVALID_INPUT",
+        `Cannot complete Swarm while member(s) are still working: ${snapshot.workingMemberNames.map((n) => "@" + n).join(", ")}. Call swarm_wait to let them finish, or stop/kill them first.`,
+      );
+    }
+
+    // Gate B: Unmerged worktree branches with commits ahead of baseBranch
+    const unmergedAhead = await this.getUnmergedMembersWithCommits();
+    if (unmergedAhead.length > 0) {
+      const labels = unmergedAhead.map(
+        ({ member: m, commitsAhead }) =>
+          `@${m.name} (${m.branch ?? m.workspace}, ${commitsAhead} commit${commitsAhead === 1 ? "" : "s"} ahead)`,
+      );
+      throw new SwarmProtocolError(
+        "INVALID_INPUT",
+        `Cannot complete Swarm while unmerged worktree branch(es) have commits ahead of ${currentRun.baseBranch}: ${labels.join(", ")}. Merge ready branches via swarm{action:"merge", name} or kill obsolete branches via swarm{action:"kill", name} first.`,
+        {
+          unmergedMembers: unmergedAhead.map(({ member: m, commitsAhead }) => ({
+            name: m.name,
+            branch: m.branch,
+            commitsAhead,
+          })),
+        },
+      );
+    }
+
+    // Gate C: Incomplete Features
+    if (currentRun.features && currentRun.features.length > 0) {
+      const incompleteFeatures = currentRun.features.filter(
+        (f) =>
+          f.status === "pending" ||
+          f.status === "in_progress" ||
+          f.status === "failed",
+      );
+      if (incompleteFeatures.length > 0) {
+        throw new SwarmProtocolError(
+          "INVALID_INPUT",
+          `Cannot complete Mission while ${incompleteFeatures.length} feature(s) remain incomplete: ${incompleteFeatures.map((f) => `${f.id} [${f.status}]`).join(", ")}. Complete or cancel remaining features via swarm{action:"mission"} before calling done.`,
+          {
+            incompleteFeatures: incompleteFeatures.map((f) => ({
+              id: f.id,
+              status: f.status,
+            })),
+          },
+        );
+      }
+    }
+
+    // Gate D: Open Handoff Tech Debt
+    const openTechDebt = (currentRun.handoffItems ?? []).filter(
+      (h) =>
+        h.resolution === "open" &&
+        (h.type === "discovered_issue" || h.type === "incomplete_work"),
+    );
+    if (openTechDebt.length > 0) {
+      throw new SwarmProtocolError(
+        "INVALID_INPUT",
+        `Cannot complete Mission with ${openTechDebt.length} open handoff tech-debt item(s): ${openTechDebt.map((h) => `${h.id} (${h.type} from @${h.sourceMember}: "${h.summary.slice(0, 72)}")`).join("; ")}. Track follow-up features via swarm{action:"mission", mission_op:"upsert_features"} and resolve each item via swarm{action:"mission", mission_op:"resolve_handoff"} before calling done.`,
+        { openHandoffIds: openTechDebt.map((h) => h.id) },
+      );
+    }
+
+    // Gate E: 100% Validation Contract VAL-* Passed & Claimed by Completed Features
+    if (currentRun.assertions && currentRun.assertions.length > 0) {
+      const unpassedAssertions = currentRun.assertions.filter(
+        (a) => a.status !== "passed",
+      );
+      const completedFulfills = new Set(
+        (currentRun.features ?? [])
+          .filter((f) => f.status === "completed")
+          .flatMap((f) => f.fulfills),
+      );
+      const unclaimedByCompleted = currentRun.assertions.filter(
+        (a) => !completedFulfills.has(a.id),
+      );
+      if (unpassedAssertions.length > 0 || unclaimedByCompleted.length > 0) {
+        const reasons: string[] = [];
+        if (unpassedAssertions.length > 0) {
+          reasons.push(
+            `unpassed VAL-* assertions: ${unpassedAssertions.map((a) => `${a.id} [${a.status}]`).join(", ")} (verify via @validator calling swarm{action:"mission", mission_op:"verify_assertion"}, or use audited mission_op:"override_assertion" with >=30 char justification)`,
+          );
+        }
+        if (unclaimedByCompleted.length > 0) {
+          reasons.push(
+            `VAL-* assertions not claimed in fulfills[] of any "completed" feature: ${unclaimedByCompleted.map((a) => a.id).join(", ")} (ensure completed features claim 100% of assertions via swarm{action:"mission", mission_op:"upsert_features"})`,
+          );
+        }
+        throw new SwarmProtocolError(
+          "INVALID_INPUT",
+          `Cannot complete Mission until 100% of Validation Contract passes and is claimed: ${reasons.join("; ")}.`,
+          {
+            unpassedAssertionIds: unpassedAssertions.map((a) => a.id),
+            unclaimedAssertionIds: unclaimedByCompleted.map((a) => a.id),
+          },
+        );
+      }
     }
   }
 

@@ -63,7 +63,7 @@ import {
   validateChannelName,
   validateMemberName,
 } from "../src/store/index.js";
-import { isPrototypeKey } from "../src/store/swarm-store.js";
+import { isPrototypeKey, MAX_LIBRARY_TOPIC_BYTES } from "../src/store/swarm-store.js";
 import {
   isSwarmProtocolError,
   type BoardMessage,
@@ -3297,5 +3297,41 @@ describe("v0.3.7 store, board, ledger, settings & worktree regression fixes", ()
     assert.equal(td.removed.length, 2);
     assert.deepEqual(observedForceFlags, [false, false]);
     assert.equal(cacheMap.has(path.resolve(clonePath)), false);
+  });
+
+  it("v1.0.0: enforces MAX_LIBRARY_TOPIC_BYTES safety cap on SwarmStore.writeLibraryTopic (direct write & append)", async () => {
+    const projectDir = await makeTempDir("pi-swarm-v100-libcap-");
+    const store = new SwarmStore(projectDir);
+    const run = await store.createRun({
+      id: "run-lib-cap",
+      title: "Library Cap Test",
+      objective: "Prevent runaway log dumps into library/*.md",
+      baseBranch: "main",
+      ownerSessionId: "sess-cap",
+    });
+
+    assert.equal(MAX_LIBRARY_TOPIC_BYTES, 256 * 1024);
+
+    // 1. Direct write exceeding MAX_LIBRARY_TOPIC_BYTES is rejected with INVALID_INPUT
+    const oversized = "x".repeat(MAX_LIBRARY_TOPIC_BYTES + 1);
+    await assert.rejects(
+      () => store.writeLibraryTopic(run.id, "testing", oversized),
+      (err) => assertProtocolCode(err, "INVALID_INPUT"),
+    );
+
+    // 2. Write right up to the limit succeeds
+    const nearLimit = "a".repeat(MAX_LIBRARY_TOPIC_BYTES - 64);
+    const written = await store.writeLibraryTopic(run.id, "notes", nearLimit);
+    assert.equal(written.content, nearLimit);
+
+    // 3. Appending past MAX_LIBRARY_TOPIC_BYTES fails cleanly without corrupting existing topic on disk
+    await assert.rejects(
+      () =>
+        store.writeLibraryTopic(run.id, "notes", "b".repeat(128), {
+          append: true,
+        }),
+      (err) => assertProtocolCode(err, "INVALID_INPUT"),
+    );
+    assert.equal(await store.readLibraryTopic(run.id, "notes"), nearLimit);
   });
 });

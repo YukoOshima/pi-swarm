@@ -226,7 +226,7 @@ export const SwarmToolParamsSchema = Type.Object({
   workspace: Type.Optional(
     stringEnum(WORKSPACE_MODES, {
       description:
-        'Workspace mode for action="add": "inherit" (default, shared repo), "share" (isolated worktree for concurrent editing), or "branch" (isolated worktree).',
+        'Workspace mode for action="add" or mission_op="dispatch_ready": "inherit" (default — shared workspace on disjoint filesOwned, zero Git worktrees), "share" (explicit opt-in isolated Git worktree when concurrent workers genuinely must edit overlapping files), or "branch" (explicit opt-in isolated branch clone for experiments).',
       default: "inherit",
     }),
   ),
@@ -529,13 +529,13 @@ export const SwarmToolParamsSchema = Type.Object({
       minimum: 1,
       maximum: 64,
       description:
-        'Optional cap on parallel workers spawned in one batch for mission_op="dispatch_ready".',
+        'Optional cap on parallel workers spawned in one batch for mission_op="dispatch_ready" (defaults to workspace="inherit" on disjoint filesOwned with zero Git worktrees unless workspace="share"|"branch" is explicitly passed).',
     }),
   ),
   force: Type.Optional(
     Type.Boolean({
       description:
-        'Force override when explicitly authorized (for action="kill", action="mission", or human /swarm done --force; LLM orchestrator cannot use force:true on action="done").',
+        'Force override when explicitly authorized (for action="kill" on dirty worktrees, or human CLI force overrides; LLM agents cannot pass force:true on action="mission" or action="done").',
     }),
   ),
   summary: Type.Optional(
@@ -1002,6 +1002,7 @@ function buildManageMissionInputFromParams(
       ? { libraryAppend: params.library_append }
       : {}),
     ...(params.max_dispatch !== undefined ? { maxDispatch: params.max_dispatch } : {}),
+    ...(params.workspace !== undefined ? { workspace: params.workspace } : {}),
     ...(hostContext !== undefined ? { hostContext } : {}),
     ...(params.force !== undefined ? { force: params.force } : {}),
     callerName,
@@ -1338,6 +1339,9 @@ function renderSwarmCall(
           metaParts.push(`@${args.assigned_member.trim().replace(/^@/, "")}`);
         }
       } else if (missionOp === "dispatch_ready") {
+        if (typeof args?.workspace === "string" && args.workspace.trim()) {
+          metaParts.push(args.workspace.trim());
+        }
         if (typeof args?.max_dispatch === "number" && Number.isFinite(args.max_dispatch)) {
           metaParts.push(`max=${Math.floor(args.max_dispatch)}`);
         }
@@ -1929,13 +1933,14 @@ export function createSwarmTool(deps: SwarmToolDeps): ToolDefinition {
     name: SWARM_TOOL,
     label: "Swarm",
     description:
-      'Manage the dynamic Pi Swarm & Mission Goal Engine: set run title/direction ("title"), spawn workers/validators/sharded groups with optional context forking or isolated worktrees ("add"), inspect roster/channels ("status"), list models ("models"), hot-switch & resume a waiting member model ("model"), steer/redirect a member mid-flight ("steer"), stop a member ("stop"), permanently retire a member ("kill"), land a share/branch worktree ("merge"), manage channels ("channel"), manage dynamic Mission VAL-* assertions/features/handoffs/manifest ("mission"), or complete the run ("done").',
+      'Manage the dynamic Pi Swarm & Mission Goal Engine: set run title/direction ("title"), spawn workers/validators/sharded groups ("add", defaulting to workspace="inherit" shared workspace with zero Git worktrees unless workspace="share"|"branch" is explicitly requested), inspect roster/channels ("status"), list models ("models"), hot-switch & resume a waiting member model ("model"), steer/redirect a member mid-flight ("steer"), stop a member ("stop"), permanently retire a member ("kill"), land a share/branch worktree ("merge"), manage channels ("channel"), manage dynamic Mission VAL-* assertions/features/handoffs/manifest or dispatch ready features ("mission"; dispatch_ready defaults to workspace="inherit" on disjoint filesOwned), or complete the run ("done").',
     promptSnippet:
       "Manage dynamic swarm members, mission features/assertions/handoffs, steering, models, worktrees, channels, and run lifecycle.",
     promptGuidelines: [
-      `Use ${SWARM_TOOL} with action="add" to delegate technical work to named workers or independent read-only validators (workspace="share" for shared worktrees or workspace="branch" for isolated clones; fork="<member>|orchestrator" to branch conversation history).`,
-      `Use action="mission" to inspect or dynamically evolve VAL-* assertions, feature queue, operational commands/boundaries, and resolve open worker handoff items. Use action="steer" to redirect mid-flight, action="merge" to land worktrees, action="kill" once integrated, and action="done" when all features and VAL-* assertions pass.`,
+      `Use ${SWARM_TOOL} with action="add" or mission_op="dispatch_ready" to delegate technical work to named workers or independent read-only validators. Both default to workspace="inherit" (shared workspace on disjoint filesOwned, zero Git worktrees); pass workspace="share" or "branch" only as explicit opt-in when concurrent workers genuinely must edit overlapping files or run isolated branch experiments, and fork="<member>|orchestrator" to branch conversation history.`,
+      `Use action="mission" to inspect or dynamically evolve VAL-* assertions, feature queue, operational commands/boundaries, and resolve open worker handoff items. Use action="steer" to redirect mid-flight, action="merge" to land opt-in share/branch worktrees, action="kill" once integrated, and action="done" when all features and VAL-* assertions pass.`,
     ],
+    executionMode: "sequential",
     parameters: SwarmToolParamsSchema,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       return runToolSafe(async () => {
@@ -2299,6 +2304,13 @@ export function createSwarmTool(deps: SwarmToolDeps): ToolDefinition {
               throw new SwarmProtocolError(
                 "NOT_FOUND",
                 "Mission Goal Engine management is not available on this SwarmEngine instance.",
+              );
+            }
+            if (params.force === true && callerRole !== "human") {
+              throw new SwarmProtocolError(
+                "PERMISSION_DENIED",
+                `Role "${callerRole}" (@${callerName}) cannot pass force:true on swarm{action:"mission"}. Only human callers may force-override mission guards; for justified VAL-* exceptions use audited swarm{action:"mission", mission_op:"override_assertion", assertion_id, justification}.`,
+                { callerRole },
               );
             }
             const missionInput = buildManageMissionInputFromParams(
@@ -3203,6 +3215,7 @@ export function createMemberScopedTools(
   const scopedSwarmTool = defineTool({
     name: SWARM_TOOL,
     label: "Swarm",
+    executionMode: "sequential",
     description:
       member.role === "validator"
         ? 'Scoped Swarm helper tool for read-only validators: inspect roster ("status"), list models ("models"), inspect Mission status, read/write shared library topics, or verify VAL-* assertions ("mission"), spawn read-only validator helpers ("add"), switch model for self or own helpers ("model"), steer/stop/kill own helpers ("steer"/"stop"/"kill"), or list/join/leave channels ("channel").'
@@ -3552,6 +3565,13 @@ export function createMemberScopedTools(
               throw new SwarmProtocolError(
                 "PERMISSION_DENIED",
                 `Mission Goal Engine management is not available in this member bridge context.`,
+              );
+            }
+            if (params.force === true) {
+              throw new SwarmProtocolError(
+                "PERMISSION_DENIED",
+                `Member "@${member.name}" (${member.role}) cannot pass force:true on swarm{action:"mission"}.`,
+                { callerRole: member.role, callerName: member.name },
               );
             }
             const missionInput = buildManageMissionInputFromParams(

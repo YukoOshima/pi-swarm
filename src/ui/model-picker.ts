@@ -1059,14 +1059,14 @@ export class SwarmModelPickerView implements Component, Focusable {
         this.tui.requestRender();
         return;
       }
-      if (this.searchQuery.length === 0) {
-        const altTabKeys = ["1", "2", "3", "4"] as const;
-        for (let i = 0; i < altTabKeys.length; i++) {
-          if (matchesKey(data, Key.alt(altTabKeys[i]!))) {
-            this.jumpToTab(i);
-            return;
-          }
+      const altTabKeys = ["1", "2", "3", "4"] as const;
+      for (let i = 0; i < altTabKeys.length; i++) {
+        if (matchesKey(data, Key.alt(altTabKeys[i]!))) {
+          this.jumpToTab(i);
+          return;
         }
+      }
+      if (this.searchQuery.length === 0) {
         if (matchesKey(data, Key.right)) {
           this.switchTab(1);
           return;
@@ -2027,8 +2027,72 @@ export class SwarmHubView implements Component, Focusable {
     });
   }
 
+  private formatHubGoalBadges(
+    run: NonNullable<SwarmSnapshot["run"]>,
+    styled: boolean,
+  ): string {
+    const features = run.features ?? [];
+    const nonCancelled = features.filter((f) => f.status !== "cancelled");
+    const featTotal =
+      features.length > 0
+        ? nonCancelled.length > 0
+          ? nonCancelled.length
+          : features.length
+        : 0;
+    const featDone = nonCancelled.filter((f) => f.status === "completed").length;
+    const featFailed = nonCancelled.filter((f) => f.status === "failed").length;
+
+    const assertions = run.assertions ?? [];
+    const valTotal = assertions.length;
+    const valPassed = assertions.filter((a) => a.status === "passed").length;
+    const valFailed = assertions.filter((a) => a.status === "failed").length;
+    const valOverridden = assertions.filter((a) => Boolean(a.overridden)).length;
+
+    const sealedCount = (run.milestones ?? []).filter((m) =>
+      Boolean(m.sealed),
+    ).length;
+    const openDebt = (run.handoffItems ?? []).filter(
+      (h) =>
+        h.resolution === "open" &&
+        (h.type === "discovered_issue" || h.type === "incomplete_work"),
+    ).length;
+
+    const parts: string[] = [];
+    if (features.length > 0) {
+      const raw = `Feat ${featDone}/${featTotal}`;
+      parts.push(
+        styled
+          ? `${this.theme.fg("muted", "Feat")} ${this.theme.fg(featFailed > 0 ? "error" : featDone === featTotal && featTotal > 0 ? "success" : "accent", `${featDone}/${featTotal}`)}`
+          : raw,
+      );
+    }
+    if (assertions.length > 0) {
+      const ovrRaw = valOverridden > 0 ? ` (${valOverridden} ovr)` : "";
+      parts.push(
+        styled
+          ? `${this.theme.fg("muted", "VAL")} ${this.theme.fg(valFailed > 0 ? "error" : valPassed === valTotal && valTotal > 0 ? "success" : "accent", `${valPassed}/${valTotal}`)}${ovrRaw ? this.theme.fg("warning", ovrRaw) : ""}`
+          : `VAL ${valPassed}/${valTotal}${ovrRaw}`,
+      );
+    }
+    if (sealedCount > 0) {
+      const sRaw = `[S] ${sealedCount}`;
+      parts.push(styled ? this.theme.fg("success", sRaw) : sRaw);
+    }
+    if (openDebt > 0) {
+      const dRaw = `!${openDebt} debt`;
+      parts.push(styled ? this.theme.fg("warning", dRaw) : dRaw);
+    }
+    const sep = styled ? this.theme.fg("dim", " · ") : " · ";
+    return parts.join(sep);
+  }
+
   private rebuildMenu(): void {
     const run = this.snapshot.run;
+    const hasGoalContract = Boolean(
+      run &&
+        ((run.features && run.features.length > 0) ||
+          (run.assertions && run.assertions.length > 0)),
+    );
     const items: HubMenuItem[] = [];
     if (run && this.hasActiveOrPausedRun()) {
       const isCrashRecoveredUnstarted =
@@ -2036,7 +2100,12 @@ export class SwarmHubView implements Component, Focusable {
         this.snapshot.workingMemberNames.length === 0 &&
         this.options.activatedRun === false;
       items.push(
-        { id: "ui", label: "◆ Open Mission Control (4-Tab UI)" },
+        {
+          id: "ui",
+          label: hasGoalContract
+            ? "◆ Open Mission Control (4-Tab UI · [v] Contract)"
+            : "◆ Open Mission Control (4-Tab UI)",
+        },
         { id: "models", label: "◇ Configure Mission Models & Effort [Alt+M]" },
         { id: "tweak", label: "▸ Tweak Plan / Add Members" },
         run.status === "paused" || isCrashRecoveredUnstarted
@@ -2071,7 +2140,12 @@ export class SwarmHubView implements Component, Focusable {
         { id: "models", label: "◇ Configure Mission Models & Effort [Alt+M]" },
       );
       if (run) {
-        items.push({ id: "ui", label: "◆ Inspect Run (4-Tab UI)" });
+        items.push({
+          id: "ui",
+          label: hasGoalContract
+            ? "◆ Inspect Run & Contract (4-Tab UI · [v])"
+            : "◆ Inspect Run (4-Tab UI)",
+        });
         items.push({ id: "teardown", label: "✗ Teardown Clean Worktrees" });
       }
       if (this.runs.length > 0) {
@@ -2638,6 +2712,8 @@ export class SwarmHubView implements Component, Focusable {
     const standbyActive = this.isOrchestratorStandbyActive();
     if (run) {
       const title = sanitizePlainText(run.title || run.objective) || run.id;
+      const hubGoalStyled = this.formatHubGoalBadges(run, true);
+      const hubGoalPlain = this.formatHubGoalBadges(run, false);
       if (activeOrPaused) {
         const badge = formatRunStatusBadge(run.status, this.theme);
         const leftHeader = `${this.theme.fg("accent", this.theme.bold(title))} [${badge}]`;
@@ -2676,9 +2752,11 @@ export class SwarmHubView implements Component, Focusable {
               mergedCount > 0
                 ? this.theme.fg("success", `${mergedCount} merged`)
                 : this.theme.fg("dim", "0 merged");
+            const goalInline =
+              hubGoalStyled && maxInner < 12 ? `${sep}${hubGoalStyled}` : "";
             body.push(
               fitLine(
-                `${workShort}${sep}${waitShort}${sep}${mergeShort}`,
+                `${workShort}${sep}${waitShort}${sep}${mergeShort}${goalInline}`,
                 innerWidth,
               ),
             );
@@ -2699,16 +2777,32 @@ export class SwarmHubView implements Component, Focusable {
               !compact && stoppedCount > 0
                 ? `${sep}${this.theme.fg("warning", `■ ${stoppedCount} stopped`)}`
                 : "";
+            const goalInline =
+              hubGoalStyled && maxInner < 12 ? `${sep}${hubGoalStyled}` : "";
             body.push(
               fitLine(
-                `${this.theme.fg("muted", "Pipeline: ")}${workStyled}${sep}${waitStyled}${sep}${mergeStyled}${stopStyled}`,
+                `${this.theme.fg("muted", "Pipeline: ")}${workStyled}${sep}${waitStyled}${sep}${mergeStyled}${stopStyled}${goalInline}`,
+                innerWidth,
+              ),
+            );
+          }
+          if (hubGoalStyled && maxInner >= 12) {
+            const contractHint =
+              innerWidth >= 70
+                ? ` ${this.theme.fg("dim", "[Mission Control → v]")}`
+                : "";
+            body.push(
+              fitLine(
+                `${this.theme.fg("muted", "Goal:     ")}${this.theme.fg("accent", "◆")} ${hubGoalStyled}${contractHint}`,
                 innerWidth,
               ),
             );
           }
         }
       } else {
-        const summary = `${run.id} · ${run.status} · working:${this.snapshot.workingMemberNames.length} waiting:${this.snapshot.waitingMemberNames.length} · board #${this.snapshot.boardHead}`;
+        const summary = hubGoalPlain
+          ? `${run.id} · ${run.status} · ${hubGoalPlain} · board #${this.snapshot.boardHead}`
+          : `${run.id} · ${run.status} · working:${this.snapshot.workingMemberNames.length} waiting:${this.snapshot.waitingMemberNames.length} · board #${this.snapshot.boardHead}`;
         body.push(
           fitLine(
             `${this.theme.fg("accent", this.theme.bold(title))}  ${this.theme.fg("dim", summary)}`,

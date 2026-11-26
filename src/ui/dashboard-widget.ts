@@ -529,6 +529,22 @@ function selectGoalPreviewFeatures(
     .map((item) => item.f);
 }
 
+function selectNotableAssertions(
+  assertions: readonly MissionAssertion[],
+): MissionAssertion[] {
+  const rank = (a: MissionAssertion): number => {
+    if (a.overridden) return 0;
+    if (a.status === "failed") return 1;
+    if (a.status === "blocked") return 2;
+    return 3;
+  };
+  return assertions
+    .filter(
+      (a) => Boolean(a.overridden) || a.status === "failed" || a.status === "blocked",
+    )
+    .sort((a, b) => rank(a) - rank(b));
+}
+
 function resolveEffectiveRoleModels(
   snapshot: SwarmSnapshot,
   run?: SwarmRunState | null,
@@ -788,28 +804,55 @@ export class SwarmDashboardComponent implements Component {
       return lines;
     }
 
-    const metaParts: string[] = [];
+    const sep = this.theme.fg("dim", " · ");
     const goal = summarizeGoalProgress(run);
-    if (goal.hasCompactBadges) {
-      metaParts.push(
-        formatCompactGoalBadges(goal, {
+    const goalBadge = goal.hasCompactBadges
+      ? formatCompactGoalBadges(goal, {
           includeBar: false,
           includeSealed: false,
           theme: this.theme,
-        }),
-      );
+        })
+      : "";
+    const fleetBadge =
+      mergedCount > 0
+        ? this.theme.fg("success", `${mergedCount} merged`)
+        : memberCount > 0
+          ? this.theme.fg("muted", `${memberCount} members`)
+          : "";
+    const usageBadge = usage ? this.theme.fg("dim", usage) : "";
+    const verboseHint = this.theme.fg("dim", "Alt+W expand · Alt+S panel");
+    const shortHint = this.theme.fg("dim", "Alt+W/S");
+    const boardBadge = this.theme.fg("dim", `Board:#${snapshot.boardHead}`);
+
+    const minLeftWidth = Math.min(
+      visibleWidth(left),
+      Math.max(24, Math.floor(width * 0.38)),
+    );
+    const maxRightWidth = Math.max(0, width - minLeftWidth - 2);
+
+    const candidateLists: string[][] = [
+      ...(width >= 104
+        ? [[goalBadge, fleetBadge, usageBadge, verboseHint]]
+        : []),
+      [goalBadge, fleetBadge, usageBadge, shortHint],
+      [goalBadge, fleetBadge, usageBadge],
+      [goalBadge, fleetBadge],
+      [goalBadge || fleetBadge],
+      [boardBadge],
+    ];
+
+    let right = fitLine(boardBadge, maxRightWidth);
+    for (const parts of candidateLists) {
+      const filtered = parts.filter(Boolean);
+      if (filtered.length === 0) continue;
+      const joined = filtered.join(sep);
+      if (visibleWidth(joined) <= maxRightWidth) {
+        right = joined;
+        break;
+      }
     }
-    if (mergedCount > 0) {
-      metaParts.push(this.theme.fg("success", `${mergedCount} merged`));
-    } else if (memberCount > 0) {
-      metaParts.push(this.theme.fg("muted", `${memberCount} members`));
-    }
-    if (usage) {
-      metaParts.push(this.theme.fg("dim", usage));
-    }
-    metaParts.push(this.theme.fg("dim", "Alt+W expand · Alt+S panel"));
-    const right = metaParts.join(this.theme.fg("dim", " · "));
-    lines.push(fitLine(joinColumns(left, right, width), width));
+
+    lines.push(fitLine(joinColumns(left, right, width, 2), width));
     if (this.state.orchestratorStandby && !this.state.draftActive) {
       lines.push(...this.renderStandbyBanner(width));
     }
@@ -1134,14 +1177,25 @@ export class SwarmDashboardComponent implements Component {
             ),
           );
         } else if (goal.features.length > 0) {
-          const pillFeats = selectGoalPreviewFeatures(goal.features, 4).map((f) => {
+          const notableVals = selectNotableAssertions(goal.assertions);
+          const featLimit = notableVals.length > 0 ? 3 : 4;
+          const pillFeats = selectGoalPreviewFeatures(goal.features, featLimit).map((f) => {
             const g = formatFeatureStatusGlyph(f.status, this.theme);
             const owner =
-              innerWidth >= 88 && f.assignedMember
+              innerWidth >= 88 && f.assignedMember && notableVals.length === 0
                 ? ` ${this.theme.fg("dim", `(@${sanitizePlainText(f.assignedMember)})`)}`
                 : "";
             return `${g} ${this.theme.bold(sanitizePlainText(f.id))}${owner}`;
           });
+          if (notableVals.length > 0) {
+            const topVal = notableVals[0]!;
+            const ovrTag = topVal.overridden
+              ? ` ${this.theme.fg("warning", "[OVERRIDE]")}`
+              : "";
+            pillFeats.push(
+              `${formatAssertionStatusGlyph(topVal.status, this.theme)} ${this.theme.bold(sanitizePlainText(topVal.id))}${ovrTag}`,
+            );
+          }
           body.push(
             fitLine(`  ${pillFeats.join(this.theme.fg("dim", " · "))}`, innerWidth),
           );
@@ -1178,16 +1232,28 @@ export class SwarmDashboardComponent implements Component {
 
         const minRosterAndBoardReserve =
           (members.length > 0 ? 4 : 2) + (recentBoard.length > 0 ? 2 : 0);
-        const itemSlotBudget = Math.min(
-          maxInner >= 20 ? 4 : 3,
-          Math.max(0, maxInner - body.length - minRosterAndBoardReserve),
+        const remainingGoalBudget = Math.max(
+          0,
+          maxInner - body.length - minRosterAndBoardReserve,
         );
+        const notableAssertions = selectNotableAssertions(goal.assertions);
+        const itemSlotBudget = Math.min(
+          maxInner >= 20 ? (notableAssertions.length > 0 ? 5 : 4) : 4,
+          remainingGoalBudget,
+        );
+        let usedGoalSlots = 0;
+
         if (itemSlotBudget > 0 && goal.features.length > 0) {
+          const reservedForNotable =
+            notableAssertions.length > 0 && itemSlotBudget >= 2
+              ? Math.min(notableAssertions.length, itemSlotBudget >= 5 ? 2 : 1)
+              : 0;
+          const featSlotBudget = Math.max(1, itemSlotBudget - reservedForNotable);
           const sealedSet = new Set(goal.sealedMilestoneLabels);
           const previewCount =
-            goal.features.length > itemSlotBudget && itemSlotBudget >= 2
-              ? itemSlotBudget - 1
-              : itemSlotBudget;
+            goal.features.length > featSlotBudget && featSlotBudget >= 2
+              ? featSlotBudget - 1
+              : featSlotBudget;
           const previewFeats = selectGoalPreviewFeatures(goal.features, previewCount);
           for (const f of previewFeats) {
             const glyph = formatFeatureStatusGlyph(f.status, this.theme);
@@ -1208,8 +1274,12 @@ export class SwarmDashboardComponent implements Component {
                 innerWidth,
               ),
             );
+            usedGoalSlots += 1;
           }
-          if (goal.features.length > previewFeats.length && body.length < maxInner - minRosterAndBoardReserve) {
+          if (
+            goal.features.length > previewFeats.length &&
+            usedGoalSlots < itemSlotBudget - reservedForNotable
+          ) {
             const hidden = goal.features.length - previewFeats.length;
             body.push(
               fitLine(
@@ -1217,20 +1287,35 @@ export class SwarmDashboardComponent implements Component {
                 innerWidth,
               ),
             );
+            usedGoalSlots += 1;
           }
-        } else if (itemSlotBudget > 0 && goal.assertions.length > 0) {
-          for (const a of goal.assertions.slice(0, itemSlotBudget)) {
+        }
+
+        const remainingAssertionSlots = Math.max(0, itemSlotBudget - usedGoalSlots);
+        if (remainingAssertionSlots > 0 && goal.assertions.length > 0) {
+          const assertionsToRender =
+            goal.features.length === 0
+              ? [
+                  ...notableAssertions,
+                  ...goal.assertions.filter((a) => !notableAssertions.includes(a)),
+                ]
+              : notableAssertions.length > 0
+                ? notableAssertions
+                : goal.assertions;
+          for (const a of assertionsToRender.slice(0, remainingAssertionSlots)) {
             const glyph = formatAssertionStatusGlyph(a.status, this.theme);
             const ovrBadge = a.overridden
               ? ` ${this.theme.fg("warning", "[OVERRIDE]")}`
               : "";
-            const ovrJust =
+            const detailText =
               a.overridden && a.overrideJustification
                 ? ` ${this.theme.fg("dim", `— ${sanitizePlainText(a.overrideJustification)}`)}`
-                : "";
+                : (a.status === "failed" || a.status === "blocked") && a.evidence
+                  ? ` ${this.theme.fg("dim", `— ${sanitizePlainText(a.evidence)}`)}`
+                  : "";
             body.push(
               fitLine(
-                `  ${glyph} ${this.theme.bold(sanitizePlainText(a.id))}${ovrBadge}: ${sanitizePlainText(a.title)}${ovrJust}`,
+                `  ${glyph} ${this.theme.bold(sanitizePlainText(a.id))}${ovrBadge}: ${sanitizePlainText(a.title)}${detailText}`,
                 innerWidth,
               ),
             );
@@ -1292,7 +1377,7 @@ export class SwarmDashboardComponent implements Component {
           header: "Model",
           minWidth: 12,
           maxWidth: 26,
-          flex: 1,
+          flex: innerWidth < 96 ? 0 : 1,
           priority: 75,
           render: (m) => {
             if (!m.model) return this.theme.fg("dim", "default");
@@ -1322,7 +1407,7 @@ export class SwarmDashboardComponent implements Component {
           minWidth: 5,
           maxWidth: 6,
           align: "right",
-          priority: 55,
+          priority: 42,
           render: (m) => this.theme.fg("muted", String(m.turns)),
         },
         {
@@ -1331,7 +1416,7 @@ export class SwarmDashboardComponent implements Component {
           minWidth: 14,
           maxWidth: 36,
           flex: 2,
-          priority: 45,
+          priority: 58,
           render: (m) => {
             const text =
               m.error ||
@@ -1380,7 +1465,7 @@ export class SwarmDashboardComponent implements Component {
         header: true,
         theme: this.theme,
         maxRows: maxRosterRows,
-        columnGap: innerWidth < 60 || (innerWidth >= 88 && innerWidth < 104) ? 1 : 2,
+        columnGap: innerWidth < 104 ? 1 : 2,
       });
       // Guard against dataSlots === 1 with members.length === 2 producing an unwanted "+1 more row"
       if (tableLines.length > tableLineBudget) {
@@ -2123,7 +2208,7 @@ export function formatZeroTurnModelsView(
 
   out.push("");
   out.push(
-    "_Tip: Hot-switch any `waiting` member's model with `/swarm model <member> <model>` or press `[m]` in `/swarm tasks`._",
+    "_Tip: Switch any `waiting`, `working` (queued at turn end), or `stopped` member's model with `/swarm model @<member> <model>` or press `[m]` in `/swarm tasks`._",
   );
 
   return out.join("\n");

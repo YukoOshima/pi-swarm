@@ -1545,12 +1545,13 @@ describe("swarm-overlay", () => {
               assert.equal(mockEngine.posted.length, 2);
               assert.equal(mockEngine.posted[1]!.text, "@worker-1 please check EOF");
 
-              // [m] on working member worker-1 -> warns (does not call switchModel)
+              // [m] on working member worker-1 opens inline queued turn-end switch (Esc cancels cleanly)
               comp.handleInput?.("m");
               assert.match(
                 stripTerminalSequences(comp.render(100).join("\n")),
-                /must be waiting/,
+                /Queue turn-end model switch for worker-1/,
               );
+              comp.handleInput?.("\x1b");
               assert.equal(mockEngine.switched.length, 0);
 
               // [g] Merge worktree on worker-1
@@ -5275,17 +5276,14 @@ describe("v0.8.0 UI Goal Progress, Contract Inspector & Proposal Card", () => {
         }
 
         const initialPlain = stripTerminalSequences(comp.render(100).join("\n"));
-        assert.match(initialPlain, /Commands & Boundaries/);
-        assert.match(initialPlain, /\$ typecheck: npm run typecheck/);
-        assert.match(initialPlain, /\$ test: npm test/);
-        assert.match(initialPlain, /! Do not read auth\.json or credentials/);
+        assert.match(initialPlain, /Features: 3 .* VAL: 3 .* Milestones: 2/);
         assert.match(initialPlain, /Validation Contract \(3 VAL-\* assertions\)/);
         assert.match(initialPlain, /\[✓\] VAL-CONTRACT-01/);
         assert.match(initialPlain, /\[ \] VAL-RUNTIME-02/);
         assert.match(initialPlain, /\[ \] VAL-UI-03/);
         assert.match(initialPlain, /Feature Queue \(3 features across 2 milestones\)/);
 
-        // Scroll down with ']' / PgDn to inspect feature dependsOn & fulfills + Strategy
+        // Scroll down with ']' / PgDn to inspect feature dependsOn & fulfills + Commands & Boundaries + Strategy
         comp.handleInput("]");
         comp.handleInput("]");
         const scrolledPlain = stripTerminalSequences(comp.render(100).join("\n"));
@@ -5294,6 +5292,10 @@ describe("v0.8.0 UI Goal Progress, Contract Inspector & Proposal Card", () => {
         assert.match(combined, /fulfills: VAL-RUNTIME-02/);
         assert.match(combined, /dependsOn: feat-contract/);
         assert.match(combined, /feat-contract \[m1-store \[S\]\]/);
+        assert.match(combined, /Commands & Boundaries/);
+        assert.match(combined, /\$ typecheck: npm run typecheck/);
+        assert.match(combined, /\$ test: npm test/);
+        assert.match(combined, /! Do not read auth\.json or credentials/);
 
         // Confirm & Launch still works seamlessly after scrolling
         comp.handleInput("\r");
@@ -5324,15 +5326,19 @@ describe("v0.8.0 UI Goal Progress, Contract Inspector & Proposal Card", () => {
           assertIntactBoxBorders(lines, w, `v080-proposal@20x${w}`);
         }
         const top72 = stripTerminalSequences(comp72.render(72).join("\n"));
-        assert.match(top72, /Commands & Boundaries/);
+        assert.match(top72, /Features: 3 .* VAL: 3 .* Milestones: 2/);
+        assert.match(top72, /Validation Contract/);
         assert.match(top72, /Confirm — launch dynamic Swarm/);
         assert.match(top72, /Continue refining/);
         assert.match(top72, /Cancel — discard draft/);
 
-        comp72.handleInput("\x1b[6~"); // PgDn scrolls into Validation Contract & Feature Queue
+        comp72.handleInput("\x1b[6~"); // PgDn scrolls into Feature Queue
         const mid72Lines = comp72.render(72);
         assertIntactBoxBorders(mid72Lines, 72, "v080-proposal-scrolled@72x20");
-        assert.match(stripTerminalSequences(mid72Lines.join("\n")), /Validation Contract/);
+        assert.match(
+          stripTerminalSequences(mid72Lines.join("\n")),
+          /Feature Queue|feat-runtime/,
+        );
       } finally {
         comp72.dispose();
       }
@@ -5829,37 +5835,39 @@ describe("v0.9.0 UI Services, Audited Overrides & Library Inspector", () => {
         }
 
         const topPlain = stripTerminalSequences(comp.render(100).join("\n"));
-        assert.match(topPlain, /Commands & Boundaries/);
-        assert.match(topPlain, /Services & Ports \(2\)/);
+        assert.match(topPlain, /Validation Contract \(2 VAL-\* assertions\)/);
         assert.match(
           topPlain,
-          /▸ worker-redis :6379 — start: redis-server --port 6379/,
-        );
-        assert.match(topPlain, /healthcheck: redis-cli -p 6379 ping/);
-        assert.match(
-          topPlain,
-          /▸ api-server :3000 — start: npm run start:api/,
+          /\[✓\] VAL-EXT-02 \[OVERRIDE\]: External webhook replay verified/,
         );
         assert.match(
           topPlain,
-          /healthcheck: curl -sf http:\/\/127\.0\.0\.1:3000\/healthz/,
+          /override: Staging sandbox offline during tweak/,
         );
-        assert.match(topPlain, /dependsOn: worker-redis/);
+        assert.match(topPlain, /Feature Queue \(1 feature across 1 milestone\)/);
 
-        // Scroll down to verify overridden assertion badge + justification in tweak preview
+        // Scroll down to verify Commands & Boundaries + Services & Ports in tweak preview
         comp.handleInput("]");
         comp.handleInput("]");
         const scrolledLines = comp.render(100);
         assertIntactBoxBorders(scrolledLines, 100, "v090-proposal-scrolled@30x100");
         const combined = `${topPlain}\n${stripTerminalSequences(scrolledLines.join("\n"))}`;
+        assert.match(combined, /Commands & Boundaries/);
+        assert.match(combined, /Services & Ports \(2\)/);
         assert.match(
           combined,
-          /\[✓\] VAL-EXT-02 \[OVERRIDE\]: External webhook replay verified/,
+          /▸ worker-redis :6379 — start: redis-server --port 6379/,
+        );
+        assert.match(combined, /healthcheck: redis-cli -p 6379 ping/);
+        assert.match(
+          combined,
+          /▸ api-server :3000 — start: npm run start:api/,
         );
         assert.match(
           combined,
-          /override: Staging sandbox offline during tweak/,
+          /healthcheck: curl -sf http:\/\/127\.0\.0\.1:3000\/healthz/,
         );
+        assert.match(combined, /dependsOn: worker-redis/);
 
         comp.handleInput("\r");
         assert.deepEqual(outcome, {
@@ -5888,7 +5896,9 @@ describe("v0.9.0 UI Services, Audited Overrides & Library Inspector", () => {
           assert.ok(lines.length <= 16, `72x20 proposal@${w} exceeded 16 lines: ${lines.length}`);
           assertIntactBoxBorders(lines, w, `v090-proposal@20x${w}`);
         }
-        comp72.handleInput("]"); // scroll into Services & Ports
+        comp72.handleInput("]"); // 3 * 3 = offset 9 -> includes line 11 (Services & Ports (2)) with zero skipped lines!
+        comp72.handleInput("]");
+        comp72.handleInput("]");
         const scrolled72 = comp72.render(72);
         assertIntactBoxBorders(scrolled72, 72, "v090-proposal-scrolled@72x20");
         assert.match(
@@ -6672,4 +6682,707 @@ describe("Persistent Orchestrator standby UX in SwarmHubView & dashboard-widget 
     assert.doesNotMatch(completedDraftMd, /Persistent Orchestrator Standby/);
   });
 });
+
+// ============================================================================
+// v1.0.0 TUI Overlays, Library Reader, Responsive Layout & Border Integrity
+// ============================================================================
+
+describe("v1.0.0 TUI Overlays, Library Reader, Responsive Layout & Border Integrity", () => {
+  const fixedNow = () => Date.parse("2026-11-26T06:30:00.000Z");
+
+  function assertStrictBoxBorders(
+    lines: readonly string[],
+    width: number,
+    label: string,
+  ): void {
+    assert.ok(lines.length >= 2, `${label}: expected >= 2 lines, got ${lines.length}`);
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]!;
+      const plain = stripTerminalSequences(line);
+      assert.equal(
+        visibleWidth(line),
+        width,
+        `${label} row ${i}: expected visibleWidth ${width}, got ${visibleWidth(line)}: ${JSON.stringify(plain)}`,
+      );
+      if (i === 0) {
+        assert.ok(plain.startsWith("╭") && plain.endsWith("╮"), `${label} top border broken: ${plain}`);
+      } else if (i === lines.length - 1) {
+        assert.ok(plain.startsWith("╰") && plain.endsWith("╯"), `${label} bottom border broken: ${plain}`);
+      } else {
+        assert.ok(plain.startsWith("│") && plain.endsWith("│"), `${label} side border broken on row ${i}: ${plain}`);
+      }
+    }
+  }
+
+  it("maintains zero replaceControlCharacters and zero tower strings across all src/**/*.ts files", () => {
+    const walkTsFiles = (dir: string): string[] => {
+      const out: string[] = [];
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          out.push(...walkTsFiles(full));
+        } else if (entry.isFile() && entry.name.endsWith(".ts")) {
+          out.push(full);
+        }
+      }
+      return out;
+    };
+    const allSrcFiles = walkTsFiles(path.resolve(process.cwd(), "src"));
+    assert.ok(allSrcFiles.length >= 10);
+    for (const filePath of allSrcFiles) {
+      const rel = path.relative(process.cwd(), filePath);
+      const src = readFileSync(filePath, "utf8");
+      assert.doesNotMatch(src, /replaceControlCharacters/, `${rel} must not use replaceControlCharacters`);
+      assert.doesNotMatch(src, /tower/i, `${rel} must not contain 'tower'`);
+    }
+  });
+
+  it("(1) questionnaire.ts passes overlay: true + centered overlayOptions and renders VAL-* & features first at scrollOffset = 0 across 72x20, 80x24, and 100x30", async () => {
+    const theme = createMockTheme();
+    const ui = createQuestionnaireUI();
+    const seenCustomOpts: Array<Record<string, unknown> | undefined> = [];
+
+    const makeOverlayCaptureCtx = (
+      rows: number,
+      cols: number,
+      onComp: (comp: Component) => void,
+    ): ExtensionContext => {
+      const { tui } = createMockTUI(rows, cols);
+      return {
+        mode: "tui",
+        hasUI: true,
+        ui: {
+          theme,
+          async custom<T>(
+            factory: (
+              t: TUI,
+              th: Theme,
+              kb: unknown,
+              done: (r: T) => void,
+            ) => Component & { dispose?(): void },
+            opts?: Record<string, unknown>,
+          ): Promise<T> {
+            seenCustomOpts.push(opts);
+            return new Promise<T>((resolve) => {
+              const comp = factory(tui, theme, {}, resolve);
+              if (isFocusable(comp)) comp.focused = true;
+              onComp(comp);
+            });
+          },
+        },
+      } as unknown as ExtensionContext;
+    };
+
+    await ui.askQuestion(
+      makeOverlayCaptureCtx(24, 80, (comp) => {
+        assertStrictBoxBorders(comp.render(80), 80, "askQuestion@80x24");
+        comp.handleInput?.("1");
+      }),
+      {
+        id: "q1",
+        question: "Workspace strategy?",
+        options: [{ label: "inherit", value: "inherit" }],
+      },
+    );
+
+    await ui.askQuestionnaire(
+      makeOverlayCaptureCtx(24, 80, (comp) => {
+        assertStrictBoxBorders(comp.render(80), 80, "askQuestionnaire@80x24");
+        comp.handleInput?.("1");
+        comp.handleInput?.("\r");
+      }),
+      [
+        {
+          id: "q1",
+          question: "Workspace strategy?",
+          options: [{ label: "inherit", value: "inherit" }],
+        },
+      ],
+    );
+
+    const richProposal: ProposedSwarmPlan = {
+      title: "v1.0.0 Contract-First Proposal",
+      objective: "Verify VAL-* and Feature Queue appear before Commands and Services at scrollOffset = 0",
+      strategy: "Shared workspace inherit slices",
+      acceptanceCriteria: "All VAL-* pass",
+      baseBranch: "main",
+      maxConcurrency: 6,
+      validatorEnabled: true,
+      commands: [
+        { name: "init", command: "npm ci" },
+        { name: "typecheck", command: "npm run typecheck" },
+        { name: "test", command: "npm test" },
+      ],
+      services: [
+        { name: "api", port: 3100, start: "npm run start:api", healthcheck: "curl -sf http://127.0.0.1:3100/healthz" },
+      ],
+      boundaries: [
+        "Never read auth.json",
+        "Keep box borders 1-cell safe",
+      ],
+      milestones: [
+        { label: "m1-ui", status: "pending" },
+        { label: "m2-docs", status: "pending" },
+      ],
+      assertions: [
+        {
+          id: "VAL-MODAL-01",
+          title: "Overlay modals float cleanly",
+          description: "overlay: true passed to ctx.ui.custom",
+          evidenceRequired: "node --import tsx --test tests/ui.test.ts",
+          status: "pending",
+          updatedAt: "2026-11-26T06:30:00.000Z",
+        },
+      ],
+      features: [
+        {
+          id: "feat-modal-ui",
+          title: "Contract-first proposal layout",
+          description: "Render VAL-* and features before commands",
+          milestone: "m1-ui",
+          filesOwned: ["src/ui/questionnaire.ts", "tests/ui.test.ts"],
+          fulfills: ["VAL-MODAL-01"],
+          status: "pending",
+          updatedAt: "2026-11-26T06:30:00.000Z",
+        },
+        {
+          id: "feat-readme",
+          title: "Document v1.0.0 inherit default",
+          description: "Update README and package.json",
+          milestone: "m2-docs",
+          filesOwned: ["README.md", "package.json"],
+          dependsOn: ["feat-modal-ui"],
+          fulfills: ["VAL-MODAL-01"],
+          status: "pending",
+          updatedAt: "2026-11-26T06:30:00.000Z",
+        },
+      ],
+    };
+
+    await ui.confirmProposal(
+      makeOverlayCaptureCtx(24, 80, (comp) => {
+        const lines80 = comp.render(80);
+        assertStrictBoxBorders(lines80, 80, "confirmProposal@80x24");
+        const plain80 = stripTerminalSequences(lines80.join("\n"));
+        // Sticky summary + VAL-* + Feature Queue + evidenceRequired + filesOwned at scrollOffset = 0!
+        assert.match(plain80, /Features: 2 \(feat-modal-ui, feat-readme\) · VAL: 1 · Milestones: 2/);
+        assert.match(plain80, /Validation Contract \(1 VAL-\* assertion\)/);
+        assert.match(plain80, /VAL-MODAL-01.*\[req: node --import tsx/);
+        assert.match(plain80, /Feature Queue \(2 features across 2 milestones\)/);
+        assert.match(plain80, /feat-modal-ui/);
+        assert.match(plain80, /PgUp\/PgDn or \[ \/ \] scroll/);
+        assert.match(plain80, /\[ \/ \] Scroll/);
+        // Validation Contract appears BEFORE Commands & Boundaries in document order
+        comp.handleInput?.("\r");
+      }),
+      richProposal,
+    );
+
+    assert.equal(seenCustomOpts.length, 3);
+    for (const opt of seenCustomOpts) {
+      assert.equal(opt?.overlay, true);
+      assert.deepEqual(opt?.overlayOptions, {
+        width: "88%",
+        maxWidth: 108,
+        minWidth: 52,
+        maxHeight: "88%",
+        anchor: "center",
+        margin: 1,
+      });
+      assert.equal((opt?.blocked as { kind?: string })?.kind, "question");
+    }
+
+    // Check 72x20, 80x24, 100x30, and tall 108x44 (>28 rows!) border integrity
+    for (const [cols, rows] of [
+      [72, 20],
+      [80, 24],
+      [100, 30],
+      [108, 44],
+    ] as const) {
+      const { tui } = createMockTUI(rows, cols);
+      const comp = new ConfirmProposalComponent(tui, theme, richProposal, undefined, () => {});
+      try {
+        const rendered = comp.render(cols);
+        assertStrictBoxBorders(rendered, cols, `confirmProposal@${cols}x${rows}`);
+        const plain = stripTerminalSequences(rendered.join("\n"));
+        assert.match(plain, /Features: 2/);
+        assert.match(plain, /VAL-MODAL-01/);
+        if (cols >= 80) {
+          assert.match(plain, /files: src\/ui\/questionnaire\.ts, tests\/ui\.tes/);
+        }
+        if (cols >= 100) {
+          assert.match(plain, /files: src\/ui\/questionnaire\.ts, tests\/ui\.test\.ts/);
+        }
+        if (cols >= 108) {
+          assert.match(plain, /VAL-MODAL-01.*\[req: node --import tsx --test tests\/ui\.test\.ts\]/);
+        }
+        if (rows === 44) {
+          // Tall terminal cap raised from 28 to Math.min(36, rows - 4) = 36!
+          assert.ok(rendered.length > 28 && rendered.length <= 36);
+          const valIdx = plain.indexOf("── Validation Contract");
+          const featIdx = plain.indexOf("── Feature Queue");
+          const cmdIdx = plain.indexOf("── Commands & Boundaries");
+          const svcIdx = plain.indexOf("── Services & Ports");
+          assert.ok(valIdx > 0 && featIdx > valIdx && cmdIdx > featIdx && svcIdx > cmdIdx);
+        }
+      } finally {
+        comp.dispose();
+      }
+    }
+  });
+
+  it("(2) dashboard-widget.ts shows [OVERRIDE]/failed VAL-* in Alt+W when features exist, keeps completed title & Activity column at 80 cols, and updates zero-turn models tip", () => {
+    const theme = createMockTheme();
+    const snap = makeSampleSnapshot();
+    const run = snap.run!;
+    run.title = "Shared Workspace Payment Pipeline";
+    run.members["worker-1"]!.mergedCommitSha = "a1b2c3d4e5f6";
+    run.members["worker-1"]!.currentActivity = "Running vitest payment.spec.ts";
+    run.features = [
+      {
+        id: "feat-pay",
+        title: "Implement idempotency key store",
+        description: "Prevent duplicate charges",
+        milestone: "m1-core",
+        fulfills: ["VAL-PAY-01", "VAL-PAY-02"],
+        status: "in_progress",
+        assignedMember: "worker-1",
+        updatedAt: "2026-11-26T06:20:00.000Z",
+      },
+      {
+        id: "feat-webhook",
+        title: "Verify webhook signature",
+        description: "HMAC SHA-256 check",
+        milestone: "m1-core",
+        fulfills: ["VAL-EXT-03"],
+        status: "completed",
+        assignedMember: "worker-2",
+        mergedCommitSha: "a1b2c3d4e5f6",
+        updatedAt: "2026-11-26T06:15:00.000Z",
+      },
+    ];
+    run.assertions = [
+      {
+        id: "VAL-PAY-01",
+        title: "Idempotent charge replay returns cached receipt",
+        description: "200 OK with identical charge_id",
+        status: "passed",
+        evidence: "tests/payment.spec.ts passed",
+        verifiedBy: "validator",
+        verifiedByRole: "validator",
+        updatedAt: "2026-11-26T06:18:00.000Z",
+      },
+      {
+        id: "VAL-PAY-02",
+        title: "Concurrent duplicate charge returns 409",
+        description: "Race condition guard",
+        status: "failed",
+        evidence: "Missing row lock on key insert",
+        verifiedBy: "validator",
+        verifiedByRole: "validator",
+        updatedAt: "2026-11-26T06:22:00.000Z",
+      },
+      {
+        id: "VAL-EXT-03",
+        title: "Live bank sandbox settlement callback",
+        description: "External settlement webhook",
+        status: "passed",
+        overridden: true,
+        overrideJustification: "Bank sandbox down; verified with signed replay payload",
+        verifiedBy: "orchestrator",
+        verifiedByRole: "orchestrator",
+        updatedAt: "2026-11-26T06:24:00.000Z",
+      },
+    ];
+
+    // 1. Alt+W expanded dashboard at 100x30, 80x24, and 72x20 shows [OVERRIDE] & failed VAL-* EVEN WHEN features.length > 0, AND keeps Activity column at 80 cols!
+    for (const [cols, rows] of [
+      [100, 30],
+      [80, 24],
+      [72, 20],
+    ] as const) {
+      const { tui } = createMockTUI(rows, cols);
+      const widget = createSwarmWidget(
+        () => snap,
+        createSwarmWidgetState({ expanded: true }),
+        { now: fixedNow },
+      )(tui, theme);
+      try {
+        const lines = widget.render(cols);
+        assertStrictBoxBorders(lines, cols, `dashboard-expanded@${cols}x${rows}`);
+        const plain = stripTerminalSequences(lines.join("\n"));
+        assert.match(plain, /feat-pay/);
+        assert.match(plain, /VAL-EXT-03 \[OVERRIDE\]/);
+        if (rows >= 30) {
+          assert.match(plain, /Bank sandbox down/);
+          assert.match(plain, /VAL-PAY-02/);
+        }
+        if (cols === 80) {
+          // Activity column MUST stay visible at 80 cols even when mergedCommitSha widens Workspace!
+          assert.match(plain, /Activity/);
+          assert.match(plain, /Running vites/);
+        }
+      } finally {
+        widget.dispose();
+      }
+    }
+
+    // 2. renderCompletedCompact preserves readable mission title at 80 and 100 cols!
+    const completedSnap: SwarmSnapshot = {
+      ...snap,
+      run: { ...run, status: "completed" },
+    };
+    for (const cols of [80, 100] as const) {
+      const { tui } = createMockTUI(24, cols);
+      const widget = createSwarmWidget(
+        () => completedSnap,
+        createSwarmWidgetState({ expanded: false }),
+        { now: fixedNow },
+      )(tui, theme);
+      try {
+        const lines = widget.render(cols);
+        assertAllLinesFit(lines, cols, `completed-compact@${cols}`);
+        const plain = stripTerminalSequences(lines[0]!);
+        assert.match(plain, /🐝 \[completed\] Shared Workspace/);
+      } finally {
+        widget.dispose();
+      }
+    }
+
+    // 3. formatZeroTurnModelsView tip mentions waiting, working (queued at turn end), and stopped (@<member>)
+    const modelsMd = formatZeroTurnModelsView(DEFAULT_SWARM_SETTINGS, snap, "openai/gpt-5.4");
+    assert.match(modelsMd, /`waiting`, `working` \(queued at turn end\), or `stopped`/);
+    assert.match(modelsMd, /@<member>/);
+  });
+
+  it("(3) SwarmOverlayComponent reads library/*.md via [l], scrolls with [/], ignores uppercase G on Members tab, fits ? Help in 62 cols, and SwarmModelPickerView Alt+1..4 works with non-empty searchQuery", async () => {
+    const theme = createMockTheme();
+    const snap = makeSampleSnapshot();
+    const run = snap.run!;
+    run.features = [
+      {
+        id: "feat-lib",
+        title: "Populate shared library notes",
+        description: "Write architecture and custom worker notes",
+        milestone: "m1",
+        fulfills: ["VAL-LIB-01"],
+        status: "completed",
+        assignedMember: "worker-1",
+        updatedAt: "2026-11-26T06:20:00.000Z",
+      },
+    ];
+    run.assertions = [
+      {
+        id: "VAL-LIB-01",
+        title: "Inline library reader renders markdown",
+        description: "Pressing l cycles topics and Esc returns to contract",
+        status: "passed",
+        evidence: "Verified in UI test",
+        verifiedBy: "validator",
+        verifiedByRole: "validator",
+        updatedAt: "2026-11-26T06:25:00.000Z",
+      },
+    ];
+    // Add multi-line board post to verify [/] scrolling in Expanded Post Reader
+    snap.recentBoard.push({
+      seq: 6,
+      runId: run.id,
+      channel: "main",
+      from: "worker-1",
+      fromRole: "worker",
+      text: Array.from({ length: 24 }, (_, i) => `Post body line ${i + 1}`).join("\n"),
+      mentions: ["orchestrator"],
+      channelMentions: [],
+      kind: "done",
+      timestamp: "2026-11-26T06:26:00.000Z",
+    });
+    snap.boardHead = 6;
+
+    const libraryFiles: Record<string, string> = {
+      architecture: "# Architecture Overview\n\nWorkers share `workspace: inherit` on disjoint `filesOwned` slices.",
+      "worker-quirks": "# Worker Quirks\n\n- Line 1\n" + Array.from({ length: 20 }, (_, i) => `- Quirk detail ${i + 1}`).join("\n"),
+    };
+    const missionCalls: Array<{ op: string; libraryTopic?: string }> = [];
+    const mergedMembers: string[] = [];
+    const switchedModels: SwitchModelOptions[] = [];
+
+    const engine: ISwarmEngine = {
+      startRun: async () => run,
+      attachRun: async () => snap,
+      setTitle: async () => run,
+      updateDirection: async () => run,
+      addMembers: async () => [],
+      postMessage: async () => snap.recentBoard[0]!,
+      readBoard: async () => ({ messages: snap.recentBoard, head: snap.boardHead }),
+      waitForBoard: async () => ({ wokeBy: "timeout", messages: [], head: 6, summary: "" }),
+      parkOrchestratorWait: async () => ({
+        parked: false,
+        messages: [],
+        head: 6,
+        activeMembers: [],
+        summary: "",
+      }),
+      clearOrchestratorWait: () => {},
+      steerMember: async () => ({ delivery: "steered" }),
+      switchModel: async (opts) => {
+        switchedModels.push(opts);
+        return {
+          targetName: opts.targetName ?? "worker-1",
+          model: opts.model ?? "openai/gpt-5.4",
+          thinkingLevel: opts.thinkingLevel,
+          deferred: true,
+        };
+      },
+      stopMember: async () => {},
+      killMember: async () => {},
+      mergeMember: async (name) => {
+        mergedMembers.push(name);
+        return { mergedCommitSha: "deadbeef1234", strategy: "merge", changedFiles: ["a.ts"] };
+      },
+      manageChannel: async () => ({
+        action: "create",
+        name: "main",
+        topic: "",
+        createdBy: ORCHESTRATOR_NAME,
+        createdAt: "",
+        subscribers: [],
+        archived: false,
+        summary: "ok",
+      }),
+      manageMission: async (input) => {
+        missionCalls.push({ op: input.op, libraryTopic: input.libraryTopic });
+        const topics = Object.keys(libraryFiles);
+        if (input.op === "read_library" && input.libraryTopic) {
+          return {
+            op: "read_library",
+            libraryTopic: input.libraryTopic,
+            libraryContent: libraryFiles[input.libraryTopic] ?? "",
+            libraryTopics: topics,
+            summary: "ok",
+          };
+        }
+        return {
+          op: "read_library",
+          libraryTopics: topics,
+          summary: "ok",
+        };
+      },
+      completeRun: async () => run,
+      pause: async () => run,
+      resume: async () => run,
+      teardown: async () => ({ removed: [], skipped: [], errors: [] }),
+      listModels: async () => [],
+      getSnapshot: () => snap,
+      subscribe: () => () => {},
+      dispose: async () => {},
+    };
+
+    const mockTui = createMockTUI(24, 100);
+    await openSwarmOverlay(
+      {
+        mode: "tui",
+        hasUI: true,
+        ui: {
+          theme,
+          notify() {},
+          async custom<T>(
+            factory: (
+              t: TUI,
+              th: Theme,
+              kb: unknown,
+              done: (r: T) => void,
+            ) => Component & { dispose?(): void },
+          ): Promise<T> {
+            return new Promise<T>((resolve) => {
+              const comp = factory(mockTui.tui, theme, {}, resolve);
+              if (isFocusable(comp)) comp.focused = true;
+              void (async () => {
+                await flushAsync();
+
+                // 1. Board tab shows [3] Graph/Contract & [3→v] Contract cue; Expanded Post Reader scrolls with ] and [
+                const board100 = stripTerminalSequences(comp.render(100).join("\n"));
+                assert.match(board100, /\[3\] Graph\/Contract/);
+                assert.match(board100, /\[3→v\] Contract/);
+
+                comp.handleInput?.("\r"); // open Expanded Post Reader on #6
+                comp.handleInput?.("]");
+                comp.handleInput?.("]");
+                assert.match(
+                  stripTerminalSequences(comp.render(100).join("\n")),
+                  /Post body line 1[5-9]|Post body line 2[0-4]/,
+                );
+                comp.handleInput?.("[");
+                comp.handleInput?.("\x1b"); // back to Board
+
+                // 2. ? Help fits cleanly within 66-col outer box (62-col inner width at 72x20) without clipping descriptions!
+                (mockTui.tui.terminal as unknown as { rows: number; columns: number }).rows = 20;
+                comp.handleInput?.("?");
+                const help66 = comp.render(66); // innerWidth = 62!
+                assertStrictBoxBorders(help66, 66, "overlay-help@66x20");
+                for (const hl of help66.slice(1, -1)) {
+                  const plainHl = stripTerminalSequences(hl);
+                  assert.ok(
+                    !plainHl.includes("…"),
+                    `? Help line clipped at 62 inner cols: ${plainHl}`,
+                  );
+                }
+                comp.handleInput?.("?");
+                (mockTui.tui.terminal as unknown as { rows: number; columns: number }).rows = 24;
+
+                // 3. Members tab: uppercase G MUST NOT trigger merge; lowercase g DOES merge; [m] on working member queues turn-end switch even with empty availableModels
+                comp.handleInput?.("2");
+                comp.handleInput?.("G");
+                await flushAsync();
+                assert.equal(mergedMembers.length, 0, "Uppercase G must never trigger git merge");
+
+                comp.handleInput?.("m");
+                for (const ch of "openai/gpt-5.4:high") comp.handleInput?.(ch);
+                comp.handleInput?.("\r");
+                await flushAsync();
+                assert.equal(switchedModels.length, 1);
+                assert.equal(switchedModels[0]!.targetName, "worker-1");
+                assert.equal(switchedModels[0]!.deferIfWorking, true);
+
+                comp.handleInput?.("g");
+                await flushAsync();
+                assert.deepEqual(mergedMembers, ["worker-1"]);
+
+                // 4. Graph/Contract tab: [v] switches to [3] Contract, loads real libraryTopics, scrolls with ]/[, and [l] reads library/*.md inline!
+                comp.handleInput?.("3");
+                comp.handleInput?.("v");
+                await flushAsync();
+
+                const contractTop = stripTerminalSequences(comp.render(100).join("\n"));
+                assert.match(contractTop, /\[3\] Contract/);
+                assert.ok(missionCalls.some((c) => c.op === "read_library" && !c.libraryTopic));
+
+                // Scroll to bottom with ] to verify scroll indicator & real topic list
+                comp.handleInput?.("]");
+                comp.handleInput?.("]");
+                const contractBottom = stripTerminalSequences(comp.render(100).join("\n"));
+                assert.match(contractBottom, /architecture\.md · worker-quirks\.md/);
+
+                // Press [l] -> opens 1st topic (architecture.md) inline!
+                comp.handleInput?.("l");
+                await flushAsync();
+                const reader1Lines = comp.render(80);
+                assertStrictBoxBorders(reader1Lines, 80, "library-reader-1@80x24");
+                const reader1Plain = stripTerminalSequences(reader1Lines.join("\n"));
+                assert.match(reader1Plain, /Shared Library: architecture\.md \(1\/2\)/);
+                assert.match(reader1Plain, /# Architecture Overview/);
+                assert.match(reader1Plain, /disjoint `filesOwned` slices/);
+
+                // Press [l] again -> cycles to 2nd topic (worker-quirks.md), scroll with ] and [
+                comp.handleInput?.("l");
+                await flushAsync();
+                const reader2Top = stripTerminalSequences(comp.render(80).join("\n"));
+                assert.match(reader2Top, /Shared Library: worker-quirks\.md \(2\/2\)/);
+                assert.match(reader2Top, /↓ \d+ more/);
+                comp.handleInput?.("]");
+                const reader2Scrolled = stripTerminalSequences(comp.render(80).join("\n"));
+                assert.match(reader2Scrolled, /↑ \d+ above/);
+                assert.match(reader2Scrolled, /Quirk detail 1[0-9]/);
+
+                // Press [l] past last topic -> returns to full Contract overview!
+                comp.handleInput?.("l");
+                await flushAsync();
+                assert.match(
+                  stripTerminalSequences(comp.render(80).join("\n")),
+                  /Mission Contract & Features/,
+                );
+
+                // Re-open with [l] and press Esc -> returns to Contract overview (does NOT close overlay!)
+                comp.handleInput?.("l");
+                await flushAsync();
+                assert.match(
+                  stripTerminalSequences(comp.render(80).join("\n")),
+                  /Shared Library: architecture\.md/,
+                );
+                comp.handleInput?.("\x1b");
+                assert.match(
+                  stripTerminalSequences(comp.render(80).join("\n")),
+                  /Mission Contract & Features/,
+                );
+
+                // Check 100x30, 80x24, and 72x20 border integrity on Contract view
+                for (const [c, r] of [
+                  [100, 30],
+                  [80, 24],
+                  [72, 20],
+                ] as const) {
+                  (mockTui.tui.terminal as unknown as { rows: number; columns: number }).rows = r;
+                  assertStrictBoxBorders(comp.render(c), c, `overlay-contract@${c}x${r}`);
+                }
+
+                comp.handleInput?.("q");
+              })();
+            });
+          },
+        },
+      } as unknown as ExtensionContext,
+      engine,
+      null,
+      { now: fixedNow },
+    );
+
+    // 5. SwarmHubView surfaces Feat X/Y · VAL A/B + [v] Contract cue
+    {
+      const { tui: hubTui } = createMockTUI(24, 80);
+      const hub = new SwarmHubView(hubTui, theme, {
+        state: { settings: { ...DEFAULT_SWARM_SETTINGS } },
+        snapshot: snap,
+        runs: [],
+        availableModels: [],
+        onComplete: () => {},
+      });
+      try {
+        const hubLines = hub.render(80);
+        assertStrictBoxBorders(hubLines, 80, "hub-goal@80x24");
+        const hubPlain = stripTerminalSequences(hubLines.join("\n"));
+        assert.match(hubPlain, /Feat 1\/1 · VAL 1\/1/);
+        assert.match(hubPlain, /Open Mission Control \(4-Tab UI · \[v\] Contract\)/);
+      } finally {
+        hub.dispose();
+      }
+    }
+
+    // 6. SwarmModelPickerView Alt+1..4 switches role tabs even when searchQuery is non-empty!
+    {
+      const { tui: pickerTui } = createMockTUI(24, 80);
+      const picker = new SwarmModelPickerView(pickerTui, theme, {
+        mode: "roles",
+        initialTab: "orchestrator",
+        state: { settings: { ...DEFAULT_SWARM_SETTINGS } },
+        availableModels: [
+          { id: "claude-opus-4-6", provider: "anthropic", fullId: "anthropic/claude-opus-4-6" },
+          { id: "gpt-5.4", provider: "openai", fullId: "openai/gpt-5.4" },
+        ],
+        onClose: () => {},
+      });
+      picker.focused = true;
+      try {
+        for (const ch of "claude") picker.handleInput(ch);
+        assert.match(stripTerminalSequences(picker.render(80).join("\n")), /claude/);
+
+        // Alt+3 jumps directly to Validator tab even while "claude" was in filterInput!
+        picker.handleInput("\x1b3");
+        const valPlain = stripTerminalSequences(picker.render(80).join("\n"));
+        assert.match(valPlain, /Independently audits diffs/);
+
+        // Type another filter and test Alt+4 -> Fallbacks, then Alt+2 -> Worker
+        for (const ch of "gpt") picker.handleInput(ch);
+        picker.handleInput("\x1b4");
+        assert.match(stripTerminalSequences(picker.render(80).join("\n")), /Pool:/);
+
+        for (const ch of "opus") picker.handleInput(ch);
+        picker.handleInput("\x1b2");
+        assert.match(stripTerminalSequences(picker.render(80).join("\n")), /Builds slices/);
+        assertStrictBoxBorders(picker.render(80), 80, "picker-alt-tab@80x24");
+      } finally {
+        picker.dispose();
+      }
+    }
+  });
+});
+
 

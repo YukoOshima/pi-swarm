@@ -5,6 +5,7 @@ import {
   Input,
   Key,
   matchesKey,
+  type OverlayOptions,
   type TUI,
 } from "@earendil-works/pi-tui";
 import { SWARM_SETTINGS_BOUNDS } from "../store/index.js";
@@ -103,8 +104,17 @@ function normalizeQuestionOptions(spec: QuestionSpec): {
 
 function computeDialogMaxLines(tui: TUI): number {
   const rows = tui.terminal?.rows ?? 24;
-  return Math.max(10, Math.min(28, rows - 4));
+  return Math.max(10, Math.min(36, rows - 4));
 }
+
+const QUESTIONNAIRE_OVERLAY_OPTIONS: OverlayOptions & { maxWidth: number } = {
+  width: "88%",
+  maxWidth: 108,
+  minWidth: 52,
+  maxHeight: "88%",
+  anchor: "center",
+  margin: 1,
+};
 
 const computeInnerWidth = computeBoxInnerWidth;
 
@@ -1476,13 +1486,13 @@ export class ConfirmProposalComponent implements Component, Focusable {
     }
 
     if (ch === "[" || matchesKey(data, Key.pageUp)) {
-      this.previewScrollOffset = Math.max(0, this.previewScrollOffset - 4);
+      this.previewScrollOffset = Math.max(0, this.previewScrollOffset - 3);
       this.tui.requestRender();
       return;
     }
 
     if (ch === "]" || matchesKey(data, Key.pageDown)) {
-      this.previewScrollOffset += 4;
+      this.previewScrollOffset += 3;
       this.tui.requestRender();
       return;
     }
@@ -1529,7 +1539,7 @@ export class ConfirmProposalComponent implements Component, Focusable {
       : this.theme.fg("accent", `[${key}]`);
   }
 
-  private renderControlsHint(innerWidth: number): string {
+  private renderControlsHint(innerWidth: number, isScrollable = false): string {
     if (this.editingComment) {
       const sep = this.theme.fg("dim", " · ");
       const saveLine = `${this.formatHintChip("Enter", "Save Note", true)}${sep}${this.formatHintChip("Esc", "Cancel")}`;
@@ -1548,27 +1558,37 @@ export class ConfirmProposalComponent implements Component, Focusable {
         ? "Refine"
         : "Cancel";
 
+    const scrollChip = isScrollable ? [this.formatHintChip(" / ", "Scroll")] : [];
+    const scrollChipCompact = isScrollable ? [this.formatHintChip(" / ")] : [];
+
     if (innerWidth >= 84) {
       const sep = this.theme.fg("dim", " · ");
+      const concLabel = isScrollable && innerWidth < 98 ? "Max" : "Concurrency";
       const parts = [
         this.formatHintChip("Enter", enterFull, isConfirmSel),
+        ...scrollChip,
         this.formatHintChip("m", "Models"),
         this.formatHintChip("v", "Validator"),
-        this.formatHintChip("+/-", "Concurrency"),
+        this.formatHintChip("+/-", concLabel),
         this.formatHintChip("c", "Note"),
       ];
-      if (innerWidth >= 100) {
+      if (innerWidth >= (isScrollable ? 110 : 100)) {
         parts.push(this.formatHintChip("Esc", "Refine"));
       }
-      return fitLine(parts.join(sep), innerWidth);
+      const joined = parts.join(sep);
+      if (visibleWidth(joined) <= innerWidth) {
+        return fitLine(joined, innerWidth);
+      }
+      return fitLine(parts.join(" "), innerWidth);
     }
 
     if (innerWidth >= 76) {
       const parts = [
         this.formatHintChip("Enter", enterFull, isConfirmSel),
+        ...scrollChip,
         this.formatHintChip("m", "Models"),
-        this.formatHintChip("v", "Validator"),
-        this.formatHintChip("+/-", "Concurrency"),
+        this.formatHintChip("v", isScrollable ? "Val" : "Validator"),
+        this.formatHintChip("+/-", isScrollable ? "Max" : "Concurrency"),
         this.formatHintChip("c", "Note"),
       ];
       return fitLine(parts.join(" "), innerWidth);
@@ -1577,16 +1597,21 @@ export class ConfirmProposalComponent implements Component, Focusable {
     if (innerWidth >= 52) {
       const parts = [
         this.formatHintChip("Enter", enterShort, isConfirmSel),
+        ...scrollChip,
         this.formatHintChip("m", "Models"),
         this.formatHintChip("v", "Val"),
         this.formatHintChip("+/-", "Max"),
         this.formatHintChip("c", "Note"),
       ];
-      return fitLine(parts.join(" "), innerWidth);
+      const joined = parts.join(" ");
+      if (visibleWidth(joined) <= innerWidth) {
+        return fitLine(joined, innerWidth);
+      }
     }
 
     const compactParts = [
       this.formatHintChip("Enter", enterShort, isConfirmSel),
+      ...scrollChipCompact,
       this.formatHintChip("m"),
       this.formatHintChip("v"),
       this.formatHintChip("+/-"),
@@ -1640,7 +1665,11 @@ export class ConfirmProposalComponent implements Component, Focusable {
         fitLine(this.theme.fg("accent", this.theme.bold(cleanTitle)), innerWidth),
       );
     }
-    if (cleanObjective && cleanObjective !== cleanTitle && maxInnerLines >= 11) {
+    if (
+      cleanObjective &&
+      cleanObjective !== cleanTitle &&
+      maxInnerLines >= (hasMissionSections ? 16 : 11)
+    ) {
       const objMaxLines =
         maxInnerLines <= 12 || (hasMissionSections && maxInnerLines <= 24)
           ? 1
@@ -1697,12 +1726,156 @@ export class ConfirmProposalComponent implements Component, Focusable {
 
     const cleanStrategy = sanitizePlainText(this.plan.strategy);
     const cleanAcceptance = sanitizePlainText(this.plan.acceptanceCriteria);
+    let isPreviewScrollable = false;
 
     if (hasMissionSections) {
       const allPreviewLines: string[] = [];
       const sep = this.theme.fg("dim", " · ");
 
-      // 1. Commands & Boundaries
+      const distinctMilestones = new Set(
+        features.map((f) => sanitizePlainText(f.milestone)).filter(Boolean),
+      );
+      const milestoneCount =
+        distinctMilestones.size > 0
+          ? distinctMilestones.size
+          : this.plan.milestones && this.plan.milestones.length > 0
+            ? this.plan.milestones.length
+            : features.length > 0
+              ? 1
+              : 0;
+
+      // 1. Validation Contract (N VAL-* assertions — contract-first!)
+      if (assertions.length > 0) {
+        const contractHeader =
+          innerWidth >= 42
+            ? `Validation Contract (${assertions.length} VAL-* assertion${assertions.length === 1 ? "" : "s"})`
+            : `Contract (${assertions.length} VAL-*)`;
+        allPreviewLines.push(
+          renderHorizontalRule(innerWidth, contractHeader, this.theme),
+        );
+        for (const a of assertions) {
+          const glyph =
+            a.status === "passed"
+              ? this.theme.fg("success", "[✓]")
+              : a.status === "failed"
+                ? this.theme.fg("error", "[✗]")
+                : a.status === "blocked"
+                  ? this.theme.fg("warning", "[!]")
+                  : this.theme.fg("muted", "[ ]");
+          const idStr = this.theme.bold(sanitizePlainText(a.id));
+          const overrideBadge = a.overridden
+            ? ` ${this.theme.fg("warning", this.theme.bold("[OVERRIDE]"))}`
+            : "";
+          const titleStr = sanitizePlainText(a.title);
+          const descStr = sanitizePlainText(a.description);
+          const reqStr = a.evidenceRequired
+            ? sanitizePlainText(a.evidenceRequired)
+            : "";
+          const justStr = a.overrideJustification
+            ? sanitizePlainText(a.overrideJustification)
+            : "";
+          if (justStr) {
+            const primaryVal = `  ${glyph} ${idStr}${overrideBadge}: ${titleStr}`;
+            const justMeta = `${this.theme.fg("warning", "override:")} ${this.theme.fg("muted", justStr)}`;
+            const singleVal = `${primaryVal}${sep}${justMeta}`;
+            if (visibleWidth(singleVal) <= innerWidth) {
+              allPreviewLines.push(fitLine(singleVal, innerWidth));
+            } else {
+              allPreviewLines.push(fitLine(primaryVal, innerWidth));
+              allPreviewLines.push(fitLine(`      ${justMeta}`, innerWidth));
+            }
+          } else {
+            const reqTail =
+              reqStr && innerWidth >= 60
+                ? ` ${this.theme.fg("muted", `[req: ${reqStr}]`)}`
+                : "";
+            const descTail =
+              descStr && descStr !== titleStr
+                ? ` ${this.theme.fg("dim", `— ${descStr}`)}`
+                : "";
+            allPreviewLines.push(
+              fitLine(
+                `  ${glyph} ${idStr}${overrideBadge}: ${titleStr}${reqTail}${descTail}`,
+                innerWidth,
+              ),
+            );
+          }
+        }
+      }
+
+      // 2. Feature Queue (M features across K milestones, filesOwned, fulfills & dependsOn)
+      if (features.length > 0) {
+        const msTotal = Math.max(1, milestoneCount);
+        const queueHeader =
+          innerWidth >= 48
+            ? `Feature Queue (${features.length} feature${features.length === 1 ? "" : "s"} across ${msTotal} milestone${msTotal === 1 ? "" : "s"})`
+            : `Features (${features.length} / ${msTotal} ms)`;
+        allPreviewLines.push(
+          renderHorizontalRule(innerWidth, queueHeader, this.theme),
+        );
+
+        const sealedSet = new Set(
+          (this.plan.milestones ?? [])
+            .filter((m) => Boolean(m.sealed))
+            .map((m) => sanitizePlainText(m.label)),
+        );
+        for (const f of features) {
+          const glyph =
+            f.status === "completed"
+              ? this.theme.fg("success", "[✓]")
+              : f.status === "in_progress"
+                ? this.theme.fg("accent", "[▸]")
+                : f.status === "failed"
+                  ? this.theme.fg("error", "[!]")
+                  : f.status === "cancelled"
+                    ? this.theme.fg("dim", "[~]")
+                    : this.theme.fg("muted", "[ ]");
+          const idStr = this.theme.bold(sanitizePlainText(f.id));
+          const msClean = sanitizePlainText(f.milestone);
+          const msPart = msClean
+            ? ` ${this.theme.fg("muted", `[${msClean}${sealedSet.has(msClean) ? " [S]" : ""}]`)}`
+            : "";
+          const titleStr = sanitizePlainText(f.title);
+          const fulfillsPlain =
+            f.fulfills && f.fulfills.length > 0
+              ? `fulfills: ${f.fulfills.map(sanitizePlainText).join(", ")}`
+              : "";
+          const filesOwnedList = (f.filesOwned ?? [])
+            .map(sanitizePlainText)
+            .filter(Boolean);
+          const filesPlain =
+            filesOwnedList.length > 0 && innerWidth >= 52
+              ? filesOwnedList.length <= 2
+                ? `files: ${filesOwnedList.join(", ")}`
+                : `files: ${filesOwnedList[0]}, ${filesOwnedList[1]}, +${filesOwnedList.length - 2}`
+              : "";
+          const depsPlain =
+            f.dependsOn && f.dependsOn.length > 0
+              ? `dependsOn: ${f.dependsOn.map(sanitizePlainText).join(", ")}`
+              : "";
+          const metaPlain = [fulfillsPlain, filesPlain, depsPlain]
+            .filter(Boolean)
+            .join(" · ");
+          const metaStyled = metaPlain ? this.theme.fg("dim", metaPlain) : "";
+          const primary = titleStr
+            ? `  ${glyph} ${idStr}${msPart}: ${titleStr}`
+            : `  ${glyph} ${idStr}${msPart}`;
+
+          if (!metaStyled) {
+            allPreviewLines.push(fitLine(primary, innerWidth));
+          } else {
+            const single = `${primary}${sep}${metaStyled}`;
+            if (visibleWidth(single) <= innerWidth) {
+              allPreviewLines.push(fitLine(single, innerWidth));
+            } else {
+              allPreviewLines.push(fitLine(primary, innerWidth));
+              allPreviewLines.push(fitLine(`      ${metaStyled}`, innerWidth));
+            }
+          }
+        }
+      }
+
+      // 3. Commands & Boundaries
       if (commands.length > 0 || boundaries.length > 0) {
         allPreviewLines.push(
           renderHorizontalRule(innerWidth, "Commands & Boundaries", this.theme),
@@ -1739,7 +1912,7 @@ export class ConfirmProposalComponent implements Component, Focusable {
         }
       }
 
-      // 1b. Services & Ports (alongside Commands & Boundaries)
+      // 4. Services & Ports
       if (services.length > 0) {
         const svcHeader =
           innerWidth >= 36
@@ -1795,126 +1968,7 @@ export class ConfirmProposalComponent implements Component, Focusable {
         }
       }
 
-      // 2. Validation Contract (N VAL-* assertions)
-      if (assertions.length > 0) {
-        const contractHeader =
-          innerWidth >= 42
-            ? `Validation Contract (${assertions.length} VAL-* assertion${assertions.length === 1 ? "" : "s"})`
-            : `Contract (${assertions.length} VAL-*)`;
-        allPreviewLines.push(
-          renderHorizontalRule(innerWidth, contractHeader, this.theme),
-        );
-        for (const a of assertions) {
-          const glyph =
-            a.status === "passed"
-              ? this.theme.fg("success", "[✓]")
-              : a.status === "failed"
-                ? this.theme.fg("error", "[✗]")
-                : a.status === "blocked"
-                  ? this.theme.fg("warning", "[!]")
-                  : this.theme.fg("muted", "[ ]");
-          const idStr = this.theme.bold(sanitizePlainText(a.id));
-          const overrideBadge = a.overridden
-            ? ` ${this.theme.fg("warning", this.theme.bold("[OVERRIDE]"))}`
-            : "";
-          const titleStr = sanitizePlainText(a.title);
-          const descStr = sanitizePlainText(a.description);
-          const justStr = a.overrideJustification
-            ? sanitizePlainText(a.overrideJustification)
-            : "";
-          if (justStr) {
-            const primaryVal = `  ${glyph} ${idStr}${overrideBadge}: ${titleStr}`;
-            const justMeta = `${this.theme.fg("warning", "override:")} ${this.theme.fg("muted", justStr)}`;
-            const singleVal = `${primaryVal}${sep}${justMeta}`;
-            if (visibleWidth(singleVal) <= innerWidth) {
-              allPreviewLines.push(fitLine(singleVal, innerWidth));
-            } else {
-              allPreviewLines.push(fitLine(primaryVal, innerWidth));
-              allPreviewLines.push(fitLine(`      ${justMeta}`, innerWidth));
-            }
-          } else {
-            const descTail =
-              descStr && descStr !== titleStr
-                ? ` ${this.theme.fg("dim", `— ${descStr}`)}`
-                : "";
-            allPreviewLines.push(
-              fitLine(
-                `  ${glyph} ${idStr}${overrideBadge}: ${titleStr}${descTail}`,
-                innerWidth,
-              ),
-            );
-          }
-        }
-      }
-
-      // 3. Feature Queue (M features across K milestones, fulfills & dependsOn)
-      if (features.length > 0) {
-        const distinctMilestones = new Set(
-          features.map((f) => sanitizePlainText(f.milestone)).filter(Boolean),
-        );
-        const milestoneCount =
-          distinctMilestones.size > 0
-            ? distinctMilestones.size
-            : Math.max(1, this.plan.milestones?.length ?? 1);
-        const queueHeader =
-          innerWidth >= 48
-            ? `Feature Queue (${features.length} feature${features.length === 1 ? "" : "s"} across ${milestoneCount} milestone${milestoneCount === 1 ? "" : "s"})`
-            : `Features (${features.length} / ${milestoneCount} ms)`;
-        allPreviewLines.push(
-          renderHorizontalRule(innerWidth, queueHeader, this.theme),
-        );
-
-        const sealedSet = new Set(
-          (this.plan.milestones ?? [])
-            .filter((m) => Boolean(m.sealed))
-            .map((m) => sanitizePlainText(m.label)),
-        );
-        for (const f of features) {
-          const glyph =
-            f.status === "completed"
-              ? this.theme.fg("success", "[✓]")
-              : f.status === "in_progress"
-                ? this.theme.fg("accent", "[▸]")
-                : f.status === "failed"
-                  ? this.theme.fg("error", "[!]")
-                  : f.status === "cancelled"
-                    ? this.theme.fg("dim", "[~]")
-                    : this.theme.fg("muted", "[ ]");
-          const idStr = this.theme.bold(sanitizePlainText(f.id));
-          const msClean = sanitizePlainText(f.milestone);
-          const msPart = msClean
-            ? ` ${this.theme.fg("muted", `[${msClean}${sealedSet.has(msClean) ? " [S]" : ""}]`)}`
-            : "";
-          const titleStr = sanitizePlainText(f.title);
-          const fulfillsPlain =
-            f.fulfills && f.fulfills.length > 0
-              ? `fulfills: ${f.fulfills.map(sanitizePlainText).join(", ")}`
-              : "";
-          const depsPlain =
-            f.dependsOn && f.dependsOn.length > 0
-              ? `dependsOn: ${f.dependsOn.map(sanitizePlainText).join(", ")}`
-              : "";
-          const metaPlain = [fulfillsPlain, depsPlain].filter(Boolean).join(" · ");
-          const metaStyled = metaPlain ? this.theme.fg("dim", metaPlain) : "";
-          const primary = titleStr
-            ? `  ${glyph} ${idStr}${msPart}: ${titleStr}`
-            : `  ${glyph} ${idStr}${msPart}`;
-
-          if (!metaStyled) {
-            allPreviewLines.push(fitLine(primary, innerWidth));
-          } else {
-            const single = `${primary}${sep}${metaStyled}`;
-            if (visibleWidth(single) <= innerWidth) {
-              allPreviewLines.push(fitLine(single, innerWidth));
-            } else {
-              allPreviewLines.push(fitLine(primary, innerWidth));
-              allPreviewLines.push(fitLine(`      ${metaStyled}`, innerWidth));
-            }
-          }
-        }
-      }
-
-      // 4. Compact Strategy & Acceptance Criteria
+      // 5. Compact Strategy & Acceptance Criteria
       if (cleanStrategy || cleanAcceptance) {
         allPreviewLines.push(
           renderHorizontalRule(innerWidth, "Plan Strategy & Criteria", this.theme),
@@ -1939,7 +1993,7 @@ export class ConfirmProposalComponent implements Component, Focusable {
         }
       }
 
-      // 5. Optional initialMembers summary
+      // 6. Optional initialMembers summary
       if (initialMembers.length > 0) {
         allPreviewLines.push(
           renderHorizontalRule(
@@ -1958,17 +2012,45 @@ export class ConfirmProposalComponent implements Component, Focusable {
         );
       }
 
+      // Sticky 1-line contract/feature summary at top of preview when features or assertions exist
+      const hasContractOrFeatures = features.length > 0 || assertions.length > 0;
+      if (hasContractOrFeatures && previewBudget >= 2) {
+        const featIdsSnippet =
+          features.length > 0 && innerWidth >= 74
+            ? ` (${features
+                .slice(0, 2)
+                .map((f) => sanitizePlainText(f.id))
+                .join(", ")}${features.length > 2 ? `, +${features.length - 2}` : ""})`
+            : "";
+        const stickyParts: string[] = [
+          `${this.theme.fg("muted", "Features:")} ${this.theme.fg("accent", this.theme.bold(String(features.length)))}${this.theme.fg("dim", featIdsSnippet)}`,
+          `${this.theme.fg("muted", "VAL:")} ${this.theme.fg("accent", this.theme.bold(String(assertions.length)))}`,
+          `${this.theme.fg("muted", "Milestones:")} ${this.theme.fg("accent", String(milestoneCount))}`,
+        ];
+        if (services.length > 0 && innerWidth >= 86) {
+          stickyParts.push(
+            `${this.theme.fg("muted", "Services:")} ${this.theme.fg("accent", String(services.length))}`,
+          );
+        }
+        body.push(
+          fitLine(
+            `  ${this.theme.fg("accent", "◆")} ${stickyParts.join(sep)}`,
+            innerWidth,
+          ),
+        );
+        previewBudget -= 1;
+      }
+
       if (previewBudget > 0 && allPreviewLines.length > 0) {
         if (allPreviewLines.length <= previewBudget) {
           this.previewScrollOffset = 0;
           body.push(...allPreviewLines);
         } else if (previewBudget === 1) {
           const miniParts: string[] = [];
-          if (features.length > 0) miniParts.push(`Feat:${features.length}`);
-          if (assertions.length > 0) miniParts.push(`VAL:${assertions.length}`);
-          if (services.length > 0) miniParts.push(`Svc:${services.length}`);
-          if (commands.length > 0) miniParts.push(`Cmd:${commands.length}`);
-          if (boundaries.length > 0) miniParts.push(`Bnd:${boundaries.length}`);
+          if (features.length > 0) miniParts.push(`Features: ${features.length}`);
+          if (assertions.length > 0) miniParts.push(`VAL: ${assertions.length}`);
+          if (milestoneCount > 0) miniParts.push(`Milestones: ${milestoneCount}`);
+          if (services.length > 0) miniParts.push(`Services: ${services.length}`);
           body.push(
             fitLine(
               this.theme.fg("muted", `  ◆ ${miniParts.join(" · ")}`),
@@ -1976,6 +2058,7 @@ export class ConfirmProposalComponent implements Component, Focusable {
             ),
           );
         } else {
+          isPreviewScrollable = true;
           const windowSize = previewBudget - 1;
           const maxOffset = Math.max(0, allPreviewLines.length - windowSize);
           this.previewScrollOffset = Math.max(
@@ -1997,9 +2080,9 @@ export class ConfirmProposalComponent implements Component, Focusable {
           if (above > 0) dirParts.push(`↑ ${above} above`);
           if (below > 0) dirParts.push(`↓ ${below} more`);
           const cueText =
-            innerWidth >= 48
-              ? `  ${dirParts.join(" · ")}  ([/]/PgUp/PgDn scroll)`
-              : `  ${dirParts.join(" · ")} ([/])`;
+            innerWidth >= 52
+              ? `  ${dirParts.join(" · ")}  (PgUp/PgDn or [ / ] scroll)`
+              : `  ${dirParts.join(" · ")} ([ / ] scroll)`;
           body.push(fitLine(this.theme.fg("accent", cueText), innerWidth));
         }
       }
@@ -2083,7 +2166,7 @@ export class ConfirmProposalComponent implements Component, Focusable {
       body.push(fitLine(`${ptr}${num}${label}${badge}`, innerWidth));
     }
 
-    body.push(this.renderControlsHint(innerWidth));
+    body.push(this.renderControlsHint(innerWidth, isPreviewScrollable));
 
     const titleText =
       this.options?.mode === "tweak"
@@ -2124,6 +2207,8 @@ export function createQuestionnaireUI(
                 return component;
               },
               {
+                overlay: true,
+                overlayOptions: QUESTIONNAIRE_OVERLAY_OPTIONS,
                 blocked: {
                   kind: "question",
                   message: sanitizePlainText(spec.question) || "Swarm question",
@@ -2156,6 +2241,8 @@ export function createQuestionnaireUI(
                 return component;
               },
               {
+                overlay: true,
+                overlayOptions: QUESTIONNAIRE_OVERLAY_OPTIONS,
                 blocked: {
                   kind: "question",
                   message: `Swarm questionnaire (${questions.length} questions)`,
@@ -2222,6 +2309,8 @@ export function createQuestionnaireUI(
                 return component;
               },
               {
+                overlay: true,
+                overlayOptions: QUESTIONNAIRE_OVERLAY_OPTIONS,
                 blocked: {
                   kind: "question",
                   message:

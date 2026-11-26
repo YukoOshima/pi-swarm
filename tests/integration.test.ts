@@ -513,7 +513,7 @@ function createMockPiHarness(
   cwd: string,
   options?: {
     sessionId?: string;
-    mode?: "tui" | "rpc";
+    mode?: "tui" | "rpc" | "print" | "json";
     initialHostModel?: Model<Api>;
     modelRuntime?: ModelRuntime;
     initialSessionMessages?: AgentMessage[];
@@ -3950,8 +3950,12 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     assert.match(helpText, /Alt\+S/);
     assert.match(helpText, /Alt\+M/);
     assert.match(helpText, /Alt\+W/);
-    assert.match(helpText, /Ctrl\+Shift\+S/);
-    assert.match(helpText, /\/swarm stop/);
+    assert.equal(helpText.includes("Ctrl+Shift+S"), false);
+    assert.equal(helpText.includes("Ctrl+Shift+M"), false);
+    assert.equal(helpText.includes("Ctrl+Shift+T"), false);
+    assert.match(helpText, /\/swarm stop <member> \[reason\]/);
+    assert.match(helpText, /\/swarm done \[--force\] \[summary\]/);
+    assert.match(helpText, /\/swarm tasks contract/);
 
     // Helper to invoke `tool_call` hook
     const checkToolCall = async (
@@ -10145,5 +10149,365 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
         ).setHumanInputAwaited;
       }
     }
+  });
+
+  it("33. v1.0.0: links initial_members <-> features at launch (no dispatch_ready double-spawn), passes ephemeralAudit:true in print mode, resets Sisyphus count on real goal progress, emits clean Goal Contract Satisfied checkpoint, preserves [NEEDS_HUMAN] across tool-only turns, and completes /swarm tasks contract", async () => {
+    const repoDir = await createTempGitRepo("v100-lifecycle-and-linking");
+    tempDirs.push(repoDir);
+    const store = new SwarmStore(repoDir);
+
+    const spawnedRequests: SpawnMemberRequest[] = [];
+    const liveSimRuntime = {
+      ...createMockModelRuntime(),
+      stream: () => {
+        throw new Error("Mock transport intercepts before network stream");
+      },
+    } as unknown as ModelRuntime;
+
+    let releaseInitialWorkers!: () => void;
+    const initialWorkersGate = new Promise<void>((r) => {
+      releaseInitialWorkers = r;
+    });
+
+    const mockTransport: ISwarmTransport = {
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        spawnedRequests.push(request);
+        if (request.runId === "draft-contract-review") {
+          return createMockPersistentMemberHandle({
+            request,
+            runInitialTurn: async ({ pushAssistantMessage }) => {
+              pushAssistantMessage("<approved/>");
+              return {
+                agentId: request.agentId,
+                name: request.name,
+                role: request.role,
+                outcome: "stopped",
+                summary: "<approved/>",
+                tokens: 60,
+                cost: 0.0006,
+              };
+            },
+          }).handle;
+        }
+        return createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async () => {
+            if (request.name === "auth-worker" || request.name === "feat-billing") {
+              await initialWorkersGate;
+              await request.engineApi?.postMessage({
+                text: `@orchestrator [done] Implemented ${request.name} cleanly`,
+                kind: "done",
+                verificationEvidence: "node --test passed (12/12 assertions green)",
+              });
+            }
+            return {
+              agentId: request.agentId,
+              name: request.name,
+              role: request.role,
+              outcome: "waiting",
+              summary: `${request.name} finished`,
+              tokens: 50,
+              cost: 0.0005,
+            };
+          },
+        }).handle;
+      },
+    };
+
+    // Use mode: "print" to verify hasLivePiModelRuntime supports "print" (and "json") modes too!
+    const host = createMockPiHarness(repoDir, {
+      mode: "print",
+      sessionId: "sess-v100-host",
+      modelRuntime: liveSimRuntime,
+    });
+    createPiSwarmExtension({
+      transportFactory: () => mockTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: false,
+      }),
+    })(host.pi);
+    await host.emit("session_start", { reason: "startup" });
+
+    // 1. Verify `/swarm tasks ` completions include `"contract"` while SWARM_SUBCOMMANDS stays exact 21 items
+    assert.equal(SWARM_SUBCOMMANDS.length, 21);
+    const swarmCmd = host.commands.get("swarm")!;
+    const tasksCompletions = (await swarmCmd.getArgumentCompletions?.("tasks c")) as Array<{
+      value: string;
+      label: string;
+    }> | null;
+    assert.ok(
+      (tasksCompletions ?? []).some((c) => c.value === "tasks contract" && c.label === "contract"),
+      "Expected `/swarm tasks c` to suggest `tasks contract`",
+    );
+
+    // 2. Launch via `/swarm-direct` with 3 features + 2 wave-1 `initial_members` (1 explicit `feature_id`, 1 auto-matched by name):
+    //    - Live `@contract-reviewer` runs in `"print"` mode with `ephemeralAudit: true`!
+    //    - Wave-1 features immediately become `in_progress` with `assignedMember` set!
+    //    - `dispatch_ready` skips both wave-1 features and ONLY dispatches the remaining ready feature (`feat-docs`)!
+    await host.runCommand("swarm-direct", "Ship auth, billing, and docs");
+    const planRes = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "v1.0.0 Feature Linking Mission",
+      objective: "Ship auth, billing, and docs on inherit workspaces",
+      strategy: "Wave 1 parallel inherit workers on disjoint files_owned",
+      acceptance_criteria: "All tests pass",
+      base_branch: "main",
+      assertions: [
+        { id: "VAL-AUTH-001", title: "Auth", description: "Auth works" },
+        { id: "VAL-BILL-001", title: "Billing", description: "Billing works" },
+        { id: "VAL-DOCS-001", title: "Docs", description: "Docs updated" },
+      ],
+      features: [
+        {
+          id: "feat-auth",
+          title: "Auth Slice",
+          description: "Implement auth",
+          milestone: "M1",
+          files_owned: ["src/auth.ts"],
+          fulfills: ["VAL-AUTH-001"],
+        },
+        {
+          id: "feat-billing",
+          title: "Billing Slice",
+          description: "Implement billing",
+          milestone: "M1",
+          files_owned: ["src/billing.ts"],
+          fulfills: ["VAL-BILL-001"],
+        },
+        {
+          id: "feat-docs",
+          title: "Docs Slice",
+          description: "Write docs",
+          milestone: "M1",
+          files_owned: ["docs/guide.md"],
+          fulfills: ["VAL-DOCS-001"],
+        },
+      ],
+      initial_members: [
+        {
+          name: "auth-worker",
+          role: "worker",
+          workspace: "inherit",
+          feature_id: "feat-auth",
+          brief: "Own src/auth.ts",
+        },
+        {
+          name: "feat-billing",
+          role: "worker",
+          workspace: "inherit",
+          brief: "Own src/billing.ts",
+        },
+      ],
+    });
+    assert.equal(planRes.isError, undefined, JSON.stringify(planRes));
+    const runId: string = planRes.details.runId;
+
+    const reviewerReq = spawnedRequests.find((r) => r.runId === "draft-contract-review");
+    assert.ok(reviewerReq, "Expected live @contract-reviewer spawn in print mode");
+    assert.equal(
+      reviewerReq!.ephemeralAudit,
+      true,
+      "runAdversarialContractReview must set ephemeralAudit: true",
+    );
+
+    const runAtLaunch = await store.loadRun(runId);
+    const featAuthAtLaunch = runAtLaunch.features!.find((f) => f.id === "feat-auth")!;
+    const featBillingAtLaunch = runAtLaunch.features!.find((f) => f.id === "feat-billing")!;
+    const featDocsAtLaunch = runAtLaunch.features!.find((f) => f.id === "feat-docs")!;
+    assert.equal(featAuthAtLaunch.status, "in_progress");
+    assert.equal(featAuthAtLaunch.assignedMember, "auth-worker");
+    assert.equal(featBillingAtLaunch.status, "in_progress");
+    assert.equal(featBillingAtLaunch.assignedMember, "feat-billing");
+    assert.equal(featDocsAtLaunch.status, "pending");
+    assert.equal(featDocsAtLaunch.assignedMember, undefined);
+    assert.equal(runAtLaunch.milestones?.[0]?.status, "in_progress");
+
+    // `dispatch_ready` must NOT double-spawn `feat-auth` or `feat-billing` — only `feat-docs`!
+    const dispatchRes = await host.executeTool(SWARM_TOOL, {
+      action: "mission",
+      mission_op: "dispatch_ready",
+    });
+    assert.equal(dispatchRes.isError, undefined, JSON.stringify(dispatchRes));
+    assert.deepEqual(dispatchRes.details.dispatchedFeatures, ["feat-docs"]);
+
+    // Let initial inherit workers finish with `[done]` + `verification_evidence` -> auto-completes both features!
+    releaseInitialWorkers();
+    await waitFor(async () => {
+      const r = await store.loadRun(runId);
+      return (
+        r.members["auth-worker"]?.state === "waiting" &&
+        r.members["feat-billing"]?.state === "waiting" &&
+        r.members["feat-docs"]?.state === "waiting"
+      );
+    });
+    const runAfterWave1 = await store.loadRun(runId);
+    assert.equal(
+      runAfterWave1.features!.find((f) => f.id === "feat-auth")?.status,
+      "completed",
+      "Inherit worker [done] with verification_evidence must auto-complete linked feature",
+    );
+    assert.equal(
+      runAfterWave1.features!.find((f) => f.id === "feat-billing")?.status,
+      "completed",
+    );
+
+    // Also verify buildLaunchKickoffPrompt with 0 initial members highlights dispatch_ready & inherit default
+    const emptyKickoff = buildLaunchKickoffPrompt(runAfterWave1, []);
+    assert.match(emptyKickoff, /dispatch_ready/);
+    assert.match(emptyKickoff, /workspace:"inherit"/);
+
+    // Verify write guard reason teaches workspace:"inherit" default & dispatch_ready
+    const writeGuardRes = (
+      await host.emit("tool_call", {
+        type: "tool_call",
+        toolCallId: "tc-v100-write",
+        toolName: "write",
+        input: { path: "src/auth.ts", content: "x" },
+      })
+    ).find(Boolean);
+    assert.equal(writeGuardRes?.block, true);
+    assert.match(String(writeGuardRes?.reason), /workspace:"inherit"/);
+    assert.match(String(writeGuardRes?.reason), /dispatch_ready/);
+
+    // 3. Verify `[NEEDS_HUMAN]` in an earlier assistant message is NOT wiped out by a trailing tool-only turn!
+    await host.emit("before_agent_start", {
+      messageType: "user",
+      prompt: "Continue mission",
+      systemPromptOptions: { sections: {} },
+    });
+    // Flush any queued board wakeups first
+    host.sentMessages.length = 0;
+    await host.emit("turn_end", {
+      turnIndex: 0,
+      message: makeAssistantMsg("Need external API token to verify staging [NEEDS_HUMAN]"),
+    });
+    // Trailing tool-only assistant message (no text content blocks)
+    await host.emit("turn_end", {
+      turnIndex: 1,
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "tc-status", name: "swarm", arguments: { action: "status" } }],
+      },
+    });
+    await host.emit("agent_settled", { aborted: false });
+    // Flush any pending board wakeups if they fired, then test agent_settled cleanly
+    await host.emit("before_agent_start", {
+      messageType: "custom",
+      systemPromptOptions: { sections: {} },
+    });
+    await host.emit("turn_end", {
+      turnIndex: 0,
+      message: makeAssistantMsg("Waiting on staging credentials [NEEDS_HUMAN]"),
+    });
+    await host.emit("turn_end", {
+      turnIndex: 1,
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "tc-only", name: "read_board", arguments: {} }],
+      },
+    });
+    const checkpointsBeforeHuman = host.sentMessages.filter(
+      (m) => (m.message.details as { goalCheckpoint?: boolean } | undefined)?.goalCheckpoint,
+    ).length;
+    await host.emit("agent_settled", { aborted: false });
+    const checkpointsAfterHuman = host.sentMessages.filter(
+      (m) => (m.message.details as { goalCheckpoint?: boolean } | undefined)?.goalCheckpoint,
+    ).length;
+    assert.equal(
+      checkpointsAfterHuman,
+      checkpointsBeforeHuman,
+      "Trailing tool-only turn must not wipe earlier [NEEDS_HUMAN] marker",
+    );
+
+    // 4. Verify Sisyphus `contState.count` resets on real goal progress (allowing >12 total checkpoints across milestones)
+    //    AND emits a clean `Goal Contract Satisfied` checkpoint without contradictory wave instructions once 100% satisfied!
+    await host.emit("input", { source: "interactive", text: "Proceed without staging" });
+
+    // Burn 10 pure board-churn checkpoints (POST_MESSAGE_TOOL advances snapshot.boardHead/progressKey, NOT goalFingerprint)
+    for (let i = 0; i < 10; i++) {
+      await host.executeTool(POST_MESSAGE_TOOL, {
+        text: `Churn note #${i + 1}`,
+      });
+      await host.emit("before_agent_start", {
+        messageType: "custom",
+        systemPromptOptions: { sections: {} },
+      });
+      await host.emit("turn_end", {
+        turnIndex: 0,
+        message: makeAssistantMsg(`Still thinking #${i + 1}`),
+      });
+      await host.emit("agent_settled", { aborted: false });
+    }
+
+    const getCheckpoints = () =>
+      host.sentMessages.filter(
+        (m) => (m.message.details as { goalCheckpoint?: boolean } | undefined)?.goalCheckpoint,
+      );
+    assert.equal(getCheckpoints().length, 10);
+    assert.equal(
+      (getCheckpoints()[9]!.message.details as { continuationCount?: number }).continuationCount,
+      10,
+    );
+
+    // Now advance REAL goal progress (complete feat-docs + pass all 3 assertions!) -> resets contState.count to 0 -> 1!
+    const updDocRes = await host.executeTool(SWARM_TOOL, {
+      action: "mission",
+      mission_op: "update_feature",
+      feature_id: "feat-docs",
+      feature_status: "completed",
+    });
+    assert.equal(updDocRes.isError, undefined, JSON.stringify(updDocRes));
+
+    // Clean up feat-docs worker if it was spawned on an isolated branch before engine default flip
+    const midRun = await store.loadRun(runId);
+    if (midRun.members["feat-docs"] && midRun.members["feat-docs"].workspace !== "inherit") {
+      await host.executeTool(SWARM_TOOL, {
+        action: "kill",
+        name: "feat-docs",
+        reason: "Clean up isolated test worker",
+      });
+    }
+
+    for (const valId of ["VAL-AUTH-001", "VAL-BILL-001", "VAL-DOCS-001"]) {
+      const ovRes = await host.executeTool(SWARM_TOOL, {
+        action: "mission",
+        mission_op: "override_assertion",
+        assertion_id: valId,
+        justification: "Verified directly in v1.0.0 integration test suite with 100% green checks",
+      });
+      assert.equal(ovRes.isError, undefined, JSON.stringify(ovRes));
+    }
+
+    await host.emit("before_agent_start", {
+      messageType: "custom",
+      systemPromptOptions: { sections: {} },
+    });
+    await host.emit("turn_end", {
+      turnIndex: 0,
+      message: makeAssistantMsg("All assertions verified; stopping before done."),
+    });
+    await host.emit("agent_settled", { aborted: false });
+
+    assert.equal(getCheckpoints().length, 11);
+    const satisfiedCp = getCheckpoints()[10]!;
+    assert.equal(
+      (satisfiedCp.message.details as { continuationCount?: number }).continuationCount,
+      1,
+      "Real goal progress must reset continuationCount back to 1 instead of marching toward 12",
+    );
+    const satisfiedText = String(satisfiedCp.message.content);
+    assert.match(satisfiedText, /Goal Contract Satisfied/);
+    assert.match(satisfiedText, /call `swarm\{action:"done", summary\}` now/);
+    assert.equal(
+      satisfiedText.includes("Advance the next wave"),
+      false,
+      "Satisfied Goal Checkpoint must not emit contradictory 'Advance the next wave' bullets",
+    );
+
+    await host.executeTool(SWARM_TOOL, {
+      action: "done",
+      summary: "Completed v1.0.0 lifecycle test cleanly",
+    });
+    await host.emit("session_shutdown", { reason: "quit" });
   });
 });

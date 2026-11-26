@@ -2545,9 +2545,10 @@ describe("v0.6.0 drafting prompts & polished TUI renderers", () => {
     assert.match(kickoff, /1–3 high-leverage trade-off questions/);
     assert.match(kickoff, /\(Recommended\)/);
     assert.match(kickoff, /Never interrogate the user on obvious details/i);
-    // Right-sizing
+    // Right-sizing & workspace:"inherit" default
     assert.match(kickoff, /1–2 workers/);
-    assert.match(kickoff, /Disjoint parallel `share` authors \+ independent `validator`/);
+    assert.match(kickoff, /Disjoint parallel `inherit` authors \+ independent `validator`/);
+    assert.match(kickoff, /workspace:\s*"inherit"/);
     // Wave-by-wave disjoint file/directory ownership & runnable verification commands
     assert.match(
       kickoff,
@@ -7155,4 +7156,322 @@ describe("droid-agy-lightweight-planning-and-library-carryover: VAL-SYNTH-001", 
     assert.equal(reviewCalls, 1);
   });
 });
+
+// ============================================================================
+// 14. v1.0.0 Drafting: inherit-default prompts, feature_id linking & review bounce budget
+// ============================================================================
+
+describe("v1.0.0 drafting: inherit-default prompts, initial_members.feature_id & reviewPassCounts resilience", () => {
+  it("establishes workspace:'inherit' as default (opt-in 'share'), VAL-CROSS-*, and Known Pre-Existing Issues across prompts and schemas", () => {
+    const kickoff = buildDraftingKickoffPrompt("Ship multi-module API", "swarm", {
+      baseBranch: "main",
+      maxConcurrency: 4,
+      validatorEnabled: true,
+    });
+    const overlay = buildDraftingSystemOverlay({
+      version: 2,
+      mode: "swarm",
+      seed: "Ship multi-module API",
+      startedAt: new Date().toISOString(),
+      validatorEnabled: true,
+      maxConcurrency: 4,
+      baseBranch: "main",
+    });
+    const direct = buildDirectPlanPrompt("Ship multi-module API", "main", {
+      maxConcurrency: 4,
+      validatorEnabled: true,
+    });
+
+    for (const [label, text] of [
+      ["kickoff", kickoff],
+      ["overlay", overlay],
+      ["direct", direct],
+    ] as const) {
+      assert.match(text, /inherit/i, `${label} must highlight workspace: "inherit" default`);
+      assert.match(text, /VAL-CROSS-\*/, `${label} must guide cross-feature VAL-CROSS-* assertions`);
+      assert.match(
+        text,
+        /## Known Pre-Existing Issues/,
+        `${label} must instruct recording pre-existing issues in library/testing.md`,
+      );
+      assert.match(text, /dispatch_ready/, `${label} must reference dispatch_ready`);
+    }
+
+    const schemaJson = JSON.stringify(ProposeSwarmPlanParamsSchema);
+    assert.equal(schemaJson.includes('"anyOf"'), false);
+    assert.equal(schemaJson.includes('"oneOf"'), false);
+    assert.ok(
+      "feature_id" in InitialMemberProposalSchema.properties,
+      "InitialMemberProposalSchema must expose optional flat feature_id",
+    );
+  });
+
+  it("normalizes initial_members[].feature_id -> featureId and rejects unknown, duplicate, validator, or auto-match-colliding feature_id claims", () => {
+    const baseContract = {
+      assertions: [
+        { id: "VAL-A-001", title: "A1", description: "Desc 1" },
+        { id: "VAL-B-001", title: "B1", description: "Desc 2" },
+      ],
+      features: [
+        {
+          id: "feat-auth",
+          title: "Auth",
+          description: "Auth slice",
+          milestone: "M1",
+          files_owned: ["src/auth.ts"],
+          fulfills: ["VAL-A-001"],
+        },
+        {
+          id: "feat-billing",
+          title: "Billing",
+          description: "Billing slice",
+          milestone: "M1",
+          files_owned: ["src/billing.ts"],
+          fulfills: ["VAL-B-001"],
+        },
+      ],
+    };
+
+    // 1. Valid explicit feature_id normalizes to featureId on InitialMemberProposal
+    const validRes = validateProposedSwarmPlan(
+      makeSamplePlanParams({
+        ...baseContract,
+        initial_members: [
+          {
+            name: "worker-one",
+            role: "worker",
+            brief: "Implement feat-auth in src/auth.ts",
+            feature_id: "  feat-auth  ",
+          },
+          {
+            name: "feat-billing",
+            role: "worker",
+            brief: "Implement feat-billing in src/billing.ts",
+          },
+        ],
+      }),
+    );
+    assert.equal(validRes.valid, true);
+    if (validRes.valid) {
+      assert.equal(validRes.initialMembers?.[0]?.featureId, "feat-auth");
+      assert.equal(validRes.initialMembers?.[1]?.featureId, undefined);
+    }
+
+    // 2. Unknown feature_id is rejected
+    const unknownFid = validateProposedSwarmPlan(
+      makeSamplePlanParams({
+        ...baseContract,
+        initial_members: [
+          {
+            name: "worker-one",
+            role: "worker",
+            brief: "Unknown feature",
+            feature_id: "feat-nonexistent",
+          },
+        ],
+      }),
+    );
+    assert.equal(unknownFid.valid, false);
+    if (!unknownFid.valid) {
+      assert.ok(unknownFid.issues.some((i) => /does not match any defined feature/.test(i.message)));
+    }
+
+    // 3. Duplicate explicit feature_id across two initial workers is rejected
+    const dupFid = validateProposedSwarmPlan(
+      makeSamplePlanParams({
+        ...baseContract,
+        initial_members: [
+          {
+            name: "worker-a",
+            role: "worker",
+            brief: "Claim feat-auth",
+            feature_id: "feat-auth",
+          },
+          {
+            name: "worker-b",
+            role: "worker",
+            brief: "Also claim feat-auth",
+            feature_id: "feat-auth",
+          },
+        ],
+      }),
+    );
+    assert.equal(dupFid.valid, false);
+    if (!dupFid.valid) {
+      assert.ok(dupFid.issues.some((i) => /Duplicate initial_members feature_id/.test(i.message)));
+    }
+
+    // 4. Validator claiming feature_id is rejected
+    const valFid = validateProposedSwarmPlan(
+      makeSamplePlanParams({
+        ...baseContract,
+        initial_members: [
+          {
+            name: "auditor",
+            role: "validator",
+            brief: "Read-only audit",
+            feature_id: "feat-auth",
+          },
+        ],
+      }),
+    );
+    assert.equal(valFid.valid, false);
+    if (!valFid.valid) {
+      assert.ok(valFid.issues.some((i) => /only "worker" members may claim a feature_id/.test(i.message)));
+    }
+
+    // 5. Explicit feature_id colliding with another worker whose name auto-matches that feature is rejected
+    const autoCollide = validateProposedSwarmPlan(
+      makeSamplePlanParams({
+        ...baseContract,
+        initial_members: [
+          {
+            name: "feat-auth",
+            role: "worker",
+            brief: "Auto-matches feat-auth",
+          },
+          {
+            name: "worker-other",
+            role: "worker",
+            brief: "Explicitly claims feat-auth",
+            feature_id: "feat-auth",
+          },
+        ],
+      }),
+    );
+    assert.equal(autoCollide.valid, false);
+    if (!autoCollide.valid) {
+      assert.ok(autoCollide.issues.some((i) => /auto-matches feature "feat-auth"/.test(i.message)));
+    }
+  });
+
+  it("does not burn Pass 1 when reviewProposedContract returns undefined/throws, and resets reviewPassCounts on modal 'continue'", async () => {
+    const harness = new MockPiHarness();
+    let reviewStep = 0;
+    let modalStep = 0;
+    const confirmedPlans: ProposedSwarmPlan[] = [];
+
+    const controller = registerDraftingTools(harness.api, {
+      worktree: createMockWorktree({ currentBranch: "main" }),
+      ui: {
+        askQuestion: async () => ({ cancelled: true, isCustom: false }),
+        askQuestionnaire: async () => ({ cancelled: true, answers: {}, items: [] }),
+        confirmProposal: async (_ctx, plan) => {
+          modalStep += 1;
+          if (modalStep <= 2) {
+            // Step 1: after undefined timeout; Step 2: after Pass 2 -> user clicks "Continue refining"!
+            return {
+              action: "continue",
+              validatorEnabled: plan.validatorEnabled,
+              maxConcurrency: plan.maxConcurrency,
+              feedback: `Refine step ${modalStep}`,
+            };
+          }
+          return {
+            action: "confirm",
+            validatorEnabled: plan.validatorEnabled,
+            maxConcurrency: plan.maxConcurrency,
+          };
+        },
+      },
+      getSettings: () => ({ ...DEFAULT_SWARM_SETTINGS }),
+      onPlanConfirmed: async (plan) => {
+        confirmedPlans.push(plan);
+        return createMockRun(plan);
+      },
+      reviewProposedContract: async () => {
+        reviewStep += 1;
+        if (reviewStep === 1) {
+          // Simulate timeout / transient failure -> must NOT increment reviewPassCounts!
+          return undefined;
+        }
+        if (reviewStep === 2 || reviewStep === 4) {
+          return {
+            approved: false,
+            summary: `Blocking finding on review call #${reviewStep}`,
+            findings: [
+              {
+                severity: "blocking",
+                category: "missing_assertion",
+                message: `Missing edge-case assertion (#${reviewStep})`,
+              },
+            ],
+          };
+        }
+        return {
+          approved: true,
+          summary: "Contract looks solid.",
+          findings: [],
+        };
+      },
+    });
+
+    controller.start({
+      mode: "swarm",
+      seed: "Verify reviewPassCounts timeout & continue reset",
+      validatorEnabled: true,
+      maxConcurrency: 4,
+    });
+
+    const proposeTool = harness.registeredTools.get(PROPOSE_SWARM_PLAN_TOOL);
+    const ctx = harness.createContext();
+    const validInput = proposeTool.prepareArguments(
+      makeSamplePlanParams({
+        assertions: [{ id: "VAL-R-001", title: "R1", description: "Desc 1" }],
+        features: [
+          {
+            id: "feat-r1",
+            title: "Feat R1",
+            description: "Slice R1",
+            milestone: "M1",
+            files_owned: ["src/r1.ts"],
+            fulfills: ["VAL-R-001"],
+          },
+        ],
+        initial_members: [
+          {
+            name: "worker-r",
+            role: "worker",
+            brief: "Build r1",
+            featureId: "feat-r1",
+          } as any,
+        ],
+      }),
+    );
+    assert.equal(validInput.initial_members?.[0]?.feature_id, "feat-r1");
+
+    // Call 1: reviewProposedContract returns undefined -> modal opens (user chooses "continue"), Pass 1 was NOT burned!
+    const call1 = await proposeTool.execute("tc-r1", validInput, undefined, undefined, ctx);
+    assert.equal((call1.details as ProposeSwarmPlanToolDetails).outcome, "continue");
+    assert.equal(modalStep, 1);
+
+    // Call 2: reviewProposedContract returns blocking finding -> STILL bounces as Pass 1 (skipping modal)!
+    const call2 = await proposeTool.execute("tc-r2", validInput, undefined, undefined, ctx);
+    const call2Details = call2.details as ProposeSwarmPlanToolDetails;
+    assert.equal(call2Details.outcome, "contract_review_changes_requested");
+    assert.equal(call2Details.reviewPass, 1);
+    assert.equal(modalStep, 1);
+
+    // Call 3: Pass 2 approves -> modal opens -> user clicks "continue" ("Continue refining"), resetting reviewPassCounts!
+    const call3 = await proposeTool.execute("tc-r3", validInput, undefined, undefined, ctx);
+    const call3Details = call3.details as ProposeSwarmPlanToolDetails;
+    assert.equal(call3Details.outcome, "continue");
+    assert.equal(call3Details.reviewPass, 2);
+    assert.equal(modalStep, 2);
+
+    // Call 4: After user clicked "continue", newly revised proposal gets a FRESH Pass 1 blocking bounce!
+    const call4 = await proposeTool.execute("tc-r4", validInput, undefined, undefined, ctx);
+    const call4Details = call4.details as ProposeSwarmPlanToolDetails;
+    assert.equal(call4Details.outcome, "contract_review_changes_requested");
+    assert.equal(call4Details.reviewPass, 1);
+    assert.equal(modalStep, 2);
+
+    // Call 5: Pass 2 approves -> modal confirms cleanly!
+    const call5 = await proposeTool.execute("tc-r5", validInput, undefined, undefined, ctx);
+    assert.equal((call5.details as ProposeSwarmPlanToolDetails).outcome, "confirmed");
+    assert.equal(confirmedPlans.length, 1);
+    assert.equal(confirmedPlans[0]?.initialMembers?.[0]?.featureId, "feat-r1");
+  });
+});
+
 

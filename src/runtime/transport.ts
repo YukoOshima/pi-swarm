@@ -43,6 +43,7 @@ import {
   type SwarmModelRole,
   SwarmProtocolError,
   type SwarmSettings,
+  type SwarmWorkspaceMode,
   type TokenUsage,
 } from "../types.js";
 import { parseModelSpec } from "../store/settings.js";
@@ -327,6 +328,110 @@ const PKG_PRE_FLAG_RE =
 
 const SIMPLE_TOKEN_RE = /^[A-Za-z0-9_./:-]+$/;
 
+const INLINE_SCRIPT_INVOCATION_RE = new RegExp(
+  `${CMD_PREFIX_RE}(?:(?:node|bun|deno)\\b[^\\n;|&]*\\s(?:-e|--eval|-p|--print)\\b|python3?\\b[^\\n;|&]*\\s-c\\b)`,
+);
+const INLINE_SCRIPT_MUTATION_API_RE =
+  /(?:\bfs\s*\.|\bnode:fs\b|['"]fs(?:\/promises)?['"]|\b(?:writeFile|writeFileSync|appendFile|appendFileSync|unlink|unlinkSync|rmSync|rmdir|rmdirSync|mkdir|mkdirSync|rename|renameSync|copyFile|copyFileSync|chmod|chmodSync|truncate|truncateSync|createWriteStream)\b|\bDeno\.(?:writeTextFile|writeFile|remove|mkdir|rename)\b|\bBun\.write\b|\bopen\s*\([^)\r\n]*['"][wax+][bt+]*['"]|\bpathlib\b|\bshutil\b|\bos\.(?:remove|unlink|rmdir|removedirs|mkdir|makedirs|rename|replace|chmod)\b|\.write_text\s*\(|\.write_bytes\s*\()/;
+
+const SHELL_WORD_BOUNDARY_RE = /[\s;&|()<>`]/;
+
+/**
+ * Strips empty quote pairs (`""`, `''`, `$''`, `$""`) when attached to an adjacent word token
+ * (e.g. `r""m` -> `rm`, `git c''heckout` -> `git checkout`, `git reset --""hard` -> `git reset --hard`)
+ * while preserving standalone empty arguments like `sed -i '' 's/a/b/'` and quotes inside literals.
+ */
+function stripWordAdjacentEmptyQuotes(command: string): string {
+  let out = "";
+  let i = 0;
+  while (i < command.length) {
+    const ch = command[i]!;
+    if (ch === "\\" && i + 1 < command.length) {
+      out += command.slice(i, i + 2);
+      i += 2;
+      continue;
+    }
+
+    // Consume any contiguous run of empty quote pairs at top-level unquoted position
+    if (
+      (ch === "'" && command[i + 1] === "'") ||
+      (ch === '"' && command[i + 1] === '"') ||
+      (ch === "$" &&
+        ((command[i + 1] === "'" && command[i + 2] === "'") ||
+          (command[i + 1] === '"' && command[i + 2] === '"')))
+    ) {
+      const runStart = i;
+      let cursor = i;
+      while (cursor < command.length) {
+        if (
+          (command[cursor] === "'" && command[cursor + 1] === "'") ||
+          (command[cursor] === '"' && command[cursor + 1] === '"')
+        ) {
+          cursor += 2;
+          continue;
+        }
+        if (
+          command[cursor] === "$" &&
+          ((command[cursor + 1] === "'" && command[cursor + 2] === "'") ||
+            (command[cursor + 1] === '"' && command[cursor + 2] === '"'))
+        ) {
+          cursor += 3;
+          continue;
+        }
+        break;
+      }
+      const prevChar = out.length > 0 ? out[out.length - 1]! : "";
+      const nextChar = cursor < command.length ? command[cursor]! : "";
+      const touchesWordLeft =
+        prevChar.length > 0 && !SHELL_WORD_BOUNDARY_RE.test(prevChar);
+      const touchesWordRight =
+        nextChar.length > 0 && !SHELL_WORD_BOUNDARY_RE.test(nextChar);
+      if (touchesWordLeft || touchesWordRight) {
+        i = cursor;
+        continue;
+      }
+      out += command.slice(runStart, cursor);
+      i = cursor;
+      continue;
+    }
+
+    if (ch === "'" || (ch === "$" && command[i + 1] === "'")) {
+      const isAnsi = ch === "$";
+      const start = i;
+      i += isAnsi ? 2 : 1;
+      while (i < command.length && command[i] !== "'") {
+        if (isAnsi && command[i] === "\\" && i + 1 < command.length) {
+          i += 2;
+          continue;
+        }
+        i += 1;
+      }
+      if (i < command.length) i += 1;
+      out += command.slice(start, i);
+      continue;
+    }
+
+    if (ch === '"' || (ch === "$" && command[i + 1] === '"')) {
+      const start = i;
+      i += ch === "$" ? 2 : 1;
+      while (i < command.length && command[i] !== '"') {
+        if (command[i] === "\\" && i + 1 < command.length) {
+          i += 2;
+          continue;
+        }
+        i += 1;
+      }
+      if (i < command.length) i += 1;
+      out += command.slice(start, i);
+      continue;
+    }
+
+    out += ch;
+    i += 1;
+  }
+  return out;
+}
+
 const VALIDATOR_FORBIDDEN_PATTERNS: ReadonlyArray<{ pattern: RegExp; reason: string }> = [
   {
     pattern: MUTATING_REDIRECTION_RE,
@@ -374,7 +479,8 @@ const VALIDATOR_FORBIDDEN_PATTERNS: ReadonlyArray<{ pattern: RegExp; reason: str
   },
 ];
 
-function unquoteSimpleTokens(command: string): string {
+function unquoteSimpleTokens(rawCommand: string): string {
+  const command = stripWordAdjacentEmptyQuotes(rawCommand);
   let out = "";
   let i = 0;
   while (i < command.length) {
@@ -533,7 +639,8 @@ function scanMaskedShellSegment(
   return { masked: out, nextIndex: i };
 }
 
-function maskQuotedShellLiterals(command: string): string {
+function maskQuotedShellLiterals(rawCommand: string): string {
+  const command = stripWordAdjacentEmptyQuotes(rawCommand);
   const { masked } = scanMaskedShellSegment(command, 0);
   // Preserve shell-eval invocations (`sh -c`, `/bin/bash -c`, `eval`) when invoked at command position.
   if (SHELL_EVAL_CMD_RE.test(masked)) {
@@ -1166,11 +1273,20 @@ export function isReadOnlyValidationCommand(
   command: string,
   scratchOrOptions?: string | { scratchDir?: string },
 ): CommandGuardResult {
-  const trimmed = command.trim();
+  const trimmed = stripWordAdjacentEmptyQuotes(command.trim());
   if (!trimmed) {
     return { allowed: true };
   }
   const normalized = maskQuotedShellLiterals(trimmed);
+  if (
+    INLINE_SCRIPT_INVOCATION_RE.test(normalized) &&
+    INLINE_SCRIPT_MUTATION_API_RE.test(trimmed)
+  ) {
+    return {
+      allowed: false,
+      reason: "Inline script file mutations (`node -e` / `python -c` write APIs) are blocked in read-only validator sessions.",
+    };
+  }
   let firstForbiddenReason: string | undefined;
   for (const rule of VALIDATOR_FORBIDDEN_PATTERNS) {
     if (rule.pattern.test(normalized)) {
@@ -1346,24 +1462,93 @@ export function isReadOnlyValidationCommand(
   return { allowed: true };
 }
 
+const WORKER_MUTATION_OP_RE =
+  /(?:>|>>|\b(?:rm|rmdir|mv|cp|tee|touch|mkdir|chmod|chown|ln|truncate|dd|sed\s+-i|perl\s+-i|cat\s+<<|(?:node|bun|deno)\s+(?:-e|--eval|-p|--print)|python3?\s+-c)\b)/;
+
+function detectWorktreeSwarmTraversal(
+  command: string,
+  posixWorktreePath: string,
+): boolean {
+  const swarmMarkers = [`/${SWARM_DIR}/`, "/.swarm/"] as const;
+  let swarmRoot: string | undefined;
+  for (const marker of swarmMarkers) {
+    const idx = posixWorktreePath.indexOf(marker);
+    if (idx >= 0) {
+      swarmRoot = posixWorktreePath.slice(0, idx + marker.length - 1);
+      break;
+    }
+  }
+  if (!swarmRoot) {
+    return false;
+  }
+  const repoRoot = path.posix.dirname(
+    swarmRoot.endsWith(`/${SWARM_DIR}`)
+      ? path.posix.dirname(swarmRoot)
+      : swarmRoot,
+  );
+  const gitRoot = `${repoRoot}/.git`;
+  const hasMutation = WORKER_MUTATION_OP_RE.test(command);
+  const relTokens = command.match(/(?:^|[\s"'`=(<>])((?:\.\.\/)+(?:\.\.|[^\s;&|()"'`<>]*))/g);
+  if (!relTokens) {
+    return false;
+  }
+  for (const rawMatch of relTokens) {
+    const token = rawMatch.replace(/^[\s"'`=(<>]+/, "");
+    if (!token) continue;
+    const resolved = path.posix.resolve(posixWorktreePath, token);
+    if (
+      resolved === posixWorktreePath ||
+      resolved.startsWith(`${posixWorktreePath}/`)
+    ) {
+      continue;
+    }
+    const inSwarmDir =
+      resolved === swarmRoot || resolved.startsWith(`${swarmRoot}/`);
+    const inGitDir =
+      resolved === gitRoot || resolved.startsWith(`${gitRoot}/`);
+    if (!inSwarmDir && !inGitDir) {
+      continue;
+    }
+    if (hasMutation || inGitDir) {
+      return true;
+    }
+    const relFromSwarm = resolved.slice(swarmRoot.length + 1);
+    if (
+      relFromSwarm === "focus.json" ||
+      relFromSwarm === "draft.json" ||
+      relFromSwarm.startsWith("locks") ||
+      /(?:^|\/)(?:state\.json|board\.jsonl|events\.jsonl|ROSTER\.md|features\.json|validation-state\.json)(?:\/|$)/.test(
+        relFromSwarm,
+      ) ||
+      relFromSwarm.startsWith("runs/")
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Guard for bash commands executed by a Worker.
  * Blocks direct mutation of `.pi/swarm/` / `.swarm/` / `.git/` internals and manual
- * `git merge` / `git push` / `git worktree` (and switching to `baseBranch` when isolated).
+ * `git merge` / `git push` / `git worktree` (switching to `baseBranch` when isolated,
+ * and destructive workspace-wide git commands when `workspace === "inherit"`).
  */
 export function isForbiddenWorkerBashCommand(
   command: string,
   baseBranch = "",
   worktreePath = "",
+  options?: { workspace?: SwarmWorkspaceMode } | SwarmWorkspaceMode,
 ): CommandGuardResult {
-  const trimmed = command.trim();
+  const trimmed = stripWordAdjacentEmptyQuotes(command.trim());
   if (!trimmed) {
     return { allowed: true };
   }
 
   let pathChecked = trimmed;
+  let posixWt = "";
   if (worktreePath.trim()) {
-    const posixWt = path.resolve(worktreePath).replace(/\\/g, "/");
+    posixWt = path.resolve(worktreePath).replace(/\\/g, "/");
     pathChecked = pathChecked.split(posixWt).join(".");
     if (worktreePath !== posixWt) {
       pathChecked = pathChecked.split(worktreePath).join(".");
@@ -1373,13 +1558,18 @@ export function isForbiddenWorkerBashCommand(
 
   if (
     /(?:^|[\s"'`\/])(?:\.pi\/swarm|\.swarm|\.git)(?:\/|$|\s|["'`])/.test(pathChecked) &&
-    /(?:>|>>|\b(?:rm|mv|cp|tee|touch|mkdir|chmod|truncate|sed\s+-i|perl\s+-i|cat\s+<<)\b)/.test(
-      pathCheckedNoBenignRedir,
-    )
+    WORKER_MUTATION_OP_RE.test(pathCheckedNoBenignRedir)
   ) {
     return {
       allowed: false,
       reason: `Workers are forbidden from mutating \`${SWARM_DIR}/\` or \`.git/\` directly. Use Swarm tools instead.`,
+    };
+  }
+
+  if (posixWt && detectWorktreeSwarmTraversal(pathCheckedNoBenignRedir, posixWt)) {
+    return {
+      allowed: false,
+      reason: `Workers are forbidden from traversing outside their worktree into \`${SWARM_DIR}/\` or \`.git/\` internals. Use Swarm tools instead.`,
     };
   }
 
@@ -1393,6 +1583,43 @@ export function isForbiddenWorkerBashCommand(
       reason:
         "Workers must not run `git merge`, `git push`, or `git worktree`. Only the Swarm Orchestrator merges.",
     };
+  }
+
+  const effectiveWorkspace =
+    typeof options === "string" ? options : options?.workspace;
+  if (effectiveWorkspace === "inherit") {
+    const inheritResetRe = new RegExp(
+      `${GIT_PREFIX_RE}\\s+reset\\b[^\\n;&|]*\\s--(?:hard|merge|keep)(?=\\s|$|[;&|)\\r\\n\`"'])`,
+    );
+    const inheritCleanRe = new RegExp(
+      `${GIT_PREFIX_RE}\\s+clean\\b(?![^\\n;&|]*(?:\\s-[a-zA-Z]*n|\\s--dry-run)\\b)`,
+    );
+    const inheritStashRe = new RegExp(
+      `${GIT_PREFIX_RE}\\s+stash\\b(?!\\s+(?:list|show)\\b)(?=\\s|$|[;&|)\\r\\n\`"'])`,
+    );
+    const inheritCheckoutWipeRe = new RegExp(
+      `${GIT_PREFIX_RE}\\s+checkout\\b[^\\n;&|]*(?:\\s(?:-f|--force)\\b|(?:\\s--)?\\s+\\.(?=\\s|$|[;&|)\\r\\n\`"'])|\\s--\\s+\\*)`,
+    );
+    const inheritRestoreWipeRe = new RegExp(
+      `${GIT_PREFIX_RE}\\s+restore\\b[^\\n;&|]*(?:(?:\\s--)?\\s+\\.(?=\\s|$|[;&|)\\r\\n\`"'])|\\s+\\*)`,
+    );
+    const inheritSwitchForceRe = new RegExp(
+      `${GIT_PREFIX_RE}\\s+switch\\b[^\\n;&|]*\\s(?:-f|--force|--discard-changes)\\b`,
+    );
+    if (
+      inheritResetRe.test(masked) ||
+      inheritCleanRe.test(masked) ||
+      inheritStashRe.test(masked) ||
+      inheritCheckoutWipeRe.test(masked) ||
+      inheritRestoreWipeRe.test(masked) ||
+      inheritSwitchForceRe.test(masked)
+    ) {
+      return {
+        allowed: false,
+        reason:
+          'Workers in shared `workspace: "inherit"` must not run destructive workspace-wide git commands (`git reset --hard`, `git clean`, `git checkout -- .`, `git restore .`, `git stash`) because sibling workers share the working tree.',
+      };
+    }
   }
 
   if (baseBranch) {
@@ -1613,7 +1840,7 @@ async function openOrCreateMemberSessionManager(
     }
   }
 
-  if (request.sessionDir && !request.isMonitor) {
+  if (request.sessionDir && !request.isMonitor && !request.ephemeralAudit) {
     await mkdir(request.sessionDir, { recursive: true });
     const created = SessionManager.create(request.cwd, request.sessionDir);
     if (request.seedMessages && request.seedMessages.length > 0) {
@@ -1721,6 +1948,7 @@ export function createWorkerGuardExtensionFactory(
           event.input.command,
           enforceBaseBranchGuard ? (baseBranch ?? "") : "",
           request.cwd,
+          { workspace: request.workspace },
         );
         if (!check.allowed) {
           const baseReason = check.reason ?? "Command is forbidden in worker sessions.";
@@ -1741,6 +1969,7 @@ export function createValidatorGuardExtensionFactory(
   enforceReadOnlyBash: boolean,
   requestCwd: string,
   scratchDir?: string,
+  forbidAllBash = false,
 ): ExtensionFactory {
   const resolvedScratch = scratchDir?.trim()
     ? path.resolve(scratchDir.trim())
@@ -1748,7 +1977,10 @@ export function createValidatorGuardExtensionFactory(
 
   return (pi) => {
     pi.on("tool_call", (event) => {
-      if (isToolCallEventType("powershell", event)) {
+      if (
+        isToolCallEventType("powershell", event) ||
+        (forbidAllBash && isToolCallEventType("bash", event))
+      ) {
         return {
           block: true,
           reason: `Independent validator @${memberName} is strictly read-only. Tool "${event.toolName}" is blocked.`,
@@ -2204,6 +2436,7 @@ export class InProcessPiTransport implements ISwarmTransport {
 
     const validatorScratchDir =
       !request.isMonitor &&
+      !request.ephemeralAudit &&
       request.role === "validator" &&
       request.scratchDir?.trim()
         ? path.resolve(request.scratchDir.trim())
@@ -2212,53 +2445,60 @@ export class InProcessPiTransport implements ISwarmTransport {
       await mkdir(validatorScratchDir, { recursive: true }).catch(() => {});
     }
 
-    const allowedTools: string[] = request.isMonitor
-      ? [POST_MESSAGE_TOOL, READ_BOARD_TOOL]
-      : request.role === "validator"
-        ? Array.from(
-            new Set<string>([
-              ...VALIDATOR_BUILTIN_TOOLS,
-              ...(validatorScratchDir ? ["write", "edit"] : []),
-              "bash",
-              SWARM_TOOL,
-              POST_MESSAGE_TOOL,
-              READ_BOARD_TOOL,
-              SWARM_WAIT_TOOL,
-            ]),
-          )
-        : Array.from(new Set<string>([...WORKER_BUILTIN_TOOLS, ...SWARM_CORE_TOOLS]));
+    const allowedTools: string[] = request.ephemeralAudit
+      ? [...VALIDATOR_BUILTIN_TOOLS]
+      : request.isMonitor
+        ? [POST_MESSAGE_TOOL, READ_BOARD_TOOL]
+        : request.role === "validator"
+          ? Array.from(
+              new Set<string>([
+                ...VALIDATOR_BUILTIN_TOOLS,
+                ...(validatorScratchDir ? ["write", "edit"] : []),
+                "bash",
+                SWARM_TOOL,
+                POST_MESSAGE_TOOL,
+                READ_BOARD_TOOL,
+                SWARM_WAIT_TOOL,
+              ]),
+            )
+          : Array.from(new Set<string>([...WORKER_BUILTIN_TOOLS, ...SWARM_CORE_TOOLS]));
 
     const bridge = request.engineApi ?? createFallbackBridge(request);
-    const allMemberTools: ToolDefinition[] = createMemberScopedTools(bridge, {
-      name: request.name,
-      role: request.role,
-      runId: request.runId,
-      defaultChannel: request.channels?.[0],
-      onWaitRecorded: ({ since, mentionsOnly }) => {
-        endTurnRequested = true;
-        emitTelemetry({
-          type: "waiting",
-          activity: `waiting (since #${since})`,
-          logLine: `swarm_wait since=#${since} mentions_only=${mentionsOnly}`,
+    const allMemberTools: ToolDefinition[] = request.ephemeralAudit
+      ? []
+      : createMemberScopedTools(bridge, {
+          name: request.name,
+          role: request.role,
+          runId: request.runId,
+          defaultChannel: request.channels?.[0],
+          onWaitRecorded: ({ since, mentionsOnly }) => {
+            endTurnRequested = true;
+            emitTelemetry({
+              type: "waiting",
+              activity: `waiting (since #${since})`,
+              logLine: `swarm_wait since=#${since} mentions_only=${mentionsOnly}`,
+            });
+          },
+          onSelfModelSwitchScheduled: () => {
+            endTurnRequested = true;
+          },
         });
-      },
-      onSelfModelSwitchScheduled: () => {
-        endTurnRequested = true;
-      },
-    });
-    const customTools: ToolDefinition[] = request.isMonitor
-      ? allMemberTools.filter(
-          (t) => t.name === POST_MESSAGE_TOOL || t.name === READ_BOARD_TOOL,
-        )
-      : allMemberTools;
+    const customTools: ToolDefinition[] = request.ephemeralAudit
+      ? []
+      : request.isMonitor
+        ? allMemberTools.filter(
+            (t) => t.name === POST_MESSAGE_TOOL || t.name === READ_BOARD_TOOL,
+          )
+        : allMemberTools;
 
     const guardFactory: ExtensionFactory =
-      request.role === "validator"
+      request.role === "validator" || request.ephemeralAudit
         ? createValidatorGuardExtensionFactory(
             request.name,
             this.validatorReadOnlyBash,
             request.cwd,
             validatorScratchDir,
+            Boolean(request.ephemeralAudit),
           )
         : createWorkerGuardExtensionFactory(request, request.baseBranch);
 
@@ -2427,16 +2667,29 @@ export class InProcessPiTransport implements ISwarmTransport {
                 appendSystemPrompt: [],
                 extensionFactories: [],
               })
-            : new DefaultResourceLoader({
-                cwd: request.cwd,
-                agentDir,
-                settingsManager,
-                noExtensions: true,
-                noThemes: true,
-                noPromptTemplates: true,
-                appendSystemPrompt: request.systemPrompt ? [request.systemPrompt] : [],
-                extensionFactories: [guardFactory],
-              });
+            : request.ephemeralAudit
+              ? new DefaultResourceLoader({
+                  cwd: request.cwd,
+                  agentDir,
+                  settingsManager,
+                  noExtensions: true,
+                  noSkills: true,
+                  noContextFiles: true,
+                  noThemes: true,
+                  noPromptTemplates: true,
+                  appendSystemPrompt: request.systemPrompt ? [request.systemPrompt] : [],
+                  extensionFactories: [guardFactory],
+                })
+              : new DefaultResourceLoader({
+                  cwd: request.cwd,
+                  agentDir,
+                  settingsManager,
+                  noExtensions: true,
+                  noThemes: true,
+                  noPromptTemplates: true,
+                  appendSystemPrompt: request.systemPrompt ? [request.systemPrompt] : [],
+                  extensionFactories: [guardFactory],
+                });
           await resourceLoader.reload();
 
           if (killed || abortedByCaller) {

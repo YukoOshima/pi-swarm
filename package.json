@@ -1,7 +1,7 @@
 {
   "name": "pi-swarm",
-  "version": "0.9.0",
-  "description": "Dynamic Mission Goal Engine & Antigravity Swarm multi-agent orchestration for Pi with mandatory VAL-* validation contracts, pre-modal Adversarial Contract Reviewer, audited [OVERRIDE] gates, deterministic dispatch_ready queue runner, auto-spawned dual-layer scrutiny+behavioral validator, services.json port manifest, shared library/*.md, Sisyphus auto-continuation, 3-role models, and isolated Git worktrees.",
+  "version": "1.0.0",
+  "description": "Dynamic Mission Goal Engine & Antigravity Swarm multi-agent orchestration for Pi with shared-workspace (workspace: \"inherit\") collaboration on disjoint filesOwned slices by default, opt-in Git worktrees (share/branch), mandatory VAL-* validation contracts, Adversarial Contract Reviewer, audited [OVERRIDE] gates, deterministic dispatch_ready runner, dual-layer validator, services.json, shared library/*.md, Sisyphus auto-continuation, and 3-role models.",
   "type": "module",
   "license": "MIT",
   "keywords": [

@@ -210,7 +210,7 @@ const InitialMemberRoleSchema = Type.Unsafe<SwarmMemberRole>(
 const InitialMemberWorkspaceSchema = Type.Unsafe<SwarmWorkspaceMode>(
   StringEnum(["inherit", "share", "branch"] as const, {
     description:
-      'Workspace mode: "inherit" (default, shared repo root for read-only scouting/validation), "share" (isolated Git worktree on a new branch), or "branch" (isolated Git worktree clone).',
+      'Workspace mode: "inherit" (default and preferred for both single workers and parallel workers owning disjoint files_owned slices in the shared repo — zero worktree creation, zero merge commits, instant shared visibility for @validator), "share" (opt-in isolated Git worktree ONLY when concurrent workers genuinely must edit overlapping files), or "branch" (opt-in isolated Git worktree clone for isolated/destructive branch experiments).',
   }),
 );
 
@@ -229,6 +229,12 @@ export const InitialMemberProposalSchema = Type.Object({
     Type.Array(Type.String(), {
       description:
         'Optional additional board channels to subscribe this member to (e.g. ["backend", "api"]). "main" is always included.',
+    }),
+  ),
+  feature_id: Type.Optional(
+    Type.String({
+      description:
+        "Optional Mission feature ID from features[] that this initial worker claims at launch (auto-matched when member name equals feature id).",
     }),
   ),
 });
@@ -278,7 +284,7 @@ export const MissionFeatureProposalSchema = Type.Object({
   files_owned: Type.Optional(
     Type.Array(Type.String(), {
       description:
-        "Optional disjoint file or directory paths owned by this feature so parallel share workers never collide on the same file.",
+        "Optional disjoint file or directory paths owned by this feature so parallel workers (default workspace: 'inherit' in the shared repo, or opt-in 'share' worktrees) never collide on the same file.",
     }),
   ),
   preconditions: Type.Optional(
@@ -391,18 +397,18 @@ export const ProposeSwarmPlanParamsSchema = Type.Object({
   initial_members: Type.Optional(
     Type.Array(InitialMemberProposalSchema, {
       description:
-        "Optional wave-1 workers only by default (1–2 workers for small/single-module tasks; disjoint parallel 'share' workers for multi-module work). Spawn an independent 'validator' on demand once a worker commits/posts '[done]' (only include a validator initially when reviewing already-existing code). Keep briefs concise and grounded in already-installed repo verification scripts (no speculative 'npx -y' downloads). Leave omitted/empty to spawn dynamically after launch.",
+        "Optional wave-1 workers only by default (1–2 workers for small/single-module tasks; disjoint parallel 'inherit' workers in the shared repo for multi-module work — use opt-in 'share' worktrees ONLY when concurrent workers must edit overlapping files). Spawn an independent 'validator' on demand once a worker posts '[done]' (only include a validator initially when reviewing already-existing code). Keep briefs concise and grounded in already-installed repo verification scripts (no speculative 'npx -y' downloads). Leave omitted/empty to spawn dynamically after launch (or via swarm{action:'mission', mission_op:'dispatch_ready'}, which defaults to workspace:'inherit').",
     }),
   ),
   assertions: Type.Array(MissionAssertionProposalSchema, {
     minItems: 1,
     description:
-      "Mandatory contract-first validation assertions (e.g. VAL-AUTH-001) defining concrete testable behaviors and required evidence (minItems: 1). Features must claim 100% of assertions via fulfills.",
+      "Mandatory contract-first validation assertions (e.g. VAL-AUTH-001, plus VAL-CROSS-* for cross-feature integration) defining concrete testable behaviors and required evidence (minItems: 1). Features must claim 100% of assertions via fulfills.",
   }),
   features: Type.Array(MissionFeatureProposalSchema, {
     minItems: 1,
     description:
-      "Mandatory ordered vertical features grouped by milestone with acyclic depends_on, disjoint files_owned for parallel share worktrees, and 1-to-1 fulfills coverage of assertions (minItems: 1).",
+      "Mandatory ordered vertical features grouped by milestone with acyclic depends_on, disjoint files_owned for parallel workers (workspace: 'inherit' default; 'share' opt-in only for overlapping concurrent edits), and 1-to-1 fulfills coverage of assertions (minItems: 1).",
   }),
   commands: Type.Optional(
     Type.Array(MissionCommandProposalSchema, {
@@ -1896,10 +1902,50 @@ export function validateProposedSwarmPlan(
       }
     }
 
+    const rawFeatureIdVal =
+      (raw as Record<string, unknown>).feature_id !== undefined
+        ? (raw as Record<string, unknown>).feature_id
+        : (raw as Record<string, unknown>).featureId;
+    let normalizedFeatureId: string | undefined;
+    let featureIdOk = true;
+    if (rawFeatureIdVal !== undefined) {
+      if (typeof rawFeatureIdVal !== "string" || !rawFeatureIdVal.trim()) {
+        featureIdOk = false;
+        issues.push({
+          code: "INVALID_INPUT",
+          field: "feature_id",
+          memberName: memberTag,
+          message: `Initial member "${memberTag}" feature_id must be a non-empty string.`,
+        });
+      } else {
+        const trimmedFid = rawFeatureIdVal.trim();
+        if (isPrototypeKey(trimmedFid)) {
+          featureIdOk = false;
+          issues.push({
+            code: "INVALID_INPUT",
+            field: "feature_id",
+            memberName: memberTag,
+            message: `Initial member "${memberTag}" feature_id "${trimmedFid}" is forbidden (prototype key).`,
+          });
+        } else if (isValidMemberRole(raw.role) && raw.role !== "worker") {
+          featureIdOk = false;
+          issues.push({
+            code: "INVALID_INPUT",
+            field: "feature_id",
+            memberName: memberTag,
+            message: `Initial member "${memberTag}" has role "${raw.role}" and cannot claim implementation ownership of feature "${trimmedFid}" via feature_id — only "worker" members may claim a feature_id.`,
+          });
+        } else {
+          normalizedFeatureId = trimmedFid;
+        }
+      }
+    }
+
     if (
       name &&
       isValidMemberRole(raw.role) &&
       brief &&
+      featureIdOk &&
       (raw.workspace === undefined || isValidWorkspaceMode(raw.workspace))
     ) {
       normalizedMembers.push({
@@ -1908,6 +1954,7 @@ export function validateProposedSwarmPlan(
         brief,
         ...(raw.workspace !== undefined ? { workspace: raw.workspace } : {}),
         ...(normalizedChannels ? { channels: normalizedChannels } : {}),
+        ...(normalizedFeatureId ? { featureId: normalizedFeatureId } : {}),
       });
     }
   }
@@ -2618,6 +2665,60 @@ export function validateProposedSwarmPlan(
         field: "assertions",
         message: `Unclaimed assertion(s) in validation contract: ${unclaimed.join(", ")} — features must claim 100% of assertions via fulfills[].`,
       });
+    }
+  }
+
+  // Validate initial_members[].featureId references against defined features and prevent duplicate claims
+  if (normalizedMembers.some((m) => Boolean(m.featureId))) {
+    const definedFeatureIds = new Set<string>(seenFeatureIds);
+    if (existingRun) {
+      if (params.features === undefined) {
+        for (const prevId of existingFeatureMap.keys()) {
+          definedFeatureIds.add(prevId);
+        }
+      } else {
+        for (const carriedId of carriedCompletedIds) {
+          definedFeatureIds.add(carriedId);
+        }
+      }
+    }
+
+    const explicitFeatureClaimOwners = new Map<string, string>();
+    for (const m of normalizedMembers) {
+      if (!m.featureId) continue;
+      if (!definedFeatureIds.has(m.featureId)) {
+        issues.push({
+          code: "INVALID_INPUT",
+          field: "initial_members",
+          memberName: m.name,
+          message: `Initial member "${m.name}" feature_id "${m.featureId}" does not match any defined feature in features[].`,
+        });
+        continue;
+      }
+      const prevOwner = explicitFeatureClaimOwners.get(m.featureId);
+      if (prevOwner && prevOwner !== m.name) {
+        issues.push({
+          code: "INVALID_INPUT",
+          field: "initial_members",
+          memberName: m.name,
+          message: `Duplicate initial_members feature_id "${m.featureId}" claimed by both "${prevOwner}" and "${m.name}" — each feature can be claimed by at most one initial worker.`,
+        });
+      } else {
+        explicitFeatureClaimOwners.set(m.featureId, m.name);
+      }
+    }
+
+    for (const m of normalizedMembers) {
+      if (m.role !== "worker" || m.featureId) continue;
+      const collidingExplicitOwner = explicitFeatureClaimOwners.get(m.name);
+      if (collidingExplicitOwner && collidingExplicitOwner !== m.name) {
+        issues.push({
+          code: "INVALID_INPUT",
+          field: "initial_members",
+          memberName: m.name,
+          message: `Initial worker "${m.name}" auto-matches feature "${m.name}" which is already claimed via feature_id by "${collidingExplicitOwner}" — rename "${m.name}" or assign a distinct feature_id.`,
+        });
+      }
     }
   }
 
@@ -3602,7 +3703,7 @@ export function createProposeSwarmPlanTool(
     promptSnippet:
       "Validate and present a Contract-First Dynamic Swarm Plan (title, objective, strategy, acceptance criteria, mandatory VAL-* assertions & milestone features, commands, services, boundaries, optional initial members) for user confirmation before launching.",
     promptGuidelines: [
-      `Call \`${PROPOSE_SWARM_PLAN_TOOL}\` once requirements are clear with wave-by-wave disjoint file/directory ownership in \`strategy\`, exact runnable verification commands using already-installed repo scripts (no speculative \`npx -y\` downloads) in \`acceptance_criteria\` and \`commands\` (including optional \`"init"\` worktree setup), optional \`services\` with unique \`port\`s and acyclic \`depends_on\`, **mandatory** testable \`VAL-<AREA>-<NNN>\` \`assertions\` (\`minItems: 1\`) paired with ordered \`features\` (\`minItems: 1\`, 100% \`fulfills\` coverage + acyclic \`depends_on\` + disjoint \`files_owned\`), and wave-1 workers only in \`initial_members\` (spawn \`validator\` on demand once workers commit/post \`[done]\`); do NOT duplicate the full plan in prose beforehand because the expandable proposal card and confirmation modal present it automatically.`,
+      `Call \`${PROPOSE_SWARM_PLAN_TOOL}\` once requirements are clear with wave-by-wave disjoint file/directory ownership in \`strategy\` (defaulting to \`workspace:"inherit"\` in the shared repo; use opt-in \`workspace:"share"\` only when concurrent workers must edit overlapping files), exact runnable verification commands using already-installed repo scripts (no speculative \`npx -y\` downloads) in \`acceptance_criteria\` and \`commands\` (including optional \`"init"\` worktree setup), optional \`services\` with unique \`port\`s and acyclic \`depends_on\`, **mandatory** testable \`VAL-<AREA>-<NNN>\` (and \`VAL-CROSS-*\` for multi-module/milestone integration) \`assertions\` (\`minItems: 1\`) paired with ordered \`features\` (\`minItems: 1\`, 100% \`fulfills\` coverage + acyclic \`depends_on\` + disjoint \`files_owned\`), and wave-1 workers only in \`initial_members\` (\`workspace:"inherit"\` default, optional \`feature_id\` matching \`features[]\`; spawn \`validator\` on demand once workers post \`[done]\`); do NOT duplicate the full plan in prose beforehand because the expandable proposal card and confirmation modal present it automatically.`,
     ],
     exposure: "model-only",
     defaultActive: false,
@@ -3636,6 +3737,12 @@ export function createProposeSwarmPlanTool(
             return item;
           }
           const m = item as Record<string, unknown>;
+          const rawFeatureId =
+            typeof m.feature_id === "string"
+              ? m.feature_id
+              : typeof m.featureId === "string"
+                ? m.featureId
+                : undefined;
           return {
             ...m,
             name: typeof m.name === "string" ? m.name : "",
@@ -3647,6 +3754,7 @@ export function createProposeSwarmPlanTool(
                   ),
                 }
               : {}),
+            ...(rawFeatureId !== undefined ? { feature_id: rawFeatureId } : {}),
           };
         });
       }
@@ -3823,10 +3931,6 @@ export function createProposeSwarmPlanTool(
         currentDraft?.validatorEnabled !== false &&
         proposedPlan.validatorEnabled !== false
       ) {
-        const currentPass = (reviewPassCounts.get(draftReviewKey) ?? 0) + 1;
-        reviewPassCounts.set(draftReviewKey, currentPass);
-        attachedReviewPass = currentPass;
-
         let review: ContractReviewResult | undefined;
         try {
           review = await deps.reviewProposedContract(proposedPlan, ctx, signal);
@@ -3835,7 +3939,10 @@ export function createProposeSwarmPlanTool(
         }
 
         if (review) {
+          const currentPass = (reviewPassCounts.get(draftReviewKey) ?? 0) + 1;
+          reviewPassCounts.set(draftReviewKey, currentPass);
           attachedContractReview = review;
+          attachedReviewPass = currentPass;
           const findings = Array.isArray(review.findings) ? review.findings : [];
           const hasBlockingFinding =
             !review.approved ||
@@ -4032,7 +4139,10 @@ export function createProposeSwarmPlanTool(
         };
       }
 
-      // "continue" (refine) — keep draft active and persist any toggled Validator / concurrency settings
+      // "continue" (refine) — reset contract review pass counter so revised proposals receive a fresh Pass 1 review,
+      // keep draft active, and persist any toggled Validator / concurrency settings
+      reviewPassCounts.delete(draftReviewKey);
+      reviewPassCounts.delete(ephemeralReviewKey);
       const refinedValidatorEnabled = outcome.validatorEnabled;
       const refinedMaxConcurrency = sanitizePositiveInt(
         outcome.maxConcurrency,
@@ -4054,7 +4164,6 @@ export function createProposeSwarmPlanTool(
           baseBranch,
         });
       } else {
-        const priorPassCount = reviewPassCounts.get(draftReviewKey);
         updatedDraft = draftController.start({
           mode: currentDraft?.mode ?? "swarm",
           seed: currentDraft?.seed || validation.objective,
@@ -4067,13 +4176,6 @@ export function createProposeSwarmPlanTool(
             : {}),
           questionnaireEcho: currentDraft?.questionnaireEcho,
         });
-        const nextReviewKey = resolveDraftReviewKey(updatedDraft, ctx);
-        if (nextReviewKey !== draftReviewKey) {
-          reviewPassCounts.delete(draftReviewKey);
-          if (priorPassCount !== undefined) {
-            reviewPassCounts.set(nextReviewKey, priorPassCount);
-          }
-        }
       }
       deps.onDraftChanged?.(updatedDraft, ctx);
 
@@ -4128,6 +4230,9 @@ export function createProposeSwarmPlanTool(
                   (c): c is string => typeof c === "string" && c.trim().length > 0,
                 ),
               }
+            : {}),
+          ...(typeof m.feature_id === "string" && m.feature_id.trim()
+            ? { featureId: m.feature_id.trim() }
             : {}),
         }));
 

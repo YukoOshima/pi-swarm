@@ -277,13 +277,13 @@ const DRAFTING_WRITE_GUARD_REASON =
   "Swarm Drafting Mode is read-only reconnaissance. Clarify via swarm_questionnaire or call propose_swarm_plan to launch the Swarm.";
 
 const ORCHESTRATOR_WRITE_GUARD_REASON =
-  'Orchestrator must not edit repository files directly in Persistent Orchestrator Mode (doing so dirties baseBranch and breaks worktree merges). Delegate code/file changes to an isolated worker via swarm{action:"add", workspace:"share"} (or propose_swarm_plan when in standby/drafting, or steer @member via post_message / swarm{action:"steer"}). For operations no Swarm member is allowed to perform (workers cannot run git push or git merge), ask the user to run `!<command>` themselves or leave Persistent Orchestrator Mode with `/swarm exit`.';
+  'Orchestrator must not edit repository files directly in Persistent Orchestrator Mode (doing so bypasses worker ownership and dirties baseBranch). Delegate code/file changes to a worker via swarm{action:"add"} (defaults to workspace:"inherit" in the shared repo on disjoint filesOwned; use workspace:"share" only when concurrent workers must edit overlapping files) or swarm{action:"mission", mission_op:"dispatch_ready"} (or propose_swarm_plan when in standby/drafting, or steer @member via post_message / swarm{action:"steer"}). For operations no Swarm member is allowed to perform (workers cannot run git push or git merge), ask the user to run `!<command>` themselves or leave Persistent Orchestrator Mode with `/swarm exit`.';
 
 function buildOrchestratorBashGuardReason(detail?: string): string {
   const cleanDetail = detail
     ? detail.replace(/\s+in read-only validator sessions\.?$/i, ".")
     : "Mutating shell command pattern matched.";
-  return `Orchestrator must not edit repository files directly or run mutating bash commands in Persistent Orchestrator Mode (best-effort pattern matching blocked this command: ${cleanDetail}) Read-only inspection/test commands (e.g. git status, git diff, rg, ls, npm test) stay allowed. Delegate file edits, builds, and branch commits to an isolated worker via swarm{action:"add", workspace:"share"} (or propose_swarm_plan when in standby/drafting; land worker branches via swarm{action:"merge"}). For operations no Swarm member is allowed to perform (workers cannot run git push or git merge), ask the user to run \`!<command>\` themselves or leave Persistent Orchestrator Mode with \`/swarm exit\`.`;
+  return `Orchestrator must not edit repository files directly or run mutating bash commands in Persistent Orchestrator Mode (best-effort pattern matching blocked this command: ${cleanDetail}) Read-only inspection/test commands (e.g. git status, git diff, rg, ls, npm test) stay allowed. Delegate file edits, builds, and commits to a worker via swarm{action:"add"} (defaults to workspace:"inherit" in the shared repo on disjoint filesOwned; use workspace:"share" only when concurrent workers must edit overlapping files) or swarm{action:"mission", mission_op:"dispatch_ready"} (or propose_swarm_plan when in standby/drafting; land any opt-in share/branch worker branches via swarm{action:"merge"}). For operations no Swarm member is allowed to perform (workers cannot run git push or git merge), ask the user to run \`!<command>\` themselves or leave Persistent Orchestrator Mode with \`/swarm exit\`.`;
 }
 
 const MODEL_ROLES: ReadonlyArray<SwarmModelRole> = [
@@ -2069,10 +2069,10 @@ export function buildLaunchKickoffPrompt(
   } else {
     const workflowHint =
       run.validatorEnabled !== false
-        ? "researchers/scouts -> scaffold -> parallel `share` authors -> independent read-only `validator`"
-        : "researchers/scouts -> scaffold -> parallel `share` authors";
+        ? "researchers/scouts -> scaffold -> parallel `inherit` authors on disjoint `filesOwned` (or opt-in `share` worktrees only for overlapping concurrent edits) -> independent read-only `validator`"
+        : "researchers/scouts -> scaffold -> parallel `inherit` authors on disjoint `filesOwned` (or opt-in `share` worktrees only for overlapping concurrent edits)";
     lines.push(
-      `You now have the 4 core Swarm tools (\`swarm\`, \`post_message\`, \`read_board\`, \`swarm_wait\`). Begin Phase 1 by delegating technical work via \`swarm{action:"add"}\` (${workflowHint}), wait via \`swarm_wait\`, merge & kill finished members, and call \`swarm{action:"done", summary}\` when complete.`,
+      `You now have the 4 core Swarm tools (\`swarm\`, \`post_message\`, \`read_board\`, \`swarm_wait\`). Begin Phase 1 by dispatching ready contract features via \`swarm{action:"mission", mission_op:"dispatch_ready"}\` (defaults to \`workspace:"inherit"\`) or delegating technical work via \`swarm{action:"add"}\` (${workflowHint}), wait via \`swarm_wait\`, merge any opt-in worktrees & kill finished members, and call \`swarm{action:"done", summary}\` when complete.`,
     );
   }
 
@@ -2152,7 +2152,7 @@ function buildMissionResumePrompt(
 
 function buildHelpMarkdown(): string {
   return [
-    "### 🐝 Pi Swarm v0.9.0 (`/swarm`) — Dynamic Mission Goal Engine & Antigravity Swarm Commands",
+    "### 🐝 Pi Swarm v1.0.0 (`/swarm`) — Dynamic Mission Goal Engine & Antigravity Swarm Commands",
     "",
     "| Command | Description |",
     "| --- | --- |",
@@ -2163,12 +2163,12 @@ function buildHelpMarkdown(): string {
     "| `/swarm status` · `/swarm contract` · `/swarm mission` | Zero-LLM-turn dashboard: Mission Features, `VAL-*` Validation Contract, handoffs, 3-role models & roster (also `/swarm goal`) |",
     "| `/swarm board [limit] [--channel <ch>] [--search <q>]` | Zero-LLM-turn shared `#seq` Message Board feed (filterable by channel or substring) |",
     "| `/swarm graph` | Zero-LLM-turn ASCII/Unicode Spawn Tree & Peer `@mention` / `#channel` interaction graph |",
-    "| `/swarm tasks [tab\\|member\\|#ch]` · `/swarm ui` · `/swarm mc` | Open interactive 4-tab Mission Control (`[M]` models, `[P]` pause/resume, `[v]` contract/graph, `[?]` help; aliases: `mc`, `open`, `panel`) |",
+    "| `/swarm tasks [board\\|members\\|graph\\|contract\\|search\\|member\\|#ch]` · `/swarm ui` · `/swarm mc` | Open interactive 4-tab Mission Control (use `/swarm tasks contract` for Mission Contract & Features; `[M]` models, `[P]` pause/resume, `[v]` contract/graph, `[?]` help; aliases: `mc`, `open`, `panel`) |",
     "| `/swarm models [role\\|--print]` | Open interactive Mission Model Picker (`Orchestrator` / `Worker` / `Validator` / `Fallbacks`), or `--print` overview |",
     "| `/swarm model <target> <model[:thinking]\\|default> [thinking] [--global]` | Set role default (propagates to live members) OR hot-switch a live member (`@name`) |",
     "| `/swarm steer <member> <message>` | Redirect a working member immediately or wake a parked member with new direction |",
     "| `/swarm stop <member> [reason]` | Stop a working member cleanly without deleting its worktree or conversation history |",
-    "| `/swarm merge <member>` | Merge a member's `share` worktree or `branch` clone onto `baseBranch` (`autoRebase` + `--no-ff`) |",
+    "| `/swarm merge <member>` | Merge a member's opt-in `share` worktree or `branch` clone onto `baseBranch` (`autoRebase` + `--no-ff`) |",
     "| `/swarm kill <member> [--force] [reason]` | Permanently kill a member and remove its clean worktree (`--force` overrides dirty worktree guard) |",
     "| `/swarm done [--force] [summary]` | Complete the active Swarm run, retire ephemeral workers/validators, and keep `@orchestrator` on standby (`--force` force-closes unfinished Mission gates) |",
     "| `/swarm exit [--force]` · `/swarm leave [--force]` | Exit Persistent Swarm Orchestrator Mode, restoring `idle` tools, pre-swarm host model & direct editing (`--force` pauses & detaches a live run cleanly so it stays resumable) |",
@@ -2183,7 +2183,7 @@ function buildHelpMarkdown(): string {
     "",
     "**Persistent Orchestrator Mode & Manual Git Commands:** Launching a Swarm run as owner (`/swarm <goal>`, `/swarm direct <goal>`, `/swarm-direct <goal>`) or resuming one (`/swarm resume`) keeps `@orchestrator` on duty in `standby` across subsequent coding tasks until you run `/swarm exit` (or Hub `Exit Swarm Orchestrator Mode`). While active, `write`, `edit`, and `powershell` are blocked and mutating `bash` commands are filtered by best-effort pattern matching (to prevent habitual direct edits, not as a sandbox); run manual git operations (`git push`, manual `git commit`) via `!<command>` (e.g. `!git push`) or exit first with `/swarm exit`.",
     "**Mid-Flight Redirection & Goal Continuation:** Type any message directly to the Orchestrator while workers run to adjust scope (`swarm{action:\"mission\"}`), or run `/swarm steer <member> <msg>`. Active Goal runs auto-continue until all features & `VAL-*` assertions pass (or `[NEEDS_HUMAN]` is raised).",
-    "**TUI Shortcuts:** `Alt+S` / `Ctrl+Shift+S` opens Mission Control / Hub · `Alt+M` / `Ctrl+Shift+M` opens Mission Model Picker · `Alt+W` / `Ctrl+Shift+T` toggles expanded above-editor dashboard · `Esc` collapses expanded dashboard.",
+    "**TUI Shortcuts:** `Alt+S` opens Mission Control / Hub · `Alt+M` opens Mission Model Picker · `Alt+W` toggles expanded above-editor dashboard.",
   ].join("\n");
 }
 
@@ -3033,28 +3033,74 @@ function extractAgentMessagePlainText(msg: unknown): string | undefined {
         parts.push((part as { text: string }).text);
       }
     }
+    if (parts.length === 0) {
+      return undefined;
+    }
     return parts.join("\n");
   }
   return undefined;
+}
+
+function computeGoalProgressFingerprint(run: SwarmRunState): string {
+  const completedFeatures = (run.features ?? [])
+    .filter((f) => f.status === "completed")
+    .map((f) => f.id)
+    .sort()
+    .join(",");
+  const passedAssertions = (run.assertions ?? [])
+    .filter((a) => a.status === "passed")
+    .map((a) => a.id)
+    .sort()
+    .join(",");
+  const resolvedHandoffs = (run.handoffItems ?? [])
+    .filter((h) => h.resolution !== "open")
+    .map((h) => `${h.id}:${h.resolution}`)
+    .sort()
+    .join(",");
+  const sealedMilestones = (run.milestones ?? [])
+    .filter((m) => m.sealed === true || m.status === "done")
+    .map((m) => `${m.label}:${m.status}:${m.sealed ? "1" : "0"}`)
+    .sort()
+    .join(",");
+  const mergedMembers = getOrderedMembers(run)
+    .filter((m) => Boolean(m.mergedCommitSha))
+    .map((m) => `${m.name}:${m.mergedCommitSha}`)
+    .sort()
+    .join(",");
+  return `${completedFeatures}|${passedAssertions}|${resolvedHandoffs}|${sealedMilestones}|${mergedMembers}|${run.memberOrder.length}`;
 }
 
 function inspectGoalRemainingWork(run: SwarmRunState): {
   hasStructuredGoal: boolean;
   unfinishedFeatures: MissionFeature[];
   unpassedAssertions: MissionAssertion[];
+  unclaimedAssertions: MissionAssertion[];
   openHandoffs: MissionHandoffItem[];
   unfinishedMilestones: SwarmMilestone[];
   unmergedMembers: SwarmMemberRecord[];
 } {
-  const unfinishedFeatures = (run.features ?? []).filter(
+  const allFeatures = run.features ?? [];
+  const allAssertions = run.assertions ?? [];
+  const unfinishedFeatures = allFeatures.filter(
     (f) =>
       f.status === "pending" ||
       f.status === "in_progress" ||
       f.status === "failed",
   );
-  const unpassedAssertions = (run.assertions ?? []).filter(
+  const unpassedAssertions = allAssertions.filter(
     (a) => a.status !== "passed",
   );
+  const claimingFeatures =
+    unfinishedFeatures.length === 0
+      ? allFeatures.filter((f) => f.status === "completed")
+      : allFeatures.filter((f) => f.status !== "cancelled");
+  const claimedAssertionIds = new Set<string>(
+    claimingFeatures.flatMap((f) => f.fulfills ?? []),
+  );
+  const unclaimedAssertions =
+    allAssertions.length > 0
+      ? allAssertions.filter((a) => !claimedAssertionIds.has(a.id))
+      : [];
   const openHandoffs = (run.handoffItems ?? []).filter(
     (h) => h.resolution === "open",
   );
@@ -3072,16 +3118,18 @@ function inspectGoalRemainingWork(run: SwarmRunState): {
   const hasStructuredGoal = Boolean(
     unfinishedFeatures.length > 0 ||
       unpassedAssertions.length > 0 ||
+      unclaimedAssertions.length > 0 ||
       openHandoffs.length > 0 ||
       unfinishedMilestones.length > 0 ||
-      (run.features && run.features.length > 0) ||
-      (run.assertions && run.assertions.length > 0),
+      allFeatures.length > 0 ||
+      allAssertions.length > 0,
   );
 
   return {
     hasStructuredGoal,
     unfinishedFeatures,
     unpassedAssertions,
+    unclaimedAssertions,
     openHandoffs,
     unfinishedMilestones,
     unmergedMembers,
@@ -3138,6 +3186,20 @@ function buildGoalCheckpointMessage(
     );
   }
 
+  if (goalState.unclaimedAssertions.length > 0) {
+    const unclaimedSummary = goalState.unclaimedAssertions
+      .slice(0, 8)
+      .map((a) => `\`${sanitizePlainText(a.id)}\``)
+      .join(", ");
+    const unclaimedMore =
+      goalState.unclaimedAssertions.length > 8
+        ? `, … +${goalState.unclaimedAssertions.length - 8} more`
+        : "";
+    lines.push(
+      `- **Unclaimed Validation Assertions (${goalState.unclaimedAssertions.length}/${totalAssertions}):** ${unclaimedSummary}${unclaimedMore} (must be claimed in \`fulfills[]\` of a \`"completed"\` feature)`,
+    );
+  }
+
   if (goalState.openHandoffs.length > 0) {
     const handoffSummary = goalState.openHandoffs
       .slice(0, 6)
@@ -3177,15 +3239,21 @@ function buildGoalCheckpointMessage(
     );
   }
 
-  if (
+  const isFullySatisfied =
     goalState.unfinishedFeatures.length === 0 &&
     goalState.unpassedAssertions.length === 0 &&
+    goalState.unclaimedAssertions.length === 0 &&
     goalState.openHandoffs.length === 0 &&
-    goalState.unfinishedMilestones.length === 0
-  ) {
+    goalState.unfinishedMilestones.length === 0 &&
+    goalState.unmergedMembers.length === 0;
+
+  if (isFullySatisfied) {
     lines.push(
-      `- **Goal Contract Satisfied:** All features (${totalFeatures}/${totalFeatures}) and VAL-* assertions (${totalAssertions}/${totalAssertions}) are complete — merge any remaining worktrees and call \`swarm{action:"done", summary}\` now to close the Mission.`,
+      `- **Goal Contract Satisfied:** All features (${totalFeatures}/${totalFeatures}) and VAL-* assertions (${totalAssertions}/${totalAssertions}) are complete with 0 open handoffs and 0 unmerged branches — call \`swarm{action:"done", summary}\` now to close the Mission.`,
+      "",
+      "Do NOT stop with plain text while the Mission is active — call `swarm{action:\"done\", summary}` now (or only if genuinely blocked on human input, output `[NEEDS_HUMAN]`).",
     );
+    return lines.join("\n");
   }
 
   const validatorGuidance =
@@ -3196,8 +3264,8 @@ function buildGoalCheckpointMessage(
   lines.push(
     "",
     "Do NOT stop with plain text while the Mission is active:",
-    `- Advance the next wave via \`swarm{action:"add"}\` or wake/steer parked members via \`post_message\` / \`swarm{action:"steer"}\` (and call \`swarm_wait{since: ${snapshot.boardHead}}\` while members work).`,
-    `- Resolve any open handoff items via \`swarm{action:"mission", mission_op:"upsert_features"}\` + \`swarm{action:"mission", mission_op:"resolve_handoff"}\`, ${validatorGuidance}merge verified branches (\`swarm{action:"merge"}\`), or call \`swarm{action:"done", summary}\` once 100% complete.`,
+    `- Advance the next wave via \`swarm{action:"mission", mission_op:"dispatch_ready"}\` or \`swarm{action:"add"}\`, or wake/steer parked members via \`post_message\` / \`swarm{action:"steer"}\` (and call \`swarm_wait{since: ${snapshot.boardHead}}\` while members work).`,
+    `- Resolve any open handoff items via \`swarm{action:"mission", mission_op:"upsert_features"}\` + \`swarm{action:"mission", mission_op:"resolve_handoff"}\`, ${validatorGuidance}merge any opt-in branches (\`swarm{action:"merge"}\`), or call \`swarm{action:"done", summary}\` once 100% complete.`,
     "- Only if genuinely blocked on external credentials or a human product decision, explain the blocker clearly and output `[NEEDS_HUMAN]` to pause auto-continuation.",
   );
 
@@ -3347,6 +3415,7 @@ export function createPiSwarmExtension(
       {
         count: number;
         lastProgressKey?: string;
+        lastGoalFingerprint?: string;
         stagnantTurns: number;
         tripped?: boolean;
       }
@@ -5476,8 +5545,64 @@ export function createPiSwarmExtension(
     // ------------------------------------------------------------------------
     // Plan Confirmation Callback (`propose_swarm_plan` -> real store/git/engine)
     // ------------------------------------------------------------------------
-    async function spawnInitialMembersForRun(
+    async function updateRunFeatureAssignment(
+      store: ISwarmStore,
       engine: ISwarmEngine,
+      runId: string,
+      featureId: string,
+      status: MissionFeature["status"],
+      assignedMember: string | undefined,
+      toolCtx: ExtensionContext,
+    ): Promise<void> {
+      if (typeof engine.manageMission === "function") {
+        await engine.manageMission({
+          op: "update_feature",
+          featureId,
+          featureStatus: status,
+          assignedMember: assignedMember ?? "",
+          callerName: ORCHESTRATOR_NAME,
+          callerRole: "orchestrator",
+          hostContext: toolCtx,
+        });
+        return;
+      }
+      const cur = await store.loadRun(runId);
+      if (!cur.features || cur.features.length === 0) {
+        return;
+      }
+      const nowIso = new Date((overrides.now ?? Date.now)()).toISOString();
+      const nextFeatures = cur.features.map((f) => {
+        if (f.id !== featureId) return { ...f };
+        const copy: MissionFeature = {
+          ...f,
+          status,
+          updatedAt: nowIso,
+        };
+        if (assignedMember) {
+          copy.assignedMember = assignedMember;
+        } else {
+          delete copy.assignedMember;
+        }
+        return copy;
+      });
+      const nextMilestones = derivePlanMilestones(
+        cur.milestones,
+        nextFeatures,
+        cur.assertions,
+        cur.milestones,
+      );
+      await store.updateRun(runId, {
+        features: nextFeatures,
+        ...(nextMilestones !== undefined ? { milestones: nextMilestones } : {}),
+        actor: ORCHESTRATOR_NAME,
+      });
+      await engine.attachRun(runId, toolCtx);
+    }
+
+    async function spawnInitialMembersForRun(
+      store: ISwarmStore,
+      engine: ISwarmEngine,
+      runId: string,
       plan: ProposedSwarmPlan,
       toolCtx: ExtensionContext,
       existingMembers?: Record<string, SwarmMemberRecord>,
@@ -5530,6 +5655,55 @@ export function createPiSwarmExtension(
 
       for (const memberSpec of candidates) {
         attemptedCount += 1;
+        let claimedFeature:
+          | {
+              id: string;
+              priorStatus: MissionFeature["status"];
+              priorAssigned?: string;
+            }
+          | undefined;
+
+        if (memberSpec.role === "worker") {
+          try {
+            const latestRun = await store.loadRun(runId);
+            const runFeatures = latestRun.features ?? [];
+            const explicitFid = memberSpec.featureId?.trim();
+            const matchedFeat = explicitFid
+              ? runFeatures.find(
+                  (f) =>
+                    f.id === explicitFid &&
+                    f.status !== "completed" &&
+                    f.status !== "cancelled",
+                )
+              : runFeatures.find(
+                  (f) =>
+                    f.id === memberSpec.name &&
+                    f.status === "pending" &&
+                    !f.assignedMember,
+                );
+            if (matchedFeat) {
+              claimedFeature = {
+                id: matchedFeat.id,
+                priorStatus: matchedFeat.status,
+                ...(matchedFeat.assignedMember
+                  ? { priorAssigned: matchedFeat.assignedMember }
+                  : {}),
+              };
+              await updateRunFeatureAssignment(
+                store,
+                engine,
+                runId,
+                matchedFeat.id,
+                "in_progress",
+                memberSpec.name,
+                toolCtx,
+              );
+            }
+          } catch {
+            claimedFeature = undefined;
+          }
+        }
+
         try {
           const added = await engine.addMembers({
             name: memberSpec.name,
@@ -5542,7 +5716,41 @@ export function createPiSwarmExtension(
             hostContext: toolCtx,
           });
           spawnedInitial.push(...added);
+          const primarySpawned = added[0];
+          if (
+            claimedFeature &&
+            primarySpawned &&
+            primarySpawned.role === "worker" &&
+            primarySpawned.name !== memberSpec.name
+          ) {
+            const afterSpawnRun = await store.loadRun(runId).catch(() => null);
+            const curFeat = afterSpawnRun?.features?.find(
+              (f) => f.id === claimedFeature!.id,
+            );
+            if (curFeat && curFeat.status === "in_progress") {
+              await updateRunFeatureAssignment(
+                store,
+                engine,
+                runId,
+                claimedFeature.id,
+                "in_progress",
+                primarySpawned.name,
+                toolCtx,
+              ).catch(() => {});
+            }
+          }
         } catch (err) {
+          if (claimedFeature) {
+            await updateRunFeatureAssignment(
+              store,
+              engine,
+              runId,
+              claimedFeature.id,
+              claimedFeature.priorStatus,
+              claimedFeature.priorAssigned,
+              toolCtx,
+            ).catch(() => {});
+          }
           if (firstInitialErr === undefined) {
             firstInitialErr = err;
           }
@@ -5618,7 +5826,9 @@ export function createPiSwarmExtension(
 
         const { spawnedInitial, failedInitial, firstInitialErr, attemptedCount } =
           await spawnInitialMembersForRun(
+            store,
             engine,
+            revisedRun.id,
             plan,
             toolCtx,
             revisedRun.members,
@@ -5779,9 +5989,9 @@ export function createPiSwarmExtension(
       // 4. Attach & start the run in SwarmEngine (defer focus entry until initialMembers settle)
       await engine.startRun(createdRun.id, toolCtx);
 
-      // 5. Pre-create any custom channels referenced by initialMembers, then spawn them immediately
+      // 5. Pre-create any custom channels referenced by initialMembers, claim matched wave-1 features, then spawn them immediately
       const { spawnedInitial, failedInitial, firstInitialErr, attemptedCount } =
-        await spawnInitialMembersForRun(engine, plan, toolCtx);
+        await spawnInitialMembersForRun(store, engine, createdRun.id, plan, toolCtx);
 
       // If ALL initialMembers failed before any started, roll back run cleanly so draft remains intact
       if (
@@ -5851,7 +6061,11 @@ export function createPiSwarmExtension(
     // Ephemeral Read-Only Adversarial Contract Reviewer (`runAdversarialContractReview`)
     // ------------------------------------------------------------------------
     function hasLivePiModelRuntime(ctx: ExtensionContext | undefined): boolean {
-      if (!ctx || (ctx.mode !== "tui" && ctx.mode !== "rpc")) {
+      const mode = (ctx as { mode?: string } | undefined)?.mode;
+      if (
+        !ctx ||
+        (mode !== "tui" && mode !== "rpc" && mode !== "print" && mode !== "json")
+      ) {
         return false;
       }
       const rawRuntime = (
@@ -6021,6 +6235,7 @@ export function createPiSwarmExtension(
           systemPrompt,
           initialPrompt,
           keepWarm: false,
+          ephemeralAudit: true,
           ...(reviewerModel ? { modelOverride: reviewerModel } : {}),
           ...(reviewerThinking ? { thinkingLevel: reviewerThinking } : {}),
           hostContext: ctx,
@@ -8324,6 +8539,8 @@ export function createPiSwarmExtension(
       orchestratorMode = false;
       autoConfirmDefault = false;
       lastCompletedRunId = null;
+      latestHumanDirection = undefined;
+      waitArmedTurnIndex = null;
       const prevFocused = engine.getSnapshot().activeRunId;
       if (prevFocused) {
         activatedRunIds.delete(prevFocused);
@@ -8337,10 +8554,13 @@ export function createPiSwarmExtension(
         syncDraftWidgetState(null);
       }
       persistCurrentFocus(null, sessionId, "user_unfocus");
-      applySwarmToolProfile(pi, computeDesiredToolProfile(ctx));
+      const nextMode = computeDesiredToolProfile(ctx);
+      applySwarmToolProfile(pi, nextMode);
       syncActiveRunSections({ ctx });
       clearWorkingMessageAndTitle(ctx);
-      await restorePreSwarmHostModel(ctx);
+      if (nextMode === "idle") {
+        await restorePreSwarmHostModel(ctx);
+      }
       refreshUI(ctx);
     }
 
@@ -9390,12 +9610,15 @@ export function createPiSwarmExtension(
       if (sub === "tasks" || sub === "ui" || sub === "mc" || sub === "open" || sub === "panel") {
         const lowerActive = argPrefix.toLowerCase();
         const items: AutocompleteItem[] = [];
-        for (const tab of ["board", "members", "graph", "search"] as const) {
+        for (const tab of ["board", "members", "graph", "contract", "search"] as const) {
           if (tab.startsWith(lowerActive)) {
             items.push({
               value: `${sub} ${tab}`,
               label: tab,
-              description: `Open Swarm overlay on the ${tab} tab`,
+              description:
+                tab === "contract"
+                  ? "Open Swarm overlay on the Mission Contract & Features view"
+                  : `Open Swarm overlay on the ${tab} tab`,
             });
           }
         }
@@ -9864,7 +10087,7 @@ export function createPiSwarmExtension(
     // ------------------------------------------------------------------------
     pi.registerCommand("swarm", {
       description:
-        "Pi Swarm v0.9.0 — Dynamic Mission Goal Engine & Antigravity Swarm orchestrator (VAL-* contracts, Sisyphus auto-continuation, Droid Mission model/effort picker & cross-session resume, shared #seq board, non-blocking swarm_wait, warm sessions & worktrees)",
+        "Pi Swarm v1.0.0 — Dynamic Mission Goal Engine & Antigravity Swarm orchestrator (VAL-* contracts, Sisyphus auto-continuation, Droid Mission model/effort picker & cross-session resume, shared #seq board, non-blocking swarm_wait, warm sessions & worktrees)",
       getArgumentCompletions: getSwarmCompletions,
       handler: handleSwarmCommand,
     });
@@ -9965,7 +10188,13 @@ export function createPiSwarmExtension(
 
       const snapshot = getSnapshotSafe();
       const hasOwnedLiveRun = isOwnedLiveRun(snapshot.run, ctx);
-      const isPersistentOrchestratorOwner = orchestratorMode || hasOwnedLiveRun;
+      const isGuardedRunOwner =
+        Boolean(snapshot.run) &&
+        isRunningProfileRun(snapshot.run) &&
+        isCurrentSessionOwner(snapshot.run, ctx) &&
+        (snapshot.run!.status === "active" || Boolean(snapshot.run!.ownerSessionId));
+      const isPersistentOrchestratorOwner =
+        orchestratorMode || hasOwnedLiveRun || isGuardedRunOwner;
 
       if (!isPersistentOrchestratorOwner) {
         if (draftController.isActive() && isEditTool) {
@@ -10469,22 +10698,36 @@ export function createPiSwarmExtension(
       }
 
       const progressKey = `${run.revision}:${snapshot.boardHead}`;
+      const goalFingerprint = computeGoalProgressFingerprint(run);
       let contState = goalContinuationByRunId.get(run.id);
       if (!contState) {
         contState = { count: 0, stagnantTurns: 0 };
         goalContinuationByRunId.set(run.id, contState);
       }
 
-      if (contState.tripped && contState.lastProgressKey === progressKey) {
+      if (
+        contState.tripped &&
+        contState.lastGoalFingerprint === goalFingerprint &&
+        (contState.lastProgressKey === progressKey || contState.count >= 12)
+      ) {
         return;
       }
 
       if (contState.lastProgressKey === undefined) {
         contState.lastProgressKey = progressKey;
+        contState.lastGoalFingerprint = goalFingerprint;
         contState.stagnantTurns = 0;
+      } else if (contState.lastGoalFingerprint !== goalFingerprint) {
+        // Real Mission goal progress advanced — reset total continuation count as well as stagnation!
+        contState.lastGoalFingerprint = goalFingerprint;
+        contState.lastProgressKey = progressKey;
+        contState.count = 0;
+        contState.stagnantTurns = 0;
+        contState.tripped = false;
       } else if (contState.lastProgressKey === progressKey) {
         contState.stagnantTurns += 1;
       } else {
+        // Board/revision churn without goal-state advancement: reset stagnantTurns, keep count < 12 cap
         contState.lastProgressKey = progressKey;
         contState.stagnantTurns = 0;
         contState.tripped = false;

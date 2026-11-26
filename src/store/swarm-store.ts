@@ -90,6 +90,7 @@ import { SWARM_SETTINGS_BOUNDS } from "./settings.js";
 
 const SAFE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const LIBRARY_TOPIC_PATTERN = /^[a-z0-9][a-z0-9-_]{0,47}$/i;
+export const MAX_LIBRARY_TOPIC_BYTES = 256 * 1024;
 
 const DEFAULT_LIBRARY_STARTER_CONTENT: Readonly<
   Record<(typeof DEFAULT_LIBRARY_TOPICS)[number], string>
@@ -3256,6 +3257,19 @@ export class SwarmStore implements ISwarmStore {
         { runId: safeRunId, topic: safeTopic },
       );
     }
+    const incomingBytes = Buffer.byteLength(content, "utf8");
+    if (incomingBytes > MAX_LIBRARY_TOPIC_BYTES) {
+      throw new SwarmProtocolError(
+        "INVALID_INPUT",
+        `Library topic "${safeTopic}" content exceeds maximum size of ${MAX_LIBRARY_TOPIC_BYTES} bytes (got ${incomingBytes} bytes). Keep shared library notes concise instead of dumping raw logs.`,
+        {
+          runId: safeRunId,
+          topic: safeTopic,
+          bytes: incomingBytes,
+          maxBytes: MAX_LIBRARY_TOPIC_BYTES,
+        },
+      );
+    }
 
     return this.withRunLock(safeRunId, async () => {
       await this.readStateUnlocked(safeRunId);
@@ -3285,6 +3299,20 @@ export class SwarmStore implements ISwarmStore {
         } else {
           nextContent = `${existing}\n${content}`;
         }
+      }
+
+      const totalBytes = Buffer.byteLength(nextContent, "utf8");
+      if (totalBytes > MAX_LIBRARY_TOPIC_BYTES) {
+        throw new SwarmProtocolError(
+          "INVALID_INPUT",
+          `Library topic "${safeTopic}" exceeds maximum size of ${MAX_LIBRARY_TOPIC_BYTES} bytes after update (got ${totalBytes} bytes). Keep shared library notes concise instead of dumping raw logs.`,
+          {
+            runId: safeRunId,
+            topic: safeTopic,
+            bytes: totalBytes,
+            maxBytes: MAX_LIBRARY_TOPIC_BYTES,
+          },
+        );
       }
 
       await writeTmpAndRename(topicPath, nextContent);

@@ -313,17 +313,109 @@ function overlayAssertionGlyph(status: AssertionStatus, theme?: Theme): string {
   }
 }
 
+interface MissionContractRenderOptions {
+  libraryTopics?: readonly string[] | null;
+  activeReader?: {
+    topic: string;
+    content: string;
+    loading: boolean;
+    error?: string;
+  } | null;
+  canReadLibrary?: boolean;
+}
+
+function normalizeOverlayLibraryTopic(raw: string): string {
+  return sanitizePlainText(raw).trim().replace(/\.md$/i, "");
+}
+
 function buildMissionContractLines(
   run: SwarmRunState,
   width: number,
   theme?: Theme,
+  options?: MissionContractRenderOptions,
 ): string[] {
   const targetWidth = Math.max(0, Math.floor(width));
   if (targetWidth === 0) return [];
 
+  const sep = theme ? theme.fg("dim", " · ") : " · ";
+  const activeReader = options?.activeReader ?? null;
+  if (activeReader) {
+    const readerLines: string[] = [];
+    const rawTopics =
+      options?.libraryTopics && options.libraryTopics.length > 0
+        ? options.libraryTopics.map(normalizeOverlayLibraryTopic).filter(Boolean)
+        : [activeReader.topic];
+    const idx = Math.max(0, rawTopics.indexOf(activeReader.topic));
+    const headerTitle =
+      targetWidth >= 58
+        ? `Shared Library: ${activeReader.topic}.md (${idx + 1}/${rawTopics.length}) [l: next · Esc: contract]`
+        : targetWidth >= 42
+          ? `Library: ${activeReader.topic}.md (${idx + 1}/${rawTopics.length}) [l/Esc]`
+          : `${activeReader.topic}.md [l/Esc]`;
+    readerLines.push(renderHorizontalRule(targetWidth, headerTitle, theme));
+
+    const topicPills = rawTopics.map((t) => {
+      const label = `${t}.md`;
+      if (t === activeReader.topic) {
+        return theme ? theme.fg("accent", theme.bold(`[▸ ${label}]`)) : `[▸ ${label}]`;
+      }
+      return theme ? theme.fg("muted", label) : label;
+    });
+    readerLines.push(fitLine(`  ${topicPills.join(sep)}`, targetWidth));
+
+    const fullTopicPath = `.pi/swarm/runs/${sanitizePlainText(run.id)}/library/${activeReader.topic}.md`;
+    readerLines.push(
+      fitLine(
+        theme
+          ? `  ${theme.fg("muted", "Path:")} ${theme.fg("dim", fullTopicPath)}`
+          : `  Path: ${fullTopicPath}`,
+        targetWidth,
+      ),
+    );
+    readerLines.push(renderHorizontalRule(targetWidth, undefined, theme));
+
+    if (activeReader.loading) {
+      const loadingMsg = `  Loading ${activeReader.topic}.md…`;
+      readerLines.push(
+        fitLine(theme ? theme.fg("muted", loadingMsg) : loadingMsg, targetWidth),
+      );
+    } else if (activeReader.error) {
+      const errMsg = `  Library read error: ${sanitizePlainText(activeReader.error)}`;
+      readerLines.push(
+        fitLine(theme ? theme.fg("error", errMsg) : errMsg, targetWidth),
+      );
+    } else if (!activeReader.content.trim()) {
+      const emptyMsg = `  (topic ${activeReader.topic}.md is empty)`;
+      readerLines.push(
+        fitLine(theme ? theme.fg("dim", emptyMsg) : emptyMsg, targetWidth),
+      );
+    } else {
+      for (const rawLine of activeReader.content.split(/\r?\n/)) {
+        const cleanLine = sanitizeDiffLine(rawLine);
+        if (cleanLine.length === 0) {
+          readerLines.push("");
+          continue;
+        }
+        const wrapped = wrapLines(cleanLine, Math.max(1, targetWidth - 2));
+        const isHeading = /^#{1,6}\s/.test(cleanLine.trimStart());
+        const isFence = /^```/.test(cleanLine.trimStart());
+        for (const seg of wrapped) {
+          const styledSeg = theme
+            ? isHeading
+              ? theme.fg("accent", theme.bold(seg))
+              : isFence
+                ? theme.fg("dim", seg)
+                : seg
+            : seg;
+          readerLines.push(fitLine(`  ${styledSeg}`, targetWidth));
+        }
+      }
+    }
+    return readerLines.map((l) => fitLine(l, targetWidth));
+  }
+
   const goal = summarizeOverlayGoal(run);
   const sealedSet = new Set(goal.sealedMilestones);
-  const sep = theme ? theme.fg("dim", " · ") : " · ";
   const lines: string[] = [];
 
   lines.push(
@@ -738,17 +830,70 @@ function buildMissionContractLines(
     }
   }
 
-  // 7. Shared Mission Library Reference
+  // 7. Shared Mission Library Reference & Real Topics
   const libraryPath = `.pi/swarm/runs/${sanitizePlainText(run.id)}/library/`;
-  lines.push(renderHorizontalRule(targetWidth, "Shared Library", theme));
-  lines.push(
-    fitLine(
-      theme
-        ? `  ${theme.fg("accent", "◆")} ${theme.bold(libraryPath)}${theme.fg("dim", " (architecture · environment · testing)")}`
-        : `  ◆ ${libraryPath} (architecture · environment · testing)`,
-      targetWidth,
-    ),
-  );
+  const libRuleTitle = options?.canReadLibrary
+    ? targetWidth >= 48
+      ? "Shared Library [l: read topic]"
+      : "Shared Library [l]"
+    : "Shared Library";
+  lines.push(renderHorizontalRule(targetWidth, libRuleTitle, theme));
+
+  const loadedTopics = options?.libraryTopics;
+  if (loadedTopics !== undefined && loadedTopics !== null) {
+    const cleanTopics = loadedTopics
+      .map(normalizeOverlayLibraryTopic)
+      .filter(Boolean);
+    if (cleanTopics.length === 0) {
+      lines.push(
+        fitLine(
+          theme
+            ? `  ${theme.fg("accent", "◆")} ${theme.bold(libraryPath)}${theme.fg("dim", " (no .md topics yet)")}`
+            : `  ◆ ${libraryPath} (no .md topics yet)`,
+          targetWidth,
+        ),
+      );
+    } else {
+      const mdNames = cleanTopics.map((t) => `${t}.md`).join(" · ");
+      const singleLib = theme
+        ? `  ${theme.fg("accent", "◆")} ${theme.bold(libraryPath)} ${theme.fg("muted", `(${mdNames})`)}`
+        : `  ◆ ${libraryPath} (${mdNames})`;
+      if (visibleWidth(singleLib) <= targetWidth) {
+        lines.push(fitLine(singleLib, targetWidth));
+      } else {
+        lines.push(
+          fitLine(
+            theme
+              ? `  ${theme.fg("accent", "◆")} ${theme.bold(libraryPath)}`
+              : `  ◆ ${libraryPath}`,
+            targetWidth,
+          ),
+        );
+        const wrappedTopics = wrapLines(
+          mdNames,
+          Math.max(1, targetWidth - 6),
+          3,
+        );
+        for (const wt of wrappedTopics) {
+          lines.push(
+            fitLine(
+              `      ${theme ? theme.fg("muted", wt) : wt}`,
+              targetWidth,
+            ),
+          );
+        }
+      }
+    }
+  } else {
+    lines.push(
+      fitLine(
+        theme
+          ? `  ${theme.fg("accent", "◆")} ${theme.bold(libraryPath)}${theme.fg("dim", " (architecture.md · environment.md · testing.md)")}`
+          : `  ◆ ${libraryPath} (architecture.md · environment.md · testing.md)`,
+        targetWidth,
+      ),
+    );
+  }
 
   return lines.map((l) => fitLine(l, targetWidth));
 }
@@ -846,6 +991,16 @@ export class SwarmOverlayComponent implements Component, Focusable {
   // Graph / Mission Contract tab state
   private graphViewMode: SwarmOverlayGraphView;
   private graphScrollOffset = 0;
+  private libraryTopics: string[] | null = null;
+  private libraryTopicsRunId: string | null = null;
+  private libraryRefreshInFlight = false;
+  private activeLibraryReader: {
+    topic: string;
+    content: string;
+    loading: boolean;
+    error?: string;
+  } | null = null;
+  private libraryRequestId = 0;
   private graphCache:
     | {
         runId: string;
@@ -854,6 +1009,7 @@ export class SwarmOverlayComponent implements Component, Focusable {
         lastSeq: number;
         width: number;
         mode: SwarmOverlayGraphView;
+        libraryKey: string;
         lines: string[];
       }
     | undefined;
@@ -955,6 +1111,10 @@ export class SwarmOverlayComponent implements Component, Focusable {
         this.expandedPost = null;
         this.graphViewMode = "graph";
         this.graphScrollOffset = 0;
+        this.libraryTopics = null;
+        this.libraryTopicsRunId = null;
+        this.activeLibraryReader = null;
+        this.libraryRequestId += 1;
         this.graphCache = undefined;
         this.lastBoardRefreshRunId = null;
         this.lastBoardRefreshHead = null;
@@ -1007,11 +1167,156 @@ export class SwarmOverlayComponent implements Component, Focusable {
       }
 
       this.syncSpinnerTimer(this.hasWorkingMembers());
+      if (this.activeTab === "graph" && this.graphViewMode === "contract") {
+        void this.refreshLibraryTopics();
+      }
       this.tui.requestRender();
     });
 
     this.syncSpinnerTimer(this.hasWorkingMembers());
     void this.refreshFullBoard();
+    if (this.activeTab === "graph" && this.graphViewMode === "contract") {
+      void this.refreshLibraryTopics();
+    }
+  }
+
+  private getLibraryCacheKey(): string {
+    const topicsPart =
+      this.libraryTopics === null ? "null" : this.libraryTopics.join(",");
+    const readerPart = this.activeLibraryReader
+      ? `${this.activeLibraryReader.topic}:${this.activeLibraryReader.loading ? "1" : "0"}:${this.activeLibraryReader.error ?? ""}:${this.activeLibraryReader.content.length}`
+      : "none";
+    const capPart = typeof this.engine.manageMission === "function" ? "rw" : "ro";
+    return `${capPart}|${topicsPart}|${readerPart}`;
+  }
+
+  private async refreshLibraryTopics(force = false): Promise<string[] | null> {
+    const runId = this.snapshot.run?.id;
+    if (
+      this.closed ||
+      !runId ||
+      typeof this.engine.manageMission !== "function"
+    ) {
+      return null;
+    }
+    if (!force && this.libraryRefreshInFlight) {
+      return this.libraryTopics;
+    }
+    this.libraryRefreshInFlight = true;
+    try {
+      const res = await this.engine.manageMission({
+        op: "read_library",
+        callerRole: "human",
+        callerName: "human",
+      });
+      if (this.closed || this.snapshot.run?.id !== runId) {
+        return null;
+      }
+      const normalized = (res.libraryTopics ?? [])
+        .map(normalizeOverlayLibraryTopic)
+        .filter(Boolean);
+      this.libraryTopics = normalized;
+      this.libraryTopicsRunId = runId;
+      this.graphCache = undefined;
+      this.tui.requestRender();
+      return normalized;
+    } catch {
+      return this.libraryTopics;
+    } finally {
+      this.libraryRefreshInFlight = false;
+    }
+  }
+
+  private async handleCycleLibraryTopic(): Promise<void> {
+    const runId = this.snapshot.run?.id;
+    if (!runId || typeof this.engine.manageMission !== "function") {
+      this.setFeedback("info", "Shared Library reader unavailable for this run.");
+      return;
+    }
+
+    let topics =
+      this.libraryTopicsRunId === runId && this.libraryTopics !== null
+        ? this.libraryTopics
+        : await this.refreshLibraryTopics(true);
+    if (this.closed || this.snapshot.run?.id !== runId) return;
+    topics = topics ?? [];
+
+    if (topics.length === 0) {
+      this.activeLibraryReader = null;
+      this.graphCache = undefined;
+      this.setFeedback("info", "Shared Library has no .md topics yet.");
+      return;
+    }
+
+    const currentTopic = this.activeLibraryReader?.topic;
+    const curIdx = currentTopic ? topics.indexOf(currentTopic) : -1;
+    const nextIdx = curIdx + 1;
+    if (curIdx >= 0 && nextIdx >= topics.length) {
+      // Cycling past the last topic returns cleanly to the full Contract overview
+      this.activeLibraryReader = null;
+      this.graphScrollOffset = 0;
+      this.graphCache = undefined;
+      this.feedback = undefined;
+      this.tui.requestRender();
+      return;
+    }
+
+    const targetTopic = topics[nextIdx >= 0 ? nextIdx : 0]!;
+    const reqId = ++this.libraryRequestId;
+    this.activeLibraryReader = {
+      topic: targetTopic,
+      content: "",
+      loading: true,
+    };
+    this.graphScrollOffset = 0;
+    this.graphCache = undefined;
+    this.feedback = undefined;
+    this.tui.requestRender();
+
+    try {
+      const res = await this.engine.manageMission({
+        op: "read_library",
+        libraryTopic: targetTopic,
+        callerRole: "human",
+        callerName: "human",
+      });
+      if (
+        this.closed ||
+        this.snapshot.run?.id !== runId ||
+        reqId !== this.libraryRequestId
+      ) {
+        return;
+      }
+      if (res.libraryTopics) {
+        this.libraryTopics = res.libraryTopics
+          .map(normalizeOverlayLibraryTopic)
+          .filter(Boolean);
+        this.libraryTopicsRunId = runId;
+      }
+      this.activeLibraryReader = {
+        topic: targetTopic,
+        content: res.libraryContent ?? "",
+        loading: false,
+      };
+      this.graphCache = undefined;
+      this.tui.requestRender();
+    } catch (err) {
+      if (
+        this.closed ||
+        this.snapshot.run?.id !== runId ||
+        reqId !== this.libraryRequestId
+      ) {
+        return;
+      }
+      this.activeLibraryReader = {
+        topic: targetTopic,
+        content: "",
+        loading: false,
+        error: formatErrorMessage(err),
+      };
+      this.graphCache = undefined;
+      this.tui.requestRender();
+    }
   }
 
   private hasWorkingMembers(): boolean {
@@ -1132,6 +1437,9 @@ export class SwarmOverlayComponent implements Component, Focusable {
       this.setSearchFocused(true);
     } else {
       this.setSearchFocused(false);
+    }
+    if (tab === "graph" && this.graphViewMode === "contract") {
+      void this.refreshLibraryTopics();
     }
     this.clampSelections();
   }
@@ -1919,7 +2227,7 @@ export class SwarmOverlayComponent implements Component, Focusable {
         this.tui.requestRender();
         return;
       }
-      if (matchesKey(data, Key.pageUp) || ch === "b") {
+      if (matchesKey(data, Key.pageUp) || ch === "[" || ch === "b") {
         this.expandedPost.scrollOffset = Math.max(
           0,
           this.expandedPost.scrollOffset - 5,
@@ -1927,7 +2235,7 @@ export class SwarmOverlayComponent implements Component, Focusable {
         this.tui.requestRender();
         return;
       }
-      if (matchesKey(data, Key.pageDown) || ch === " ") {
+      if (matchesKey(data, Key.pageDown) || ch === "]" || ch === " ") {
         this.expandedPost.scrollOffset += 5;
         this.tui.requestRender();
         return;
@@ -1967,6 +2275,19 @@ export class SwarmOverlayComponent implements Component, Focusable {
         this.showHelp = false;
         this.tui.requestRender();
       }
+      return;
+    }
+
+    if (
+      isEscapeKey(data) &&
+      this.activeTab === "graph" &&
+      this.graphViewMode === "contract" &&
+      this.activeLibraryReader !== null
+    ) {
+      this.activeLibraryReader = null;
+      this.graphScrollOffset = 0;
+      this.graphCache = undefined;
+      this.tui.requestRender();
       return;
     }
 
@@ -2184,25 +2505,20 @@ export class SwarmOverlayComponent implements Component, Focusable {
     }
 
     if (ch === "m") {
-      if ((this.options?.availableModels?.length ?? 0) > 0) {
-        if (selected.state === "killed") {
-          this.setFeedback("warning", `Cannot switch model on killed member ${selected.name}.`);
-          return;
-        }
-        this.openMemberModelPicker(selected);
+      if (selected.state === "killed") {
+        this.setFeedback("warning", `Cannot switch model on killed member ${selected.name}.`);
         return;
       }
-      if (selected.state !== "waiting" && selected.state !== "stopped") {
-        this.setFeedback(
-          "warning",
-          `Cannot hot-switch model while ${selected.name} is ${selected.state} (must be waiting or stopped).`,
-        );
+      if ((this.options?.availableModels?.length ?? 0) > 0) {
+        this.openMemberModelPicker(selected);
         return;
       }
       this.enterInlineMode(
         { kind: "model", member: selected },
         "› ",
-        `New model for ${selected.name} (e.g. openai/gpt-5.4:high)…`,
+        selected.state === "working"
+          ? `Queue turn-end model for ${selected.name} (e.g. openai/gpt-5.4:high)…`
+          : `New model for ${selected.name} (e.g. openai/gpt-5.4:high)…`,
       );
       this.tui.requestRender();
       return;
@@ -2224,7 +2540,7 @@ export class SwarmOverlayComponent implements Component, Focusable {
       return;
     }
 
-    if (ch === "g" || ch === "G") {
+    if (ch === "g") {
       void this.runMergeMember(selected);
       return;
     }
@@ -2252,9 +2568,17 @@ export class SwarmOverlayComponent implements Component, Focusable {
     if (ch === "v" || ch === "V") {
       this.graphViewMode =
         this.graphViewMode === "contract" ? "graph" : "contract";
+      this.activeLibraryReader = null;
       this.graphScrollOffset = 0;
       this.graphCache = undefined;
+      if (this.graphViewMode === "contract") {
+        void this.refreshLibraryTopics();
+      }
       this.tui.requestRender();
+      return;
+    }
+    if ((ch === "l" || ch === "L") && this.graphViewMode === "contract") {
+      void this.handleCycleLibraryTopic();
       return;
     }
     if (matchesKey(data, Key.up) || ch === "k") {
@@ -2267,12 +2591,12 @@ export class SwarmOverlayComponent implements Component, Focusable {
       this.tui.requestRender();
       return;
     }
-    if (matchesKey(data, Key.pageUp)) {
+    if (matchesKey(data, Key.pageUp) || ch === "[") {
       this.graphScrollOffset = Math.max(0, this.graphScrollOffset - 6);
       this.tui.requestRender();
       return;
     }
-    if (matchesKey(data, Key.pageDown)) {
+    if (matchesKey(data, Key.pageDown) || ch === "]") {
       this.graphScrollOffset += 6;
       this.tui.requestRender();
       return;
@@ -2331,18 +2655,32 @@ export class SwarmOverlayComponent implements Component, Focusable {
 
     const ultraCompact = innerWidth < 46;
     const compact = innerWidth < 64;
+    const isContractMode = this.graphViewMode === "contract";
+    const tab3Label = ultraCompact
+      ? isContractMode
+        ? "[3]Cnt"
+        : "[3]Grp"
+      : compact
+        ? isContractMode
+          ? "[3]Contract"
+          : "[3]Graph"
+        : isContractMode
+          ? "[3] Contract"
+          : innerWidth >= 86
+            ? "[3] Graph/Contract"
+            : "[3] Graph";
     const tabs: { id: SwarmOverlayTab; label: string }[] = ultraCompact
       ? [
           { id: "board", label: "[1]Brd" },
           { id: "members", label: "[2]Mem" },
-          { id: "graph", label: "[3]Grp" },
+          { id: "graph", label: tab3Label },
           { id: "search", label: "[4]Find" },
         ]
       : compact
         ? [
             { id: "board", label: `[1]Board(#${boardCount})` },
             { id: "members", label: `[2]Mem(${workingCount}/${members.length})` },
-            { id: "graph", label: "[3]Graph" },
+            { id: "graph", label: tab3Label },
             { id: "search", label: "[4]Find" },
           ]
         : [
@@ -2351,7 +2689,7 @@ export class SwarmOverlayComponent implements Component, Focusable {
               id: "members",
               label: `[2] Members (${workingCount}/${members.length})`,
             },
-            { id: "graph", label: "[3] Graph" },
+            { id: "graph", label: tab3Label },
             { id: "search", label: "[4] Search" },
           ];
 
@@ -2953,10 +3291,12 @@ export class SwarmOverlayComponent implements Component, Focusable {
     innerWidth: number,
     budget: number,
   ): string[] {
+    if (budget <= 0) return [];
     const lastSeq =
       this.boardMessages.length > 0
         ? this.boardMessages[this.boardMessages.length - 1]!.seq
         : 0;
+    const libraryKey = this.getLibraryCacheKey();
     const cached = this.graphCache;
     let allLines: string[];
     if (
@@ -2966,11 +3306,17 @@ export class SwarmOverlayComponent implements Component, Focusable {
       cached.boardLen === this.boardMessages.length &&
       cached.lastSeq === lastSeq &&
       cached.width === innerWidth &&
-      cached.mode === this.graphViewMode
+      cached.mode === this.graphViewMode &&
+      cached.libraryKey === libraryKey
     ) {
       allLines = cached.lines;
     } else if (this.graphViewMode === "contract") {
-      allLines = buildMissionContractLines(run, innerWidth, this.theme);
+      allLines = buildMissionContractLines(run, innerWidth, this.theme, {
+        libraryTopics:
+          this.libraryTopicsRunId === run.id ? this.libraryTopics : null,
+        activeReader: this.activeLibraryReader,
+        canReadLibrary: typeof this.engine.manageMission === "function",
+      });
       this.graphCache = {
         runId: run.id,
         revision: run.revision,
@@ -2978,6 +3324,7 @@ export class SwarmOverlayComponent implements Component, Focusable {
         lastSeq,
         width: innerWidth,
         mode: this.graphViewMode,
+        libraryKey,
         lines: allLines,
       };
     } else {
@@ -3049,18 +3396,42 @@ export class SwarmOverlayComponent implements Component, Focusable {
         lastSeq,
         width: innerWidth,
         mode: this.graphViewMode,
+        libraryKey,
         lines: allLines,
       };
     }
-    const maxOffset = Math.max(0, allLines.length - budget);
-    if (this.graphScrollOffset > maxOffset) {
-      this.graphScrollOffset = maxOffset;
+
+    if (allLines.length > budget && budget >= 2) {
+      const sliceBudget = budget - 1;
+      const maxOffset = Math.max(0, allLines.length - sliceBudget);
+      this.graphScrollOffset = Math.max(
+        0,
+        Math.min(this.graphScrollOffset, maxOffset),
+      );
+      const visible = allLines
+        .slice(this.graphScrollOffset, this.graphScrollOffset + sliceBudget)
+        .map((l) => fitLine(l, innerWidth));
+      const above = this.graphScrollOffset;
+      const below = Math.max(
+        0,
+        allLines.length - (this.graphScrollOffset + sliceBudget),
+      );
+      const dirParts: string[] = [];
+      if (above > 0) dirParts.push(`↑ ${above} above`);
+      if (below > 0) dirParts.push(`↓ ${below} more`);
+      const cueSuffix =
+        innerWidth >= 52 ? "  ([/]/PgUp/PgDn scroll)" : " ([/])";
+      visible.push(
+        fitLine(
+          this.theme.fg("accent", `  ${dirParts.join(" · ")}${cueSuffix}`),
+          innerWidth,
+        ),
+      );
+      return visible;
     }
-    const visible = allLines.slice(
-      this.graphScrollOffset,
-      this.graphScrollOffset + budget,
-    );
-    return visible.map((l) => fitLine(l, innerWidth));
+
+    this.graphScrollOffset = 0;
+    return allLines.slice(0, budget).map((l) => fitLine(l, innerWidth));
   }
 
   private renderSearchTab(innerWidth: number, budget: number): string[] {
@@ -3160,7 +3531,9 @@ export class SwarmOverlayComponent implements Component, Focusable {
         : `Wake / message @${mode.member.name}:`;
     }
     const cur = mode.member.model ?? this.hostModel ?? "host default";
-    return `Hot-switch model for ${mode.member.name} (current: ${cur}):`;
+    return mode.member.state === "working"
+      ? `Queue turn-end model switch for ${mode.member.name} (current: ${cur}):`
+      : `Hot-switch model for ${mode.member.name} (current: ${cur}):`;
   }
 
   private formatActionPill(
@@ -3228,6 +3601,14 @@ export class SwarmOverlayComponent implements Component, Focusable {
           ? this.theme.fg("warning", `!${goal.openDebtItems.length} debt`)
           : "";
 
+      const contractCue =
+        this.activeTab === "graph"
+          ? this.theme.fg(
+              "dim",
+              this.graphViewMode === "contract" ? "[v] Graph" : "[v] Contract",
+            )
+          : this.theme.fg("dim", "[3→v] Contract");
+
       const phaseHasSealed = Boolean(phasePart && goal.sealedMilestones.length > 0);
       const withPhaseParts = [
         phasePart ?? "",
@@ -3238,21 +3619,32 @@ export class SwarmOverlayComponent implements Component, Focusable {
       ].filter(Boolean);
       const coreGoalParts = [featSeg, valSeg, sealedSeg, debtSeg].filter(Boolean);
 
+      const withPhaseAndCueLeft = [...withPhaseParts, contractCue].join(sep);
       const withPhaseLeft = withPhaseParts.join(sep);
+      const coreWithCueLeft = [...coreGoalParts, contractCue].join(sep);
       const coreGoalLeft = coreGoalParts.join(sep);
       const compactFleetRight = `${this.theme.fg(workingCount > 0 ? "accent" : "muted", `${workingCount}w`)}/${this.theme.fg("muted", `${waitingCount}wait`)}${stoppedCount > 0 ? `/${this.theme.fg("warning", `${stoppedCount}stop`)}` : ""}${mergedCount > 0 ? `/${this.theme.fg("success", `${mergedCount}m`)}` : ""}`;
 
       if (innerWidth < 48) {
         return fitLine(`${coreGoalLeft}${sep}${compactFleetRight}`, innerWidth);
       }
+      if (visibleWidth(withPhaseAndCueLeft) + 2 + visibleWidth(pipelineRight) <= innerWidth) {
+        return joinColumns(withPhaseAndCueLeft, pipelineRight, innerWidth, 2);
+      }
       if (visibleWidth(withPhaseLeft) + 2 + visibleWidth(pipelineRight) <= innerWidth) {
         return joinColumns(withPhaseLeft, pipelineRight, innerWidth, 2);
+      }
+      if (visibleWidth(coreWithCueLeft) + 2 + visibleWidth(pipelineRight) <= innerWidth) {
+        return joinColumns(coreWithCueLeft, pipelineRight, innerWidth, 2);
       }
       if (visibleWidth(coreGoalLeft) + 2 + visibleWidth(pipelineRight) <= innerWidth) {
         return joinColumns(coreGoalLeft, pipelineRight, innerWidth, 2);
       }
       if (visibleWidth(withPhaseLeft) + 2 + visibleWidth(compactFleetRight) <= innerWidth) {
         return joinColumns(withPhaseLeft, compactFleetRight, innerWidth, 2);
+      }
+      if (visibleWidth(coreWithCueLeft) + 2 + visibleWidth(compactFleetRight) <= innerWidth) {
+        return joinColumns(coreWithCueLeft, compactFleetRight, innerWidth, 2);
       }
       return joinColumns(coreGoalLeft, compactFleetRight, innerWidth, 2);
     }
@@ -3366,7 +3758,7 @@ export class SwarmOverlayComponent implements Component, Focusable {
       return fitLine(
         this.theme.fg(
           "dim",
-          "[↑↓/PgUp/PgDn] scroll · [Enter/Esc] back to list · [q] close",
+          "[↑↓/[/]/PgUp/PgDn] scroll · [Enter/Esc] back to list · [q] close",
         ),
         innerWidth,
       );
@@ -3374,13 +3766,29 @@ export class SwarmOverlayComponent implements Component, Focusable {
     if (this.activeTab === "members") {
       return this.renderMembersActionBar(innerWidth);
     }
+    if (
+      this.activeTab === "graph" &&
+      this.graphViewMode === "contract" &&
+      this.activeLibraryReader !== null
+    ) {
+      const libReaderBar =
+        innerWidth >= 82
+          ? "[l] next topic · [↑↓/jk/[/]] scroll · [Esc] back to contract · [v] graph · [q] close"
+          : innerWidth >= 56
+            ? "[l] next · [↑↓/[/]] scroll · [Esc] contract · [q] close"
+            : "[l] next · [↑↓/[/]] · [Esc] back";
+      return fitLine(this.theme.fg("dim", libReaderBar), innerWidth);
+    }
     let text: string;
     if (innerWidth >= 108) {
       const globalSuffix = " · [M] models · [P] pause · [?] help · [Esc/q] close";
       if (this.activeTab === "board") {
         text = `[Enter] read · [p] post · [c] channel · [1-4/Tab] tabs${globalSuffix}`;
       } else if (this.activeTab === "graph") {
-        text = `[v] Contract/Graph · [↑↓/jk] scroll · [1-4/Tab] tabs${globalSuffix}`;
+        text =
+          this.graphViewMode === "contract"
+            ? `[v] Contract/Graph · [l] library · [↑↓/jk/[/]] scroll${globalSuffix}`
+            : `[v] Contract/Graph · [↑↓/jk/[/]] scroll · [1-4/Tab] tabs${globalSuffix}`;
       } else {
         text = this.searchFocused
           ? "Type to search · [↑↓] select · [Tab] switch tab · [Esc] finish typing"
@@ -3391,10 +3799,17 @@ export class SwarmOverlayComponent implements Component, Focusable {
       if (this.activeTab === "board") {
         text = `[Enter] read · [p] post · [c] ch${midSuffix}`;
       } else if (this.activeTab === "graph") {
-        text =
-          innerWidth >= 90
-            ? `[v] Contract/Graph · [↑↓/jk] scroll${midSuffix}`
-            : "[v] Contract/Graph · [↑↓/jk] scroll · [?] help · [Esc/q] close";
+        if (this.graphViewMode === "contract") {
+          text =
+            innerWidth >= 92
+              ? `[v] Contract/Graph · [l] library · [↑↓/[/]] scroll${midSuffix}`
+              : "[v] Contract/Graph · [l] library · [↑↓/[/]] scroll · [?] help · [Esc/q] close";
+        } else {
+          text =
+            innerWidth >= 90
+              ? `[v] Contract/Graph · [↑↓/jk/[/]] scroll${midSuffix}`
+              : "[v] Contract/Graph · [↑↓/jk] scroll · [?] help · [Esc/q] close";
+        }
       } else {
         text = this.searchFocused
           ? "Type to filter · [↑↓] select · [Tab] tab · [Esc] browse"
@@ -3405,12 +3820,21 @@ export class SwarmOverlayComponent implements Component, Focusable {
       if (this.activeTab === "board") {
         text = `[Enter] read · [p] post · [c] ch${tightSuffix}`;
       } else if (this.activeTab === "graph") {
-        text =
-          innerWidth >= 62
-            ? `[v] Contract/Graph · [↑↓/jk] scroll${tightSuffix}`
-            : innerWidth >= 48
-              ? "[v] Contract/Graph · [↑↓] · [?] · [q] close"
-              : "[v] view · [↑↓] · [q] close";
+        if (this.graphViewMode === "contract") {
+          text =
+            innerWidth >= 62
+              ? `[v] Graph · [l] library · [↑↓/[/]] scroll${tightSuffix}`
+              : innerWidth >= 48
+                ? "[v] Graph · [l] lib · [↑↓/[/]] · [q] close"
+                : "[v] view · [l] lib · [q] close";
+        } else {
+          text =
+            innerWidth >= 62
+              ? `[v] Contract/Graph · [↑↓/jk] scroll${tightSuffix}`
+              : innerWidth >= 48
+                ? "[v] Contract/Graph · [↑↓] · [?] · [q] close"
+                : "[v] view · [↑↓] · [q] close";
+        }
       } else {
         text = this.searchFocused
           ? "Type filter · [↑↓] sel · [Tab] tab · [Esc] browse"
@@ -3444,17 +3868,17 @@ export class SwarmOverlayComponent implements Component, Focusable {
     if (this.showHelp) {
       const helpBody = [
         fitLine(this.theme.fg("accent", this.theme.bold("Global & Overlay Shortcuts")), innerWidth),
-        fitLine("  Alt+S / Alt+M / Alt+W   Mission Control / Models / Expand Dashboard", innerWidth),
-        fitLine("  1-4 / Tab / Shift+Tab   Switch Board, Members, Graph, Search tabs", innerWidth),
-        fitLine("  j / k or ↑ / ↓          Navigate Down / Up across all tabs", innerWidth),
-        fitLine("  M / P / ? / Esc or q    Mission Models / Pause-Resume / Help / Close", innerWidth),
+        fitLine("  Alt+S / Alt+M / Alt+W  Panel / Models / Dashboard", innerWidth),
+        fitLine("  1-4 / Tab / Shift+Tab  Switch 4 Mission tabs", innerWidth),
+        fitLine("  j / k or ↑ / ↓ / [ ]   Move or page scroll", innerWidth),
+        fitLine("  M / P / ? / Esc or q   Models / Pause / Help / Quit", innerWidth),
         fitLine(this.theme.fg("accent", this.theme.bold("Board [1] & Search [4]")), innerWidth),
-        fitLine("  Enter / c / p / /       Read full post / Channel filter / Post / Search", innerWidth),
+        fitLine("  Enter / c / p / /      Read post / Ch / Post / Find", innerWidth),
         fitLine(this.theme.fg("accent", this.theme.bold("Members Tab [2]")), innerWidth),
-        fitLine("  w / r / m / g / x / K   Steer / Retry / Model / Merge / Stop / Kill", innerWidth),
-        fitLine("  Enter / l / d / [ ]     Toggle Brief & Logs / Git Diff / Scroll detail", innerWidth),
-        fitLine(this.theme.fg("accent", this.theme.bold("Graph & Mission Tab [3]")), innerWidth),
-        fitLine("  [v] Contract/Graph      Toggle Mission Contract & Features / Spawn Graph", innerWidth),
+        fitLine("  w / r / m / g / x / K  Steer/Retry/Model/Merge/Stop/Kill", innerWidth),
+        fitLine("  Enter / l / d / [ ]    Brief & Logs / Diff / Scroll", innerWidth),
+        fitLine(this.theme.fg("accent", this.theme.bold("Graph & Contract Tab [3]")), innerWidth),
+        fitLine("  [v] Contract/Graph · [l] Read library/*.md", innerWidth),
       ];
       const maxEntries = Math.max(1, maxInnerLines - 2);
       const outHelp = helpBody.slice(0, maxEntries);
