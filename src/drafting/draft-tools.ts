@@ -14,6 +14,7 @@ import {
   CHANNEL_NAME_PATTERN,
   findSafetySensitiveMemberSegment,
   MEMBER_NAME_PATTERN,
+  ORCHESTRATOR_NAME,
   PROPOSE_SWARM_PLAN_TOOL,
   RESERVED_MEMBER_NAMES,
   SWARM_QUESTIONNAIRE_TOOL,
@@ -23,7 +24,9 @@ import {
 import { SWARM_SETTINGS_BOUNDS, isPrototypeKey } from "../store/index.js";
 import {
   SwarmProtocolError,
+  isReconRun,
   isSwarmProtocolError,
+  type ActiveSwarmDraft,
   type ConfirmProposalOptions,
   type ContractReviewResult,
   type InitialMemberProposal,
@@ -41,6 +44,7 @@ import {
   type QuestionSpec,
   type SwarmDraftMode,
   type SwarmErrorCode,
+  type SwarmMemberRecord,
   type SwarmMemberRole,
   type SwarmMilestone,
   type SwarmRoleModelConfig,
@@ -84,6 +88,13 @@ export interface DraftingDeps {
   ) => Promise<ContractReviewResult | undefined>;
   /** Optional default `autoConfirm` resolver consulted by `propose_swarm_plan` when `currentDraft === null` (e.g. sticky `/swarm direct` sessions in Standby Orchestrator mode). */
   getDefaultAutoConfirm?: (ctx: ExtensionContext) => boolean;
+  /** Optional hook invoked when `propose_swarm_plan` is cancelled (e.g. to clean up a live read-only recon run). */
+  onDraftCancelled?: (
+    draft: ActiveSwarmDraft,
+    ctx: ExtensionContext,
+  ) => void | Promise<void>;
+  /** Optional resolver returning the active read-only recon run (if any) so `propose_swarm_plan` checks member handle collisions and validates `fork` targets. */
+  getReconRun?: () => SwarmRunState | null | undefined;
 }
 
 export interface DraftPlanValidationIssue {
@@ -225,6 +236,12 @@ export const InitialMemberProposalSchema = Type.Object({
       "Concise public assignment posted on the shared Message Board: exclusive file/directory ownership, constraints, already-installed repo verification scripts (avoid speculative 'npx -y' downloads), and next-peer @mention.",
   }),
   workspace: Type.Optional(InitialMemberWorkspaceSchema),
+  fork: Type.Optional(
+    Type.String({
+      description:
+        "Optional warm recon/peer member handle (or 'orchestrator') to fork conversation context from.",
+    }),
+  ),
   channels: Type.Optional(
     Type.Array(Type.String(), {
       description:
@@ -397,7 +414,7 @@ export const ProposeSwarmPlanParamsSchema = Type.Object({
   initial_members: Type.Optional(
     Type.Array(InitialMemberProposalSchema, {
       description:
-        "Optional wave-1 workers only by default (1–2 workers for small/single-module tasks; disjoint parallel 'inherit' workers in the shared repo for multi-module work — use opt-in 'share' worktrees ONLY when concurrent workers must edit overlapping files). Spawn an independent 'validator' on demand once a worker posts '[done]' (only include a validator initially when reviewing already-existing code). Keep briefs concise and grounded in already-installed repo verification scripts (no speculative 'npx -y' downloads). Leave omitted/empty to spawn dynamically after launch (or via swarm{action:'mission', mission_op:'dispatch_ready'}, which defaults to workspace:'inherit').",
+        "Optional wave-1 workers only by default (1–2 workers for small/single-module tasks; disjoint parallel 'inherit' workers in the shared repo for multi-module work — use opt-in 'share' worktrees ONLY when concurrent workers must edit overlapping files; optionally set 'fork' to inherit a warm recon worker's context). Spawn an independent 'validator' on demand as soon as the first slice is ready (or continuously alongside parallel authors — ~1 read-only validator per 2–4 authors, reusing warm validator(s) for peer-to-peer @worker <-> @validator review & fix loops; domain names like val-api / val-ui allowed; only include a validator initially when reviewing already-existing code). Keep briefs concise and grounded in already-installed repo verification scripts (no speculative 'npx -y' downloads). Leave omitted/empty to spawn dynamically after launch (or via swarm{action:'mission', mission_op:'dispatch_ready'}, which defaults to workspace:'inherit').",
     }),
   ),
   assertions: Type.Array(MissionAssertionProposalSchema, {
@@ -1721,6 +1738,15 @@ export function validateProposedSwarmPlan(
   const nowIso = options?.now ?? new Date().toISOString();
   const isTweak = options?.mode === "tweak" && Boolean(options?.existingRun);
   const existingRun = isTweak ? options?.existingRun ?? null : null;
+  const existingMemberRun = options?.existingRun ?? null;
+  const existingMemberByLower = new Map<string, SwarmMemberRecord>();
+  if (existingMemberRun?.members) {
+    for (const member of Object.values(existingMemberRun.members)) {
+      if (member && typeof member.name === "string" && member.name.trim()) {
+        existingMemberByLower.set(member.name.trim().toLowerCase(), member);
+      }
+    }
+  }
 
   const title = typeof params.title === "string" ? params.title.trim() : "";
   const objective =
@@ -1833,6 +1859,17 @@ export function validateProposedSwarmPlan(
         memberName: name,
         message: `Duplicate initial member name "${name}" — every member must have a unique name.`,
       });
+    } else if (
+      isReconRun(existingMemberRun) &&
+      existingMemberByLower.has(name.toLowerCase())
+    ) {
+      const existingMember = existingMemberByLower.get(name.toLowerCase())!;
+      issues.push({
+        code: "DUPLICATE_MEMBER",
+        field: "initial_members",
+        memberName: name,
+        message: `Initial member name "${name}" collides with existing member "${existingMember.name}" in the active Swarm run — choose a distinct handle (or use fork: "${existingMember.name}" to inherit its warm context).`,
+      });
     } else {
       seenNames.add(name);
     }
@@ -1863,6 +1900,76 @@ export function validateProposedSwarmPlan(
         memberName: memberTag,
         message: `Initial member "${memberTag}" has invalid workspace "${String(raw.workspace)}"; expected "inherit", "share", or "branch".`,
       });
+    }
+
+    let normalizedFork: string | undefined;
+    let forkOk = true;
+    const rawForkVal = (raw as Record<string, unknown>).fork;
+    if (rawForkVal !== undefined) {
+      if (typeof rawForkVal !== "string") {
+        forkOk = false;
+        issues.push({
+          code: "INVALID_INPUT",
+          field: "fork",
+          memberName: memberTag,
+          message: `Initial member "${memberTag}" fork must be a string.`,
+        });
+      } else {
+        const trimmedFork = rawForkVal.trim();
+        if (trimmedFork.length > 0) {
+          const forkLower = trimmedFork.toLowerCase();
+          if (isPrototypeKey(trimmedFork)) {
+            forkOk = false;
+            issues.push({
+              code: "INVALID_INPUT",
+              field: "fork",
+              memberName: memberTag,
+              message: `Initial member "${memberTag}" fork "${trimmedFork}" is forbidden (prototype key).`,
+            });
+          } else if (name && forkLower === name.toLowerCase()) {
+            forkOk = false;
+            issues.push({
+              code: "INVALID_INPUT",
+              field: "fork",
+              memberName: memberTag,
+              message: `Initial member "${memberTag}" cannot fork from itself.`,
+            });
+          } else if (
+            forkLower === ORCHESTRATOR_NAME ||
+            forkLower === "coordinator"
+          ) {
+            normalizedFork = ORCHESTRATOR_NAME;
+          } else if (existingMemberRun) {
+            const matchedExisting = existingMemberByLower.get(forkLower);
+            const matchedEarlier = normalizedMembers.find(
+              (m) => m.name.toLowerCase() === forkLower,
+            );
+            if (matchedExisting) {
+              normalizedFork = matchedExisting.name;
+            } else if (matchedEarlier) {
+              normalizedFork = matchedEarlier.name;
+            } else {
+              forkOk = false;
+              issues.push({
+                code: "MEMBER_NOT_FOUND",
+                field: "fork",
+                memberName: memberTag,
+                message: `Initial member "${memberTag}" fork target "${trimmedFork}" does not match "orchestrator" or any existing member in the active Swarm run.`,
+              });
+            }
+          } else if (!MEMBER_NAME_PATTERN.test(forkLower)) {
+            forkOk = false;
+            issues.push({
+              code: "INVALID_NAME",
+              field: "fork",
+              memberName: memberTag,
+              message: `Initial member "${memberTag}" fork target "${trimmedFork}" is invalid — expected "orchestrator" or a lowercase member handle matching ${MEMBER_NAME_PATTERN.source}.`,
+            });
+          } else {
+            normalizedFork = trimmedFork;
+          }
+        }
+      }
     }
 
     let normalizedChannels: string[] | undefined;
@@ -1946,6 +2053,7 @@ export function validateProposedSwarmPlan(
       isValidMemberRole(raw.role) &&
       brief &&
       featureIdOk &&
+      forkOk &&
       (raw.workspace === undefined || isValidWorkspaceMode(raw.workspace))
     ) {
       normalizedMembers.push({
@@ -1953,6 +2061,7 @@ export function validateProposedSwarmPlan(
         role: raw.role,
         brief,
         ...(raw.workspace !== undefined ? { workspace: raw.workspace } : {}),
+        ...(normalizedFork ? { fork: normalizedFork } : {}),
         ...(normalizedChannels ? { channels: normalizedChannels } : {}),
         ...(normalizedFeatureId ? { featureId: normalizedFeatureId } : {}),
       });
@@ -3703,7 +3812,7 @@ export function createProposeSwarmPlanTool(
     promptSnippet:
       "Validate and present a Contract-First Dynamic Swarm Plan (title, objective, strategy, acceptance criteria, mandatory VAL-* assertions & milestone features, commands, services, boundaries, optional initial members) for user confirmation before launching.",
     promptGuidelines: [
-      `Call \`${PROPOSE_SWARM_PLAN_TOOL}\` once requirements are clear with wave-by-wave disjoint file/directory ownership in \`strategy\` (defaulting to \`workspace:"inherit"\` in the shared repo; use opt-in \`workspace:"share"\` only when concurrent workers must edit overlapping files), exact runnable verification commands using already-installed repo scripts (no speculative \`npx -y\` downloads) in \`acceptance_criteria\` and \`commands\` (including optional \`"init"\` worktree setup), optional \`services\` with unique \`port\`s and acyclic \`depends_on\`, **mandatory** testable \`VAL-<AREA>-<NNN>\` (and \`VAL-CROSS-*\` for multi-module/milestone integration) \`assertions\` (\`minItems: 1\`) paired with ordered \`features\` (\`minItems: 1\`, 100% \`fulfills\` coverage + acyclic \`depends_on\` + disjoint \`files_owned\`), and wave-1 workers only in \`initial_members\` (\`workspace:"inherit"\` default, optional \`feature_id\` matching \`features[]\`; spawn \`validator\` on demand once workers post \`[done]\`); do NOT duplicate the full plan in prose beforehand because the expandable proposal card and confirmation modal present it automatically.`,
+      `Call \`${PROPOSE_SWARM_PLAN_TOOL}\` once requirements are clear with wave-by-wave disjoint file/directory ownership in \`strategy\` (defaulting to \`workspace:"inherit"\` in the shared repo; use opt-in \`workspace:"share"\` only when concurrent workers must edit overlapping files), exact runnable verification commands using already-installed repo scripts (no speculative \`npx -y\` downloads) in \`acceptance_criteria\` and \`commands\` (including optional \`"init"\` worktree setup), optional \`services\` with unique \`port\`s and acyclic \`depends_on\`, **mandatory** testable \`VAL-<AREA>-<NNN>\` (and \`VAL-CROSS-*\` for multi-module/milestone integration) \`assertions\` (\`minItems: 1\`) paired with ordered \`features\` (\`minItems: 1\`, 100% \`fulfills\` coverage + acyclic \`depends_on\` + disjoint \`files_owned\`), and wave-1 workers only in \`initial_members\` (\`workspace:"inherit"\` default, optional \`feature_id\` matching \`features[]\`, optional \`fork\` from a warm recon worker; spawn \`validator\` on demand as soon as the first slice is ready — ~1 read-only validator per 2–4 authors for continuous peer-to-peer \`@worker <-> @validator\` review & fix loops, domain names like \`val-api\`/\`val-ui\` allowed); do NOT duplicate the full plan in prose beforehand because the expandable proposal card and confirmation modal present it automatically.`,
     ],
     exposure: "model-only",
     defaultActive: false,
@@ -3839,17 +3948,28 @@ export function createProposeSwarmPlanTool(
       const currentDraft = ensureDraftSynced(draftController, ctx);
       const settings = deps.getSettings();
 
-      // Load existing run in tweak mode so pre-modal gates & smart progress merge inspect real state
+      // Load existing run in tweak mode OR active read-only recon run during drafting
       let existingRun: SwarmRunState | null = null;
-      if (
-        currentDraft?.mode === "tweak" &&
-        currentDraft.targetRunId &&
-        deps.store
-      ) {
+      const isTweakDraft = currentDraft?.mode === "tweak";
+      if (isTweakDraft && currentDraft.targetRunId && deps.store) {
         try {
           existingRun = await deps.store.loadRun(currentDraft.targetRunId);
         } catch {
           existingRun = null;
+        }
+      } else if (!isTweakDraft) {
+        const reconRun = deps.getReconRun?.() ?? null;
+        if (reconRun) {
+          existingRun = reconRun;
+        } else if (currentDraft?.reconRunId && deps.store) {
+          try {
+            const loadedRecon = await deps.store.loadRun(currentDraft.reconRunId);
+            if (loadedRecon?.runMode === "recon") {
+              existingRun = loadedRecon;
+            }
+          } catch {
+            existingRun = null;
+          }
         }
       }
 
@@ -3908,10 +4028,10 @@ export function createProposeSwarmPlanTool(
         ...(validation.commands ? { commands: validation.commands } : {}),
         ...(validation.services ? { services: validation.services } : {}),
         ...(validation.boundaries ? { boundaries: validation.boundaries } : {}),
-        ...(existingRun?.handoffItems && existingRun.handoffItems.length > 0
+        ...(isTweakDraft && existingRun?.handoffItems && existingRun.handoffItems.length > 0
           ? { handoffItems: structuredClone(existingRun.handoffItems) }
           : {}),
-        ...(existingRun?.lastAudit
+        ...(isTweakDraft && existingRun?.lastAudit
           ? { lastAudit: structuredClone(existingRun.lastAudit) }
           : {}),
       };
@@ -4105,6 +4225,7 @@ export function createProposeSwarmPlanTool(
       if (outcome.action === "cancel") {
         reviewPassCounts.delete(draftReviewKey);
         reviewPassCounts.delete(ephemeralReviewKey);
+        const cancelledDraft = currentDraft;
         const fallbackCancelProfile =
           currentDraft?.mode === "tweak" || currentDraft?.targetRunId
             ? "running"
@@ -4112,8 +4233,20 @@ export function createProposeSwarmPlanTool(
               ? "standby"
               : "idle";
         draftController.clear(
-          deps.onDraftChanged ? undefined : fallbackCancelProfile,
+          deps.onDraftChanged || deps.onDraftCancelled
+            ? undefined
+            : fallbackCancelProfile,
         );
+        if (cancelledDraft && deps.onDraftCancelled) {
+          try {
+            await deps.onDraftCancelled(cancelledDraft, ctx);
+          } catch {
+            // Keep cancellation resilient even if recon cleanup throws
+          }
+        }
+        if (!deps.onDraftChanged && deps.onDraftCancelled) {
+          draftController.applyToolProfile(fallbackCancelProfile);
+        }
         deps.onDraftChanged?.(null, ctx);
 
         const summary = formatProposalTranscriptSummary(proposedPlan);
@@ -4168,6 +4301,7 @@ export function createProposeSwarmPlanTool(
           mode: currentDraft?.mode ?? "swarm",
           seed: currentDraft?.seed || validation.objective,
           targetRunId: currentDraft?.targetRunId,
+          reconRunId: currentDraft?.reconRunId,
           validatorEnabled: refinedValidatorEnabled,
           maxConcurrency: refinedMaxConcurrency,
           baseBranch,
@@ -4224,6 +4358,9 @@ export function createProposeSwarmPlanTool(
           role: isValidMemberRole(m.role) ? m.role : "worker",
           brief: typeof m.brief === "string" ? m.brief.trim() : "",
           ...(isValidWorkspaceMode(m.workspace) ? { workspace: m.workspace } : {}),
+          ...(typeof m.fork === "string" && m.fork.trim()
+            ? { fork: m.fork.trim() }
+            : {}),
           ...(Array.isArray(m.channels) && m.channels.length > 0
             ? {
                 channels: m.channels.filter(
@@ -4484,7 +4621,8 @@ export function createProposeSwarmPlanTool(
             .map((m) => {
               const name = formatInlineSnippet(m.name, 24) || "(unnamed)";
               const ws = m.workspace ?? "inherit";
-              return `${theme.fg("accent", name)}${theme.fg("dim", `(${m.role}/${ws})`)}`;
+              const forkTag = m.fork ? ` <- ${formatInlineSnippet(m.fork, 20)}` : "";
+              return `${theme.fg("accent", name)}${theme.fg("dim", `(${m.role}/${ws}${forkTag})`)}`;
             })
             .join(theme.fg("dim", " · "));
           const moreTag =

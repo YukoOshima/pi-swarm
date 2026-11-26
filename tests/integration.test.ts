@@ -26,6 +26,7 @@ import {
   POST_MESSAGE_TOOL,
   PROPOSE_SWARM_PLAN_TOOL,
   READ_BOARD_TOOL,
+  RECON_SWARM_TOOLS,
   STANDBY_SWARM_TOOLS,
   SWARM_BOARD_FILE,
   SWARM_CONTRACT_CUSTOM_TYPE,
@@ -57,6 +58,7 @@ import {
   type SwarmExtensionOptions,
   buildLaunchKickoffPrompt,
   createPiSwarmExtension,
+  extractValidatorVerdict,
   parseContractReviewOutput,
   parseSwarmCommand,
   parseSwarmGoalLaunchOptions,
@@ -1065,7 +1067,7 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     assert.ok(harness.widgetHistory.some((w) => w.key === SWARM_WIDGET_KEY));
     assert.ok(harness.statusHistory.some((s) => s.key === SWARM_STATUS_KEY));
 
-    // 1. `/swarm "Build feature"` applies orchestratorModel & enters drafting (3 tools)
+    // 1. `/swarm "Build feature"` applies orchestratorModel & enters drafting-recon (all 7 tools)
     await harness.runCommand("swarm", "Build compute feature");
     assert.ok(
       harness.setModelCalls.some(
@@ -1076,11 +1078,11 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     assert.ok(harness.thinkingLevelCalls.includes("high"));
 
     const draftingActiveTools = harness.pi.getActiveTools();
-    for (const t of DRAFTING_TOOLS) {
-      assert.ok(draftingActiveTools.includes(t), `Expected drafting tool ${t}`);
-    }
-    for (const t of SWARM_CORE_TOOLS) {
-      assert.ok(!draftingActiveTools.includes(t), `Core tool ${t} should be inactive in drafting`);
+    for (const t of RECON_SWARM_TOOLS) {
+      assert.ok(
+        draftingActiveTools.includes(t),
+        `Expected recon-drafting tool ${t} to be active during /swarm drafting`,
+      );
     }
 
     // Prompt-cache-safe drafting tail injection
@@ -10646,6 +10648,694 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       undefined,
       "Refinement after propose_swarm_plan bounce must allow targeted checks",
     );
+
+    await host.emit("session_shutdown", { reason: "quit" });
+  });
+
+  it("35. Recon-in-Swarm E2E: lazy recon run, read-only worker wakeups during drafting, in-place promotion with fork & preserved board/library, and clean cancel/exit/discovery isolation", async () => {
+    const repoDir = await createTempGitRepo("recon-in-swarm-e2e");
+    tempDirs.push(repoDir);
+
+    const store = new SwarmStore(repoDir);
+    const spawnedRequests: SpawnMemberRequest[] = [];
+    const wakeCounts = new Map<string, number>();
+    let releaseReconWorker!: () => void;
+    const reconGate = new Promise<void>((resolve) => {
+      releaseReconWorker = resolve;
+    });
+
+    const mockTransport: ISwarmTransport = {
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        spawnedRequests.push(request);
+        const tracker = createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async ({ pushAssistantMessage }) => {
+            if (request.name === "research-arch") {
+              assert.equal(request.readOnlyRecon, true, "Recon worker must spawn with readOnlyRecon=true");
+              assert.equal(request.workspace, "inherit", "Recon worker must use inherit workspace");
+              await reconGate;
+              await request.engineApi!.manageMission!({
+                op: "write_library",
+                libraryTopic: "architecture",
+                libraryContent: "# Architecture\n\nDiscovered modular plugin layout during recon.\n",
+              });
+              pushAssistantMessage("Explored architecture: modular plugin layout verified.");
+              await request.engineApi!.postMessage({
+                text: "@orchestrator [done] Architecture mapped in library/architecture.md; ready for plan.",
+                kind: "done",
+              });
+              return {
+                agentId: request.agentId,
+                name: request.name,
+                role: request.role,
+                outcome: "waiting",
+                summary: "Recon arch complete",
+                tokens: 300,
+                cost: 0.003,
+              };
+            }
+
+            if (request.name === "impl-arch") {
+              assert.equal(request.readOnlyRecon ?? false, false, "Promoted worker must be writable (not readOnlyRecon)");
+              assert.ok(
+                Array.isArray(request.seedMessages) && request.seedMessages.length > 0,
+                "Forked initial worker must inherit seedMessages from research-arch",
+              );
+              pushAssistantMessage("Implementing feature using forked recon context.");
+              await request.engineApi!.postMessage({
+                text: "@orchestrator [done] Implemented feature cleanly.",
+                kind: "done",
+              });
+              return {
+                agentId: request.agentId,
+                name: request.name,
+                role: request.role,
+                outcome: "waiting",
+                summary: "Impl done",
+                tokens: 400,
+                cost: 0.004,
+              };
+            }
+
+            pushAssistantMessage(`Recon worker ${request.name} ready.`);
+            return {
+              agentId: request.agentId,
+              name: request.name,
+              role: request.role,
+              outcome: "waiting",
+              summary: `${request.name} parked`,
+              tokens: 100,
+              cost: 0.001,
+            };
+          },
+          runWakeTurn: async () => {
+            wakeCounts.set(request.name, (wakeCounts.get(request.name) ?? 0) + 1);
+            return {
+              agentId: request.agentId,
+              name: request.name,
+              role: request.role,
+              outcome: "waiting",
+              summary: "Woken",
+              tokens: 50,
+              cost: 0.0005,
+            };
+          },
+        });
+        return tracker.handle;
+      },
+    };
+
+    let confirmAction: "confirm" | "cancel" = "confirm";
+    const mockUI: IQuestionnaireUI = {
+      async askQuestion() {
+        return { cancelled: false, answer: "ok", isCustom: false };
+      },
+      async askQuestionnaire() {
+        return { cancelled: false, answers: {}, items: [] };
+      },
+      async confirmProposal(_ctx, plan) {
+        return {
+          action: confirmAction,
+          validatorEnabled: plan.validatorEnabled,
+          maxConcurrency: plan.maxConcurrency,
+        };
+      },
+    };
+
+    const host = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-recon-e2e",
+    });
+    createPiSwarmExtension({
+      transportFactory: () => mockTransport,
+      questionnaireUI: mockUI,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: false,
+      }),
+    })(host.pi);
+    await host.emit("session_start", { reason: "startup" });
+
+    // 1. `/swarm <goal>` exposes all 7 RECON_SWARM_TOOLS without creating a run yet
+    await host.runCommand("swarm", "Build modular plugin loader");
+    const reconProfileTools = host.pi.getActiveTools();
+    for (const t of RECON_SWARM_TOOLS) {
+      assert.ok(reconProfileTools.includes(t), `Expected ${t} active in recon drafting mode`);
+    }
+    assert.equal((await store.listRuns()).length, 0, "Draft start must remain lazy (0 runs on disk)");
+
+    const preAddStatus = await host.executeTool(SWARM_TOOL, { action: "status" });
+    assert.equal(preAddStatus.isError, undefined);
+    assert.match(String(preAddStatus.content?.[0]?.text ?? ""), /Drafting\/Recon ready/i);
+
+    // 2. First `swarm{action:"add"}` lazily creates a `runMode:"recon"` run
+    const addReconRes = await host.executeTool(SWARM_TOOL, {
+      action: "add",
+      name: "research-arch",
+      brief: "Map plugin architecture and write library/architecture.md.",
+    });
+    assert.equal(addReconRes.isError, undefined, JSON.stringify(addReconRes));
+
+    const runsAfterAdd = await store.listRuns();
+    assert.equal(runsAfterAdd.length, 1);
+    const reconRunId = runsAfterAdd[0]!.id;
+    const reconRun = await store.loadRun(reconRunId);
+    assert.equal(reconRun.runMode, "recon");
+    assert.equal(reconRun.phase, "recon");
+    assert.equal(reconRun.members["research-arch"]?.recon, true);
+
+    // before_agent_start injects BOTH drafting overlay AND live recon roster state
+    const reconPromptEv = { systemPromptOptions: { sections: {} as Record<string, string> } };
+    await host.emit("before_agent_start", reconPromptEv);
+    assert.match(reconPromptEv.systemPromptOptions.sections.swarm ?? "", /swarm_drafting_active/);
+    assert.match(reconPromptEv.systemPromptOptions.sections.swarm_state ?? "", /research-arch/);
+
+    // 3. Park via swarm_wait and release recon worker -> wakeup flushes DURING drafting!
+    const wakeupsBefore = host.sentMessages.filter(
+      (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
+    ).length;
+    const waitRes = await host.executeTool(SWARM_WAIT_TOOL, { since: 1, mentions_only: true });
+    assert.equal(waitRes.details.parked, true);
+
+    releaseReconWorker();
+    await waitFor(
+      () =>
+        host.sentMessages.filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE)
+          .length > wakeupsBefore,
+    );
+    const reconWakeup = host.sentMessages
+      .filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE)
+      .pop()!;
+    assert.match(String(reconWakeup.message.content), /Architecture mapped in library\/architecture\.md/);
+    await waitFor(async () => (await store.loadRun(reconRunId)).members["research-arch"]?.state === "waiting");
+
+    // 4. propose_swarm_plan rejects name collision with existing recon worker
+    const collideRes = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Modular Plugin Loader",
+      objective: "Build modular plugin loader",
+      strategy: "Fork recon worker",
+      acceptance_criteria: "Tests pass",
+      base_branch: "main",
+      initial_members: [
+        {
+          name: "research-arch",
+          role: "worker",
+          workspace: "inherit",
+          brief: "Collides with existing recon worker",
+        },
+      ],
+    });
+    assert.equal(collideRes.details?.outcome, "validation_error");
+
+    // 5. propose_swarm_plan Confirm promotes in-place with fork:"research-arch"
+    const confirmRes = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Modular Plugin Loader",
+      objective: "Build modular plugin loader",
+      strategy: "Fork research-arch into impl-arch",
+      acceptance_criteria: "Loader implemented and verified",
+      base_branch: "main",
+      validator_enabled: true,
+      initial_members: [
+        {
+          name: "impl-arch",
+          role: "worker",
+          workspace: "inherit",
+          fork: "research-arch",
+          brief: "Implement modular plugin loader using forked recon context.",
+        },
+      ],
+    });
+    assert.equal(confirmRes.isError, undefined, JSON.stringify(confirmRes));
+    assert.equal(confirmRes.details?.outcome, "confirmed");
+    assert.equal(
+      confirmRes.details?.runId,
+      reconRunId,
+      "Confirm must promote the recon run IN-PLACE under the exact same runId",
+    );
+
+    // Wait for impl-arch to finish initial turn and kickoff wakeup to flush
+    await waitFor(async () => (await store.loadRun(reconRunId)).members["impl-arch"]?.state === "waiting");
+    await waitFor(() =>
+      host.sentMessages.some(
+        (m) =>
+          m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE &&
+          (m.message.details as { kickoff?: boolean } | undefined)?.kickoff === true,
+      ),
+    );
+
+    const promotedRun = await store.loadRun(reconRunId);
+    assert.equal(promotedRun.runMode, "executing");
+    assert.equal(promotedRun.phase, undefined);
+    assert.equal(
+      wakeCounts.get("research-arch") ?? 0,
+      0,
+      "Silent promotion [decision] must NOT wake warm waiting recon worker",
+    );
+    const preservedArch = await store.readLibraryTopic(reconRunId, "architecture");
+    assert.match(preservedArch ?? "", /Discovered modular plugin layout during recon/);
+    const promotedBoard = await store.readBoard(reconRunId, { channel: "*", limit: 50 });
+    assert.ok(
+      promotedBoard.messages.some((m) => m.text.includes("Architecture mapped in library/architecture.md")),
+      "Pre-promotion recon board messages must be preserved",
+    );
+    const kickoffMsg = host.sentMessages
+      .filter(
+        (m) =>
+          m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE &&
+          (m.message.details as { kickoff?: boolean } | undefined)?.kickoff === true,
+      )
+      .pop()!;
+    assert.match(String(kickoffMsg.message.content), /Promoted from Recon/);
+    assert.match(String(kickoffMsg.message.content), /@research-arch/);
+
+    // Active tools narrowed to 4 SWARM_CORE_TOOLS
+    const runningTools = host.pi.getActiveTools();
+    for (const t of SWARM_CORE_TOOLS) {
+      assert.ok(runningTools.includes(t));
+    }
+    for (const t of DRAFTING_TOOLS) {
+      assert.ok(!runningTools.includes(t));
+    }
+
+    // Complete promoted run and exit orchestrator mode cleanly
+    const doneRes = await host.executeTool(SWARM_TOOL, {
+      action: "done",
+      summary: "Promoted recon mission completed",
+    });
+    assert.equal(doneRes.isError, undefined, JSON.stringify(doneRes));
+    await host.runCommand("swarm", "exit");
+
+    // 6. Cancel via `/swarm cancel` kills recon worker, abandons recon run, restores idle tools
+    await host.runCommand("swarm", "Explore caching layer");
+    await host.executeTool(SWARM_TOOL, {
+      action: "add",
+      name: "scout-cache",
+      brief: "Inspect cache usage",
+    });
+    const recon2Summary = (await store.listRuns()).find((r) => r.runMode === "recon" && r.status === "active")!;
+    assert.ok(recon2Summary, "Expected second active recon run");
+    await waitFor(async () => (await store.loadRun(recon2Summary.id)).members["scout-cache"]?.state === "waiting");
+
+    await host.runCommand("swarm", "cancel");
+    const recon2After = await store.loadRun(recon2Summary.id);
+    assert.equal(recon2After.status, "abandoned");
+    assert.equal(recon2After.members["scout-cache"]?.state, "killed");
+    assert.ok(host.pi.getActiveTools().includes(SWARM_TOOL));
+    assert.ok(!host.pi.getActiveTools().includes(PROPOSE_SWARM_PLAN_TOOL));
+
+    // 7. Cancel via `propose_swarm_plan` Cancel (`onDraftCancelled`) kills recon worker & abandons recon run
+    confirmAction = "cancel";
+    await host.runCommand("swarm", "Explore auth layer");
+    await host.executeTool(SWARM_TOOL, {
+      action: "add",
+      name: "scout-auth",
+      brief: "Inspect auth usage",
+    });
+    const recon3Summary = (await store.listRuns()).find((r) => r.runMode === "recon" && r.status === "active")!;
+    assert.ok(recon3Summary, "Expected third active recon run");
+    await waitFor(async () => (await store.loadRun(recon3Summary.id)).members["scout-auth"]?.state === "waiting");
+
+    const cancelProposalRes = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Auth Plan",
+      objective: "Explore auth layer",
+      strategy: "Single worker",
+      acceptance_criteria: "Tests pass",
+      base_branch: "main",
+    });
+    assert.equal(cancelProposalRes.details?.outcome, "cancelled");
+    const recon3After = await store.loadRun(recon3Summary.id);
+    assert.equal(recon3After.status, "abandoned");
+    assert.equal(recon3After.members["scout-auth"]?.state, "killed");
+
+    // 8. `/swarm exit` must NOT be blocked by an active recon run and cleans it up cleanly
+    await host.runCommand("swarm", "Explore billing layer");
+    await host.executeTool(SWARM_TOOL, {
+      action: "add",
+      name: "scout-bill",
+      brief: "Inspect billing usage",
+    });
+    const recon4Summary = (await store.listRuns()).find((r) => r.runMode === "recon" && r.status === "active")!;
+    assert.ok(recon4Summary, "Expected fourth active recon run");
+    await waitFor(async () => (await store.loadRun(recon4Summary.id)).members["scout-bill"]?.state === "waiting");
+
+    await host.runCommand("swarm", "exit");
+    const recon4After = await store.loadRun(recon4Summary.id);
+    assert.equal(recon4After.status, "abandoned");
+    assert.equal(recon4After.members["scout-bill"]?.state, "killed");
+
+    // 9. Fresh session_start must NEVER show unfinished-mission discovery prompts for recon runs (even active ones!)
+    const activeOrphanRecon = await store.createRun({
+      title: "Recon: Orphaned draft",
+      objective: "Orphaned recon",
+      baseBranch: "main",
+      ownerSessionId: "old-session",
+      ownerPid: 0,
+      runMode: "recon",
+      phase: "recon",
+    });
+    assert.equal(activeOrphanRecon.runMode, "recon");
+
+    const freshHost = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-recon-fresh",
+    });
+    createPiSwarmExtension({
+      transportFactory: () => mockTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        stallWatchdogEnabled: false,
+      }),
+    })(freshHost.pi);
+    await freshHost.emit("session_start", { reason: "startup" });
+    assert.equal(
+      freshHost.notifications.some((n) => /unfinished Swarm Mission/i.test(n.message)),
+      false,
+      "Active or abandoned recon runs must be excluded from session_start unfinished-mission discovery",
+    );
+
+    await host.emit("session_shutdown", { reason: "quit" });
+    await freshHost.emit("session_shutdown", { reason: "quit" });
+  });
+
+  it("36. Fluid Live Multi-Validator Continuous Review: @val-api & @val-ui verify VAL-* assertions across slices and render PASS with both handles in Mission Complete Card", async () => {
+    const repoDir = await createTempGitRepo("multi-validator-card");
+    tempDirs.push(repoDir);
+
+    const store = new SwarmStore(repoDir);
+    const mockTransport: ISwarmTransport = {
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        const tracker = createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async ({ pushAssistantMessage }) => {
+            if (request.name === "author-api") {
+              await request.engineApi!.postMessage({
+                text: "@val-api [done] Implemented API endpoint.",
+                kind: "done",
+                featureId: "feat-api",
+                verificationEvidence: "Ran API unit tests (2/2 passed) and verified GET /status returns 200 JSON.",
+              });
+            } else if (request.name === "author-ui") {
+              await request.engineApi!.postMessage({
+                text: "@val-ui [done] Implemented UI panel.",
+                kind: "done",
+                featureId: "feat-ui",
+                verificationEvidence: "Ran UI component tests (3/3 passed) and verified panel renders status cleanly.",
+              });
+            } else if (request.name === "val-api") {
+              assert.equal(request.role, "validator");
+              assert.equal(request.workspace, "inherit");
+              await request.engineApi!.manageMission!({
+                op: "verify_assertion",
+                assertionId: "VAL-API-001",
+                assertionStatus: "passed",
+                evidence: "API contract verified via curl & unit tests",
+              });
+              await request.engineApi!.postMessage({
+                text: "@orchestrator Checked feat-api slice and stamped VAL-API-001.",
+                kind: "review",
+              });
+            } else if (request.name === "val-ui") {
+              assert.equal(request.role, "validator");
+              assert.equal(request.workspace, "inherit");
+              await request.engineApi!.manageMission!({
+                op: "verify_assertion",
+                assertionId: "VAL-UI-001",
+                assertionStatus: "passed",
+                evidence: "UI rendering checked across breakpoints",
+              });
+              // Deliberately neutral wording (no PASS/APPROVED keyword) to prove assertion-backed verdict!
+              await request.engineApi!.postMessage({
+                text: "@orchestrator Re-checked feat-ui, no remaining issues.",
+                kind: "review",
+              });
+            }
+            pushAssistantMessage(`${request.name} turn done`);
+            return {
+              agentId: request.agentId,
+              name: request.name,
+              role: request.role,
+              outcome: "waiting",
+              summary: `${request.name} done`,
+              tokens: 250,
+              cost: 0.0025,
+            };
+          },
+        });
+        return tracker.handle;
+      },
+    };
+
+    const host = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-multi-val",
+    });
+    createPiSwarmExtension({
+      transportFactory: () => mockTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        validatorEnabled: true,
+        stallWatchdogEnabled: false,
+      }),
+    })(host.pi);
+    await host.emit("session_start", { reason: "startup" });
+
+    // Launch with validator ON and 0 initialMembers to also verify fluid launch kickoff wording
+    await host.runCommand("swarm-direct", "--fast Deliver API and UI slices");
+    const planRes = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Multi-Validator Delivery",
+      objective: "Ship API and UI slices with continuous live validator review",
+      strategy: "Parallel inherit authors paired with @val-api and @val-ui",
+      acceptance_criteria: "VAL-API-001 and VAL-UI-001 pass",
+      base_branch: "main",
+      validator_enabled: true,
+      assertions: [
+        {
+          id: "VAL-API-001",
+          title: "API endpoint returns 200",
+          description: "Endpoint responds with valid JSON payload",
+        },
+        {
+          id: "VAL-UI-001",
+          title: "UI panel renders status",
+          description: "Panel renders fetched API status cleanly",
+        },
+      ],
+      features: [
+        {
+          id: "feat-api",
+          title: "API slice",
+          description: "Implement API endpoint",
+          milestone: "m1",
+          files_owned: ["src/api.ts"],
+          fulfills: ["VAL-API-001"],
+        },
+        {
+          id: "feat-ui",
+          title: "UI slice",
+          description: "Implement UI panel",
+          milestone: "m1",
+          files_owned: ["src/ui.ts"],
+          fulfills: ["VAL-UI-001"],
+        },
+      ],
+    });
+    assert.equal(planRes.isError, undefined, JSON.stringify(planRes));
+    const runId: string = planRes.details.runId;
+
+    await waitFor(() =>
+      host.sentMessages.some(
+        (m) =>
+          m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE &&
+          (m.message.details as { kickoff?: boolean } | undefined)?.kickoff === true,
+      ),
+    );
+    const kickoffText = String(
+      host.sentMessages
+        .filter(
+          (m) =>
+            m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE &&
+            (m.message.details as { kickoff?: boolean } | undefined)?.kickoff === true,
+        )
+        .pop()!.message.content,
+    );
+    assert.match(kickoffText, /Start immediately by dispatching/);
+    assert.match(kickoffText, /paired with continuous independent read-only/);
+    assert.equal(kickoffText.includes("Begin Phase 1"), false);
+
+    // Spawn authors & domain-named validators
+    await host.executeTool(SWARM_TOOL, {
+      action: "add",
+      name: "author-api",
+      role: "worker",
+      brief: "Implement feat-api",
+    });
+    await host.executeTool(SWARM_TOOL, {
+      action: "add",
+      name: "author-ui",
+      role: "worker",
+      brief: "Implement feat-ui",
+    });
+    await host.executeTool(SWARM_TOOL, {
+      action: "add",
+      name: "val-api",
+      role: "validator",
+      brief: "Verify VAL-API-001 continuously",
+    });
+    await host.executeTool(SWARM_TOOL, {
+      action: "add",
+      name: "val-ui",
+      role: "validator",
+      brief: "Verify VAL-UI-001 continuously",
+    });
+
+    await waitFor(async () => {
+      const r = await store.loadRun(runId);
+      const membersReady = ["author-api", "author-ui", "val-api", "val-ui"].every(
+        (n) => r.members[n]?.state === "waiting",
+      );
+      const valsPassed = (r.assertions ?? []).every((a) => a.status === "passed");
+      return membersReady && valsPassed;
+    });
+
+    const doneRes = await host.executeTool(SWARM_TOOL, {
+      action: "done",
+      summary: "Both slices verified by domain validators",
+    });
+    assert.equal(doneRes.isError, undefined, JSON.stringify(doneRes));
+
+    const completeCard = host.sentMessages
+      .filter(
+        (m) =>
+          m.message.customType === SWARM_STATUS_CUSTOM_TYPE &&
+          (m.message.details as { runId?: string; missionCompleteCard?: boolean } | undefined)
+            ?.runId === runId &&
+          (m.message.details as { missionCompleteCard?: boolean } | undefined)
+            ?.missionCompleteCard === true,
+      )
+      .pop();
+    assert.ok(completeCard, "Expected Rich Mission Complete Card");
+    const cardText = String(completeCard.message.content);
+    assert.match(cardText, /Validator:.*✅ PASS/);
+    assert.match(cardText, /@val-api/);
+    assert.match(cardText, /@val-ui/);
+    assert.match(cardText, /2\/2 VAL-\* verified/);
+    assert.match(cardText, /Re-checked feat-ui, no remaining issues/);
+
+    // Regression checks for extractValidatorVerdict:
+    // 1. Run-wide failed/blocked (both validator-stamped and non-validator-stamped) NEVER renders PASS
+    const completedRun = await store.loadRun(runId);
+    const boardMsgs = (await store.readBoard(runId, { channel: "*", limit: 50 })).messages;
+    const withNonValidatorBlocked: SwarmRunState = {
+      ...completedRun,
+      assertions: [
+        completedRun.assertions![0]!,
+        {
+          ...completedRun.assertions![1]!,
+          status: "blocked",
+          verifiedBy: "orchestrator",
+          verifiedByRole: "orchestrator",
+        },
+      ],
+    };
+    const nonValBlockedVerdict = extractValidatorVerdict(withNonValidatorBlocked, boardMsgs);
+    assert.match(nonValBlockedVerdict, /^❌ FAIL/);
+    assert.equal(nonValBlockedVerdict.includes("✅ PASS"), false);
+
+    const withValidatorFailed: SwarmRunState = {
+      ...completedRun,
+      assertions: [
+        completedRun.assertions![0]!,
+        {
+          ...completedRun.assertions![1]!,
+          status: "failed",
+          verifiedBy: "val-ui",
+          verifiedByRole: "validator",
+        },
+      ],
+    };
+    const valFailedVerdict = extractValidatorVerdict(withValidatorFailed, boardMsgs);
+    assert.match(valFailedVerdict, /^❌ FAIL/);
+    assert.equal(valFailedVerdict.includes("✅ PASS"), false);
+
+    // 2. Pending assertions (e.g. force-closed via /swarm done --force) NEVER render PASS
+    const withPendingAssertion: SwarmRunState = {
+      ...completedRun,
+      assertions: [
+        completedRun.assertions![0]!,
+        {
+          ...completedRun.assertions![1]!,
+          status: "pending",
+          verifiedBy: undefined,
+          verifiedByRole: undefined,
+        },
+      ],
+    };
+    const pendingVerdict = extractValidatorVerdict(withPendingAssertion, boardMsgs);
+    assert.match(pendingVerdict, /^⚠️ PARTIAL/);
+    assert.match(pendingVerdict, /1 pending/);
+    assert.equal(pendingVerdict.includes("✅ PASS"), false);
+
+    // 3. Fallback text path (0 validator-checked assertions) with failed/blocked assertion NEVER renders PASS
+    const fallbackWithFailed: SwarmRunState = {
+      ...completedRun,
+      assertions: [
+        {
+          id: "VAL-FB-1",
+          title: "Fallback check",
+          description: "Must fail verdict",
+          status: "failed",
+          updatedAt: completedRun.updatedAt,
+        },
+      ],
+    };
+    const passTextBoard = [
+      {
+        seq: 99,
+        runId,
+        channel: DEFAULT_CHANNEL,
+        from: "val-api",
+        fromRole: "validator" as const,
+        text: "@orchestrator [done] PASS — everything approved",
+        mentions: ["orchestrator"],
+        channelMentions: [],
+        kind: "done" as const,
+        timestamp: completedRun.updatedAt,
+      },
+    ];
+    const fallbackFailVerdict = extractValidatorVerdict(fallbackWithFailed, passTextBoard);
+    assert.match(fallbackFailVerdict, /^❌ FAIL/);
+    assert.equal(fallbackFailVerdict.includes("✅ PASS"), false);
+
+    // 4. Recon-only `role: "validator"` (`recon: true`) is excluded from execution validator verdict
+    const reconOnlyValidatorRun: SwarmRunState = {
+      ...completedRun,
+      assertions: [],
+      memberOrder: ["recon-val"],
+      members: {
+        "recon-val": {
+          ...completedRun.members["val-api"]!,
+          name: "recon-val",
+          role: "validator",
+          recon: true,
+        },
+      },
+    };
+    const reconPostBoard = [
+      {
+        seq: 1,
+        runId,
+        channel: DEFAULT_CHANNEL,
+        from: "recon-val",
+        fromRole: "validator" as const,
+        text: "@orchestrator [done] PASS recon verified",
+        mentions: ["orchestrator"],
+        channelMentions: [],
+        kind: "done" as const,
+        timestamp: completedRun.updatedAt,
+      },
+    ];
+    const reconExcludedVerdict = extractValidatorVerdict(reconOnlyValidatorRun, reconPostBoard);
+    assert.equal(reconExcludedVerdict, "Enabled (no validator spawned)");
 
     await host.emit("session_shutdown", { reason: "quit" });
   });

@@ -87,6 +87,7 @@ import {
   type SettingsPathOptions,
 } from "./store/index.js";
 import {
+  type ActiveSwarmDraft,
   type AgentTurnResult,
   type AvailableModelInfo,
   type BoardMessage,
@@ -103,6 +104,7 @@ import {
   type MissionFeature,
   type MissionHandoffItem,
   type PersistentAgentHandle,
+  type PromoteReconRunInput,
   type ProposedSwarmPlan,
   type RoleModelOrigin,
   type RunSummary,
@@ -117,6 +119,7 @@ import {
   type SwarmSettings,
   type SwarmSnapshot,
   SwarmProtocolError,
+  isReconRun,
   isSwarmProtocolError,
 } from "./types.js";
 import {
@@ -2027,6 +2030,10 @@ export function buildLaunchKickoffPrompt(
   spawnedInitial: readonly SwarmMemberRecord[],
   failedInitial?: ReadonlyArray<{ name: string; error: string }>,
   feedback?: string,
+  options?: {
+    promotedFromRecon?: boolean;
+    warmReconHandles?: readonly string[];
+  },
 ): string {
   const lines: string[] = [
     `🐝 Dynamic Swarm "${run.title}" (\`${run.id}\`) is live on \`${run.baseBranch}\` (max concurrency: ${run.maxConcurrency}, Validator policy: ${run.validatorEnabled ? "ON" : "OFF"}).`,
@@ -2041,6 +2048,16 @@ export function buildLaunchKickoffPrompt(
   }
   if (feedback && feedback.trim()) {
     lines.push(`- **User Confirmation Notes:** ${feedback.trim()}`);
+  }
+  if (options?.promotedFromRecon) {
+    const warmHandles = (options.warmReconHandles ?? []).filter(Boolean);
+    const forkNote =
+      warmHandles.length > 0
+        ? ` Warm forkable recon worker(s): ${warmHandles.map((h) => `\`@${h}\``).join(", ")} (pass \`fork: "<handle>"\` to inherit their explored context).`
+        : "";
+    lines.push(
+      `- **Promoted from Recon:** Preserved shared Message Board history (head \`#${run.boardHead}\`) and \`library/*.md\`.${forkNote}`,
+    );
   }
 
   const activeFeatures = (run.features ?? []).filter(
@@ -2117,10 +2134,10 @@ export function buildLaunchKickoffPrompt(
   } else {
     const workflowHint =
       run.validatorEnabled !== false
-        ? "researchers/scouts -> scaffold -> parallel `inherit` authors on disjoint `filesOwned` (or opt-in `share` worktrees only for overlapping concurrent edits) -> independent read-only `validator`"
+        ? "researchers/scouts -> scaffold -> parallel `inherit` authors on disjoint `filesOwned` (or opt-in `share` worktrees only for overlapping concurrent edits) paired with continuous independent read-only `validator` review (`@worker` <-> `@validator`)"
         : "researchers/scouts -> scaffold -> parallel `inherit` authors on disjoint `filesOwned` (or opt-in `share` worktrees only for overlapping concurrent edits)";
     lines.push(
-      `You now have the 4 core Swarm tools (\`swarm\`, \`post_message\`, \`read_board\`, \`swarm_wait\`). Begin Phase 1 by dispatching ready contract features via \`swarm{action:"mission", mission_op:"dispatch_ready"}\` (defaults to \`workspace:"inherit"\`) or delegating technical work via \`swarm{action:"add"}\` (${workflowHint}), wait via \`swarm_wait\`, merge any opt-in worktrees & kill finished members, and call \`swarm{action:"done", summary}\` when complete.`,
+      `You now have the 4 core Swarm tools (\`swarm\`, \`post_message\`, \`read_board\`, \`swarm_wait\`). Start immediately by dispatching ready contract features via \`swarm{action:"mission", mission_op:"dispatch_ready"}\` (defaults to \`workspace:"inherit"\`) or delegating technical work via \`swarm{action:"add"}\` (${workflowHint}), wait via \`swarm_wait\`, merge any opt-in worktrees & kill finished members, and call \`swarm{action:"done", summary}\` when complete.`,
     );
   }
 
@@ -2750,36 +2767,129 @@ async function computeMergedGitDiffStat(
   return [...headLines, `… (+${omitted} more file line(s))`, summaryLine].join("\n");
 }
 
-function extractValidatorVerdict(
+export function extractValidatorVerdict(
   run: SwarmRunState,
   boardMessages: readonly BoardMessage[],
 ): string {
-  const validators = getOrderedMembers(run).filter((m) => m.role === "validator");
+  const allMembers = getOrderedMembers(run);
+  const reconNames = new Set(
+    allMembers.filter((m) => Boolean(m.recon)).map((m) => m.name.toLowerCase()),
+  );
+  const validators = allMembers.filter(
+    (m) => m.role === "validator" && !m.recon,
+  );
+  const validatorNames = new Set(validators.map((v) => v.name.toLowerCase()));
+  const validatorPosts = boardMessages.filter((msg) => {
+    const fromLower = msg.from.toLowerCase();
+    if (reconNames.has(fromLower)) {
+      return false;
+    }
+    return msg.fromRole === "validator" || validatorNames.has(fromLower);
+  });
+  const donePosts = validatorPosts.filter((m) => m.kind === "done");
+  const latestPost =
+    donePosts[donePosts.length - 1] ?? validatorPosts[validatorPosts.length - 1];
+
+  const assertions = run.assertions ?? [];
+  const allPassed = assertions.filter((a) => a.status === "passed");
+  const allFailedOrBlocked = assertions.filter(
+    (a) => a.status === "failed" || a.status === "blocked",
+  );
+  const allPending = assertions.filter((a) => a.status === "pending");
+  const validatorChecked = assertions.filter((a) => {
+    const verifierLower = a.verifiedBy?.trim().replace(/^@/, "").toLowerCase();
+    if (verifierLower && reconNames.has(verifierLower)) {
+      return false;
+    }
+    return (
+      a.verifiedByRole === "validator" ||
+      (verifierLower ? validatorNames.has(verifierLower) : false)
+    );
+  });
+
+  if (validatorChecked.length > 0) {
+    const passedChecked = validatorChecked.filter((a) => a.status === "passed");
+    const participantHandles: string[] = [];
+    const seenHandles = new Set<string>();
+    const addHandle = (raw?: string): void => {
+      const clean = raw?.trim().replace(/^@/, "");
+      if (!clean) return;
+      const key = clean.toLowerCase();
+      if (reconNames.has(key)) return;
+      if (!seenHandles.has(key)) {
+        seenHandles.add(key);
+        participantHandles.push(`\`@${clean}\``);
+      }
+    };
+    for (const v of validators) {
+      const participated =
+        validatorChecked.some(
+          (a) => a.verifiedBy?.toLowerCase() === v.name.toLowerCase(),
+        ) ||
+        validatorPosts.some((p) => p.from.toLowerCase() === v.name.toLowerCase());
+      if (participated) {
+        addHandle(v.name);
+      }
+    }
+    for (const a of validatorChecked) {
+      addHandle(a.verifiedBy);
+    }
+    if (participantHandles.length === 0) {
+      for (const v of validators) {
+        addHandle(v.name);
+      }
+    }
+
+    const handlesLabel = participantHandles.join(", ") || "`@validator`";
+    const latestPreview = latestPost
+      ? sanitizePlainText(latestPost.text).replace(/\s+/g, " ").trim().slice(0, 140)
+      : undefined;
+    const latestSuffix = latestPost
+      ? ` — latest \`@${latestPost.from}\` (#${latestPost.seq}): ${latestPreview}`
+      : "";
+
+    if (allFailedOrBlocked.length > 0) {
+      const pendingPart =
+        allPending.length > 0 ? `, ${allPending.length} pending` : "";
+      return `❌ FAIL — ${handlesLabel} (${allPassed.length}/${assertions.length} VAL-* passed, ${allFailedOrBlocked.length} failed/blocked${pendingPart})${latestSuffix}`;
+    }
+    if (allPending.length > 0) {
+      return `⚠️ PARTIAL — ${handlesLabel} (${passedChecked.length}/${assertions.length} VAL-* verified, ${allPending.length} pending)${latestSuffix}`;
+    }
+    if (passedChecked.length > 0) {
+      return `✅ PASS — ${handlesLabel} (${passedChecked.length}/${assertions.length} VAL-* verified)${latestSuffix}`;
+    }
+  }
+
   if (validators.length === 0) {
     return run.validatorEnabled
       ? "Enabled (no validator spawned)"
       : "Disabled";
   }
 
-  const validatorNames = new Set(validators.map((v) => v.name.toLowerCase()));
-  const validatorPosts = boardMessages.filter(
-    (msg) =>
-      msg.fromRole === "validator" ||
-      validatorNames.has(msg.from.toLowerCase()),
-  );
-  const donePosts = validatorPosts.filter((m) => m.kind === "done");
-  const latestPost =
-    donePosts[donePosts.length - 1] ?? validatorPosts[validatorPosts.length - 1];
+  const latestPreview = latestPost
+    ? sanitizePlainText(latestPost.text).replace(/\s+/g, " ").trim().slice(0, 160)
+    : undefined;
+  const fallbackHandles = validators.map((v) => `\`@${v.name}\``).join(", ");
+  const fallbackPostSuffix = latestPost
+    ? ` — latest \`@${latestPost.from}\` (#${latestPost.seq}): ${latestPreview}`
+    : "";
+
+  if (allFailedOrBlocked.length > 0) {
+    const pendingPart =
+      allPending.length > 0 ? `, ${allPending.length} pending` : "";
+    return `❌ FAIL — ${fallbackHandles} (${allPassed.length}/${assertions.length} VAL-* passed, ${allFailedOrBlocked.length} failed/blocked${pendingPart})${fallbackPostSuffix}`;
+  }
+  if (allPending.length > 0) {
+    return `⚠️ PARTIAL — ${fallbackHandles} (${allPassed.length}/${assertions.length} VAL-* passed, ${allPending.length} pending)${fallbackPostSuffix}`;
+  }
 
   if (!latestPost) {
     const states = validators.map((v) => `\`@${v.name}\` (${v.state})`).join(", ");
     return `No verdict posted (${states})`;
   }
 
-  const preview = sanitizePlainText(latestPost.text)
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 160);
+  const preview = latestPreview ?? "";
   const isPass = /\b(pass|passed|approved|lgtm|verified)\b/i.test(preview);
   const isFail = /\b(fail|failed|rejected|blocked|changes requested)\b/i.test(preview);
   const icon = isFail && !isPass ? "❌ FAIL" : isPass ? "✅ PASS" : "ℹ️ Reported";
@@ -3523,6 +3633,9 @@ export function createPiSwarmExtension(
     };
     const onModalExit = (): void => {
       widgetState.modalDepth = Math.max(0, widgetState.modalDepth - 1);
+      if (widgetState.modalDepth === 0 && pendingWakeups.length > 0) {
+        scheduleWakeupFlush();
+      }
     };
 
     async function withModalGuard<T>(fn: () => Promise<T>): Promise<T> {
@@ -3621,10 +3734,10 @@ export function createPiSwarmExtension(
     }
 
     function isRunResumableBySession(
-      summary: Pick<RunSummary, "status" | "ownerSessionId" | "ownerPid">,
+      summary: Pick<RunSummary, "status" | "runMode" | "ownerSessionId" | "ownerPid">,
       sid: string,
     ): boolean {
-      if (isTerminalRunStatus(summary.status)) {
+      if (isTerminalRunStatus(summary.status) || isReconRun(summary)) {
         return false;
       }
       if (
@@ -3753,7 +3866,7 @@ export function createPiSwarmExtension(
       run: SwarmRunState | null | undefined,
       ctx?: ExtensionContext,
     ): boolean {
-      if (!run || !isRunningProfileRun(run)) {
+      if (!run || !isRunningProfileRun(run) || isReconRun(run)) {
         return false;
       }
       const sid = getCurrentSessionId(ctx);
@@ -3863,8 +3976,9 @@ export function createPiSwarmExtension(
       ctx?: ExtensionContext,
       snapshotOverride?: SwarmSnapshot,
     ): SwarmToolProfileMode {
-      if (draftController.isActive()) {
-        return "drafting";
+      const draft = draftController.getDraft();
+      if (isDraftActive(draft)) {
+        return draft.mode === "tweak" ? "drafting" : "recon";
       }
       const run = (snapshotOverride ?? getSnapshotSafe()).run;
       if (isOwnedLiveRun(run, ctx)) {
@@ -3914,7 +4028,21 @@ export function createPiSwarmExtension(
       const draft = options?.ignoreDraft ? null : draftController.getDraft();
       if (isDraftActive(draft)) {
         activeRunSections.swarm = buildDraftingSystemOverlay(draft);
-        delete activeRunSections.swarm_state;
+        const snapshot = getSnapshotSafe();
+        if (
+          draft.mode === "swarm" &&
+          draft.reconRunId &&
+          snapshot.run &&
+          snapshot.run.id === draft.reconRunId &&
+          isReconRun(snapshot.run) &&
+          !isTerminalRunStatus(snapshot.run.status)
+        ) {
+          activeRunSections.swarm_state = buildOrchestratorLiveStateSection(snapshot, {
+            includeRecentBoard: options?.includeRecentBoard ?? false,
+          });
+        } else {
+          delete activeRunSections.swarm_state;
+        }
         return;
       }
       const snapshot = getSnapshotSafe();
@@ -4002,6 +4130,10 @@ export function createPiSwarmExtension(
         const waitingCount = snapshot.waitingMemberNames.filter(
           (name) => !workingSet.has(name),
         ).length;
+        if (isReconRun(run)) {
+          const boardTag = snapshot.boardHead > 0 ? ` · #${snapshot.boardHead}` : "";
+          return `🐝 Swarm Recon · ${workingCount}w/${waitingCount}wait${boardTag}`;
+        }
         if (run.status === "paused") {
           const shortTitle = sanitizePlainText(run.title || run.objective || run.id).slice(0, 36);
           return `🐝 Swarm (paused) · ${shortTitle}`;
@@ -4026,6 +4158,9 @@ export function createPiSwarmExtension(
         const waitingCount = snapshot.waitingMemberNames.filter(
           (name) => !workingSet.has(name),
         ).length;
+        if (isReconRun(run)) {
+          return `🐝 Swarm · Recon (${workingCount}w/${waitingCount}wait)`;
+        }
         const shortTitle = sanitizePlainText(run.title || run.objective || run.id).slice(0, 48);
         const stateTag =
           run.status === "paused" ? "Paused" : `${workingCount}w/${waitingCount}wait`;
@@ -4769,20 +4904,28 @@ export function createPiSwarmExtension(
       if (isShutDown || wakeupInFlight || userPromptPreflight || pendingWakeups.length === 0) {
         return;
       }
-      // Do not interrupt an interactive planning draft with a background wakeup turn.
-      if (draftController.isActive()) {
-        return;
-      }
       const ctx = ctxOverride ?? lastCtx;
       if (!ctx) {
         return;
+      }
+      const snapshot = getSnapshotSafe();
+      const draft = draftController.getDraft();
+      // Do not interrupt an interactive planning draft with a background wakeup turn —
+      // except for wakeups belonging to the draft's own active read-only recon run when no modal is open.
+      if (isDraftActive(draft)) {
+        const isActiveReconWakeup =
+          isReconRun(snapshot.run) &&
+          Boolean(draft.reconRunId) &&
+          snapshot.run?.id === draft.reconRunId &&
+          !isModalOpen(widgetState);
+        if (!isActiveReconWakeup) {
+          return;
+        }
       }
       // Strictly dispatch only at idle / settled boundary when no messages are queued.
       if (!ctx.isIdle() || ctx.hasPendingMessages()) {
         return;
       }
-
-      const snapshot = getSnapshotSafe();
       // Never emit ghost wakeups once a run is paused, completed, abandoned, detached, or not owned by this session.
       if (
         !snapshot.run ||
@@ -5308,10 +5451,35 @@ export function createPiSwarmExtension(
       }
 
       const draft = draftController.rehydrate(ctx, {
-        syncToolProfile: true,
+        syncToolProfile: false,
         hasActiveRun: hasFocusedRun,
         hasPersistentOrchestrator: orchestratorMode,
       });
+      if (
+        isDraftActive(draft) &&
+        draft.mode === "swarm" &&
+        draft.reconRunId &&
+        engine.getSnapshot().activeRunId !== draft.reconRunId
+      ) {
+        const loadedRecon = await store.loadRun(draft.reconRunId).catch(() => null);
+        if (
+          loadedRecon &&
+          isReconRun(loadedRecon) &&
+          !isTerminalRunStatus(loadedRecon.status) &&
+          isCurrentSessionOwner(loadedRecon, ctx)
+        ) {
+          await claimRunOwnershipIfAvailable(
+            store,
+            engine,
+            loadedRecon,
+            currentSessionId,
+            ctx,
+            allowSamePidFork,
+          );
+          await attachRunWithOwnershipGuard(engine, loadedRecon.id, ctx, false);
+        }
+      }
+      applySwarmToolProfile(pi, computeDesiredToolProfile(ctx));
       syncDraftWidgetState(draft);
       syncActiveRunSections({ ctx });
       refreshUI(ctx);
@@ -5572,6 +5740,60 @@ export function createPiSwarmExtension(
             return res;
           };
         }
+        if (prop === "addMembers") {
+          return async (input: Parameters<ISwarmEngine["addMembers"]>[0]) => {
+            if (waitArmedTurnIndex !== null && currentTurnIndex > waitArmedTurnIndex) {
+              disarmOrchestratorWait(
+                'Tool "addMembers" invoked after swarm_wait turn',
+              );
+            }
+            const curRun = target.getSnapshot().run;
+            const draft = draftController.getDraft();
+            const needsRecon =
+              (isDraftActive(draft) &&
+                draft.mode === "swarm" &&
+                (!curRun ||
+                  curRun.id !== draft.reconRunId ||
+                  !isReconRun(curRun) ||
+                  isTerminalRunStatus(curRun.status))) ||
+              (!isDraftActive(draft) &&
+                orchestratorMode &&
+                (!curRun || isTerminalRunStatus(curRun.status)));
+            if (needsRecon) {
+              await ensureReconRun(input?.hostContext ?? lastCtx);
+            }
+            await assertToolEngineOwner(target);
+            return target.addMembers(input);
+          };
+        }
+        if (prop === "manageChannel") {
+          return async (input: Parameters<ISwarmEngine["manageChannel"]>[0]) => {
+            if (waitArmedTurnIndex !== null && currentTurnIndex > waitArmedTurnIndex) {
+              disarmOrchestratorWait(
+                'Tool "manageChannel" invoked after swarm_wait turn',
+              );
+            }
+            if (input?.action === "create") {
+              const curRun = target.getSnapshot().run;
+              const draft = draftController.getDraft();
+              const needsRecon =
+                (isDraftActive(draft) &&
+                  draft.mode === "swarm" &&
+                  (!curRun ||
+                    curRun.id !== draft.reconRunId ||
+                    !isReconRun(curRun) ||
+                    isTerminalRunStatus(curRun.status))) ||
+                (!isDraftActive(draft) &&
+                  orchestratorMode &&
+                  (!curRun || isTerminalRunStatus(curRun.status)));
+              if (needsRecon) {
+                await ensureReconRun(lastCtx);
+              }
+            }
+            await assertToolEngineOwner(target);
+            return target.manageChannel(input);
+          };
+        }
         if (prop === "manageMission") {
           if (typeof target.manageMission !== "function") {
             return undefined;
@@ -5617,6 +5839,292 @@ export function createPiSwarmExtension(
         return Object.getOwnPropertyDescriptor(ensureBoundSync().engine, prop);
       },
     });
+
+    // ------------------------------------------------------------------------
+    // Recon-in-Swarm Lazy Creation, Library Carry-Over & Idempotent Cleanup
+    // ------------------------------------------------------------------------
+    function isDraftingReconMode(): boolean {
+      const draft = draftController.getDraft();
+      return isDraftActive(draft) && draft.mode === "swarm";
+    }
+
+    function getActiveReconRun(): SwarmRunState | null {
+      const draft = draftController.getDraft();
+      if (!isDraftActive(draft) || draft.mode !== "swarm" || !draft.reconRunId) {
+        return null;
+      }
+      const snapRun = activeEngine?.getSnapshot().run;
+      if (
+        snapRun &&
+        snapRun.id === draft.reconRunId &&
+        isReconRun(snapRun) &&
+        !isTerminalRunStatus(snapRun.status)
+      ) {
+        return snapRun;
+      }
+      return null;
+    }
+
+    function isStarterLibraryContent(
+      topic: string,
+      content: string | null | undefined,
+    ): boolean {
+      if (typeof content !== "string") {
+        return true;
+      }
+      const trimmed = content.trim();
+      if (!trimmed) {
+        return true;
+      }
+      const starterHeading = `# ${topic.charAt(0).toUpperCase()}${topic.slice(1)}`;
+      return trimmed === starterHeading;
+    }
+
+    async function carryOverStandbyLibrary(
+      store: ISwarmStore,
+      priorCompletedRunId: string | null,
+      targetRunId: string,
+      options?: { preserveExistingNonStarter?: boolean },
+    ): Promise<void> {
+      if (
+        !priorCompletedRunId ||
+        priorCompletedRunId === targetRunId ||
+        typeof store.listLibraryTopics !== "function" ||
+        typeof store.readLibraryTopic !== "function" ||
+        typeof store.writeLibraryTopic !== "function"
+      ) {
+        return;
+      }
+      try {
+        const priorTopics = await store.listLibraryTopics(priorCompletedRunId);
+        for (const entry of priorTopics) {
+          const topic = entry?.topic;
+          if (!topic) continue;
+          try {
+            const priorContent = await store.readLibraryTopic(
+              priorCompletedRunId,
+              topic,
+            );
+            if (isStarterLibraryContent(topic, priorContent) || typeof priorContent !== "string") {
+              continue;
+            }
+            const existingContent = await store.readLibraryTopic(targetRunId, topic);
+            if (
+              typeof existingContent === "string" &&
+              (priorContent === existingContent ||
+                priorContent.trim() === existingContent.trim())
+            ) {
+              continue;
+            }
+            if (
+              options?.preserveExistingNonStarter &&
+              !isStarterLibraryContent(topic, existingContent)
+            ) {
+              continue;
+            }
+            await store.writeLibraryTopic(targetRunId, topic, priorContent, {
+              append: false,
+              actor: ORCHESTRATOR_NAME,
+            });
+          } catch {
+            // Best-effort per topic: corrupt/unreadable topic never blocks launch
+          }
+        }
+      } catch {
+        // Best-effort carryover: missing/corrupt prior library never blocks launch
+      }
+    }
+
+    async function ensureReconRun(
+      toolCtx?: ExtensionContext,
+    ): Promise<SwarmRunState | null> {
+      const ctx = toolCtx ?? lastCtx;
+      if (!ctx) {
+        return null;
+      }
+      const { store, worktree, engine } = await ensureBound(ctx);
+      let draft = draftController.getDraft();
+
+      if (isDraftActive(draft)) {
+        if (draft.mode !== "swarm") {
+          return null;
+        }
+      } else {
+        const currentRun = engine.getSnapshot().run;
+        if (
+          currentRun &&
+          !isTerminalRunStatus(currentRun.status) &&
+          !isReconRun(currentRun)
+        ) {
+          return null;
+        }
+        if (!orchestratorMode) {
+          return null;
+        }
+      }
+
+      if (isDraftActive(draft) && draft.reconRunId) {
+        const snapRun = engine.getSnapshot().run;
+        if (
+          snapRun &&
+          snapRun.id === draft.reconRunId &&
+          isReconRun(snapRun) &&
+          !isTerminalRunStatus(snapRun.status)
+        ) {
+          return snapRun;
+        }
+        const loaded = await store.loadRun(draft.reconRunId).catch(() => null);
+        if (loaded && isReconRun(loaded) && !isTerminalRunStatus(loaded.status)) {
+          await engine.startRun(loaded.id, ctx);
+          syncDraftWidgetState(draft);
+          syncActiveRunSections({ ctx });
+          refreshUI(ctx);
+          return engine.getSnapshot().run ?? loaded;
+        }
+      }
+
+      const baseBranch =
+        (isDraftActive(draft) ? draft.baseBranch?.trim() : undefined) ||
+        (await resolveBaseBranchSafe(worktree, ctx.cwd));
+
+      const rawSeed = (isDraftActive(draft) ? draft.seed : "").trim();
+      const shortSeed = rawSeed
+        ? sanitizePlainText(rawSeed).replace(/\s+/g, " ").trim().slice(0, 48)
+        : "Workspace exploration";
+      const title = `Recon: ${shortSeed}`;
+      const objective = rawSeed || "Read-only parallel reconnaissance";
+      const ownerSessionId = getSessionIdSafe(ctx);
+      const maxConcurrency = isDraftActive(draft)
+        ? draft.maxConcurrency
+        : currentSettings.maxConcurrency;
+      const validatorEnabled = isDraftActive(draft)
+        ? draft.validatorEnabled
+        : currentSettings.validatorEnabled;
+
+      const reconRun = await store.createRun({
+        title,
+        objective,
+        strategy: "Read-only parallel reconnaissance",
+        acceptanceCriteria: "",
+        baseBranch,
+        ownerSessionId,
+        ownerPid: process.pid,
+        maxConcurrency,
+        validatorEnabled,
+        keepWorkersWarm: currentSettings.keepWorkersWarm,
+        roleModels: buildRoleModelsFromSettings(currentSettings),
+        runMode: "recon",
+        phase: "recon",
+      });
+
+      await engine.startRun(reconRun.id, ctx);
+
+      if (isDraftActive(draft)) {
+        draft = draftController.update({ reconRunId: reconRun.id }) ?? draft;
+      } else {
+        draft = draftController.start(
+          {
+            mode: "swarm",
+            seed: "",
+            baseBranch,
+            validatorEnabled,
+            maxConcurrency,
+            ...(autoConfirmDefault ? { autoConfirm: true } : {}),
+          },
+          { applyToolProfile: false, defaultBaseBranch: baseBranch },
+        );
+        draft = draftController.update({ reconRunId: reconRun.id }) ?? draft;
+        applySwarmToolProfile(pi, computeDesiredToolProfile(ctx));
+      }
+
+      invalidateRunsCache();
+      syncDraftWidgetState(draft);
+      syncActiveRunSections({ ctx });
+      refreshUI(ctx);
+
+      return engine.getSnapshot().run ?? reconRun;
+    }
+
+    async function cleanupReconRun(
+      reconRunId: string | undefined | null,
+      ctx?: ExtensionContext,
+      reason = "Recon draft cancelled",
+      options?: { skipProfileRestore?: boolean },
+    ): Promise<void> {
+      if (!reconRunId || !reconRunId.trim()) {
+        return;
+      }
+      const targetCtx = ctx ?? lastCtx;
+      const store =
+        activeStore ?? (targetCtx ? ensureBoundSync(targetCtx).store : undefined);
+      const engine =
+        activeEngine ?? (targetCtx ? ensureBoundSync(targetCtx).engine : undefined);
+      if (!store || !engine) {
+        return;
+      }
+
+      const run = await store.loadRun(reconRunId).catch(() => null);
+      if (!run || !isReconRun(run) || isTerminalRunStatus(run.status)) {
+        return;
+      }
+
+      purgePendingWakeupsForRun(run.id);
+      disarmOrchestratorWait(reason);
+
+      if (engine.getSnapshot().activeRunId !== run.id) {
+        await engine.attachRun(run.id, targetCtx).catch(() => {});
+      }
+
+      const liveSnap = engine.getSnapshot();
+      const latestRun = liveSnap.run?.id === run.id ? liveSnap.run : run;
+      for (const member of getOrderedMembers(latestRun)) {
+        if (member.state === "killed") continue;
+        try {
+          await engine.killMember(member.name, {
+            force: true,
+            reason,
+            callerName: "human",
+            callerRole: "human",
+          });
+        } catch {
+          // best-effort kill for each recon member
+        }
+      }
+
+      const refreshed = await store.loadRun(run.id).catch(() => latestRun);
+      if (!isTerminalRunStatus(refreshed.status)) {
+        await store
+          .updateRun(run.id, {
+            status: "abandoned",
+            actor: "human",
+          })
+          .catch(() => {});
+      }
+
+      activatedRunIds.delete(run.id);
+      resetGoalContinuation(run.id);
+      invalidateRunsCache();
+
+      if (engine.getSnapshot().activeRunId === run.id) {
+        await engine.attachRun(null, targetCtx).catch(() => {});
+        if (orchestratorMode && lastCompletedRunId && targetCtx) {
+          await engine.attachRun(lastCompletedRunId, targetCtx).catch(() => {});
+        }
+      }
+
+      if (!options?.skipProfileRestore) {
+        const nextMode = computeDesiredToolProfile(targetCtx);
+        applySwarmToolProfile(pi, nextMode);
+        syncActiveRunSections({ ctx: targetCtx });
+        if (nextMode === "idle") {
+          clearWorkingMessageAndTitle(targetCtx);
+          await restorePreSwarmHostModel(targetCtx);
+        } else if (nextMode === "standby") {
+          clearWorkingMessageAndTitle(targetCtx);
+        }
+        refreshUI(targetCtx);
+      }
+    }
 
     // ------------------------------------------------------------------------
     // Plan Confirmation Callback (`propose_swarm_plan` -> real store/git/engine)
@@ -5786,6 +6294,7 @@ export function createPiSwarmExtension(
             role: memberSpec.role,
             brief: memberSpec.brief,
             workspace: memberSpec.workspace ?? "inherit",
+            ...(memberSpec.fork ? { fork: memberSpec.fork } : {}),
             channels: memberSpec.channels,
             callerName: ORCHESTRATOR_NAME,
             callerRole: "orchestrator",
@@ -5961,6 +6470,175 @@ export function createPiSwarmExtension(
         return finalRun;
       }
 
+      // 1b. Recon-in-Swarm in-place promotion: promote active reconRunId to executing mode
+      if (activeDraft?.mode === "swarm" && activeDraft.reconRunId) {
+        const candidateRecon = await store
+          .loadRun(activeDraft.reconRunId)
+          .catch(() => null);
+        if (
+          candidateRecon &&
+          isReconRun(candidateRecon) &&
+          !isTerminalRunStatus(candidateRecon.status)
+        ) {
+          await assertFocusedRunOwner(store, candidateRecon.id, toolCtx);
+
+          const ready = await worktree.ensureRepoReady(plan.baseBranch);
+          const effectiveBaseBranch = ready.baseBranch || plan.baseBranch;
+
+          if (engine.getSnapshot().activeRunId !== candidateRecon.id) {
+            await engine.startRun(candidateRecon.id, toolCtx);
+          }
+
+          const priorCompletedRunId = await resolveStandbyLineageCompletedRunId(
+            store,
+            toolCtx,
+            ownerSessionId,
+          );
+          await carryOverStandbyLibrary(store, priorCompletedRunId, candidateRecon.id, {
+            preserveExistingNonStarter: true,
+          });
+
+          const initialMilestones =
+            plan.milestones !== undefined || (plan.features && plan.features.length > 0)
+              ? derivePlanMilestones(plan.milestones, plan.features, plan.assertions)
+              : undefined;
+
+          const promoteInput: PromoteReconRunInput = {
+            title: plan.title,
+            objective: plan.objective,
+            strategy: plan.strategy,
+            acceptanceCriteria: plan.acceptanceCriteria,
+            baseBranch: effectiveBaseBranch,
+            maxConcurrency: plan.maxConcurrency,
+            validatorEnabled: plan.validatorEnabled,
+            roleModels: plan.roleModels ?? buildRoleModelsFromSettings(currentSettings),
+            ...(initialMilestones !== undefined ? { milestones: initialMilestones } : {}),
+            ...(plan.assertions !== undefined ? { assertions: plan.assertions } : {}),
+            ...(plan.features !== undefined ? { features: plan.features } : {}),
+            ...(plan.commands !== undefined ? { commands: plan.commands } : {}),
+            ...(plan.services !== undefined ? { services: plan.services } : {}),
+            ...(plan.boundaries !== undefined ? { boundaries: plan.boundaries } : {}),
+            ...(plan.lastAudit !== undefined ? { lastAudit: plan.lastAudit } : {}),
+            actor: ORCHESTRATOR_NAME,
+          };
+
+          const promotedRun = engine.promoteReconRun
+            ? await engine.promoteReconRun(candidateRecon.id, promoteInput)
+            : await store.updateRun(candidateRecon.id, {
+                runMode: "executing",
+                phase: null,
+                title: promoteInput.title,
+                objective: promoteInput.objective,
+                strategy: promoteInput.strategy,
+                acceptanceCriteria: promoteInput.acceptanceCriteria,
+                baseBranch: promoteInput.baseBranch,
+                maxConcurrency: promoteInput.maxConcurrency,
+                validatorEnabled: promoteInput.validatorEnabled,
+                roleModels: promoteInput.roleModels,
+                ...(promoteInput.milestones !== undefined
+                  ? { milestones: promoteInput.milestones }
+                  : {}),
+                ...(promoteInput.assertions !== undefined
+                  ? { assertions: promoteInput.assertions }
+                  : {}),
+                ...(promoteInput.features !== undefined
+                  ? { features: promoteInput.features }
+                  : {}),
+                ...(promoteInput.commands !== undefined
+                  ? { commands: promoteInput.commands }
+                  : {}),
+                ...(promoteInput.services !== undefined
+                  ? { services: promoteInput.services }
+                  : {}),
+                ...(promoteInput.boundaries !== undefined
+                  ? { boundaries: promoteInput.boundaries }
+                  : {}),
+                ...(promoteInput.lastAudit !== undefined
+                  ? { lastAudit: promoteInput.lastAudit }
+                  : {}),
+                actor: ORCHESTRATOR_NAME,
+              });
+
+          if (plan.handoffItems && plan.handoffItems.length > 0) {
+            await store.updateRun(promotedRun.id, {
+              handoffItems: plan.handoffItems,
+              actor: ORCHESTRATOR_NAME,
+            });
+            await engine.attachRun(promotedRun.id, toolCtx);
+          }
+
+          const warmReconHandles = getOrderedMembers(promotedRun)
+            .filter((m) => m.recon && m.state !== "killed")
+            .map((m) => m.name);
+
+          const { spawnedInitial, failedInitial, firstInitialErr, attemptedCount } =
+            await spawnInitialMembersForRun(
+              store,
+              engine,
+              promotedRun.id,
+              plan,
+              toolCtx,
+              promotedRun.members,
+            );
+
+          if (
+            attemptedCount > 0 &&
+            spawnedInitial.length === 0 &&
+            firstInitialErr !== undefined
+          ) {
+            if (engine.revertReconPromotion) {
+              await engine.revertReconPromotion(promotedRun.id).catch(() => {});
+            } else {
+              await store
+                .updateRun(promotedRun.id, {
+                  runMode: "recon",
+                  phase: "recon",
+                  actor: ORCHESTRATOR_NAME,
+                })
+                .catch(() => {});
+            }
+            applySwarmToolProfile(pi, computeDesiredToolProfile(toolCtx));
+            syncActiveRunSections({ ctx: toolCtx });
+            refreshUI(toolCtx);
+            throw firstInitialErr;
+          }
+
+          if (!orchestratorMode) {
+            orchestratorMode = true;
+            autoConfirmDefault = Boolean(activeDraft?.autoConfirm);
+          }
+          persistCurrentFocus(promotedRun.id, ownerSessionId, "plan_confirmed");
+
+          const finalRun = engine.getSnapshot().run ?? promotedRun;
+          activatedRunIds.add(finalRun.id);
+          resetGoalContinuation(finalRun.id);
+          invalidateRunsCache();
+          syncSessionNameForRun(finalRun);
+
+          applySwarmToolProfile(pi, "running");
+          syncActiveRunSections({ ctx: toolCtx, ignoreDraft: true });
+          refreshUI(toolCtx);
+
+          enqueueWakeupItem({
+            type: "kickoff",
+            runId: finalRun.id,
+            summary: `Dynamic Swarm "${finalRun.title}" (${finalRun.id}) promoted from recon`,
+            kickoffBody: buildRunKickoffMessage(
+              finalRun,
+              spawnedInitial,
+              failedInitial,
+              plan.feedback,
+              {
+                promotedFromRecon: true,
+                warmReconHandles,
+              },
+            ),
+          });
+
+          return finalRun;
+        }
+      }
+
       // 2. Ensure git repo is ready and `.pi/swarm/` is excluded via `.git/info/exclude`
       const ready = await worktree.ensureRepoReady(plan.baseBranch);
       const effectiveBaseBranch = ready.baseBranch || plan.baseBranch;
@@ -6015,52 +6693,7 @@ export function createPiSwarmExtension(
       });
 
       // 3b. Droid Standby Library Carry-Over: copy non-starter library/*.md discoveries from prior completed session run
-      if (
-        priorCompletedRunId &&
-        priorCompletedRunId !== createdRun.id &&
-        typeof store.listLibraryTopics === "function" &&
-        typeof store.readLibraryTopic === "function" &&
-        typeof store.writeLibraryTopic === "function"
-      ) {
-        try {
-          const priorTopics = await store.listLibraryTopics(priorCompletedRunId);
-          for (const entry of priorTopics) {
-            const topic = entry?.topic;
-            if (!topic) continue;
-            try {
-              const priorContent = await store.readLibraryTopic(
-                priorCompletedRunId,
-                topic,
-              );
-              if (
-                typeof priorContent !== "string" ||
-                priorContent.trim().length === 0
-              ) {
-                continue;
-              }
-              const starterContent = await store.readLibraryTopic(
-                createdRun.id,
-                topic,
-              );
-              if (
-                typeof starterContent === "string" &&
-                (priorContent === starterContent ||
-                  priorContent.trim() === starterContent.trim())
-              ) {
-                continue;
-              }
-              await store.writeLibraryTopic(createdRun.id, topic, priorContent, {
-                append: false,
-                actor: ORCHESTRATOR_NAME,
-              });
-            } catch {
-              // Best-effort per topic: corrupt/unreadable topic never blocks Run 2 launch
-            }
-          }
-        } catch {
-          // Best-effort carryover: missing/corrupt prior library never blocks launching Run 2
-        }
-      }
+      await carryOverStandbyLibrary(store, priorCompletedRunId, createdRun.id);
 
       // 4. Attach & start the run in SwarmEngine (defer focus entry until initialMembers settle)
       await engine.startRun(createdRun.id, toolCtx);
@@ -6417,6 +7050,16 @@ export function createPiSwarmExtension(
       draftController,
       reviewProposedContract: runAdversarialContractReview,
       getDefaultAutoConfirm: () => orchestratorMode && autoConfirmDefault,
+      getReconRun: () => getActiveReconRun(),
+      onDraftCancelled: async (cancelledDraft: ActiveSwarmDraft, toolCtx: ExtensionContext) => {
+        if (cancelledDraft.reconRunId) {
+          await cleanupReconRun(
+            cancelledDraft.reconRunId,
+            toolCtx,
+            "Cancelled via propose_swarm_plan dialog",
+          );
+        }
+      },
       confirmProposalOptions: (toolCtx) => {
         if (!canUseCustomTui(toolCtx)) {
           return {};
@@ -6469,6 +7112,8 @@ export function createPiSwarmExtension(
       engine: toolEngineProxy,
       getCallerRole: () => "orchestrator",
       getCallerName: () => ORCHESTRATOR_NAME,
+      ensureReconRun,
+      isDraftingRecon: () => isDraftingReconMode(),
       onOrchestratorModelSwitch: async (model, thinkingLevel, reason) => {
         const trimmedModel = model.trim();
         const runtimeSettings: SwarmSettings = {
@@ -6640,6 +7285,7 @@ export function createPiSwarmExtension(
       const focusedRun = getSnapshotSafe().run;
       if (
         !focusedRun ||
+        isReconRun(focusedRun) ||
         (focusedRun.status !== "active" && focusedRun.status !== "paused")
       ) {
         return "proceed";
@@ -6716,6 +7362,7 @@ export function createPiSwarmExtension(
           : {}),
       };
 
+      const previousDraft = draftController.getDraft();
       const res = await draftController.startOrResolve(ctx, startOptions, {
         defaultBaseBranch,
       });
@@ -6726,6 +7373,17 @@ export function createPiSwarmExtension(
         }
         return;
       }
+
+      if (res.action === "replaced" && previousDraft?.reconRunId) {
+        await cleanupReconRun(
+          previousDraft.reconRunId,
+          ctx,
+          "Replaced by new Swarm draft",
+          { skipProfileRestore: true },
+        );
+      }
+
+      applySwarmToolProfile(pi, computeDesiredToolProfile(ctx));
 
       if (res.action === "appended" && ctx.hasUI) {
         ctx.ui.notify("Appended new goal details to active Swarm draft.", "info");
@@ -6833,6 +7491,7 @@ export function createPiSwarmExtension(
           : {}),
       };
 
+      const previousDraft = draftController.getDraft();
       const res = await draftController.startOrResolve(ctx, startOptions, {
         defaultBaseBranch,
       });
@@ -6843,6 +7502,17 @@ export function createPiSwarmExtension(
         }
         return;
       }
+
+      if (res.action === "replaced" && previousDraft?.reconRunId) {
+        await cleanupReconRun(
+          previousDraft.reconRunId,
+          ctx,
+          "Replaced by /swarm direct draft",
+          { skipProfileRestore: true },
+        );
+      }
+
+      applySwarmToolProfile(pi, computeDesiredToolProfile(ctx));
 
       if (res.action === "appended" && ctx.hasUI) {
         ctx.ui.notify("Appended new goal details to active Swarm draft.", "info");
@@ -6911,6 +7581,12 @@ export function createPiSwarmExtension(
         else emitZeroTurnMessage(ctx, msg);
         return;
       }
+      if (isReconRun(snapshot.run)) {
+        const msg = `Swarm run \`${snapshot.run.id}\` is in read-only recon planning mode. Continue refining the active draft and confirm via \`propose_swarm_plan\`.`;
+        if (ctx.hasUI) ctx.ui.notify(msg, "info");
+        else emitZeroTurnMessage(ctx, msg);
+        return;
+      }
 
       try {
         await assertFocusedRunOwner(store, snapshot.run.id, ctx);
@@ -6945,6 +7621,7 @@ export function createPiSwarmExtension(
           ? { skipContractReview: explicitOverrides.skipContractReview }
           : {}),
       };
+      const previousDraft = draftController.getDraft();
       const res = await draftController.startOrResolve(ctx, tweakStartOptions, {
         settings: {
           validatorEnabled: run.validatorEnabled,
@@ -6959,6 +7636,17 @@ export function createPiSwarmExtension(
         }
         return;
       }
+
+      if (res.action === "replaced" && previousDraft?.reconRunId) {
+        await cleanupReconRun(
+          previousDraft.reconRunId,
+          ctx,
+          "Replaced by /swarm tweak draft",
+          { skipProfileRestore: true },
+        );
+      }
+
+      applySwarmToolProfile(pi, computeDesiredToolProfile(ctx));
 
       if (res.action === "appended" && ctx.hasUI) {
         ctx.ui.notify("Appended new goal details to active Swarm draft.", "info");
@@ -8128,6 +8816,12 @@ export function createPiSwarmExtension(
           invalidateRunsCache();
           syncSessionNameForRun(updated);
           if (draftController.isActive()) {
+            const activeReconId = draftController.getDraft()?.reconRunId;
+            if (activeReconId && activeReconId !== updated.id) {
+              await cleanupReconRun(activeReconId, ctx, "Cancelled by /swarm resume", {
+                skipProfileRestore: true,
+              });
+            }
             draftController.clear("running");
             syncDraftWidgetState(null);
           }
@@ -8272,6 +8966,12 @@ export function createPiSwarmExtension(
         persistCurrentFocus(updated.id, currentSid, "resume_mission");
 
         if (draftController.isActive()) {
+          const activeReconId = draftController.getDraft()?.reconRunId;
+          if (activeReconId && activeReconId !== updated.id) {
+            await cleanupReconRun(activeReconId, ctx, "Cancelled by /swarm resume", {
+              skipProfileRestore: true,
+            });
+          }
           draftController.clear("running");
           syncDraftWidgetState(null);
         }
@@ -8349,8 +9049,17 @@ export function createPiSwarmExtension(
     async function handleCancelCommand(ctx: ExtensionCommandContext): Promise<void> {
       const { store, engine } = await ensureBound(ctx);
 
-      // 1. If a planning draft is active, cancel the draft and restore the underlying tool profile
+      // 1. If a planning draft is active, cancel the draft (and clean up any recon run) and restore the underlying tool profile
       if (draftController.isActive()) {
+        const activeDraft = draftController.getDraft();
+        if (activeDraft?.reconRunId) {
+          await cleanupReconRun(
+            activeDraft.reconRunId,
+            ctx,
+            "Cancelled by user via /swarm cancel",
+            { skipProfileRestore: true },
+          );
+        }
         const snapshot = engine.getSnapshot();
         const nextProfile: SwarmToolProfileMode = isOwnedLiveRun(snapshot.run, ctx)
           ? "running"
@@ -8386,6 +9095,14 @@ export function createPiSwarmExtension(
       }
 
       const run = snapshot.run;
+      if (isReconRun(run) && !isTerminalRunStatus(run.status)) {
+        await cleanupReconRun(run.id, ctx, "Cancelled by user via /swarm cancel");
+        const nextProfile = computeDesiredToolProfile(ctx);
+        const msg = `Cancelled read-only recon run \`${run.id}\` and restored \`${nextProfile}\` tools.`;
+        if (ctx.hasUI) ctx.ui.notify(`Cancelled recon run ${run.id}.`, "info");
+        emitZeroTurnMessage(ctx, msg, { runId: run.id, status: "abandoned", cancelledRecon: true });
+        return;
+      }
       if (isTerminalRunStatus(run.status)) {
         const msg = orchestratorMode
           ? `Swarm run \`${run.id}\` is already ${run.status}. Persistent Orchestrator Mode remains in standby — run \`/swarm exit\` to leave Orchestrator Mode.`
@@ -8612,6 +9329,14 @@ export function createPiSwarmExtension(
       ctx: ExtensionContext,
       sessionId: string,
     ): Promise<void> {
+      const reconToCleanup =
+        draftController.getDraft()?.reconRunId ??
+        (isReconRun(engine.getSnapshot().run) ? engine.getSnapshot().activeRunId : null);
+      if (reconToCleanup) {
+        await cleanupReconRun(reconToCleanup, ctx, "Detached via /swarm focus none", {
+          skipProfileRestore: true,
+        });
+      }
       orchestratorMode = false;
       autoConfirmDefault = false;
       lastCompletedRunId = null;
@@ -8706,6 +9431,15 @@ export function createPiSwarmExtension(
       }
       purgePendingWakeupsForRun(null);
       invalidateRunsCache();
+
+      const activeReconId =
+        draftController.getDraft()?.reconRunId ??
+        (isReconRun(run) ? run?.id : undefined);
+      if (activeReconId) {
+        await cleanupReconRun(activeReconId, ctx, "Cancelled via /swarm exit", {
+          skipProfileRestore: true,
+        });
+      }
 
       if (draftController.isActive()) {
         draftController.clear("idle");
@@ -10268,6 +11002,7 @@ export function createPiSwarmExtension(
       const hasOwnedLiveRun = isOwnedLiveRun(snapshot.run, ctx);
       const isGuardedRunOwner =
         Boolean(snapshot.run) &&
+        !isReconRun(snapshot.run) &&
         isRunningProfileRun(snapshot.run) &&
         isCurrentSessionOwner(snapshot.run, ctx) &&
         (snapshot.run!.status === "active" || Boolean(snapshot.run!.ownerSessionId));
@@ -10310,7 +11045,7 @@ export function createPiSwarmExtension(
           if (heavySuite) {
             return {
               block: true,
-              reason: `Swarm Drafting is fast structural recon only — do NOT run full test suites, linters, typecheckers, or builds (\`${heavySuite}\`) before launch. Inspect package.json/config scripts and delegate baseline test runs to Workers after calling propose_swarm_plan.`,
+              reason: `Swarm Drafting keeps the Orchestrator fast — do NOT run full test suites, linters, typecheckers, or builds (\`${heavySuite}\`) directly in the host session. Delegate baseline test/typecheck/lint probes to parallel read-only recon workers via swarm{action:"add"} (workspace:"inherit"), or proceed to propose_swarm_plan.`,
             };
           }
         }
@@ -10318,7 +11053,7 @@ export function createPiSwarmExtension(
           if (draftReconCount >= DRAFT_RECON_HARD_CAP) {
             return {
               block: true,
-              reason: `Swarm Drafting recon cap (${DRAFT_RECON_HARD_CAP} calls) reached — STOP running further read/bash recon and call swarm_questionnaire (if a genuine ambiguity remains) or propose_swarm_plan NOW! Deep code tracing and baseline tests belong to Workers after launch, and features/assertions/commands remain dynamically editable mid-mission via swarm{action:"mission"}.`,
+              reason: `Swarm Drafting recon cap (${DRAFT_RECON_HARD_CAP} calls) reached — STOP running further direct read/bash recon in the host session! Delegate deep code tracing or baseline test runs to parallel read-only recon workers via swarm{action:"add"} (then swarm_wait), or call swarm_questionnaire / propose_swarm_plan NOW. Features, assertions, and commands remain dynamically editable mid-mission via swarm{action:"mission"}.`,
             };
           }
           draftReconCount += 1;
@@ -10380,8 +11115,8 @@ export function createPiSwarmExtension(
       const remaining = Math.max(0, DRAFT_RECON_HARD_CAP - draftReconCount);
       const brakeText =
         remaining === 0
-          ? `\n\n<draft_recon_brake calls="${draftReconCount}/${DRAFT_RECON_HARD_CAP}">Recon budget exhausted (0 calls remaining). Call swarm_questionnaire or propose_swarm_plan on your VERY NEXT turn — do NOT call read/grep/find/ls/bash again.</draft_recon_brake>`
-          : `\n\n<draft_recon_brake calls="${draftReconCount}/${DRAFT_RECON_HARD_CAP}">Draft recon budget: ${draftReconCount}/${DRAFT_RECON_HARD_CAP} (${remaining} remaining). You already have enough structural context — call swarm_questionnaire (if needed) or propose_swarm_plan NOW instead of deep-reading more files.</draft_recon_brake>`;
+          ? `\n\n<draft_recon_brake calls="${draftReconCount}/${DRAFT_RECON_HARD_CAP}">Direct host recon budget exhausted (0 calls remaining). Delegate any further deep code tracing or baseline test runs to parallel read-only recon workers via swarm{action:"add"} (then swarm_wait), or call swarm_questionnaire / propose_swarm_plan on your VERY NEXT turn.</draft_recon_brake>`
+          : `\n\n<draft_recon_brake calls="${draftReconCount}/${DRAFT_RECON_HARD_CAP}">Draft host recon budget: ${draftReconCount}/${DRAFT_RECON_HARD_CAP} (${remaining} remaining). Delegate deep file reading, cross-module tracing, or baseline test runs to parallel read-only recon workers via swarm{action:"add"} (or call swarm_questionnaire / propose_swarm_plan NOW).</draft_recon_brake>`;
       const nextContent = [
         ...(Array.isArray(event.content) ? event.content : []),
         { type: "text" as const, text: brakeText },
@@ -10481,10 +11216,11 @@ export function createPiSwarmExtension(
         }
         const snapAfterFocus = getSnapshotSafe();
         draftController.rehydrate(ctx, {
-          syncToolProfile: true,
+          syncToolProfile: false,
           hasActiveRun: isOwnedLiveRun(snapAfterFocus.run, ctx),
           hasPersistentOrchestrator: orchestratorMode,
         });
+        applySwarmToolProfile(pi, computeDesiredToolProfile(ctx));
         syncDraftWidgetState(draftController.getDraft());
         syncActiveRunSections({ ctx });
         refreshUI(ctx);
@@ -10720,7 +11456,22 @@ export function createPiSwarmExtension(
         if (isDraftActive(draft)) {
           event.systemPromptOptions.sections.swarm =
             buildDraftingSystemOverlay(draft);
-          delete event.systemPromptOptions.sections.swarm_state;
+          const snapshot = getSnapshotSafe();
+          if (
+            draft.mode === "swarm" &&
+            draft.reconRunId &&
+            snapshot.run &&
+            snapshot.run.id === draft.reconRunId &&
+            isReconRun(snapshot.run) &&
+            !isTerminalRunStatus(snapshot.run.status)
+          ) {
+            event.systemPromptOptions.sections.swarm_state =
+              buildOrchestratorLiveStateSection(snapshot, {
+                includeRecentBoard: event.messageType === "user",
+              });
+          } else {
+            delete event.systemPromptOptions.sections.swarm_state;
+          }
         } else {
           const snapshot = getSnapshotSafe();
           if (isOwnedLiveRun(snapshot.run, ctx)) {
@@ -10760,7 +11511,17 @@ export function createPiSwarmExtension(
       // Fallback for non-standard harnesses without systemPromptOptions.sections
       let sectionContent: string | undefined;
       if (isDraftActive(draft)) {
-        sectionContent = buildDraftingSystemOverlay(draft);
+        const snapshot = getSnapshotSafe();
+        const hasReconRun =
+          draft.mode === "swarm" &&
+          Boolean(draft.reconRunId) &&
+          snapshot.run !== null &&
+          snapshot.run.id === draft.reconRunId &&
+          isReconRun(snapshot.run) &&
+          !isTerminalRunStatus(snapshot.run.status);
+        sectionContent = hasReconRun
+          ? `${buildDraftingSystemOverlay(draft)}\n\n${buildOrchestratorLiveStateSection(snapshot, { includeRecentBoard: event.messageType === "user" })}`
+          : buildDraftingSystemOverlay(draft);
       } else {
         const snapshot = getSnapshotSafe();
         if (isOwnedLiveRun(snapshot.run, ctx)) {
@@ -10830,6 +11591,7 @@ export function createPiSwarmExtension(
       const run = snapshot.run;
       if (
         !run ||
+        isReconRun(run) ||
         run.status !== "active" ||
         !activatedRunIds.has(run.id) ||
         !isCurrentSessionOwner(run, ctx) ||

@@ -82,6 +82,16 @@ export type SwarmWorkspaceMode = "inherit" | "share" | "branch";
 
 export type SwarmRunStatus = "active" | "paused" | "completed" | "abandoned";
 
+/** Protocol-controlled execution mode of a Swarm run (`"recon"` during read-only planning; `"executing"` or omitted for normal execution). */
+export type SwarmRunMode = "recon" | "executing";
+
+/** Returns true when a run is in read-only planning/reconnaissance mode (legacy runs without `runMode` behave as `"executing"`). */
+export function isReconRun(
+  run: Pick<SwarmRunState, "runMode"> | null | undefined,
+): boolean {
+  return run?.runMode === "recon";
+}
+
 export type SwarmAction =
   | "title"
   | "add"
@@ -128,6 +138,8 @@ export interface SwarmMemberRecord {
   name: string;
   agentId: string;
   role: SwarmMemberRole;
+  /** True for read-only reconnaissance members spawned during `runMode: "recon"` (persists read-only even after promotion). */
+  recon?: boolean;
   state: SwarmMemberState;
   /** `"orchestrator"` or the worker name that spawned this helper. */
   parentName: string;
@@ -461,6 +473,7 @@ export interface SwarmRunState {
   ownerSessionId: string;
   ownerPid: number;
   status: SwarmRunStatus;
+  runMode?: SwarmRunMode;
   phase?: string;
   milestones?: SwarmMilestone[];
   assertions?: MissionAssertion[];
@@ -493,6 +506,7 @@ export interface InitialMemberProposal {
   role: SwarmMemberRole;
   brief: string;
   workspace?: SwarmWorkspaceMode;
+  fork?: string;
   channels?: string[];
   featureId?: string;
 }
@@ -525,6 +539,7 @@ export interface ActiveSwarmDraft {
   mode: SwarmDraftMode;
   seed: string;
   targetRunId?: string;
+  reconRunId?: string;
   startedAt: string;
   validatorEnabled: boolean;
   maxConcurrency: number;
@@ -675,6 +690,7 @@ export interface CreateRunInput {
   validatorEnabled?: boolean;
   keepWorkersWarm?: boolean;
   roleModels?: SwarmRoleModels;
+  runMode?: SwarmRunMode;
   phase?: string;
   milestones?: SwarmMilestone[];
   assertions?: MissionAssertion[];
@@ -692,6 +708,7 @@ export interface RunSummary {
   objective: string;
   baseBranch: string;
   status: SwarmRunStatus;
+  runMode?: SwarmRunMode;
   memberCount: number;
   workingCount: number;
   waitingCount: number;
@@ -709,6 +726,7 @@ export interface RunUpdateInput {
   acceptanceCriteria?: string;
   baseBranch?: string;
   status?: SwarmRunStatus;
+  runMode?: SwarmRunMode;
   maxConcurrency?: number;
   validatorEnabled?: boolean;
   keepWorkersWarm?: boolean;
@@ -733,6 +751,7 @@ export interface RegisterMemberInput {
   name: string;
   agentId: string;
   role: SwarmMemberRole;
+  recon?: boolean;
   parentName: string;
   groupPrefix?: string;
   brief: string;
@@ -1055,6 +1074,8 @@ export interface AgentTurnResult {
 export interface SwarmMemberStatusEntry {
   name: string;
   role: SwarmMemberRole;
+  /** True for read-only reconnaissance members spawned during `runMode: "recon"` (persists read-only even after promotion). */
+  recon?: boolean;
   state: SwarmMemberState;
   parentName: string;
   groupPrefix?: string;
@@ -1081,6 +1102,7 @@ export interface SwarmRosterStatus {
   runId: string;
   title: string;
   status: SwarmRunStatus;
+  runMode?: SwarmRunMode;
   baseBranch: string;
   boardHead: number;
   members: SwarmMemberStatusEntry[];
@@ -1278,6 +1300,8 @@ export interface SpawnMemberRequest {
   isMonitor?: boolean;
   /** Pure read-only ephemeral contract audit mode (exposes only read/grep/find/ls, no bash or Swarm tools). */
   ephemeralAudit?: boolean;
+  /** Strictly read-only reconnaissance mode (allows read/grep/find/ls + read-only bash probes + 4 Swarm tools; NO write/edit/powershell, NO scratchDir). */
+  readOnlyRecon?: boolean;
   hostContext?: ExtensionContext;
   onTelemetry?: (event: AgentTelemetryEvent) => void;
   engineApi?: MemberEngineBridge;
@@ -1407,6 +1431,25 @@ export interface CompleteRunOptions {
   sessionId?: string;
 }
 
+export interface PromoteReconRunInput {
+  title: string;
+  objective: string;
+  strategy?: string;
+  acceptanceCriteria?: string;
+  baseBranch: string;
+  maxConcurrency: number;
+  validatorEnabled: boolean;
+  roleModels?: SwarmRoleModels;
+  milestones?: SwarmMilestone[];
+  assertions?: MissionAssertion[];
+  features?: MissionFeature[];
+  commands?: MissionCommandEntry[];
+  services?: MissionServiceEntry[];
+  boundaries?: string[];
+  lastAudit?: MissionAuditRecord;
+  actor?: string;
+}
+
 export interface TeardownOptions {
   runId?: string;
   deleteBranches?: boolean;
@@ -1495,6 +1538,11 @@ export interface ISwarmEngine {
   manageChannel(input: ManageChannelInput): Promise<ManageChannelResult>;
   manageMission?(input: ManageMissionInput): Promise<ManageMissionResult>;
   completeRun(options: CompleteRunOptions): Promise<SwarmRunState>;
+  promoteReconRun?(
+    runId: string,
+    input: PromoteReconRunInput,
+  ): Promise<SwarmRunState>;
+  revertReconPromotion?(runId: string): Promise<SwarmRunState>;
   pause(runId?: string, reason?: string): Promise<SwarmRunState>;
   resume(runId?: string, hostContext?: ExtensionContext): Promise<SwarmRunState>;
   teardown(options?: TeardownOptions): Promise<SafeTeardownResult>;

@@ -21,6 +21,7 @@ import {
   MONITOR_NAME,
   ORCHESTRATOR_NAME,
   POST_MESSAGE_TOOL,
+  PROPOSE_SWARM_PLAN_TOOL,
   RESERVED_MEMBER_NAMES,
   SWARM_BRANCH_PREFIX,
   SWARM_DIR,
@@ -45,6 +46,7 @@ import {
   type FeatureStatus,
   type HandoffItemResolution,
   type ISwarmEngine,
+  isReconRun,
   type ISwarmStore,
   type ISwarmTransport,
   type IWorktreeManager,
@@ -65,6 +67,7 @@ import {
   type ParkOrchestratorWaitResult,
   type PersistentAgentHandle,
   type PostBoardMessageInput,
+  type PromoteReconRunInput,
   type PropagateRoleModelOptions,
   type PropagateRoleModelResult,
   type ReadBoardOptions,
@@ -562,6 +565,7 @@ function buildFeatureWorkerBrief(
   run: SwarmRunState,
   feat: MissionFeature,
   workspace: SwarmWorkspaceMode = "inherit",
+  liveValidatorHandle?: string,
 ): string {
   const assertionMap = new Map((run.assertions ?? []).map((a) => [a.id, a]));
   const fulfilledDetails = feat.fulfills.map((id) => {
@@ -633,15 +637,19 @@ function buildFeatureWorkerBrief(
     workspace === "inherit"
       ? '- Verify baseline health before editing and implement/verify all changes strictly within your owned files in the shared `inherit` workspace (do NOT touch sibling files or run destructive workspace-wide git commands).'
       : `- Verify baseline health before editing, implement and verify all changes inside your isolated \`${workspace}\` worktree, and commit cleanly on your branch (\`git status\` clean).`;
+  const doorbellTarget = liveValidatorHandle?.trim() || ORCHESTRATOR_NAME;
   const doneHeaderExample =
     workspace === "inherit"
-      ? `@${ORCHESTRATOR_NAME} [done] workspace=<cwd> <concise summary>`
-      : `@${ORCHESTRATOR_NAME} [done] commit=<sha> workspace=<cwd> <concise summary>`;
+      ? `@${doorbellTarget} [done] workspace=<cwd> <concise summary>`
+      : `@${doorbellTarget} [done] commit=<sha> workspace=<cwd> <concise summary>`;
+  const fallbackNote = liveValidatorHandle?.trim()
+    ? ` (fall back to \`@${ORCHESTRATOR_NAME} [done] ...\` if \`@${doorbellTarget}\` has been retired)`
+    : "";
   lines.push(
     wsInstruction,
     "",
     "(d) Next-Peer Doorbell & Mandatory Structured Handoff:",
-    `- Report completion via \`${POST_MESSAGE_TOOL}\` starting with \`${doneHeaderExample}\` AND pass \`feature_id: "${feat.id}"\`, \`verification_evidence\` (>= 10 chars with exact commands & pass counts), plus any \`discovered_issues\` / \`left_undone\`, then call \`${SWARM_WAIT_TOOL}\`.`,
+    `- Report completion via \`${POST_MESSAGE_TOOL}\` starting with \`${doneHeaderExample}\`${fallbackNote} AND pass \`feature_id: "${feat.id}"\`, \`verification_evidence\` (>= 10 chars with exact commands & pass counts), plus any \`discovered_issues\` / \`left_undone\`, then call \`${SWARM_WAIT_TOOL}\`.`,
   );
   return lines.join("\n");
 }
@@ -688,11 +696,36 @@ function buildMilestoneValidationBrief(
       ? `Layer 2 (Behavioral / Surface — Incremental Re-Validation): ${alreadyPassed.length} assertion(s) in milestone "${milestoneLabel}" already passed (${alreadyPassed.map((a) => a.id).join(", ")}); focus behavioral testing on the remaining unpassed VAL-* assertion(s) (${unpassedDetails}) plus a fast regression check that previously passed assertions still hold.${svcLine}`
       : `Layer 2 (Behavioral / Surface Validation): Behaviorally test and verify each milestone VAL-* assertion against real execution/outputs: ${unpassedDetails}.${svcLine}`;
 
+  const hasMergedWorktrees =
+    options?.postMergeIntegrationCheck === true ||
+    mFeatures.some((f) => Boolean(f.mergedCommitSha));
+  const completionPhrase = hasMergedWorktrees
+    ? `completed and merged onto \`${run.baseBranch}\``
+    : `completed on \`${run.baseBranch}\``;
+  const diffTargetPhrase = hasMergedWorktrees
+    ? `the merged commits/diffs for milestone "${milestoneLabel}"`
+    : `the edits/diffs for milestone "${milestoneLabel}"`;
+  const warmAuthors = Array.from(
+    new Set(
+      mFeatures
+        .map((f) => f.assignedMember?.trim())
+        .filter((name): name is string => {
+          if (!name) return false;
+          const m = getOwnMember(run, name);
+          return Boolean(m && m.state !== "killed");
+        }),
+    ),
+  );
+  const defectBounceClause =
+    warmAuthors.length > 0
+      ? ` If you find defects, bounce concrete findings directly to warm feature author(s) (${warmAuthors.map((a) => `\`@${a}\``).join(", ")}) for peer-to-peer fixes before reporting your final verdict to \`@${ORCHESTRATOR_NAME} [done] ...\``
+      : ` then report your verdict to \`@${ORCHESTRATOR_NAME} [done] ...\``;
+
   return [
-    `[milestone-review] All features in milestone "${milestoneLabel}" (${mergedFeatureSummary}) are completed and merged onto \`${run.baseBranch}\`. Execute Dual-Layer Milestone Validation now:`,
-    `1. Layer 1 (Scrutiny): Run operational commands (${cmdManifest}) on \`${run.baseBranch}\` and review the merged commits/diffs for milestone "${milestoneLabel}".`,
+    `[milestone-review] All features in milestone "${milestoneLabel}" (${mergedFeatureSummary}) are ${completionPhrase}. Execute Dual-Layer Milestone Validation now:`,
+    `1. Layer 1 (Scrutiny): Run operational commands (${cmdManifest}) on \`${run.baseBranch}\` and review ${diffTargetPhrase}.`,
     `2. ${layer2Instruction}`,
-    `3. Stamp every verified assertion via \`${SWARM_TOOL}{action:"mission", mission_op:"verify_assertion", assertion_id, assertion_status, evidence}\` and record reusable testing/environment findings in \`${SWARM_DIR}/${SWARM_RUNS_DIR}/${run.id}/${SWARM_LIBRARY_DIR}/testing.md\` via \`${SWARM_TOOL}{action:"mission", mission_op:"write_library", library_topic:"testing", library_content:"...", library_append:true}\`, then report your verdict to \`@${ORCHESTRATOR_NAME} [done] ...\` and call \`${SWARM_WAIT_TOOL}\`.`,
+    `3. Stamp every verified assertion via \`${SWARM_TOOL}{action:"mission", mission_op:"verify_assertion", assertion_id, assertion_status, evidence}\` and record reusable testing/environment findings in \`${SWARM_DIR}/${SWARM_RUNS_DIR}/${run.id}/${SWARM_LIBRARY_DIR}/testing.md\` via \`${SWARM_TOOL}{action:"mission", mission_op:"write_library", library_topic:"testing", library_content:"...", library_append:true}\`;${defectBounceClause} and call \`${SWARM_WAIT_TOOL}\`.`,
   ].join("\n");
 }
 
@@ -1792,6 +1825,13 @@ export class SwarmEngine implements ISwarmEngine {
     }
     const run = this.requireActiveRun();
     const currentRun = await this.store.loadRun(run.id);
+    if (isReconRun(currentRun)) {
+      throw new SwarmProtocolError(
+        "INVALID_INPUT",
+        `Cannot complete Swarm run "${currentRun.id}" while in read-only recon mode. Propose and confirm the execution plan via ${PROPOSE_SWARM_PLAN_TOOL} first (or cancel via /swarm cancel).`,
+        { runId: currentRun.id, runMode: "recon" },
+      );
+    }
     if (currentRun.status === "completed" || currentRun.status === "abandoned") {
       throw new SwarmProtocolError(
         "INVALID_INPUT",
@@ -1895,6 +1935,131 @@ export class SwarmEngine implements ISwarmEngine {
     this.emitEngineEvent("run_finished", `Swarm run "${completed.title}" completed: ${summary}`);
     this.emitEngineEvent("snapshot_changed", `Swarm run "${completed.title}" completed.`);
     return finalRun;
+  }
+
+  /**
+   * Promotes an active `runMode: "recon"` run in-place to `runMode: "executing"` when
+   * the user confirms `propose_swarm_plan`, preserving board.jsonl, events.jsonl,
+   * library/*.md, channels, and warm/forkable recon worker sessions under the same runId.
+   */
+  async promoteReconRun(
+    runId: string,
+    input: PromoteReconRunInput,
+  ): Promise<SwarmRunState> {
+    const current = await this.store.loadRun(runId);
+    if (!isReconRun(current)) {
+      throw new SwarmProtocolError(
+        "INVALID_INPUT",
+        `Cannot promote run "${runId}": run is not in recon mode (runMode="${current.runMode ?? "executing"}").`,
+        { runId, runMode: current.runMode ?? "executing" },
+      );
+    }
+    if (current.status === "completed" || current.status === "abandoned") {
+      throw new SwarmProtocolError(
+        "INVALID_INPUT",
+        `Cannot promote ${current.status} recon run "${runId}".`,
+        { runId, status: current.status },
+      );
+    }
+
+    const actor = input.actor?.trim() || ORCHESTRATOR_NAME;
+
+    // Abort/stop any still-working recon members cleanly (preserving lastMessages & sessionFile for fork);
+    // keep already-"waiting" recon workers warm (they remain recon:true read-only forever).
+    if (this.activeRunId === runId) {
+      const workingNames = new Set(this.getWorkingOrPendingMemberNames());
+      for (const m of Object.values(current.members)) {
+        if (m.state === "killed") continue;
+        if (m.state === "working" || workingNames.has(m.name)) {
+          await this.stopMember(m.name, {
+            reason: "Stopped on recon promotion (conversation preserved for fork)",
+            humanStopped: false,
+            callerName: actor,
+            callerRole: "orchestrator",
+          }).catch(() => {});
+        }
+      }
+    }
+
+    const promoted = await this.store.updateRun(runId, {
+      runMode: "executing",
+      phase: null,
+      title: input.title,
+      objective: input.objective,
+      strategy: input.strategy ?? "",
+      acceptanceCriteria: input.acceptanceCriteria ?? "",
+      baseBranch: input.baseBranch,
+      maxConcurrency: input.maxConcurrency,
+      validatorEnabled: input.validatorEnabled,
+      ...(input.roleModels !== undefined ? { roleModels: input.roleModels } : {}),
+      ...(input.milestones !== undefined ? { milestones: input.milestones } : {}),
+      ...(input.assertions !== undefined ? { assertions: input.assertions } : {}),
+      ...(input.features !== undefined ? { features: input.features } : {}),
+      ...(input.commands !== undefined ? { commands: input.commands } : {}),
+      ...(input.services !== undefined ? { services: input.services } : {}),
+      ...(input.boundaries !== undefined ? { boundaries: input.boundaries } : {}),
+      ...(input.lastAudit !== undefined ? { lastAudit: input.lastAudit } : {}),
+      actor,
+    });
+
+    // Post a SILENT [decision] board entry (mentions: [], NO @all) so warm recon workers are NOT woken!
+    const decisionMsg = await this.store.postBoardMessage(runId, {
+      from: actor,
+      fromRole: "orchestrator",
+      channel: DEFAULT_CHANNEL,
+      kind: "decision",
+      text: `[decision] Promoted recon run "${runId}" to executing mode ("${promoted.title}") on ${promoted.baseBranch}.`,
+      mentions: [],
+      channelMentions: [],
+    });
+
+    const latest = await this.store.loadRun(runId);
+    if (this.activeRunId === runId) {
+      this.recordBoardMessageInCache(decisionMsg);
+      this.concurrencyGate.setMaxConcurrency(promoted.maxConcurrency);
+      if (latest.status === "active") {
+        this.concurrencyGate.resume();
+      }
+      await this.refreshCache(latest);
+      this.emitEngineEvent("board_posted", `Posted promotion decision #${decisionMsg.seq}`, {
+        seq: decisionMsg.seq,
+      });
+      this.emitEngineEvent(
+        "snapshot_changed",
+        `Promoted recon run "${promoted.title}" (${runId}) to executing mode.`,
+      );
+      this.maybeArmStallWatchdog();
+    }
+    return latest;
+  }
+
+  /**
+   * Rolls `runMode` back to `"recon"` if launching wave-1 `initial_members` fails
+   * immediately after `promoteReconRun`, preserving the recon board history.
+   */
+  async revertReconPromotion(runId: string): Promise<SwarmRunState> {
+    const current = await this.store.loadRun(runId);
+    if (current.status === "completed" || current.status === "abandoned") {
+      throw new SwarmProtocolError(
+        "INVALID_INPUT",
+        `Cannot revert promotion on ${current.status} run "${runId}".`,
+        { runId, status: current.status },
+      );
+    }
+    const reverted = await this.store.updateRun(runId, {
+      runMode: "recon",
+      phase: "recon",
+      actor: ORCHESTRATOR_NAME,
+    });
+    if (this.activeRunId === runId) {
+      this.cancelStallWatchdog();
+      await this.refreshCache(reverted);
+      this.emitEngineEvent(
+        "snapshot_changed",
+        `Reverted run "${reverted.title}" (${runId}) back to recon mode.`,
+      );
+    }
+    return reverted;
   }
 
   // --------------------------------------------------------------------------
@@ -2134,7 +2299,22 @@ export class SwarmEngine implements ISwarmEngine {
     const effectiveThinking =
       resolvedFromSettings.thinkingLevel ?? roleDefaultFromRun?.thinkingLevel;
 
-    const workspaceMode: SwarmWorkspaceMode = input.workspace ?? "inherit";
+    const reconRunActive = isReconRun(run);
+    const isReconMember = Boolean(reconRunActive || parentMember?.recon);
+    if (
+      isReconMember &&
+      (input.workspace === "share" || input.workspace === "branch")
+    ) {
+      throw new SwarmProtocolError(
+        "INVALID_INPUT",
+        `Isolated workspace "${input.workspace}" is blocked while Swarm run "${run.id}" is in read-only recon mode. Recon workers always run read-only in workspace:"inherit" — propose and confirm the execution plan via ${PROPOSE_SWARM_PLAN_TOOL} first.`,
+        { runId: run.id, runMode: run.runMode ?? "recon", workspace: input.workspace },
+      );
+    }
+    const workspaceMode: SwarmWorkspaceMode =
+      isReconMember || memberRole === "validator"
+        ? "inherit"
+        : (input.workspace ?? "inherit");
     const safeRunBranchSegment =
       run.id
         .trim()
@@ -2248,6 +2428,7 @@ export class SwarmEngine implements ISwarmEngine {
             name: spec.name,
             agentId,
             role: memberRole,
+            ...(isReconMember ? { recon: true } : {}),
             parentName,
             groupPrefix: spec.groupPrefix,
             brief: spec.brief,
@@ -2727,9 +2908,14 @@ export class SwarmEngine implements ISwarmEngine {
 
     // Auto-trigger milestone @validator when an inherit feature completion finishes all features of a milestone!
     if (autoCompletedInheritMilestones.size > 0) {
+      const alreadyNotifiedHandles = this.computeNotifiedValidatorHandles(
+        latestRun,
+        normalizedMsg,
+      );
       await this.maybeTriggerMilestoneValidation(
         run.id,
         autoCompletedInheritMilestones,
+        alreadyNotifiedHandles.size > 0 ? { alreadyNotifiedHandles } : undefined,
       );
     }
 
@@ -3991,6 +4177,13 @@ export class SwarmEngine implements ISwarmEngine {
       );
     }
     const run = this.requireActiveRun();
+    if (isReconRun(run)) {
+      throw new SwarmProtocolError(
+        "INVALID_INPUT",
+        `Cannot merge branches while Swarm run "${run.id}" is in read-only recon mode. Propose and confirm the execution plan via ${PROPOSE_SWARM_PLAN_TOOL} first.`,
+        { runId: run.id, runMode: "recon" },
+      );
+    }
     const member = this.findMember(run, memberName);
     if (!member) {
       throw new SwarmProtocolError("MEMBER_NOT_FOUND", `Member "${memberName}" not found.`);
@@ -4289,10 +4482,69 @@ export class SwarmEngine implements ISwarmEngine {
     } as MergeBranchResult;
   }
 
+  private computeNotifiedValidatorHandles(
+    run: SwarmRunState,
+    msg: BoardMessage,
+  ): Set<string> {
+    const notified = new Set<string>();
+    const senderLower = msg.from.toLowerCase();
+    const mentionsLower = new Set(msg.mentions.map((m) => m.toLowerCase()));
+    const chMentionsLower = new Set(msg.channelMentions.map((c) => c.toLowerCase()));
+
+    for (const member of Object.values(run.members)) {
+      if (
+        member.role !== "validator" ||
+        member.workspace !== "inherit" ||
+        member.recon ||
+        member.state === "killed" ||
+        member.humanStopped ||
+        member.name.toLowerCase() === senderLower
+      ) {
+        continue;
+      }
+      const lowerName = member.name.toLowerCase();
+      if (
+        mentionsLower.has(ALL_MENTION_NAME) ||
+        mentionsLower.has(lowerName) ||
+        (member.groupPrefix && mentionsLower.has(member.groupPrefix.toLowerCase()))
+      ) {
+        notified.add(lowerName);
+        continue;
+      }
+      let matchedChannel = false;
+      for (const ch of chMentionsLower) {
+        const chRecord = getOwnChannel(run, ch);
+        if (!chRecord || chRecord.archived) continue;
+        if (member.channels.includes(ch) || chRecord.subscribers.includes(member.name)) {
+          matchedChannel = true;
+          break;
+        }
+      }
+      if (matchedChannel) {
+        notified.add(lowerName);
+        continue;
+      }
+      if (member.state === "waiting") {
+        const live = this.liveMembers.get(member.name);
+        if (
+          live &&
+          live.parkedMentionsOnly === false &&
+          (msg.channel === DEFAULT_CHANNEL || member.channels.includes(msg.channel))
+        ) {
+          notified.add(lowerName);
+        }
+      }
+    }
+    return notified;
+  }
+
   private async maybeTriggerMilestoneValidation(
     runId: string,
     touchedMilestones: ReadonlySet<string>,
-    options?: { postMergeCheckMilestones?: ReadonlySet<string> },
+    options?: {
+      postMergeCheckMilestones?: ReadonlySet<string>;
+      alreadyNotifiedHandles?: ReadonlySet<string>;
+    },
   ): Promise<
     Array<{
       milestone: string;
@@ -4392,10 +4644,22 @@ export class SwarmEngine implements ISwarmEngine {
               m &&
                 m.role === "validator" &&
                 m.workspace === "inherit" &&
+                !m.recon &&
                 m.state !== "killed" &&
                 !m.humanStopped,
             ),
         );
+
+      if (
+        !isPostMergeIntegrationCheck &&
+        options?.alreadyNotifiedHandles &&
+        options.alreadyNotifiedHandles.size > 0 &&
+        orderedValidators.some((v) =>
+          options.alreadyNotifiedHandles!.has(v.name.toLowerCase()),
+        )
+      ) {
+        continue;
+      }
 
       const parkableValidator = orderedValidators.find((m) => {
         if (m.state !== "waiting" && m.state !== "stopped") {
@@ -4771,6 +5035,14 @@ export class SwarmEngine implements ISwarmEngine {
       );
     }
 
+    if (isReconRun(run) && op !== "write_library") {
+      throw new SwarmProtocolError(
+        "INVALID_INPUT",
+        `Mission operation "${op}" is blocked while Swarm run "${run.id}" is in read-only recon mode (only "status", "read_library", and "write_library" are allowed during recon). Propose and confirm the execution plan via ${PROPOSE_SWARM_PLAN_TOOL} first.`,
+        { runId: run.id, runMode: "recon", op },
+      );
+    }
+
     if (op === "dispatch_ready") {
       if (!isOrchestratorOrHuman(callerRole)) {
         throw new SwarmProtocolError(
@@ -4864,6 +5136,21 @@ export class SwarmEngine implements ISwarmEngine {
           }
           return false;
         });
+        const liveValidatorHandle = state.validatorEnabled
+          ? state.memberOrder
+              .map((n) => getOwnMember(state, n))
+              .find(
+                (m): m is SwarmMemberRecord =>
+                  Boolean(
+                    m &&
+                      m.role === "validator" &&
+                      m.workspace === "inherit" &&
+                      !m.recon &&
+                      m.state !== "killed" &&
+                      !m.humanStopped,
+                  ),
+              )?.name
+          : undefined;
         const planned: PlannedDispatch[] = [];
         const reservedHandles = new Set<string>();
 
@@ -4912,7 +5199,12 @@ export class SwarmEngine implements ISwarmEngine {
             this.liveMembers.keys(),
             reservedHandles,
           );
-          const brief = buildFeatureWorkerBrief(state, feat, dispatchWorkspace);
+          const brief = buildFeatureWorkerBrief(
+            state,
+            feat,
+            dispatchWorkspace,
+            liveValidatorHandle,
+          );
           planned.push({ feature: feat, handleName, brief });
         }
 
@@ -6989,8 +7281,9 @@ export class SwarmEngine implements ISwarmEngine {
         return;
       }
 
+      const readOnlyRecon = Boolean(member.recon || isReconRun(run));
       const validatorScratchDir =
-        member.role === "validator"
+        member.role === "validator" && !readOnlyRecon
           ? this.getMemberScratchDir(runId, member.name)
           : undefined;
       if (validatorScratchDir) {
@@ -7033,6 +7326,7 @@ export class SwarmEngine implements ISwarmEngine {
         sessionDir: this.store.getMemberSessionDir?.(runId),
         sessionFile: member.sessionFile,
         ...(validatorScratchDir ? { scratchDir: validatorScratchDir } : {}),
+        ...(readOnlyRecon ? { readOnlyRecon: true } : {}),
         hostContext,
         onTelemetry: (evt) => this.handleTelemetry(runId, evt),
         engineApi,
@@ -7454,8 +7748,9 @@ export class SwarmEngine implements ISwarmEngine {
       }
 
       const maxSeq = batch.reduce((acc, m) => Math.max(acc, m.seq), member.lastReadSeq);
+      const readOnlyRecon = Boolean(member.recon || isReconRun(run));
       const reviveScratchDir =
-        member.role === "validator"
+        member.role === "validator" && !readOnlyRecon
           ? this.getMemberScratchDir(runId, member.name)
           : undefined;
       if (reviveScratchDir) {
@@ -7549,6 +7844,7 @@ export class SwarmEngine implements ISwarmEngine {
           sessionDir: this.store.getMemberSessionDir?.(runId),
           sessionFile: member.sessionFile,
           ...(reviveScratchDir ? { scratchDir: reviveScratchDir } : {}),
+          ...(readOnlyRecon ? { readOnlyRecon: true } : {}),
           hostContext: this.hostContext,
           onTelemetry: (evt) => this.handleTelemetry(runId, evt),
           engineApi,
@@ -8921,7 +9217,7 @@ export class SwarmEngine implements ISwarmEngine {
       return;
     }
     const run = this.cachedRun;
-    if (!run || run.status !== "active") {
+    if (!run || run.status !== "active" || isReconRun(run)) {
       return;
     }
     if (this.boardWaiters.size > 0 || this.orchestratorWait) {
@@ -9882,6 +10178,7 @@ export class SwarmEngine implements ISwarmEngine {
         .map((m) => ({
           name: m.name,
           role: m.role,
+          ...(m.recon === true ? { recon: true } : {}),
           state: m.state,
           parentName: m.parentName,
           groupPrefix: m.groupPrefix,
@@ -9909,6 +10206,7 @@ export class SwarmEngine implements ISwarmEngine {
       runId: run.id,
       title: run.title,
       status: run.status,
+      ...(run.runMode !== undefined ? { runMode: run.runMode } : {}),
       baseBranch: run.baseBranch,
       boardHead: run.boardHead,
       members,

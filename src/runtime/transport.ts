@@ -2045,6 +2045,45 @@ export function createValidatorGuardExtensionFactory(
   };
 }
 
+/**
+ * Strictly read-only guard extension for Recon-in-Swarm members (`readOnlyRecon: true`).
+ * Blocks `write`, `edit`, `powershell`, and mutating `bash` commands (with NO scratchDir),
+ * while permitting code reads and read-only baseline `test`/`lint`/`typecheck`/`build` probes.
+ */
+export function createReconGuardExtensionFactory(
+  memberName: string,
+  enforceReadOnlyBash = true,
+): ExtensionFactory {
+  return (pi) => {
+    pi.on("tool_call", (event) => {
+      if (
+        isToolCallEventType("write", event) ||
+        isToolCallEventType("edit", event) ||
+        isToolCallEventType("powershell", event)
+      ) {
+        return {
+          block: true,
+          reason: `Read-only recon worker @${memberName} cannot modify repository files. Tool "${event.toolName}" is blocked during reconnaissance.`,
+        };
+      }
+
+      if (enforceReadOnlyBash && isToolCallEventType("bash", event)) {
+        const check = isReadOnlyValidationCommand(event.input.command);
+        if (!check.allowed) {
+          return {
+            block: true,
+            reason:
+              check.reason ??
+              `Mutating bash commands are blocked in read-only recon worker @${memberName} sessions (read-only inspection and baseline test/lint/typecheck/build probes are allowed).`,
+          };
+        }
+      }
+
+      return undefined;
+    });
+  };
+}
+
 function createFallbackBridge(request: SpawnMemberRequest): MemberEngineBridge {
   return {
     async postMessage() {
@@ -2434,9 +2473,11 @@ export class InProcessPiTransport implements ISwarmTransport {
       }
     };
 
+    const isReadOnlyRecon = Boolean(request.readOnlyRecon);
     const validatorScratchDir =
       !request.isMonitor &&
       !request.ephemeralAudit &&
+      !isReadOnlyRecon &&
       request.role === "validator" &&
       request.scratchDir?.trim()
         ? path.resolve(request.scratchDir.trim())
@@ -2449,19 +2490,27 @@ export class InProcessPiTransport implements ISwarmTransport {
       ? [...VALIDATOR_BUILTIN_TOOLS]
       : request.isMonitor
         ? [POST_MESSAGE_TOOL, READ_BOARD_TOOL]
-        : request.role === "validator"
+        : isReadOnlyRecon
           ? Array.from(
               new Set<string>([
                 ...VALIDATOR_BUILTIN_TOOLS,
-                ...(validatorScratchDir ? ["write", "edit"] : []),
                 "bash",
-                SWARM_TOOL,
-                POST_MESSAGE_TOOL,
-                READ_BOARD_TOOL,
-                SWARM_WAIT_TOOL,
+                ...SWARM_CORE_TOOLS,
               ]),
             )
-          : Array.from(new Set<string>([...WORKER_BUILTIN_TOOLS, ...SWARM_CORE_TOOLS]));
+          : request.role === "validator"
+            ? Array.from(
+                new Set<string>([
+                  ...VALIDATOR_BUILTIN_TOOLS,
+                  ...(validatorScratchDir ? ["write", "edit"] : []),
+                  "bash",
+                  SWARM_TOOL,
+                  POST_MESSAGE_TOOL,
+                  READ_BOARD_TOOL,
+                  SWARM_WAIT_TOOL,
+                ]),
+              )
+            : Array.from(new Set<string>([...WORKER_BUILTIN_TOOLS, ...SWARM_CORE_TOOLS]));
 
     const bridge = request.engineApi ?? createFallbackBridge(request);
     const allMemberTools: ToolDefinition[] = request.ephemeralAudit
@@ -2491,8 +2540,12 @@ export class InProcessPiTransport implements ISwarmTransport {
           )
         : allMemberTools;
 
-    const guardFactory: ExtensionFactory =
-      request.role === "validator" || request.ephemeralAudit
+    const guardFactory: ExtensionFactory = isReadOnlyRecon
+      ? createReconGuardExtensionFactory(
+          request.name,
+          this.validatorReadOnlyBash,
+        )
+      : request.role === "validator" || request.ephemeralAudit
         ? createValidatorGuardExtensionFactory(
             request.name,
             this.validatorReadOnlyBash,

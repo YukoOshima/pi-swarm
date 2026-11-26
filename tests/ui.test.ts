@@ -7385,4 +7385,390 @@ describe("v1.0.0 TUI Overlays, Library Reader, Responsive Layout & Border Integr
   });
 });
 
+// ============================================================================
+// Wave 2b: Recon-in-Swarm TUI Dashboard & Overlay Indicators
+// ============================================================================
+
+describe("Wave 2b: Recon-in-Swarm TUI Dashboard & Overlay Indicators", () => {
+  const fixedNow = () => Date.parse("2026-11-26T09:15:00.000Z");
+
+  function assertStrictBoxBorders(
+    lines: readonly string[],
+    width: number,
+    label: string,
+  ): void {
+    assert.ok(lines.length >= 2, `${label}: expected >= 2 lines, got ${lines.length}`);
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]!;
+      const plain = stripTerminalSequences(line);
+      assert.equal(
+        visibleWidth(line),
+        width,
+        `${label} row ${i}: expected visibleWidth ${width}, got ${visibleWidth(line)}: ${JSON.stringify(plain)}`,
+      );
+      if (i === 0) {
+        assert.ok(
+          plain.startsWith("╭") && plain.endsWith("╮"),
+          `${label} top border broken: ${plain}`,
+        );
+      } else if (i === lines.length - 1) {
+        assert.ok(
+          plain.startsWith("╰") && plain.endsWith("╯"),
+          `${label} bottom border broken: ${plain}`,
+        );
+      } else {
+        assert.ok(
+          plain.startsWith("│") && plain.endsWith("│"),
+          `${label} side border broken on row ${i}: ${plain}`,
+        );
+      }
+    }
+  }
+
+  function makeReconSnapshot(opts?: {
+    runMode?: "recon" | "executing";
+    members?: SwarmMemberRecord[];
+  }): SwarmSnapshot {
+    const members = opts?.members ?? [
+      makeSampleMember({
+        name: "recon-arch",
+        role: "worker",
+        recon: true,
+        state: "working",
+        workspace: "inherit",
+        cwd: "/tmp/repo",
+        branch: undefined,
+        currentActivity: "Mapping src/ui layout & test harness",
+        lastTool: "read",
+        turns: 2,
+      }),
+      makeSampleMember({
+        name: "recon-tests",
+        role: "worker",
+        recon: true,
+        state: "waiting",
+        workspace: "inherit",
+        cwd: "/tmp/repo",
+        branch: undefined,
+        parkedOn: "Baseline suite green (104/104)",
+        currentActivity: undefined,
+        turns: 1,
+      }),
+    ];
+    const snap = makeSampleSnapshot({
+      members,
+      boardHead: 6,
+      recentBoard: [
+        {
+          seq: 5,
+          runId: "run-20261126-recon",
+          channel: "main",
+          from: "orchestrator",
+          fromRole: "orchestrator",
+          text: "@recon-arch Trace dashboard-widget & overlay contracts",
+          mentions: ["recon-arch"],
+          channelMentions: [],
+          kind: "brief",
+          timestamp: "2026-11-26T09:10:00.000Z",
+        },
+        {
+          seq: 6,
+          runId: "run-20261126-recon",
+          channel: "main",
+          from: "recon-tests",
+          fromRole: "worker",
+          text: "@orchestrator [done] Baseline ui tests 100% green; no blockers",
+          mentions: ["orchestrator"],
+          channelMentions: [],
+          kind: "done",
+          timestamp: "2026-11-26T09:14:00.000Z",
+        },
+      ],
+    });
+    snap.run!.id = "run-20261126-recon";
+    snap.activeRunId = "run-20261126-recon";
+    snap.run!.title = "Recon: TUI Dashboard Polish";
+    snap.run!.runMode = opts?.runMode ?? "recon";
+    snap.run!.phase = (opts?.runMode ?? "recon") === "recon" ? "recon" : undefined;
+    return snap;
+  }
+
+  it("renders [R] badge alongside [W] and [V] across compact/expanded dashboard and formatZeroTurnStatusView", () => {
+    const theme = createMockTheme();
+    const mixedMembers: SwarmMemberRecord[] = [
+      makeSampleMember({
+        name: "recon-arch",
+        role: "worker",
+        recon: true,
+        state: "working",
+        workspace: "inherit",
+        branch: undefined,
+        currentActivity: "Auditing store schema",
+      }),
+      makeSampleMember({
+        name: "author-api",
+        role: "worker",
+        recon: false,
+        state: "working",
+        workspace: "share",
+        branch: "swarm/r1/author-api",
+        currentActivity: "Implementing API route",
+      }),
+      makeSampleMember({
+        name: "val-api",
+        role: "validator",
+        state: "working",
+        workspace: "inherit",
+        branch: undefined,
+        currentActivity: "Verifying VAL-API-01",
+      }),
+    ];
+    const snap = makeReconSnapshot({ runMode: "executing", members: mixedMembers });
+
+    // Compact dashboard shows [R], [W], and [V] cleanly
+    const { tui } = createMockTUI(30, 100);
+    const state = createSwarmWidgetState({ expanded: false });
+    const widget = createSwarmWidget(() => snap, state, { now: fixedNow })(tui, theme);
+    try {
+      const compactPlain = stripTerminalSequences(widget.render(100).join("\n"));
+      assert.match(compactPlain, /\[R\] recon-arch/);
+      assert.match(compactPlain, /\[W\] author-api/);
+      assert.match(compactPlain, /\[V\] val-api/);
+
+      // Expanded dashboard Roster table distinguishes [R] recon, [W] worker, [V] validator
+      state.expanded = true;
+      for (const [cols, rows] of [
+        [40, 24],
+        [60, 24],
+        [72, 20],
+        [80, 24],
+        [100, 30],
+        [120, 32],
+      ] as const) {
+        (tui.terminal as unknown as { rows: number; columns: number }).rows = rows;
+        const expanded = widget.render(cols);
+        assertStrictBoxBorders(expanded, cols, `mixed-expanded@${cols}x${rows}`);
+        const plain = stripTerminalSequences(expanded.join("\n"));
+        assert.match(plain, /\[R\]/);
+        if (rows >= 24) {
+          assert.match(plain, /\[W\]/);
+          assert.match(plain, /\[V\]/);
+        }
+      }
+    } finally {
+      widget.dispose();
+    }
+
+    // Zero-turn status view distinguishes [R], [W], [V]
+    const statusMd = formatZeroTurnStatusView(snap, { now: fixedNow });
+    assert.match(statusMd, /`recon-arch` \| \[R\] recon \|/);
+    assert.match(statusMd, /`author-api` \| \[W\] worker \|/);
+    assert.match(statusMd, /`val-api` \| \[V\] validator \|/);
+  });
+
+  it("renders [RECON] badge, swarm:recon footer, and active draft + live/waiting recon workers with 0 broken borders across 40..120 cols", () => {
+    const theme = createMockTheme();
+    const reconSnap = makeReconSnapshot({ runMode: "recon" });
+
+    // 1. Footer status line shows 🐝 swarm:recon
+    const footerLine = formatStatusLine(reconSnap, { draftActive: true });
+    assert.ok(footerLine, "Expected non-empty footer status line");
+    assert.match(footerLine!, /^🐝 swarm:recon #6/);
+    assert.match(footerLine!, /1 working · 1 waiting/);
+    assert.match(footerLine!, /draft/);
+
+    // 2. Zero-turn status view shows [RECON] header, read-only recon mode cue, and [R] recon rows
+    const reconMd = formatZeroTurnStatusView(reconSnap, { draftActive: true, now: fixedNow });
+    assert.match(reconMd, /### 🐝 Recon: TUI Dashboard Polish — `run-20261126-recon` \[RECON\] \(Live\)/);
+    assert.match(reconMd, /\*\*Mode:\*\* `\[RECON\]` Read-only reconnaissance/);
+    assert.match(reconMd, /`recon-arch` \| \[R\] recon \|/);
+    assert.match(reconMd, /`recon-tests` \| \[R\] recon \|/);
+
+    // 3. Active draft + active recon run (working + waiting recon workers + latest board post)
+    const viewports = [
+      [40, 20],
+      [60, 22],
+      [72, 20],
+      [80, 24],
+      [100, 30],
+      [120, 32],
+    ] as const;
+
+    for (const [cols, rows] of viewports) {
+      const { tui } = createMockTUI(rows, cols);
+      const state = createSwarmWidgetState({
+        expanded: false,
+        draftActive: true,
+        draftMode: "swarm",
+        draftSeed: "Polish recon indicators",
+      });
+      const widget = createSwarmWidget(() => reconSnap, state, { now: fixedNow })(tui, theme);
+      try {
+        // Compact: draft cue + [RECON] + live working & warm waiting recon workers + latest board post #6
+        const compact = widget.render(cols);
+        assertAllLinesFit(compact, cols, `recon-draft-compact@${cols}x${rows}`);
+        const compactPlain = stripTerminalSequences(compact.join("\n"));
+        assert.match(compactPlain, /Swarm Draft/);
+        assert.match(compactPlain, /\[RECON\]/);
+        assert.match(compactPlain, /\[R\] recon-arch/);
+        assert.match(compactPlain, /\[R\] recon-tests/);
+        assert.match(compactPlain, /#6/);
+
+        // Expanded: strict box borders intact + draft cue + [RECON] + [R] roster
+        state.expanded = true;
+        const expanded = widget.render(cols);
+        assertStrictBoxBorders(expanded, cols, `recon-draft-expanded@${cols}x${rows}`);
+        const expandedPlain = stripTerminalSequences(expanded.join("\n"));
+        assert.match(expandedPlain, /Swarm Draft/);
+        assert.match(expandedPlain, /\[RECON\]/);
+        assert.match(expandedPlain, /\[R\]/);
+      } finally {
+        widget.dispose();
+      }
+    }
+
+    // 4. Waiting-only recon run + active draft still surfaces waiting recon workers & latest board post
+    const waitingOnlySnap = makeReconSnapshot({
+      runMode: "recon",
+      members: [
+        makeSampleMember({
+          name: "recon-arch",
+          role: "worker",
+          recon: true,
+          state: "waiting",
+          workspace: "inherit",
+          branch: undefined,
+          parkedOn: "Ready for plan confirmation",
+          currentActivity: undefined,
+        }),
+      ],
+    });
+    const { tui: waitTui } = createMockTUI(24, 80);
+    const waitState = createSwarmWidgetState({
+      expanded: false,
+      draftActive: true,
+      draftMode: "swarm",
+    });
+    const waitWidget = createSwarmWidget(() => waitingOnlySnap, waitState, { now: fixedNow })(
+      waitTui,
+      theme,
+    );
+    try {
+      const lines = waitWidget.render(80);
+      assertAllLinesFit(lines, 80, "recon-waiting-draft-compact@80");
+      const plain = stripTerminalSequences(lines.join("\n"));
+      assert.match(plain, /Swarm Draft/);
+      assert.match(plain, /\[RECON\]/);
+      assert.match(plain, /\[R\] recon-arch/);
+      assert.match(plain, /#6/);
+    } finally {
+      waitWidget.dispose();
+    }
+  });
+
+  it("SwarmOverlayComponent renders [RECON] header/pipeline strip and [R] member badges with 0 broken borders across 40..120 cols", async () => {
+    const theme = createMockTheme();
+    const reconSnap = makeReconSnapshot({
+      runMode: "recon",
+      members: [
+        makeSampleMember({
+          name: "recon-arch",
+          role: "worker",
+          recon: true,
+          state: "working",
+          workspace: "inherit",
+          branch: undefined,
+          currentActivity: "Tracing UI layout",
+        }),
+        makeSampleMember({
+          name: "recon-val",
+          role: "validator",
+          recon: true,
+          state: "waiting",
+          workspace: "inherit",
+          branch: undefined,
+          parkedOn: "Verified baseline contract",
+          currentActivity: undefined,
+        }),
+      ],
+    });
+
+    const engine = {
+      getSnapshot: () => reconSnap,
+      subscribe: () => () => {},
+      readBoard: async () => ({ messages: reconSnap.recentBoard, head: reconSnap.boardHead }),
+    } as unknown as ISwarmEngine;
+
+    const mockTui = createMockTUI(24, 100);
+    const ctx = { mode: "tui", hasUI: true, ui: { theme, notify() {} } } as unknown as ExtensionContext;
+    const overlay = new SwarmOverlayComponent(
+      mockTui.tui,
+      theme,
+      ctx,
+      engine,
+      null,
+      { initialTab: "board", now: fixedNow },
+      () => {},
+    );
+    overlay.focused = true;
+
+    try {
+      await flushAsync();
+      const viewports = [
+        [40, 20],
+        [60, 22],
+        [72, 20],
+        [80, 24],
+        [100, 30],
+        [120, 32],
+      ] as const;
+
+      // Board tab (header + pipeline strip surface [RECON] and [R])
+      for (const [cols, rows] of viewports) {
+        (mockTui.tui.terminal as unknown as { rows: number; columns: number }).rows = rows;
+        const lines = overlay.render(cols);
+        assertStrictBoxBorders(lines, cols, `overlay-recon-board@${cols}x${rows}`);
+        const plain = stripTerminalSequences(lines.join("\n"));
+        assert.match(plain, /\[RECON\]/);
+        assert.match(plain, /\[R\]/);
+        if (cols >= 80) {
+          assert.match(plain, /Read-only/);
+        }
+      }
+
+      // Members tab (shows [R] on member rows & detail info + [RECON] header/strip)
+      overlay.handleInput("2");
+      for (const [cols, rows] of viewports) {
+        (mockTui.tui.terminal as unknown as { rows: number; columns: number }).rows = rows;
+        const lines = overlay.render(cols);
+        assertStrictBoxBorders(lines, cols, `overlay-recon-members@${cols}x${rows}`);
+        const plain = stripTerminalSequences(lines.join("\n"));
+        assert.match(plain, /\[RECON\]/);
+        assert.match(plain, /recon-arch \[R\]/);
+        assert.match(plain, /recon-val \[R\]/);
+        if (cols >= 72 && rows >= 20) {
+          assert.match(plain, /Role: \[R\] recon \(read-only\)/);
+        }
+      }
+
+      // Graph tab & Search tab also preserve strict borders & [RECON]
+      overlay.handleInput("3");
+      for (const [cols, rows] of [
+        [40, 20],
+        [72, 20],
+        [80, 24],
+        [100, 30],
+      ] as const) {
+        (mockTui.tui.terminal as unknown as { rows: number; columns: number }).rows = rows;
+        const lines = overlay.render(cols);
+        assertStrictBoxBorders(lines, cols, `overlay-recon-graph@${cols}x${rows}`);
+        assert.match(stripTerminalSequences(lines.join("\n")), /\[RECON\]/);
+      }
+    } finally {
+      overlay.dispose();
+    }
+  });
+});
+
+
 

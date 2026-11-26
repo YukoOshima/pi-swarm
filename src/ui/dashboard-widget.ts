@@ -1,24 +1,25 @@
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { Component, TUI } from "@earendil-works/pi-tui";
 import { ORCHESTRATOR_NAME } from "../constants.js";
-import type {
-  AssertionStatus,
-  BoardMessage,
-  FeatureStatus,
-  MissionAssertion,
-  MissionFeature,
-  MissionHandoffItem,
-  SwarmChannelRecord,
-  SwarmDraftMode,
-  SwarmEvent,
-  SwarmMemberRecord,
-  SwarmMemberRole,
-  SwarmMemberState,
-  SwarmModelRole,
-  SwarmRoleModels,
-  SwarmRunState,
-  SwarmSettings,
-  SwarmSnapshot,
+import {
+  isReconRun,
+  type AssertionStatus,
+  type BoardMessage,
+  type FeatureStatus,
+  type MissionAssertion,
+  type MissionFeature,
+  type MissionHandoffItem,
+  type SwarmChannelRecord,
+  type SwarmDraftMode,
+  type SwarmEvent,
+  type SwarmMemberRecord,
+  type SwarmMemberRole,
+  type SwarmMemberState,
+  type SwarmModelRole,
+  type SwarmRoleModels,
+  type SwarmRunState,
+  type SwarmSettings,
+  type SwarmSnapshot,
 } from "../types.js";
 import {
   buildSwarmGraphLines,
@@ -569,12 +570,39 @@ function formatLocalClock(timestamp: string): string {
   return `${hh}:${mm}:${ss}`;
 }
 
-function formatRoleShortBadge(role: SwarmMemberRole, theme?: Theme): string {
+function formatRoleShortBadge(
+  role: SwarmMemberRole,
+  theme?: Theme,
+  recon?: boolean,
+): string {
+  if (recon) {
+    return theme ? theme.fg("borderAccent", "[R]") : "[R]";
+  }
   const raw = role === "validator" ? "V" : "W";
   if (!theme) return `[${raw}]`;
   return role === "validator"
     ? theme.fg("warning", `[${raw}]`)
     : theme.fg("accent", `[${raw}]`);
+}
+
+function formatReconRunBadge(theme?: Theme): string {
+  return theme ? theme.fg("borderAccent", theme.bold("[RECON]")) : "[RECON]";
+}
+
+function formatMemberRoleDisplay(
+  member: Pick<SwarmMemberRecord, "role" | "recon">,
+  theme?: Theme,
+  verboseRecon = false,
+): string {
+  const short = formatRoleShortBadge(member.role, theme, member.recon);
+  if (member.recon) {
+    const label =
+      verboseRecon && member.role === "validator"
+        ? "validator (recon)"
+        : "recon";
+    return `${short} ${theme ? theme.fg("borderAccent", label) : label}`;
+  }
+  return `${short} ${formatMemberRoleBadge(member.role, theme)}`;
 }
 
 function getOrderedChannels(run: SwarmRunState): SwarmChannelRecord[] {
@@ -740,9 +768,13 @@ export class SwarmDashboardComponent implements Component {
     width: number,
     nowMs: number,
   ): string {
-    const spinColor = member.role === "validator" ? "warning" : "accent";
+    const spinColor = member.recon
+      ? "borderAccent"
+      : member.role === "validator"
+        ? "warning"
+        : "accent";
     const glyph = this.theme.fg(spinColor, SPINNER_FRAMES[this.spinnerFrame]!);
-    const rolePill = formatRoleShortBadge(member.role, this.theme);
+    const rolePill = formatRoleShortBadge(member.role, this.theme, member.recon);
     const nameStr = this.theme.bold(sanitizePlainText(member.name));
     const activityRaw =
       member.currentActivity ||
@@ -759,6 +791,26 @@ export class SwarmDashboardComponent implements Component {
 
     const left = `  ${glyph} ${rolePill} ${nameStr} ${activity}`;
     return fitLine(joinColumns(left, elapsed, width), width);
+  }
+
+  private renderWaitingReconMemberLine(
+    member: SwarmMemberRecord,
+    width: number,
+  ): string {
+    const glyph = this.theme.fg("muted", memberStateIcon(member.state));
+    const rolePill = formatRoleShortBadge(member.role, this.theme, member.recon);
+    const nameStr = this.theme.bold(sanitizePlainText(member.name));
+    const parkedRaw = member.parkedOn
+      ? sanitizePlainText(member.parkedOn)
+      : "waiting (warm)";
+    const stateTag = this.theme.fg("dim", "waiting");
+
+    if (width < 48) {
+      return fitLine(`  ${glyph} ${rolePill} ${nameStr} ${stateTag}`, width);
+    }
+
+    const left = `  ${glyph} ${rolePill} ${nameStr} ${this.theme.fg("muted", parkedRaw)}`;
+    return fitLine(joinColumns(left, stateTag, width), width);
   }
 
   private renderBoardPreviewLine(msg: BoardMessage, width: number): string {
@@ -793,7 +845,8 @@ export class SwarmDashboardComponent implements Component {
         ? `${formatTokens(snapshot.totalTokens)} ${formatCost(snapshot.totalCost)}`
         : "";
     const leadColor = run.status === "completed" ? "success" : "muted";
-    const left = `${this.theme.fg(leadColor, "🐝")} [${statusBadge}] ${this.theme.bold(titleText)}`;
+    const reconPrefix = isReconRun(run) ? `${formatReconRunBadge(this.theme)} ` : "";
+    const left = `${this.theme.fg(leadColor, "🐝")} ${reconPrefix}[${statusBadge}] ${this.theme.bold(titleText)}`;
 
     if (width < 58) {
       const right = this.theme.fg("dim", `Board:#${snapshot.boardHead}`);
@@ -870,15 +923,17 @@ export class SwarmDashboardComponent implements Component {
   ): string[] {
     const lines: string[] = [];
 
+    const reconMode = isReconRun(run);
     if (
       this.state.draftActive &&
-      (run.status !== "active" || this.state.draftMode === "tweak")
+      (run.status !== "active" || this.state.draftMode === "tweak" || reconMode)
     ) {
       lines.push(...this.renderDraftBanner(width));
     }
 
     const titleText = sanitizePlainText(run.title || run.objective) || run.id;
     const statusBadge = formatRunStatusBadge(run.status, this.theme);
+    const reconBadge = reconMode ? `${formatReconRunBadge(this.theme)} ` : "";
     const workingCount = getWorkingCount(snapshot, run, workingMembers);
     const waitingCount = getWaitingCount(snapshot, run, waitingMembers);
     const stoppedCount = stoppedMembers.length;
@@ -896,7 +951,8 @@ export class SwarmDashboardComponent implements Component {
 
     if (width < 58) {
       const left = this.theme.fg("accent", this.theme.bold(`🐝 ${titleText}`));
-      const right = `${statusBadge} · ${boardTag} · ${compactFleetTag}`;
+      const rightStatus = reconMode ? formatReconRunBadge(this.theme) : statusBadge;
+      const right = `${rightStatus} · ${boardTag} · ${compactFleetTag}`;
       lines.push(fitLine(joinColumns(left, right, width), width));
       const modelsPill = formatRoleModelsLine(
         roleModels,
@@ -908,7 +964,7 @@ export class SwarmDashboardComponent implements Component {
       );
       lines.push(fitLine(`  ${modelsPill}`, width));
     } else if (width < 76) {
-      const left = `${this.theme.fg("accent", this.theme.bold("🐝"))} [${statusBadge}] ${this.theme.fg("accent", this.theme.bold(titleText))}`;
+      const left = `${this.theme.fg("accent", this.theme.bold("🐝"))} ${reconBadge}[${statusBadge}] ${this.theme.fg("accent", this.theme.bold(titleText))}`;
       const right = `${fleetTag} · ${boardTag}`;
       lines.push(fitLine(joinColumns(left, right, width), width));
 
@@ -925,7 +981,7 @@ export class SwarmDashboardComponent implements Component {
       );
       lines.push(fitLine(joinColumns(`  ${modelsPill}`, shortcutTag, width), width));
     } else {
-      const left = `${this.theme.fg("accent", this.theme.bold("🐝"))} [${statusBadge}] ${this.theme.fg("accent", this.theme.bold(titleText))}`;
+      const left = `${this.theme.fg("accent", this.theme.bold("🐝"))} ${reconBadge}[${statusBadge}] ${this.theme.fg("accent", this.theme.bold(titleText))}`;
       const right = `${fleetTag} · ${boardTag}`;
       lines.push(fitLine(joinColumns(left, right, width), width));
 
@@ -975,7 +1031,7 @@ export class SwarmDashboardComponent implements Component {
       lines.push(fitLine(`  ${lead}${goalBadges}${activeTail}`, width));
     }
 
-    // Active working members (up to 4 + "+N more"), or awaiting-orchestrator hint when active with 0 working
+    // Active working members (up to 4 + "+N more"), plus warm waiting recon workers during recon mode
     const visibleWorking = workingMembers.slice(0, this.maxCompactWorkers);
     for (const member of visibleWorking) {
       lines.push(this.renderWorkingMemberLine(member, width, nowMs));
@@ -991,6 +1047,27 @@ export class SwarmDashboardComponent implements Component {
           width,
         ),
       );
+    } else if (reconMode && waitingMembers.length > 0) {
+      const waitingSlots = Math.max(
+        0,
+        this.maxCompactWorkers - visibleWorking.length,
+      );
+      const visibleWaiting = waitingMembers.slice(0, waitingSlots);
+      for (const member of visibleWaiting) {
+        lines.push(this.renderWaitingReconMemberLine(member, width));
+      }
+      if (waitingMembers.length > visibleWaiting.length) {
+        const extraWait = waitingMembers.length - visibleWaiting.length;
+        lines.push(
+          fitLine(
+            this.theme.fg(
+              "dim",
+              `  +${extraWait} more waiting · /swarm tasks`,
+            ),
+            width,
+          ),
+        );
+      }
     } else if (run.status === "active" && workingCount === 0 && waitingCount > 0) {
       const idleHint = `  ${this.theme.fg("warning", "⏳ 0 working")}${this.theme.fg("muted", ` — awaiting @${ORCHESTRATOR_NAME} next step`)}`;
       lines.push(fitLine(idleHint, width));
@@ -1038,10 +1115,11 @@ export class SwarmDashboardComponent implements Component {
     const maxInner = Math.max(4, maxTotalLines - 2);
 
     const body: string[] = [];
+    const reconMode = isReconRun(run);
 
     if (
       this.state.draftActive &&
-      (run.status !== "active" || this.state.draftMode === "tweak")
+      (run.status !== "active" || this.state.draftMode === "tweak" || reconMode)
     ) {
       body.push(...this.renderDraftBanner(innerWidth));
     } else if (
@@ -1066,7 +1144,8 @@ export class SwarmDashboardComponent implements Component {
     );
     const roleModels = resolveEffectiveRoleModels(snapshot, run);
 
-    const summaryLeft = `[${statusBadge}] ${sanitizePlainText(run.objective || titleText)}`;
+    const reconPrefix = reconMode ? `${formatReconRunBadge(this.theme)} ` : "";
+    const summaryLeft = `${reconPrefix}[${statusBadge}] ${sanitizePlainText(run.objective || titleText)}`;
     const summaryRight = `base:${sanitizePlainText(run.baseBranch)} · Board:#${snapshot.boardHead} · ${fleetSummaryPlain} · ${formatTokens(snapshot.totalTokens)} ${formatCost(snapshot.totalCost)}`;
     const canJoinSummary = innerWidth >= visibleWidth(summaryRight) + 24;
     body.push(
@@ -1349,7 +1428,14 @@ export class SwarmDashboardComponent implements Component {
           render: (m) => {
             const icon =
               m.state === "working"
-                ? this.theme.fg("accent", SPINNER_FRAMES[this.spinnerFrame]!)
+                ? this.theme.fg(
+                    m.recon
+                      ? "borderAccent"
+                      : m.role === "validator"
+                        ? "warning"
+                        : "accent",
+                    SPINNER_FRAMES[this.spinnerFrame]!,
+                  )
                 : m.error
                   ? this.theme.fg("error", "✗")
                   : memberStateIcon(m.state);
@@ -1359,10 +1445,10 @@ export class SwarmDashboardComponent implements Component {
         {
           key: "role",
           header: "Role",
-          minWidth: 6,
-          maxWidth: 10,
+          minWidth: 4,
+          maxWidth: 6,
           priority: 90,
-          render: (m) => formatMemberRoleBadge(m.role, this.theme),
+          render: (m) => formatRoleShortBadge(m.role, this.theme, m.recon),
         },
         {
           key: "state",
@@ -1492,7 +1578,7 @@ export class SwarmDashboardComponent implements Component {
 
     const title = this.theme.fg(
       "accent",
-      this.theme.bold(`🐝 ${titleText} · ${run.id}`),
+      this.theme.bold(`🐝 ${reconMode ? "[RECON] " : ""}${titleText} · ${run.id}`),
     );
     const standbyFooter =
       isTerminalRunStatus(run.status) &&
@@ -1616,7 +1702,8 @@ export function formatStatusLine(
   const stoppedCount = stoppedMembers.length;
   const mergedCount = countMergedMembers(run);
 
-  const statusLabel = formatRunStatusBadge(run.status);
+  const reconMode = isReconRun(run) && !isTerminalRunStatus(run.status);
+  const statusLabel = reconMode ? "recon" : formatRunStatusBadge(run.status);
   const leadTokens: string[] = [`🐝 swarm:${statusLabel}`];
   if (snapshot.boardHead > 0) {
     leadTokens.push(`#${snapshot.boardHead}`);
@@ -1641,7 +1728,7 @@ export function formatStatusLine(
   if (snapshot.totalTokens > 0) {
     parts.push(`${formatTokens(snapshot.totalTokens)} tok`);
   }
-  if (draftActive && run.status !== "active") {
+  if (draftActive && (run.status !== "active" || reconMode)) {
     parts.push("draft");
   } else if (standby && isTerminalRunStatus(run.status)) {
     parts.push(`@${ORCHESTRATOR_NAME} standby (/swarm exit)`);
@@ -1708,11 +1795,17 @@ export function formatZeroTurnStatusDashboard(
   const channels = getOrderedChannels(run);
 
   const out: string[] = [];
+  const reconMode = isReconRun(run);
   const titleStr = sanitizePlainText(run.title || run.objective) || run.id;
   out.push(
-    `### 🐝 ${titleStr} — \`${run.id}\` (${formatRunStatusBadge(run.status)})`,
+    `### 🐝 ${titleStr} — \`${run.id}\`${reconMode ? " [RECON]" : ""} (${formatRunStatusBadge(run.status)})`,
   );
   out.push("");
+  if (reconMode) {
+    out.push(
+      "- **Mode:** `[RECON]` Read-only reconnaissance (awaiting plan approval)",
+    );
+  }
   out.push(`- **Objective:** ${sanitizePlainText(run.objective)}`);
   const phaseProgress = formatPhaseMilestones(run);
   if (phaseProgress) {
@@ -2009,8 +2102,9 @@ export function formatZeroTurnStatusDashboard(
       const wsCol = mergedBadge ? `${wsBase} ${escapeMdCell(mergedBadge)}` : wsBase;
       const parentCol = `\`${escapeMdCell(m.parentName)}\``;
       const seqCol = `read #${m.lastReadSeq} / post ${m.lastPostSeq !== undefined ? `#${m.lastPostSeq}` : "—"}`;
+      const roleCol = formatMemberRoleDisplay(m, undefined, true);
       out.push(
-        `| \`${escapeMdCell(m.name)}\` | ${formatMemberRoleBadge(m.role)} | ${escapeMdCell(stateText)} | ${modelCol} | ${wsCol} | ${parentCol} | ${m.turns} | ${seqCol} |`,
+        `| \`${escapeMdCell(m.name)}\` | ${escapeMdCell(roleCol)} | ${escapeMdCell(stateText)} | ${modelCol} | ${wsCol} | ${parentCol} | ${m.turns} | ${seqCol} |`,
       );
     }
   }
@@ -2199,8 +2293,9 @@ export function formatZeroTurnModelsView(
         const wsCell = mergedBadge
           ? `\`${escapeMdCell(ws)}\` ${escapeMdCell(mergedBadge)}`
           : `\`${escapeMdCell(ws)}\``;
+        const roleCol = formatMemberRoleDisplay(m, undefined, true);
         out.push(
-          `| \`${escapeMdCell(m.name)}\` | ${formatMemberRoleBadge(m.role)} | ${escapeMdCell(formatMemberStateBadge(m.state))} | \`${escapeMdCell(liveModel)}\` | \`${escapeMdCell(thinking)}\` | ${wsCell} | ${m.turns} |`,
+          `| \`${escapeMdCell(m.name)}\` | ${escapeMdCell(roleCol)} | ${escapeMdCell(formatMemberStateBadge(m.state))} | \`${escapeMdCell(liveModel)}\` | \`${escapeMdCell(thinking)}\` | ${wsCell} | ${m.turns} |`,
         );
       }
     }

@@ -10,20 +10,21 @@ import {
 } from "@earendil-works/pi-tui";
 import { DEFAULT_CHANNEL, DEFAULT_SWARM_SETTINGS, ORCHESTRATOR_NAME } from "../constants.js";
 import { parseModelSpec } from "../store/index.js";
-import type {
-  AssertionStatus,
-  AvailableModelInfo,
-  BoardMessage,
-  DiffSummary,
-  FeatureStatus,
-  ISwarmEngine,
-  IWorktreeManager,
-  MissionAssertion,
-  MissionFeature,
-  MissionHandoffItem,
-  SwarmMemberRecord,
-  SwarmRunState,
-  SwarmSnapshot,
+import {
+  isReconRun,
+  type AssertionStatus,
+  type AvailableModelInfo,
+  type BoardMessage,
+  type DiffSummary,
+  type FeatureStatus,
+  type ISwarmEngine,
+  type IWorktreeManager,
+  type MissionAssertion,
+  type MissionFeature,
+  type MissionHandoffItem,
+  type SwarmMemberRecord,
+  type SwarmRunState,
+  type SwarmSnapshot,
 } from "../types.js";
 import {
   SwarmModelPickerView,
@@ -130,6 +131,32 @@ interface FeedbackMessage {
 
 const formatInnerClock = formatClock;
 const formatTargetsSuffix = formatBoardTargets;
+
+function formatOverlayRoleShortBadge(
+  member: Pick<SwarmMemberRecord, "role" | "recon">,
+  theme: Theme,
+): string {
+  if (member.recon) {
+    return theme.fg("borderAccent", "[R]");
+  }
+  return member.role === "validator"
+    ? theme.fg("warning", "[V]")
+    : theme.fg("accent", "[W]");
+}
+
+function formatOverlayReconRunBadge(theme: Theme): string {
+  return theme.fg("borderAccent", theme.bold("[RECON]"));
+}
+
+function countOverlayReconMembers(run: SwarmRunState): number {
+  let count = 0;
+  for (const m of getOrderedMembers(run)) {
+    if (m.recon && m.state !== "killed") {
+      count += 1;
+    }
+  }
+  return count;
+}
 
 function isTerminalRunStatus(status: string): boolean {
   return (
@@ -2917,7 +2944,11 @@ export class SwarmOverlayComponent implements Component, Focusable {
     const isWorking = member.state === "working";
     const icon = isWorking
       ? this.theme.fg(
-          member.role === "validator" ? "warning" : "accent",
+          member.recon
+            ? "borderAccent"
+            : member.role === "validator"
+              ? "warning"
+              : "accent",
           OVERLAY_SPINNER_FRAMES[this.spinnerFrame]!,
         )
       : hasError
@@ -2932,13 +2963,16 @@ export class SwarmOverlayComponent implements Component, Focusable {
       : member.state === "killed"
         ? this.theme.fg("dim", member.name)
         : this.theme.bold(member.name);
-    const roleStr = formatMemberRoleBadge(member.role, this.theme);
+    const roleShort = formatOverlayRoleShortBadge(member, this.theme);
+    const roleStr = member.recon
+      ? this.theme.fg("borderAccent", "recon")
+      : formatMemberRoleBadge(member.role, this.theme);
     const stateStr = formatMemberStateBadge(member.state, this.theme);
     const errInlineBadge = isWorking && hasError ? ` ${this.theme.fg("error", "✗")}` : "";
 
     if (innerWidth < 54) {
       return fitLine(
-        `${ptr}${icon} ${nameStr} (${roleStr}) ${stateStr}${errInlineBadge}`,
+        `${ptr}${icon} ${nameStr} ${roleShort} ${stateStr}${errInlineBadge}`,
         innerWidth,
       );
     }
@@ -2982,7 +3016,7 @@ export class SwarmOverlayComponent implements Component, Focusable {
 
     const wsSegment =
       innerWidth >= 82 || !statusDetail ? ` ${wsStr}${parentStr}` : "";
-    const left = `${ptr}${icon} ${nameStr} (${roleStr}) ${stateStr}${errInlineBadge} ${modelStr}${wsSegment}${statusDetail}`;
+    const left = `${ptr}${icon} ${nameStr} ${roleShort} (${roleStr}) ${stateStr}${errInlineBadge} ${modelStr}${wsSegment}${statusDetail}`;
     return fitLine(joinColumns(left, rightMeta, innerWidth), innerWidth);
   }
 
@@ -2997,7 +3031,10 @@ export class SwarmOverlayComponent implements Component, Focusable {
     const modelLabel = member.model
       ? `${sanitizePlainText(member.model)}${member.thinkingLevel ? `(${member.thinkingLevel})` : ""}`
       : this.hostModel ?? "host default";
-    const meta1 = `${this.theme.fg("muted", "Role:")} ${formatMemberRoleBadge(member.role, this.theme)} · ${this.theme.fg("muted", "State:")} ${formatMemberStateBadge(member.state, this.theme)} · ${this.theme.fg("muted", "Parent:")} ${sanitizePlainText(member.parentName)} · ${this.theme.fg("muted", "Model:")} ${this.theme.fg("accent", modelLabel)}`;
+    const roleDetail = member.recon
+      ? `${formatOverlayRoleShortBadge(member, this.theme)} ${this.theme.fg("borderAccent", "recon (read-only)")}`
+      : `${formatOverlayRoleShortBadge(member, this.theme)} ${formatMemberRoleBadge(member.role, this.theme)}`;
+    const meta1 = `${this.theme.fg("muted", "Role:")} ${roleDetail} · ${this.theme.fg("muted", "State:")} ${formatMemberStateBadge(member.state, this.theme)} · ${this.theme.fg("muted", "Parent:")} ${sanitizePlainText(member.parentName)} · ${this.theme.fg("muted", "Model:")} ${this.theme.fg("accent", modelLabel)}`;
     out.push(fitLine(meta1, innerWidth));
 
     if (out.length < budget) {
@@ -3559,8 +3596,12 @@ export class SwarmOverlayComponent implements Component, Focusable {
   ): string {
     const { workingCount, waitingCount, stoppedCount, mergedCount } =
       countOverlayFleetStates(this.snapshot, run);
+    const reconMode = isReconRun(run);
+    const reconCount = countOverlayReconMembers(run);
 
     const sep = this.theme.fg("dim", " · ");
+    const reconCountSeg =
+      reconCount > 0 ? this.theme.fg("borderAccent", `[R] ${reconCount}`) : "";
     const workingSeg =
       workingCount > 0
         ? this.theme.fg("accent", `Working: ${workingCount}`)
@@ -3577,7 +3618,38 @@ export class SwarmOverlayComponent implements Component, Focusable {
       mergedCount > 0
         ? this.theme.fg("success", `Merged: ${mergedCount}`)
         : this.theme.fg("muted", `Merged: ${mergedCount}`);
-    const pipelineRight = `${workingSeg}${sep}${waitingSeg}${stoppedSeg}${sep}${mergedSeg}`;
+    const basePipelineRight = `${workingSeg}${sep}${waitingSeg}${stoppedSeg}${sep}${mergedSeg}`;
+    const pipelineRight = reconCountSeg
+      ? `${reconCountSeg}${sep}${basePipelineRight}`
+      : basePipelineRight;
+    const compactFleetRight = `${reconCount > 0 ? `${this.theme.fg("borderAccent", `[R]${reconCount}`)}/` : ""}${this.theme.fg(workingCount > 0 ? "accent" : "muted", `${workingCount}w`)}/${this.theme.fg("muted", `${waitingCount}wait`)}${stoppedCount > 0 ? `/${this.theme.fg("warning", `${stoppedCount}stop`)}` : ""}${mergedCount > 0 ? `/${this.theme.fg("success", `${mergedCount}m`)}` : ""}`;
+
+    if (reconMode) {
+      const reconBadge = formatOverlayReconRunBadge(this.theme);
+      const reconPipelineRight = reconCountSeg
+        ? `${reconCountSeg}${sep}${workingSeg}${sep}${waitingSeg}${stoppedSeg}`
+        : `${workingSeg}${sep}${waitingSeg}${stoppedSeg}`;
+      const reconFullLeft = `${reconBadge} ${this.theme.fg("muted", "Read-only recon · awaiting plan approval")}`;
+      const reconMedLeft = `${reconBadge} ${this.theme.fg("muted", "Read-only · awaiting plan")}`;
+      const reconShortLeft = `${reconBadge} ${this.theme.fg("muted", "Read-only")}`;
+
+      if (innerWidth < 48) {
+        return fitLine(`${reconBadge}${sep}${compactFleetRight}`, innerWidth);
+      }
+      if (visibleWidth(reconFullLeft) + 2 + visibleWidth(reconPipelineRight) <= innerWidth) {
+        return joinColumns(reconFullLeft, reconPipelineRight, innerWidth, 2);
+      }
+      if (visibleWidth(reconMedLeft) + 2 + visibleWidth(reconPipelineRight) <= innerWidth) {
+        return joinColumns(reconMedLeft, reconPipelineRight, innerWidth, 2);
+      }
+      if (visibleWidth(reconShortLeft) + 2 + visibleWidth(reconPipelineRight) <= innerWidth) {
+        return joinColumns(reconShortLeft, reconPipelineRight, innerWidth, 2);
+      }
+      if (visibleWidth(reconMedLeft) + 2 + visibleWidth(compactFleetRight) <= innerWidth) {
+        return joinColumns(reconMedLeft, compactFleetRight, innerWidth, 2);
+      }
+      return joinColumns(reconShortLeft, compactFleetRight, innerWidth, 2);
+    }
 
     const phasePart = formatOverlayPhaseMilestones(run, this.theme);
     const goal = summarizeOverlayGoal(run);
@@ -3623,7 +3695,6 @@ export class SwarmOverlayComponent implements Component, Focusable {
       const withPhaseLeft = withPhaseParts.join(sep);
       const coreWithCueLeft = [...coreGoalParts, contractCue].join(sep);
       const coreGoalLeft = coreGoalParts.join(sep);
-      const compactFleetRight = `${this.theme.fg(workingCount > 0 ? "accent" : "muted", `${workingCount}w`)}/${this.theme.fg("muted", `${waitingCount}wait`)}${stoppedCount > 0 ? `/${this.theme.fg("warning", `${stoppedCount}stop`)}` : ""}${mergedCount > 0 ? `/${this.theme.fg("success", `${mergedCount}m`)}` : ""}`;
 
       if (innerWidth < 48) {
         return fitLine(`${coreGoalLeft}${sep}${compactFleetRight}`, innerWidth);
@@ -3911,9 +3982,11 @@ export class SwarmOverlayComponent implements Component, Focusable {
     body.push(this.renderTabBar(run, innerWidth));
 
     // Compact status + base branch & full 3-role models bar (run title is in box top border)
+    const reconMode = isReconRun(run);
     const titleStr = sanitizePlainText(run.title || run.objective) || run.id;
     const statusBadge = formatRunStatusBadge(run.status, this.theme);
-    const runLeft = `[${statusBadge}] base:${sanitizePlainText(run.baseBranch)}`;
+    const reconPrefix = reconMode ? `${formatOverlayReconRunBadge(this.theme)} ` : "";
+    const runLeft = `${reconPrefix}[${statusBadge}] base:${sanitizePlainText(run.baseBranch)}`;
     const modelsBudget = Math.max(12, innerWidth - visibleWidth(runLeft) - 2);
     const modelsLine = formatRoleModelsLine(
       this.snapshot.roleModels ?? run.roleModels,
@@ -3978,7 +4051,7 @@ export class SwarmOverlayComponent implements Component, Focusable {
 
     const boxTitle = this.theme.fg(
       "accent",
-      this.theme.bold(`🐝 ${titleStr} · ${run.id}`),
+      this.theme.bold(`🐝 ${reconMode ? "[RECON] " : ""}${titleStr} · ${run.id}`),
     );
     return renderBox(body.slice(0, maxInnerLines), targetWidth, {
       title: boxTitle,
@@ -4016,7 +4089,8 @@ async function openSwarmBasicMenu(
     for (const m of members) {
       const modelTag = m.model ? ` [${shortenModelName(m.model)}]` : "";
       const wsTag = formatWorkspaceBadge(m.workspace, m.branch);
-      const label = `${memberStateIcon(m.state)} ${m.name} (${m.role} · ${m.state}${modelTag} · ${wsTag})`;
+      const roleTag = m.recon ? "[R] recon" : m.role;
+      const label = `${memberStateIcon(m.state)} ${m.name} (${roleTag} · ${m.state}${modelTag} · ${wsTag})`;
       labelToMember.set(label, m);
       options.push(label);
     }
@@ -4029,8 +4103,9 @@ async function openSwarmBasicMenu(
       run,
     );
     const fleetHeader = `${workingCount} working · ${waitingCount} waiting${stoppedCount > 0 ? ` · ${stoppedCount} stopped` : ""}`;
+    const reconHeaderPrefix = isReconRun(run) ? "[RECON] " : "";
     const chosen = await ctx.ui.select(
-      `🐝 ${sanitizePlainText(run.title || run.id)} (${formatRunStatusBadge(run.status)} · ${fleetHeader} · Board:#${snapshot.boardHead})`,
+      `🐝 ${reconHeaderPrefix}${sanitizePlainText(run.title || run.id)} (${formatRunStatusBadge(run.status)} · ${fleetHeader} · Board:#${snapshot.boardHead})`,
       options,
     );
     if (!chosen || chosen === closeOpt) {

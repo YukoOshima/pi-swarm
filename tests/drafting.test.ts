@@ -16,6 +16,7 @@ import {
   POST_MESSAGE_TOOL,
   PROPOSE_SWARM_PLAN_TOOL,
   READ_BOARD_TOOL,
+  RECON_SWARM_TOOLS,
   RESERVED_MEMBER_NAMES,
   STANDBY_SWARM_TOOLS as CONSTANTS_STANDBY_SWARM_TOOLS,
   SWARM_CORE_TOOLS,
@@ -7473,5 +7474,526 @@ describe("v1.0.0 drafting: inherit-default prompts, initial_members.feature_id &
     assert.equal(confirmedPlans[0]?.initialMembers?.[0]?.featureId, "feat-r1");
   });
 });
+
+// ============================================================================
+// 15. Wave 2b: Recon-in-Swarm Drafting State, Tools & Continuous Validator Prompts
+// ============================================================================
+
+describe("wave-2b: recon tool profile, reconRunId, fork/collision validation, onDraftCancelled & prompts", () => {
+  it("getSwarmToolsForMode('recon') returns all 7 RECON_SWARM_TOOLS and applySwarmToolProfile swaps cleanly & idempotently while 'drafting' stays 3 tools", () => {
+    assert.equal(RECON_SWARM_TOOLS.length, 7);
+    assert.deepEqual(getSwarmToolsForMode("recon"), RECON_SWARM_TOOLS);
+    assert.deepEqual(getSwarmToolsForMode("recon"), ALL_SWARM_EXTENSION_TOOLS);
+    assert.deepEqual(getSwarmToolsForMode("drafting"), DRAFTING_TOOLS);
+    assert.equal(getSwarmToolsForMode("drafting").length, 3);
+
+    const hostAndThirdParty = [
+      "read",
+      "bash",
+      "edit",
+      "write",
+      "grep",
+      "find",
+      "ls",
+      "custom_third_party",
+    ];
+    const harness = new MockPiHarness([...hostAndThirdParty, SWARM_TOOL]);
+
+    // Swap idle -> recon (adds remaining 6 swarm tools -> exact 7 total)
+    assert.equal(applySwarmToolProfile(harness.api, "recon"), true);
+    assert.equal(harness.setActiveToolsCalls.length, 1);
+    for (const tool of hostAndThirdParty) {
+      assert.ok(harness.activeTools.includes(tool), `must keep host tool ${tool}`);
+    }
+    for (const tool of RECON_SWARM_TOOLS) {
+      assert.ok(harness.activeTools.includes(tool), `recon profile must include ${tool}`);
+    }
+    const activeReconSwarmTools = harness.activeTools.filter((t) =>
+      (ALL_SWARM_EXTENSION_TOOLS as readonly string[]).includes(t),
+    );
+    assert.equal(activeReconSwarmTools.length, 7);
+
+    // Second recon call is a prompt-cache-safe no-op
+    assert.equal(applySwarmToolProfile(harness.api, "recon"), false);
+    assert.equal(harness.setActiveToolsCalls.length, 1);
+
+    // Swap recon -> drafting narrows cleanly to 3 DRAFTING_TOOLS
+    assert.equal(applySwarmToolProfile(harness.api, "drafting"), true);
+    assert.equal(harness.setActiveToolsCalls.length, 2);
+    const activeDraftingSwarmTools = harness.activeTools.filter((t) =>
+      (ALL_SWARM_EXTENSION_TOOLS as readonly string[]).includes(t),
+    );
+    assert.deepEqual(activeDraftingSwarmTools.sort(), [...DRAFTING_TOOLS].sort());
+
+    // Swap drafting -> running narrows cleanly to 4 SWARM_CORE_TOOLS
+    assert.equal(applySwarmToolProfile(harness.api, "running"), true);
+    assert.equal(harness.setActiveToolsCalls.length, 3);
+    const activeRunningSwarmTools = harness.activeTools.filter((t) =>
+      (ALL_SWARM_EXTENSION_TOOLS as readonly string[]).includes(t),
+    );
+    assert.deepEqual(activeRunningSwarmTools.sort(), [...SWARM_CORE_TOOLS].sort());
+  });
+
+  it("persists, updates, and rehydrates reconRunId branch-locally on ActiveSwarmDraft", () => {
+    const harness = new MockPiHarness();
+    const ctx = harness.createContext();
+
+    const started = startDraft(harness.api, {
+      mode: "swarm",
+      seed: "Inspect monorepo and migrate auth",
+      reconRunId: "  run-recon-001  ",
+      validatorEnabled: true,
+      maxConcurrency: 4,
+    });
+    assert.equal(started.reconRunId, "run-recon-001");
+
+    harness.appendCompactionEntry("Compacted during recon");
+    const rehydrated = rehydrateDraft(ctx);
+    assert.ok(rehydrated);
+    assert.equal(rehydrated.reconRunId, "run-recon-001");
+
+    const snapshotWithRecon = [...harness.branchEntries];
+
+    // Update reconRunId via updateDraft
+    const updated = updateDraft(harness.api, rehydrated, {
+      reconRunId: "run-recon-002",
+    });
+    assert.equal(updated.reconRunId, "run-recon-002");
+    assert.equal(rehydrateDraft(ctx)?.reconRunId, "run-recon-002");
+
+    // Branch-local isolation: alternate branch still sees run-recon-001
+    const altCtx = harness.createContext({ branch: snapshotWithRecon });
+    assert.equal(rehydrateDraft(altCtx)?.reconRunId, "run-recon-001");
+
+    // Empty string clears reconRunId cleanly
+    const clearedField = updateDraft(harness.api, updated, { reconRunId: "" });
+    assert.equal(clearedField.reconRunId, undefined);
+    assert.equal(rehydrateDraft(ctx)?.reconRunId, undefined);
+
+    // Malformed non-string reconRunId is rejected on rehydration
+    harness.api.appendEntry(SWARM_DRAFT_ENTRY, {
+      version: SWARM_DRAFT_VERSION,
+      mode: "swarm",
+      seed: "Malformed reconRunId",
+      startedAt: new Date().toISOString(),
+      validatorEnabled: true,
+      maxConcurrency: 3,
+      reconRunId: 12345,
+    });
+    assert.equal(rehydrateDraft(ctx), null);
+  });
+
+  it("supports flat fork on InitialMemberProposalSchema, rejects recon handle collisions & invalid fork targets, renders fork, and keeps zero Type.Union/Type.Record/anyOf/oneOf", async () => {
+    // 1. Schema shape & Google-compatible flat-schema invariant
+    assert.ok(
+      "fork" in InitialMemberProposalSchema.properties,
+      "InitialMemberProposalSchema must expose flat optional fork property",
+    );
+    const forkProp = (
+      InitialMemberProposalSchema as unknown as {
+        properties?: Record<string, { type?: string }>;
+      }
+    ).properties?.fork;
+    assert.equal(forkProp?.type, "string");
+
+    const schemaJson = JSON.stringify(ProposeSwarmPlanParamsSchema);
+    assert.equal(schemaJson.includes('"anyOf"'), false);
+    assert.equal(schemaJson.includes('"oneOf"'), false);
+
+    const draftToolsSource = readFileSync(
+      fileURLToPath(new URL("../src/drafting/draft-tools.ts", import.meta.url)),
+      "utf8",
+    );
+    assert.equal(/\bType\.Union\b/.test(draftToolsSource), false);
+    assert.equal(/\bType\.Record\b/.test(draftToolsSource), false);
+    assert.equal(/\banyOf\b/.test(draftToolsSource), false);
+    assert.equal(/\boneOf\b/.test(draftToolsSource), false);
+
+    // 2. Build mock active recon run with warm read-only recon worker "research-arch"
+    const now = new Date().toISOString();
+    const reconRun: SwarmRunState = {
+      ...createMockRun({
+        title: "Recon: API Migration",
+        objective: "Inspect repo",
+        strategy: "Read-only recon",
+        acceptanceCriteria: "",
+        baseBranch: "main",
+        maxConcurrency: 4,
+        validatorEnabled: true,
+      }),
+      id: "run-recon-live-1",
+      runMode: "recon",
+      phase: "recon",
+      members: {
+        "research-arch": {
+          name: "research-arch",
+          agentId: "agent-recon-1",
+          role: "worker",
+          recon: true,
+          state: "waiting",
+          parentName: "orchestrator",
+          brief: "Inspect architecture",
+          workspace: "inherit",
+          cwd: "/tmp/mock-repo",
+          channels: ["main"],
+          lastReadSeq: 1,
+          turns: 1,
+          tokens: 1200,
+          cost: 0,
+          humanStopped: false,
+          logTail: [],
+          createdAt: now,
+          updatedAt: now,
+        },
+      },
+      memberOrder: ["research-arch"],
+    };
+
+    const baseContract = {
+      assertions: [{ id: "VAL-API-001", title: "API", description: "API passes tests" }],
+      features: [
+        {
+          id: "api-core",
+          title: "API Core",
+          description: "Implement API routes",
+          milestone: "M1",
+          files_owned: ["src/api.ts"],
+          fulfills: ["VAL-API-001"],
+        },
+      ],
+    };
+
+    // 3. Direct validateProposedSwarmPlan: normalizes fork & accepts recon member handle + orchestrator
+    const okValidation = validateProposedSwarmPlan(
+      makeSamplePlanParams({
+        ...baseContract,
+        initial_members: [
+          {
+            name: "author-api",
+            role: "worker",
+            brief: "Implement src/api.ts",
+            fork: "  research-arch  ",
+            feature_id: "api-core",
+          },
+          {
+            name: "author-docs",
+            role: "worker",
+            brief: "Update docs",
+            fork: "  orchestrator  ",
+          },
+        ],
+      }),
+      { mode: "swarm", existingRun: reconRun },
+    );
+    assert.equal(okValidation.valid, true);
+    if (okValidation.valid) {
+      assert.equal(okValidation.initialMembers?.[0]?.fork, "research-arch");
+      assert.equal(okValidation.initialMembers?.[1]?.fork, "orchestrator");
+    }
+
+    // 3b. In tweak mode on an executing run, listing an existing member in initial_members is allowed (skipped at spawn time, NOT DUPLICATE_MEMBER)
+    const executingTweakRun: SwarmRunState = {
+      ...reconRun,
+      id: "run-exec-tweak-1",
+      runMode: "executing",
+      phase: undefined,
+    };
+    const tweakReuseValidation = validateProposedSwarmPlan(
+      makeSamplePlanParams({
+        ...baseContract,
+        initial_members: [
+          {
+            name: "research-arch",
+            role: "worker",
+            brief: "Existing member retained in tweak proposal",
+          },
+        ],
+      }),
+      { mode: "tweak", existingRun: executingTweakRun },
+    );
+    assert.equal(tweakReuseValidation.valid, true);
+
+    // 4. Rejects initial_members name collision with getReconRun() via propose_swarm_plan
+    const harness = new MockPiHarness();
+    const confirmedPlans: ProposedSwarmPlan[] = [];
+    const controller = registerDraftingTools(harness.api, {
+      worktree: createMockWorktree({ currentBranch: "main" }),
+      ui: {
+        askQuestion: async () => ({ cancelled: true, isCustom: false }),
+        askQuestionnaire: async () => ({ cancelled: true, answers: {}, items: [] }),
+        confirmProposal: async (_ctx, plan) => ({
+          action: "confirm",
+          validatorEnabled: plan.validatorEnabled,
+          maxConcurrency: plan.maxConcurrency,
+        }),
+      },
+      getSettings: () => ({ ...DEFAULT_SWARM_SETTINGS }),
+      getReconRun: () => reconRun,
+      onPlanConfirmed: async (plan) => {
+        confirmedPlans.push(plan);
+        return createMockRun(plan);
+      },
+    });
+    controller.start({
+      mode: "swarm",
+      seed: "Build API routes",
+      reconRunId: reconRun.id,
+      validatorEnabled: true,
+      maxConcurrency: 4,
+    });
+
+    const proposeTool = harness.registeredTools.get(PROPOSE_SWARM_PLAN_TOOL);
+    const ctx = harness.createContext();
+
+    const collisionRes = await proposeTool.execute(
+      "tc-recon-collide",
+      makeSamplePlanParams({
+        ...baseContract,
+        initial_members: [
+          {
+            name: "research-arch",
+            role: "worker",
+            brief: "Collides with existing recon handle",
+            feature_id: "api-core",
+          },
+        ],
+      }),
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(collisionRes.isError, true);
+    assert.equal((collisionRes.details as ProposeSwarmPlanToolDetails).errorCode, "DUPLICATE_MEMBER");
+    assert.match(collisionRes.content[0].text, /research-arch/);
+
+    // 5. Rejects unknown fork handle when active recon run exists
+    const badForkRes = await proposeTool.execute(
+      "tc-recon-bad-fork",
+      makeSamplePlanParams({
+        ...baseContract,
+        initial_members: [
+          {
+            name: "author-api",
+            role: "worker",
+            brief: "Fork from missing handle",
+            fork: "research-nonexistent",
+            feature_id: "api-core",
+          },
+        ],
+      }),
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(badForkRes.isError, true);
+    assert.equal((badForkRes.details as ProposeSwarmPlanToolDetails).errorCode, "MEMBER_NOT_FOUND");
+    assert.match(badForkRes.content[0].text, /research-nonexistent/);
+
+    // 6. Accepts valid fork referencing existing recon worker and renders fork in renderCall & transcript summary
+    const validParams = makeSamplePlanParams({
+      ...baseContract,
+      initial_members: [
+        {
+          name: "author-api",
+          role: "worker",
+          brief: "Implement API routes",
+          fork: "research-arch",
+          feature_id: "api-core",
+        },
+      ],
+    });
+    const theme = createMockTheme();
+    const collapsedRender = proposeTool
+      .renderCall(validParams, theme, { expanded: false, isPartial: false })
+      .render(160)
+      .join("\n");
+    assert.match(collapsedRender, /author-api\(worker\/inherit <- research-arch\)/);
+
+    const expandedRender = proposeTool
+      .renderCall(validParams, theme, { expanded: true, isPartial: false })
+      .render(160)
+      .join("\n");
+    assert.match(expandedRender, /fork: @research-arch/);
+
+    const okRes = await proposeTool.execute("tc-recon-ok", validParams, undefined, undefined, ctx);
+    assert.equal(okRes.isError, undefined);
+    assert.equal((okRes.details as ProposeSwarmPlanToolDetails).outcome, "confirmed");
+    assert.equal(confirmedPlans[0]?.initialMembers?.[0]?.fork, "research-arch");
+  });
+
+  it("propose_swarm_plan cancel invokes onDraftCancelled(draft, ctx) cleanly and stays resilient if callback throws", async () => {
+    const harness = new MockPiHarness();
+    const cancelledDrafts: SwarmDraftState[] = [];
+    let draftActiveInsideCallback: boolean | undefined;
+
+    const controller = registerDraftingTools(harness.api, {
+      worktree: createMockWorktree({ currentBranch: "main" }),
+      ui: {
+        askQuestion: async () => ({ cancelled: true, isCustom: false }),
+        askQuestionnaire: async () => ({ cancelled: true, answers: {}, items: [] }),
+        confirmProposal: async (_ctx, plan) => ({
+          action: "cancel",
+          validatorEnabled: plan.validatorEnabled,
+          maxConcurrency: plan.maxConcurrency,
+        }),
+      },
+      getSettings: () => ({ ...DEFAULT_SWARM_SETTINGS }),
+      onPlanConfirmed: async (plan) => createMockRun(plan),
+      onDraftCancelled: async (draft) => {
+        cancelledDrafts.push(draft);
+        draftActiveInsideCallback = controller.isActive();
+      },
+    });
+
+    controller.start({
+      mode: "swarm",
+      seed: "Cancel during recon",
+      reconRunId: "run-recon-cancel-1",
+      validatorEnabled: true,
+      maxConcurrency: 4,
+    });
+    applySwarmToolProfile(harness.api, "recon");
+
+    const proposeTool = harness.registeredTools.get(PROPOSE_SWARM_PLAN_TOOL);
+    const ctx = harness.createContext();
+    const cancelRes = await proposeTool.execute(
+      "tc-cancel-recon",
+      makeSamplePlanParams({
+        assertions: [{ id: "VAL-C-001", title: "C1", description: "Desc" }],
+        features: [
+          {
+            id: "feat-c1",
+            title: "Feat C1",
+            description: "Slice",
+            milestone: "M1",
+            fulfills: ["VAL-C-001"],
+          },
+        ],
+      }),
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    assert.equal((cancelRes.details as ProposeSwarmPlanToolDetails).outcome, "cancelled");
+    assert.equal(cancelledDrafts.length, 1);
+    assert.equal(cancelledDrafts[0]?.reconRunId, "run-recon-cancel-1");
+    assert.equal(cancelledDrafts[0]?.seed, "Cancel during recon");
+    assert.equal(draftActiveInsideCallback, false);
+    assert.equal(controller.isActive(), false);
+    // Profile restored back to idle after cancellation
+    const activeSwarmAfterCancel = harness.activeTools.filter((t) =>
+      (ALL_SWARM_EXTENSION_TOOLS as readonly string[]).includes(t),
+    );
+    assert.deepEqual(activeSwarmAfterCancel, [SWARM_TOOL]);
+
+    // Resilience: throwing onDraftCancelled does not crash cancellation
+    const harness2 = new MockPiHarness();
+    let threwCalled = false;
+    const controller2 = registerDraftingTools(harness2.api, {
+      worktree: createMockWorktree({ currentBranch: "main" }),
+      ui: {
+        askQuestion: async () => ({ cancelled: true, isCustom: false }),
+        askQuestionnaire: async () => ({ cancelled: true, answers: {}, items: [] }),
+        confirmProposal: async (_ctx, plan) => ({
+          action: "cancel",
+          validatorEnabled: plan.validatorEnabled,
+          maxConcurrency: plan.maxConcurrency,
+        }),
+      },
+      getSettings: () => ({ ...DEFAULT_SWARM_SETTINGS }),
+      onPlanConfirmed: async (plan) => createMockRun(plan),
+      onDraftCancelled: async () => {
+        threwCalled = true;
+        throw new Error("simulated cleanup error");
+      },
+    });
+    controller2.start({
+      mode: "swarm",
+      seed: "Throwing cleanup",
+      reconRunId: "run-recon-throw",
+    });
+    const proposeTool2 = harness2.registeredTools.get(PROPOSE_SWARM_PLAN_TOOL);
+    const res2 = await proposeTool2.execute(
+      "tc-cancel-throw",
+      makeSamplePlanParams({
+        assertions: [{ id: "VAL-C-002", title: "C2", description: "Desc" }],
+        features: [
+          {
+            id: "feat-c2",
+            title: "Feat C2",
+            description: "Slice",
+            milestone: "M1",
+            fulfills: ["VAL-C-002"],
+          },
+        ],
+      }),
+      undefined,
+      undefined,
+      harness2.createContext(),
+    );
+    assert.equal(threwCalled, true);
+    assert.equal((res2.details as ProposeSwarmPlanToolDetails).outcome, "cancelled");
+    assert.equal(controller2.isActive(), false);
+  });
+
+  it("includes Recon-in-Swarm and continuous live validator guidance across all drafting prompts", () => {
+    const kickoff = buildDraftingKickoffPrompt("Build telemetry pipeline", "swarm", {
+      baseBranch: "main",
+      maxConcurrency: 4,
+      validatorEnabled: true,
+    });
+    const overlay = buildDraftingSystemOverlay({
+      version: 2,
+      mode: "swarm",
+      seed: "Build telemetry pipeline",
+      reconRunId: "run-recon-prompt-1",
+      startedAt: new Date().toISOString(),
+      validatorEnabled: true,
+      maxConcurrency: 4,
+      baseBranch: "main",
+    });
+    const direct = buildDirectPlanPrompt("Build telemetry pipeline", "main", {
+      maxConcurrency: 4,
+      validatorEnabled: true,
+    });
+
+    assert.match(overlay, /recon_run_id="run-recon-prompt-1"/);
+
+    for (const [label, text] of [
+      ["kickoff", kickoff],
+      ["overlay", overlay],
+      ["direct", direct],
+    ] as const) {
+      // Recon-in-Swarm guidance
+      assert.match(text, /read-only Recon mode/i, `${label} must note active read-only Recon mode`);
+      assert.match(text, /research-arch/, `${label} must suggest parallel research-* recon workers`);
+      assert.match(text, /swarm_wait/, `${label} must instruct collecting recon summaries via swarm_wait`);
+      assert.match(text, /fork/, `${label} must mention optional fork from warm recon workers`);
+      // Continuous live validator guidance
+      assert.match(
+        text,
+        /as soon as the first slice is ready/i,
+        `${label} must frame validator as continuous once first slice is ready`,
+      );
+      assert.match(
+        text,
+        /@worker <-> @validator/,
+        `${label} must describe peer-to-peer @worker <-> @validator review loops`,
+      );
+      assert.match(
+        text,
+        /val-api/,
+        `${label} must note domain validator names like val-api`,
+      );
+      assert.match(
+        text,
+        /only include a `validator` initially when reviewing already-existing code|only include a validator initially when reviewing already-existing code/i,
+        `${label} must preserve initial validator restraint`,
+      );
+    }
+  });
+});
+
 
 

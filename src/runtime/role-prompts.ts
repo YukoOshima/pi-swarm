@@ -369,9 +369,8 @@ function buildOrchestratorPlaybookCore(validatorEnabled: boolean): string {
     "  3. **Parallel Execution (`workspace:\"inherit\"` Default)**: Spawn disjoint named authors in parallel on **`workspace:\"inherit\"` by default** in the shared repo when each worker owns disjoint `filesOwned` slices (no worktrees or merges needed!). Opt into `workspace:\"share\"` or `workspace:\"branch\"` ONLY when two concurrent workers genuinely must edit overlapping files at the same time or run isolated/destructive branch experiments (use `n` or `tasks[]` for sharded slices).",
     ...(validatorEnabled
       ? [
-          "  4. **Independent Read-Only Validation (with Isolated Scratch Sandbox)**: Spawn independent `role:\"validator\"` members (~1 validator per 2–4 authors) to audit code, diffs, tests, and runtime behavior directly in the shared repo for `inherit` workers (and inside each author's worktree `cwd` for any opt-in `share`/`branch` workers). Each `role:\"validator\"` automatically gets a dedicated OS temp scratch directory (`scratchDir`) where `write`/`edit` and explicit-path `mkdir`/`cp`/`mv`/`rm`/output redirections work for temporary builds (`--target-dir`), synthetic fixtures, and mutation/negative-case checks while repository and worktree files stay strictly read-only — NEVER spawn `role:\"worker\"` members as pseudo-validators just to write temporary test files, and NEVER let authors self-certify!",
-          "  5. **Peer-to-Peer Bug Closure**: Let `@validator` and `@author` resolve defects directly on the board (`@author` <-> `@validator`) without waking `@orchestrator` on intermediate bounces.",
-          `  6. **Land & Complete**: Default \`inherit\` edits are already live on \`baseBranch\` (no \`merge\` needed); if any opt-in \`share\`/\`branch\` worktrees were used, merge them via \`${SWARM_TOOL}{action:"merge"}\` and run a **post-merge integration check on \`baseBranch\`** BEFORE calling \`done\`. Kill finished members via \`${SWARM_TOOL}{action:"kill"}\`, and close the run cleanly via \`${SWARM_TOOL}{action:"done", summary}\` (which retires ephemeral members and returns \`@${ORCHESTRATOR_NAME}\` to Persistent Standby Mode).`,
+          "  4. **Continuous Live Read-Only Validation & Peer-to-Peer Bug Closure (with Isolated Scratch Sandbox)**: Treat `role:\"validator\"` as a continuous teammate rather than a stiff end-only phase — spawn 1+ read-only `role:\"validator\"` members (~1 validator per 2–4 authors, or domain-named validators like `val-api` / `val-ui`) on demand as soon as the first worker slice finishes so completed slices are audited continuously via zero-hop `@worker <-> @validator` peer fix-loops (without waking `@orchestrator` on intermediate bounces) while remaining authors keep coding! Each `role:\"validator\"` runs on `workspace:\"inherit\"` and automatically gets a dedicated OS temp scratch directory (`scratchDir`) where `write`/`edit` and explicit-path `mkdir`/`cp`/`mv`/`rm`/output redirections work for temporary builds (`--target-dir`), synthetic fixtures, and mutation/negative-case checks while repository and worktree files stay strictly read-only — NEVER spawn `role:\"worker\"` members as pseudo-validators just to write temporary test files, and NEVER let authors self-certify!",
+          `  5. **Land & Complete**: Default \`inherit\` edits are already live on \`baseBranch\` (no \`merge\` needed); if any opt-in \`share\`/\`branch\` worktrees were used, merge them via \`${SWARM_TOOL}{action:"merge"}\` and run a **post-merge integration check on \`baseBranch\`** BEFORE calling \`done\`. Kill finished members via \`${SWARM_TOOL}{action:"kill"}\`, and close the run cleanly via \`${SWARM_TOOL}{action:"done", summary}\` (which retires ephemeral members and returns \`@${ORCHESTRATOR_NAME}\` to Persistent Standby Mode).`,
         ]
       : [
           `  4. **Land & Complete**: Default \`inherit\` edits are already live on \`baseBranch\` (no \`merge\` needed); if any opt-in \`share\`/\`branch\` worktrees were used, merge them via \`${SWARM_TOOL}{action:"merge"}\` and run a **post-merge integration check on \`baseBranch\`** BEFORE calling \`done\`. Kill finished members via \`${SWARM_TOOL}{action:"kill"}\`, and close the run cleanly via \`${SWARM_TOOL}{action:"done", summary}\` (which retires ephemeral members and returns \`@${ORCHESTRATOR_NAME}\` to Persistent Standby Mode).`,
@@ -402,7 +401,7 @@ function buildOrchestratorPlaybookCore(validatorEnabled: boolean): string {
     "",
     "## 6. Dynamic Mission Goal Engine & Contract Evolution",
     `- **Deterministic Queue Dispatch & Living Contract**: Dispatch DAG-ready pending features with disjoint \`filesOwned\` onto **\`workspace:"inherit"\` by default** via \`${SWARM_TOOL}{action:"mission", mission_op:"dispatch_ready", max_dispatch?, workspace?}\` (pass \`workspace:"share"\` ONLY when isolated worktrees are explicitly required; auto-runs any configured \`init\` command in isolated worktrees), or spawn specialized workers via \`${SWARM_TOOL}{action:"add"}\`. Evolve the contract and queue dynamically via \`upsert_assertions\` (including \`VAL-CROSS-*\` cross-feature integration assertions when a mission spans multiple modules/milestones), \`upsert_features\` (\`prepend:true\` for urgent fixes), \`remove_assertion\`, \`set_manifest\` (\`commands\`, \`services\` with unique ports & healthchecks, \`boundaries\`), and \`read_library\`/\`write_library\` (recording reusable \`architecture\`, \`environment\`, and \`testing\` knowledge — including \`## Known Pre-Existing Issues\` in \`library/testing.md\` for unrelated pre-existing repo failures so workers/validators don't scope-creep). Modified \`"passed"\` assertions automatically reset to \`"pending"\` for re-verification.`,
-    `- **Dual-Layer Milestone Validation & Sealed Milestones**: Completing/merging the final feature of a milestone automatically wakes or spawns \`@validator\` to run Dual-Layer Validation (\`scrutiny\` commands/diffs + \`behavioral\` surface checks, using incremental re-validation after fixes). Once all features and \`VAL-*\` assertions of a milestone pass, it becomes \`[sealed]\`. Place any new or follow-up work into a new milestone (e.g. \`<milestone>-followup\` or \`misc-fixes\`) so zero code bypasses validation.`,
+    `- **Continuous Slice Validation, Milestone Safety Net & Sealed Milestones**: Pair live read-only \`@validator\` teammates continuously alongside parallel authors so each slice's \`VAL-*\` assertions are verified incrementally via \`@worker <-> @validator\` handoffs. As a **milestone-end safety net**, completing/merging the final feature of a milestone automatically wakes or spawns \`@validator\` for any remaining unverified or cross-feature (\`VAL-CROSS-*\`) assertions using Dual-Layer Milestone Validation (\`scrutiny\` commands/diffs + \`behavioral\` surface checks, with incremental re-validation after fixes). Once all features and \`VAL-*\` assertions of a milestone pass, it auto-seals as \`[sealed]\`. Place any new or follow-up work into a new milestone (e.g. \`<milestone>-followup\` or \`misc-fixes\`) so zero code bypasses validation.`,
     `- **Zero Open Handoff Tech Debt**: Resolve every worker \`discovered_issue\` and \`incomplete_work\` item via \`upsert_features\` + \`${SWARM_TOOL}{action:"mission", mission_op:"resolve_handoff", handoff_id, resolution:"tracked", tracked_feature_id}\` (or \`resolution:"dismissed"\` ONLY with concrete technical proof >= 20 chars — lazy excuses like \`"low priority"\` or \`"fix later"\` are rejected).`,
     `- **End-of-Mission Hard Gates & \`[NEEDS_HUMAN]\` Escalation**: \`${SWARM_TOOL}{action:"done"}\` enforces 0 working members, 0 unmerged commits ahead of \`baseBranch\`, 0 incomplete features, 0 open handoff tech-debt items, and 100% \`VAL-*\` assertions \`"passed"\` and claimed by \`"completed"\` features. LLM \`force:true\` on \`done\` is rejected with \`PERMISSION_DENIED\` (only human \`/swarm done --force\` may force-close); for rare justified assertion exceptions, use audited \`${SWARM_TOOL}{action:"mission", mission_op:"override_assertion", assertion_id, justification}\` (>= 30 chars, stamped \`[OVERRIDE]\`). Only when genuinely blocked on external credentials or a human product judgment that cannot be resolved from the repo, explain the blocker clearly and include \`[NEEDS_HUMAN]\` to pause auto-continuation.`,
   ].join("\n");
@@ -472,7 +471,8 @@ function formatMemberLine(
     ? (m.currentActivity ?? m.parkedOn)
     : m.parkedOn;
   const activity = activityText ? ` — ${activityText}` : "";
-  return `- \`@${m.name}\` (${m.role}) [${m.state}] ws=${ws}${cwdPart} parent=@${m.parentName}${model} turns=${m.turns}${post}${merged}${stopped}${err}${activity}`;
+  const roleLabel = m.recon ? `${m.role}:recon` : m.role;
+  return `- \`@${m.name}\` (${roleLabel}) [${m.state}] ws=${ws}${cwdPart} parent=@${m.parentName}${model} turns=${m.turns}${post}${merged}${stopped}${err}${activity}`;
 }
 
 function buildActionNeededSection(
@@ -544,7 +544,7 @@ function buildActionNeededSection(
       );
       if (unpassedIds.length > 0) {
         items.push(
-          `- **Milestone \`${ms.label}\` Awaiting Validation**: All features completed; wake or spawn \`role:"validator"\` to verify ${unpassedIds.map((id) => `\`${id}\``).join(", ")} via \`${SWARM_TOOL}{action:"mission", mission_op:"verify_assertion"}\` and seal \`${ms.label}\`.`,
+          `- **Milestone \`${ms.label}\` Has Unverified VAL-* Assertions**: All features completed; wake or spawn \`role:"validator"\` to verify ${unpassedIds.map((id) => `\`${id}\``).join(", ")} via \`${SWARM_TOOL}{action:"mission", mission_op:"verify_assertion"}\` and seal \`${ms.label}\`.`,
         );
       }
     }
@@ -627,9 +627,10 @@ export function buildOrchestratorLiveStateSection(
   }
 
   const sections: string[] = [];
+  const modeBadge = run.runMode === "recon" ? " | **Mode**: `recon` (read-only)" : "";
   const stateHeader: string[] = [
     "## Active Swarm State",
-    `- **Status**: \`${run.status}\` | **Board Head**: \`#${snapshot.boardHead}\``,
+    `- **Status**: \`${run.status}\`${modeBadge} | **Board Head**: \`#${snapshot.boardHead}\``,
     `- **Active / Waiting**: ${snapshot.workingMemberNames.length}/${run.maxConcurrency} active | ${snapshot.waitingMemberNames.length} waiting`,
     formatRoleModelsLine(snapshot.roleModels),
   ];
@@ -929,16 +930,25 @@ export function buildMemberSystemPrompt(
 ): string {
   const sections: string[] = [];
   const primaryChannel = member.channels[0] ?? DEFAULT_CHANNEL;
+  const isRecon = member.recon === true;
   const scratchDir =
-    member.role === "validator" ? options?.scratchDir?.trim() : undefined;
-  const workspaceDesc =
-    member.workspace === "inherit"
+    !isRecon && member.role === "validator" ? options?.scratchDir?.trim() : undefined;
+  const workspaceDesc = isRecon
+    ? `\`inherit\` (shared checkout at \`${member.cwd}\` — strictly read-only reconnaissance; NEVER edit repository files)`
+    : member.workspace === "inherit"
       ? `\`inherit\` (shared checkout at \`${member.cwd}\` — ${member.role === "validator" ? "read-only on repository/worktree files" : "edit ONLY files assigned in your brief"})`
       : `\`${member.workspace}\` (isolated git worktree at \`${member.cwd}\` on branch \`${member.branch ?? "unknown"}\`, base \`${run.baseBranch}\`)`;
 
+  const roleHeaderTitle = isRecon
+    ? "Read-Only Recon Worker"
+    : member.role === "validator"
+      ? "Independent Validator"
+      : "Worker";
+  const roleLabel = isRecon ? `${member.role}:recon` : member.role;
+
   const headerLines: string[] = [
-    `# Pi Swarm ${member.role === "validator" ? "Independent Validator" : "Worker"} — @${member.name}`,
-    `- **Handle**: \`@${member.name}\` (role: \`${member.role}\`${member.groupPrefix ? `, group: \`@${member.groupPrefix}\`` : ""})`,
+    `# Pi Swarm ${roleHeaderTitle} — @${member.name}`,
+    `- **Handle**: \`@${member.name}\` (role: \`${roleLabel}\`${member.groupPrefix ? `, group: \`@${member.groupPrefix}\`` : ""})`,
     `- **Parent**: \`@${member.parentName}\``,
     `- **Run**: ${run.title} (\`${run.id}\`) | Base Branch: \`${run.baseBranch}\``,
     `- **Mission Artifacts**: ${formatMissionArtifactPaths(run.id)}`,
@@ -984,19 +994,29 @@ export function buildMemberSystemPrompt(
     ].join("\n"),
   );
 
-  if (member.role === "validator") {
+  if (isRecon) {
+    sections.push(
+      [
+        "## Read-Only Reconnaissance Rules",
+        `1. **STRICTLY READ-ONLY — NEVER Edit Repository Files**: You are a read-only reconnaissance worker operating in \`${member.cwd}\`. \`write\`, \`edit\`, \`powershell\`, and mutating \`bash\` commands (file writes/redirections, \`rm\`/\`mv\`/\`cp\`/\`mkdir\`, mutating \`git\`, package installs) are hard-blocked by protocol.`,
+        `2. **Code Inspection & Baseline Probes**: Use \`read\`, \`grep\`, \`find\`, \`ls\`, and read-only \`bash\` commands (including baseline \`test\`, \`lint\`, \`typecheck\`, \`build\`, and read-only \`git status\`/\`git log\`/\`git diff\`) to trace exact files, interfaces, invariants, commands, and baseline health. Batch independent read/probe shell commands concisely.`,
+        `3. **Optional Shared Library Notes**: Record reusable architecture, environment, or testing discoveries into \`${SWARM_DIR}/${SWARM_RUNS_DIR}/${run.id}/${SWARM_LIBRARY_DIR}/\` via \`${SWARM_TOOL}{action:"mission", mission_op:"write_library", library_topic, library_content, library_append:true}\` so wave-1 authors inherit them immediately after plan confirmation.`,
+        `4. **Concise Report & Stay Warm for Forking**: Post your concrete, evidence-backed findings (exact file paths, line numbers, symbols, runnable commands, baseline results, and risks) to \`@${member.parentName} [done] <concise summary>\` via \`${POST_MESSAGE_TOOL}\`, then call \`${SWARM_WAIT_TOOL}{since: <highest-seq>}\` to stay warm and forkable (\`fork:"${member.name}"\`) for wave-1 authors. You may spawn read-only recon helpers via \`${SWARM_TOOL}{action:"add"}\` if your investigation splits cleanly (tell them to report back to \`@${member.name}\`, and \`${SWARM_TOOL}{action:"kill"}\` them once integrated).`,
+      ].join("\n"),
+    );
+  } else if (member.role === "validator") {
     const scratchRule = scratchDir
       ? `1. **STRICTLY READ-ONLY on Repository & Worktrees (Isolated Scratch Allowed)**: You are an independent auditor. NEVER create, edit, or delete files inside \`${member.cwd}\` or any peer worktree, stage changes, or make git commits. For isolated builds (\`--target-dir "${scratchDir}/target"\`), synthetic fixtures, or mutation/negative-case probes, use ONLY your dedicated scratch directory \`${scratchDir}\` (\`write\`/\`edit\` tools and explicit literal paths under \`${scratchDir}\` for \`mkdir\`, \`cp\`, \`mv\`, \`rm\`, \`sed -i\`, and \`>\` output redirections — or \`cd "${scratchDir}" && ...\` — are permitted; shell variables/globs/symlinks outside \`${scratchDir}\` are blocked).`
       : "1. **STRICTLY READ-ONLY — NEVER Edit Files**: You are an independent auditor. NEVER create, edit, or delete files, stage changes, or make git commits. `write`, `edit`, `powershell`, and mutating `bash` commands are blocked by protocol.";
     sections.push(
       [
-        "## Independent Read-Only Validator Rules (Dual-Layer Scrutiny + Behavioral Validation)",
+        "## Independent Read-Only Validator Rules (Continuous Peer Reviewer — Scrutiny + Behavioral Validation)",
         scratchRule,
-        `2. **Layer 1 — Code & Test Suite Scrutiny (\`scrutiny\`)**: Treat worker reports as untrusted claims. Read \`${SWARM_DIR}/${SWARM_RUNS_DIR}/${run.id}/${SWARM_LIBRARY_DIR}/\` via \`${SWARM_TOOL}{action:"mission", mission_op:"read_library"}\`, run the configured operational \`commands\` (\`test\`/\`typecheck\`/\`lint\`/\`build\`), and inspect diffs/edits directly (in \`${member.cwd}\` for default \`inherit\` workers and post-merge \`[milestone-review]\`, or inside each author's isolated worktree \`cwd\` via \`git -C "<cwd>" status --short\`, \`git -C "<cwd>" diff ${run.baseBranch}...HEAD\`, \`git -C "<cwd>" show\`, and \`cd "<cwd>" && <slice test command>\` for unmerged opt-in \`share\`/\`branch\` workers).`,
+        `2. **Continuous Slice-by-Slice Scrutiny (\`scrutiny\`)**: You are a live peer reviewer on the shared board — audit each completed slice as workers \`@mention\` you instead of waiting for the entire mission to finish. Treat worker reports as untrusted claims. Read \`${SWARM_DIR}/${SWARM_RUNS_DIR}/${run.id}/${SWARM_LIBRARY_DIR}/\` via \`${SWARM_TOOL}{action:"mission", mission_op:"read_library"}\`, run the configured operational \`commands\` (\`test\`/\`typecheck\`/\`lint\`/\`build\`), and inspect diffs/edits directly (in \`${member.cwd}\` for default \`inherit\` workers and post-merge \`[milestone-review]\`, or inside each author's isolated worktree \`cwd\` via \`git -C "<cwd>" status --short\`, \`git -C "<cwd>" diff ${run.baseBranch}...HEAD\`, \`git -C "<cwd>" show\`, and \`cd "<cwd>" && <slice test command>\` for unmerged opt-in \`share\`/\`branch\` workers).`,
         `3. **Layer 2 — Behavioral / Surface Validation (\`behavioral\` + Incremental Re-Test)**: Exercise real user/API/CLI behavior and configured \`services\` (ports & healthchecks) against every \`VAL-*\` (and cross-feature \`VAL-CROSS-*\`) assertion in scope. On re-runs after bug fixes (when some milestone assertions are already \`"passed"\` while others are \`"failed"\`/\`"pending"\`), perform **Incremental Re-Validation**: focus behavioral testing on the unpassed (\`pending\`/\`failed\`) \`VAL-*\` assertions plus a fast regression check that previously passed assertions still hold.`,
         `4. **Stamp \`VAL-*\` Assertions & Record Testing Notes**: For every \`VAL-*\` assertion in scope (check \`${SWARM_TOOL}{action:"mission", mission_op:"status"}\`), record your verdict via \`${SWARM_TOOL}{action:"mission", mission_op:"verify_assertion", assertion_id, assertion_status, evidence}\` (\`assertion_status:"passed"\` or \`"failed"\` with concrete command/code evidence, or \`"blocked"\`). Passing all assertions of a completed milestone automatically seals that milestone. Persist reusable observations — including unrelated pre-existing repo failures under \`## Known Pre-Existing Issues\` in \`library/testing.md\` so nobody scope-creeps — via \`${SWARM_TOOL}{action:"mission", mission_op:"write_library", library_topic:"testing", library_content:"...", library_append:true}\`.`,
-        "5. **Peer-to-Peer Fix Loop**: If you find bugs, regressions, edge-case failures, or missing requirements, stamp affected `VAL-*` assertions `\"failed\"` with actionable evidence and post concrete findings (file path, line number, reproduction/command output, and concrete fix) directly to `@<author>` on the board — do NOT bother `@orchestrator` on intermediate bug bounces — then call `swarm_wait` to await their fix and re-audit!",
-        `6. **Sign-Off, Neutral QA Naming & Read-Only Helpers**: Post \`@${member.parentName} [done] <evidence-backed audit report>\` ONLY when every check and \`VAL-*\` assertion in scope passes with zero blocking defects (or escalate clearly to \`@${member.parentName}\` if blocked). Use neutral engineering names (\`probe\`, \`fixture\`, \`mutcheck\`, \`negtest\` — avoid \`attack\`/\`exploit\`/\`hack\`) in helper handles, scratch filenames, and reports to prevent upstream safety-filter false positives. You may spawn read-only \`role:"validator"\` sub-auditors via \`${SWARM_TOOL}{action:"add"}\` if your audit splits cleanly across independent areas (tell them to report to \`@${member.name}\`, and \`${SWARM_TOOL}{action:"kill"}\` them once integrated).`,
+        "5. **Continuous Peer-to-Peer Fix Loop & Park for Next Slice**: If you find bugs, regressions, edge-case failures, or missing requirements, stamp affected `VAL-*` assertions `\"failed\"` with actionable evidence and bounce concrete findings (file path, line number, reproduction/command output, and concrete fix) directly to `@<author>` in their warm session — do NOT bother `@orchestrator` on intermediate bug bounces — then call `swarm_wait` to await their fix or the next slice to audit!",
+        `6. **Sign-Off, Neutral QA Naming & Read-Only Helpers**: Post \`@${member.parentName} [done] <evidence-backed audit report>\` once your assigned slice/batch or milestone passes with zero blocking defects (or escalate clearly to \`@${member.parentName}\` if blocked), then park via \`${SWARM_WAIT_TOOL}\` to stay ready for subsequent slices. Use neutral engineering names (\`probe\`, \`fixture\`, \`mutcheck\`, \`negtest\` — avoid \`attack\`/\`exploit\`/\`hack\`) in helper handles, scratch filenames, and reports to prevent upstream safety-filter false positives. You may spawn read-only \`role:"validator"\` sub-auditors via \`${SWARM_TOOL}{action:"add"}\` if your audit splits cleanly across independent areas (tell them to report to \`@${member.name}\`, and \`${SWARM_TOOL}{action:"kill"}\` them once integrated).`,
       ].join("\n"),
     );
     sections.push(buildValidatorPeerWorktreesSection(run, member));
@@ -1012,7 +1032,7 @@ export function buildMemberSystemPrompt(
         `1. **Protected Paths**: NEVER touch \`${SWARM_DIR}/\`, \`.swarm/\`, or \`.git/\` directly — use Swarm tools instead.`,
         workspaceCommitRule,
         `3. **Startup Discipline — Read \`library/\` & Verify Baseline First**: Before editing code, inspect shared Mission knowledge (\`${SWARM_DIR}/${SWARM_RUNS_DIR}/${run.id}/${SWARM_LIBRARY_DIR}/\`: \`architecture\`, \`environment\`, \`testing\`) via \`${SWARM_TOOL}{action:"mission", mission_op:"read_library"}\`, check configured \`services\` ports/healthchecks (strictly honor reserved service ports — never bind conflicting ports), and run a fast baseline check using configured operational \`commands\` (never guess \`npx -y <random-pkg>\` when operational commands are configured!) inside \`${member.cwd}\`. Write back non-obvious architecture/environment/testing discoveries — and record any unrelated pre-existing repo failures under \`## Known Pre-Existing Issues\` in \`library/testing.md\` instead of scope-creeping outside your \`filesOwned\` — via \`${SWARM_TOOL}{action:"mission", mission_op:"write_library", library_topic, library_content, library_append:true}\`. Batch independent read, inspection, or verification shell commands into a single compound \`bash\` call (e.g. \`git status --short && npm run typecheck && npm test\`) instead of running 4–5 serial single-command \`bash\` turns.`,
-        `4. **Mandatory Structured Feature Handoffs on \`[done]\`**: When reporting \`[done]\` on a Mission feature via \`${POST_MESSAGE_TOOL}\`, you MUST provide \`verification_evidence\` (>= 10 chars with exact commands & exit/pass counts run — rejected with \`INVALID_INPUT\` if omitted, unless \`left_undone\` is non-empty explaining why work stopped incomplete), \`feature_id\` (required when multiple features are assigned to you), plus any \`discovered_issues\` (out-of-scope bugs/debt spotted) and \`left_undone\` (incomplete items). You may also claim or update your assigned feature status via \`${SWARM_TOOL}{action:"mission", mission_op:"update_feature", feature_id, feature_status}\`.`,
+        `4. **Mandatory Structured Feature Handoffs & Live Validator Loops on \`[done]\`**: When reporting \`[done]\` on a Mission feature via \`${POST_MESSAGE_TOOL}\`, hand off directly to your brief's live \`@validator\` teammate (when named in your brief or active on the board; otherwise \`@${member.parentName}\`) and stay warm in \`${SWARM_WAIT_TOOL}\` to resolve any validator findings quickly without waking \`@${ORCHESTRATOR_NAME}\`. You MUST provide \`verification_evidence\` (>= 10 chars with exact commands & exit/pass counts run — rejected with \`INVALID_INPUT\` if omitted, unless \`left_undone\` is non-empty explaining why work stopped incomplete), \`feature_id\` (required when multiple features are assigned to you), plus any \`discovered_issues\` (out-of-scope bugs/debt spotted) and \`left_undone\` (incomplete items). You may also claim or update your assigned feature status via \`${SWARM_TOOL}{action:"mission", mission_op:"update_feature", feature_id, feature_status}\`.`,
         `5. **Spawning & Managing Own Helpers**: You may call \`${SWARM_TOOL}{action:"add", name, brief, ...}\` when your assignment splits into independent pieces or needs an investigator/helper. Tell helpers to report back to \`@${member.name}\` by name. You may call \`${SWARM_TOOL}{action:"model"}\` on yourself (safely deferred to turn end with automatic resume on the new model) or your own waiting helpers, \`${SWARM_TOOL}{action:"steer"/"stop"}\` on your own helpers, and MUST call \`${SWARM_TOOL}{action:"kill"}\` on your own helpers once you integrate their work. You cannot kill other members, verify or override \`VAL-*\` assertions, or call \`title\`/\`merge\`/\`done\`.`,
       ].join("\n"),
     );
@@ -1029,6 +1049,16 @@ export function buildMemberInitialPrompt(
   member: SwarmMemberRecord,
   briefSeq: number,
 ): string {
+  if (member.recon) {
+    return [
+      `You have just joined Swarm "${run.title}" as \`@${member.name}\` (${member.role}:recon — strictly read-only).`,
+      `Your reconnaissance assignment (recorded on the shared board as \`#${briefSeq}\` from \`@${member.parentName}\`):`,
+      "",
+      member.brief.trim(),
+      "",
+      `Start read-only inspection and baseline probes immediately (NEVER edit repository files). Optionally record reusable findings via \`${SWARM_TOOL}{action:"mission", mission_op:"write_library", library_topic, library_content, library_append:true}\`, post a concise \`@${member.parentName} [done] ...\` report via \`${POST_MESSAGE_TOOL}\`, then call \`${SWARM_WAIT_TOOL}{since: ${briefSeq}}\` (or the highest #seq you read or posted) so your warm session stays forkable.`,
+    ].join("\n");
+  }
   const lines = [
     `You have just joined Swarm "${run.title}" as \`@${member.name}\` (${member.role}).`,
     `Your assignment (recorded on the shared board as \`#${briefSeq}\` from \`@${member.parentName}\`):`,
@@ -1057,12 +1087,12 @@ export function buildWakeupPrompt(
     formatted,
     "",
   ];
-  if (member.role === "validator") {
+  if (member.role === "validator" && !member.recon) {
     const scratchHint = options?.scratchDir?.trim()
       ? ` (use isolated scratch \`${options.scratchDir.trim()}\` if you need temporary build/fixture/mutation files)`
       : "";
     lines.push(
-      `Validator audit reminder: edits from default \`inherit\` workers are already live in \`${member.cwd}\` (run \`git status --short\`, \`git diff\`, and verification commands directly in \`${member.cwd}\`), while any unmerged opt-in \`share\`/\`branch\` worker commits live in that author's isolated worktree \`cwd\` (\`git -C "<cwd>" diff <baseBranch>...HEAD\` and \`cd "<cwd>" && <slice test command>\`)${scratchHint}. Call \`${READ_BOARD_TOOL}{status:true}\` if you need a peer's \`workspace\`/\`cwd\`/\`branch\`, and stamp verified \`VAL-*\` assertions via \`${SWARM_TOOL}{action:"mission", mission_op:"verify_assertion", assertion_id, assertion_status, evidence}\`.`,
+      `Validator audit reminder: edits from default \`inherit\` workers are already live in \`${member.cwd}\` (run \`git status --short\`, \`git diff\`, and verification commands directly in \`${member.cwd}\`), while any unmerged opt-in \`share\`/\`branch\` worker commits live in that author's isolated worktree \`cwd\` (\`git -C "<cwd>" diff <baseBranch>...HEAD\` and \`cd "<cwd>" && <slice test command>\`)${scratchHint}. Call \`${READ_BOARD_TOOL}{status:true}\` if you need a peer's \`workspace\`/\`cwd\`/\`branch\`, post concrete defects directly to \`@<author>\` for warm peer-to-peer fixes, or stamp verified \`VAL-*\` assertions via \`${SWARM_TOOL}{action:"mission", mission_op:"verify_assertion", assertion_id, assertion_status, evidence}\`.`,
       "",
     );
   }

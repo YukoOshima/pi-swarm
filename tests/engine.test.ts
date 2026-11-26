@@ -20,6 +20,7 @@ import {
   POST_MESSAGE_TOOL,
   PROPOSE_SWARM_PLAN_TOOL,
   READ_BOARD_TOOL,
+  RECON_SWARM_TOOLS,
   STANDBY_SWARM_TOOLS,
   SWARM_CORE_TOOLS,
   SWARM_MAX_BOARD_HOPS,
@@ -27,7 +28,10 @@ import {
   SWARM_QUESTION_TOOL,
   SWARM_TOOL,
   SWARM_WAIT_TOOL,
+  VALIDATOR_BUILTIN_TOOLS,
 } from "../src/constants.js";
+import { createReconGuardExtensionFactory } from "../src/runtime/transport.js";
+import { formatRosterStatusText } from "../src/runtime/swarm-tools.js";
 import {
   buildMemberInitialPrompt,
   buildMemberSystemPrompt,
@@ -70,6 +74,7 @@ import {
   type CreateWorktreeResult,
   type DiffSummary,
   type ISwarmStore,
+  isReconRun,
   type ISwarmTransport,
   type IWorktreeManager,
   type MemberUpdateInput,
@@ -180,6 +185,8 @@ class MockSwarmStore implements ISwarmStore {
       ownerSessionId: input.ownerSessionId,
       ownerPid: input.ownerPid ?? process.pid,
       status: "active",
+      ...(input.runMode !== undefined ? { runMode: input.runMode } : {}),
+      ...(input.phase !== undefined ? { phase: input.phase } : {}),
       maxConcurrency: input.maxConcurrency ?? 6,
       validatorEnabled: input.validatorEnabled ?? true,
       keepWorkersWarm: input.keepWorkersWarm ?? true,
@@ -236,6 +243,7 @@ class MockSwarmStore implements ISwarmStore {
         objective: r.objective,
         baseBranch: r.baseBranch,
         status: r.status,
+        ...(r.runMode !== undefined ? { runMode: r.runMode } : {}),
         memberCount: members.length,
         workingCount: members.filter((m) => m.state === "working").length,
         waitingCount: members.filter((m) => m.state === "waiting").length,
@@ -266,6 +274,7 @@ class MockSwarmStore implements ISwarmStore {
     if (patch.acceptanceCriteria !== undefined) run.acceptanceCriteria = patch.acceptanceCriteria;
     if (patch.baseBranch !== undefined) run.baseBranch = patch.baseBranch;
     if (patch.status !== undefined) run.status = patch.status;
+    if (patch.runMode !== undefined) run.runMode = patch.runMode;
     if (patch.maxConcurrency !== undefined) run.maxConcurrency = patch.maxConcurrency;
     if (patch.validatorEnabled !== undefined) run.validatorEnabled = patch.validatorEnabled;
     if (patch.keepWorkersWarm !== undefined) run.keepWorkersWarm = patch.keepWorkersWarm;
@@ -356,6 +365,7 @@ class MockSwarmStore implements ISwarmStore {
       name: member.name,
       agentId: member.agentId,
       role: member.role,
+      ...(member.recon === true ? { recon: true } : {}),
       state: member.state ?? "working",
       parentName: member.parentName,
       groupPrefix: member.groupPrefix,
@@ -12458,5 +12468,788 @@ describe("v1.0.0 Runtime Engine, Swarm Tools & Transport Hardening", () => {
     }
   });
 });
+
+// ============================================================================
+// Wave 2a: Recon-in-Swarm & Fluid Live Validator Unit Tests
+// ============================================================================
+
+describe("Wave 2a: Recon-in-Swarm lifecycle, read-only guards, and promotion", () => {
+  it("1. enforces recon mode invariants (inherit+recon:true, rejects share/branch, blocks done/merge/mutating mission, allows library & suppresses stall watchdog)", async () => {
+    assert.equal(RECON_SWARM_TOOLS.length, 7);
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), "pi-swarm-recon-store-"));
+    try {
+      const store = new SwarmStore(tmpDir);
+      const worktree = new MockWorktreeManager();
+      const transport = new ScriptedTransport();
+      const spawnedRequests: SpawnMemberRequest[] = [];
+      const origSpawn = transport.spawnMember.bind(transport);
+      transport.spawnMember = async (req) => {
+        spawnedRequests.push(req);
+        return origSpawn(req);
+      };
+
+      transport.onMember("scout", async ({ request }) => {
+        await request.engineApi?.manageMission?.({
+          op: "write_library",
+          libraryTopic: "architecture",
+          libraryContent: "# Recon Architecture\n- Found src/core.ts\n",
+          libraryAppend: false,
+        });
+        await request.engineApi?.postMessage({
+          text: "@orchestrator [done] Traced src/core.ts and ran baseline checks.",
+        });
+        return { outcome: "waiting", summary: "recon done" };
+      });
+
+      const engine = new SwarmEngine({
+        store,
+        worktree,
+        transport,
+        scratchRoot: nextTestScratchRoot("recon-invariants"),
+        settings: {
+          keepWorkersWarm: true,
+          stallWatchdogEnabled: true,
+          stallTimeoutMs: 25,
+        },
+      });
+      try {
+        const reconRun = await store.createRun({
+          id: "run-recon-1",
+          title: "Recon: Core Refactor",
+          objective: "Investigate core module before planning",
+          baseBranch: "main",
+          ownerSessionId: "sess-recon-1",
+          runMode: "recon",
+          phase: "recon",
+        });
+        assert.equal(isReconRun(reconRun), true);
+        assert.equal(reconRun.runMode, "recon");
+        const listed = await store.listRuns();
+        assert.equal(listed.find((r) => r.id === reconRun.id)?.runMode, "recon");
+
+        await engine.startRun(reconRun.id);
+
+        // Reject explicit share/branch in recon mode
+        await assert.rejects(
+          () =>
+            engine.addMembers({
+              name: "bad-share",
+              brief: "Should be rejected",
+              workspace: "share",
+            }),
+          (err: unknown) =>
+            err instanceof SwarmProtocolError &&
+            err.code === "INVALID_INPUT" &&
+            err.message.includes(PROPOSE_SWARM_PLAN_TOOL),
+        );
+        await assert.rejects(
+          () =>
+            engine.addMembers({
+              name: "bad-branch",
+              brief: "Should be rejected",
+              workspace: "branch",
+            }),
+          (err: unknown) => err instanceof SwarmProtocolError && err.code === "INVALID_INPUT",
+        );
+
+        // Spawn read-only recon worker (default role: "worker", forced inherit + recon:true)
+        const [scout] = await engine.addMembers({
+          name: "scout",
+          brief: "Inspect src/core.ts and baseline tests",
+        });
+        assert.equal(scout!.role, "worker");
+        assert.equal(scout!.recon, true);
+        assert.equal(scout!.workspace, "inherit");
+        assert.equal(worktree.createdWorktrees.length, 0);
+
+        await waitUntil(
+          () => engine.getSnapshot().run?.members["scout"]?.state === "waiting",
+        );
+        const scoutReq = spawnedRequests.find((r) => r.name === "scout");
+        assert.equal(scoutReq?.readOnlyRecon, true);
+        assert.equal(scoutReq?.scratchDir, undefined);
+        assert.match(scoutReq?.systemPrompt ?? "", /Read-Only Reconnaissance Rules/);
+        assert.match(scoutReq?.initialPrompt ?? "", /worker:recon/);
+
+        // Persists recon:true across store reload & surfaces in status/live prompt
+        const reloaded = await store.loadRun(reconRun.id);
+        assert.equal(reloaded.runMode, "recon");
+        assert.equal(reloaded.members["scout"]?.recon, true);
+        const liveSection = buildOrchestratorLiveStateSection(engine.getSnapshot());
+        assert.match(liveSection, /\(worker:recon\)/);
+        assert.match(liveSection, /`recon`/);
+
+        // Allowed mission ops: status, read_library, write_library
+        const statusRes = await engine.manageMission({ op: "status" });
+        assert.equal(statusRes.op, "status");
+        const libRead = await engine.manageMission({
+          op: "read_library",
+          libraryTopic: "architecture",
+        });
+        assert.match(libRead.libraryContent ?? "", /Found src\/core\.ts/);
+
+        // Blocked in recon mode: done, merge, and mutating mission ops
+        await assert.rejects(
+          () =>
+            engine.completeRun({
+              summary: "Attempt premature completion",
+              callerRole: "orchestrator",
+            }),
+          (err: unknown) =>
+            err instanceof SwarmProtocolError &&
+            err.code === "INVALID_INPUT" &&
+            err.message.includes(PROPOSE_SWARM_PLAN_TOOL),
+        );
+        await assert.rejects(
+          () => engine.mergeMember("scout", { callerRole: "orchestrator" }),
+          (err: unknown) =>
+            err instanceof SwarmProtocolError &&
+            err.code === "INVALID_INPUT" &&
+            err.message.includes(PROPOSE_SWARM_PLAN_TOOL),
+        );
+        for (const blockedOp of [
+          "dispatch_ready",
+          "upsert_features",
+          "upsert_assertions",
+          "set_manifest",
+        ] as const) {
+          await assert.rejects(
+            () => engine.manageMission({ op: blockedOp }),
+            (err: unknown) =>
+              err instanceof SwarmProtocolError &&
+              err.code === "INVALID_INPUT" &&
+              err.message.includes(PROPOSE_SWARM_PLAN_TOOL),
+          );
+        }
+
+        // Stall watchdog stays silent during recon mode (> stallTimeoutMs)
+        const boardHeadBeforeWait = engine.getSnapshot().boardHead;
+        await new Promise((r) => setTimeout(r, 80));
+        assert.equal(engine.getSnapshot().boardHead, boardHeadBeforeWait);
+      } finally {
+        await engine.dispose();
+      }
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  it("2. enforces read-only recon transport isolation (no write/edit/powershell, no scratchDir, allows reads & npm test)", async () => {
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), "pi-swarm-recon-transport-"));
+    try {
+      let capturedTools: unknown;
+      let capturedCustomTools: ToolDefinition[] | undefined;
+      const scratchCandidate = path.join(tmpDir, "recon-no-scratch");
+
+      const realTransport = new InProcessPiTransport({
+        agentDir: tmpDir,
+        createSession: (async (opts: any) => {
+          capturedTools = opts?.tools;
+          capturedCustomTools = opts?.customTools;
+          return {
+            session: {
+              model: opts?.model,
+              sessionManager: opts?.sessionManager,
+              extensionRunner: { hasHandlers: () => false, emit: async () => {} },
+              bindExtensions: async () => {},
+              subscribe: () => () => {},
+              prompt: async () => {},
+              abort: async () => {},
+              dispose: () => {},
+              getSessionStats: () => ({
+                tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+                cost: 0,
+              }),
+            },
+          };
+        }) as any,
+      });
+
+      const handle = await realTransport.spawnMember({
+        agentId: "scout-1",
+        name: "scout",
+        role: "worker",
+        runId: "run-recon-t",
+        cwd: tmpDir,
+        workspace: "inherit",
+        parentName: ORCHESTRATOR_NAME,
+        brief: "Read-only recon",
+        systemPrompt: "Recon system prompt",
+        initialPrompt: "Inspect repo",
+        keepWarm: true,
+        readOnlyRecon: true,
+        scratchDir: scratchCandidate,
+      });
+      await handle.currentTurn;
+
+      assert.deepEqual(capturedTools, [
+        ...VALIDATOR_BUILTIN_TOOLS,
+        "bash",
+        ...SWARM_CORE_TOOLS,
+      ]);
+      assert.equal(
+        (capturedTools as string[]).includes("write"),
+        false,
+        "readOnlyRecon must NOT expose write",
+      );
+      assert.equal(
+        (capturedTools as string[]).includes("edit"),
+        false,
+        "readOnlyRecon must NOT expose edit",
+      );
+      assert.equal(capturedCustomTools?.length, 4);
+      assert.equal(existsSync(scratchCandidate), false, "readOnlyRecon must NOT create scratchDir");
+
+      // Test createReconGuardExtensionFactory directly
+      let toolCallHandler: ((event: any) => any) | undefined;
+      const guardFactory = createReconGuardExtensionFactory("scout", true);
+      guardFactory({
+        on(eventName: string, handler: any) {
+          if (eventName === "tool_call") toolCallHandler = handler;
+        },
+      } as any);
+      assert.ok(toolCallHandler);
+
+      assert.equal(
+        toolCallHandler!({ toolName: "write", input: { path: "src/a.ts", content: "x" } })?.block,
+        true,
+      );
+      assert.equal(
+        toolCallHandler!({ toolName: "edit", input: { path: "src/a.ts" } })?.block,
+        true,
+      );
+      assert.equal(
+        toolCallHandler!({ toolName: "powershell", input: { command: "ls" } })?.block,
+        true,
+      );
+      assert.equal(
+        toolCallHandler!({ toolName: "bash", input: { command: "echo hi > out.txt" } })?.block,
+        true,
+      );
+      assert.equal(
+        toolCallHandler!({ toolName: "bash", input: { command: "rm -rf src/tmp" } })?.block,
+        true,
+      );
+      assert.equal(
+        toolCallHandler!({ toolName: "bash", input: { command: "git commit -m test" } })?.block,
+        true,
+      );
+      // Read-only reads & baseline test/typecheck probes MUST be allowed!
+      assert.equal(
+        toolCallHandler!({ toolName: "read", input: { path: "src/index.ts" } }),
+        undefined,
+      );
+      assert.equal(
+        toolCallHandler!({ toolName: "bash", input: { command: "npm test && npm run typecheck" } }),
+        undefined,
+      );
+      assert.equal(
+        toolCallHandler!({ toolName: "bash", input: { command: "git status --short" } }),
+        undefined,
+      );
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  it("3. promoteReconRun preserves board/library/warm forkable sessions silently, unlocks writable workers, and supports revertReconPromotion", async () => {
+    const tmpDir = await mkdtemp(path.join(os.tmpdir(), "pi-swarm-recon-promote-"));
+    try {
+      const store = new SwarmStore(tmpDir);
+      const worktree = new MockWorktreeManager();
+      const transport = new ScriptedTransport();
+      const spawnedRequests: SpawnMemberRequest[] = [];
+      let scoutWakeCount = 0;
+      const origSpawn = transport.spawnMember.bind(transport);
+      transport.spawnMember = async (req) => {
+        spawnedRequests.push(req);
+        return origSpawn(req);
+      };
+
+      transport.onMember("scout-warm", async ({ request, turnIndex }) => {
+        if (turnIndex > 1) {
+          scoutWakeCount += 1;
+        }
+        await request.engineApi?.postMessage({
+          text: "@orchestrator [done] Warm scout findings ready.",
+        });
+        return { outcome: "waiting", summary: "warm scout done" };
+      });
+      transport.onMember("author-1", async ({ request }) => {
+        await request.engineApi?.postMessage({
+          text: "@orchestrator [done] Implemented feature.",
+          featureId: "feat-1",
+          verificationEvidence: "npm test passed (10/10)",
+        });
+        return { outcome: "waiting", summary: "author done" };
+      });
+
+      const engine = new SwarmEngine({
+        store,
+        worktree,
+        transport,
+        scratchRoot: nextTestScratchRoot("recon-promote"),
+        settings: { keepWorkersWarm: true, stallWatchdogEnabled: false },
+      });
+      try {
+        const reconRun = await store.createRun({
+          id: "run-promote-1",
+          title: "Recon: API",
+          objective: "Explore API layer",
+          baseBranch: "main",
+          ownerSessionId: "sess-prom-1",
+          runMode: "recon",
+          phase: "recon",
+        });
+        await engine.startRun(reconRun.id);
+        await engine.manageMission({
+          op: "write_library",
+          libraryTopic: "testing",
+          libraryContent: "# Testing\n- Run npm test\n",
+        });
+        await engine.addMembers({
+          name: "scout-warm",
+          brief: "Inspect API routes",
+        });
+        await waitUntil(
+          () => engine.getSnapshot().run?.members["scout-warm"]?.state === "waiting",
+        );
+        const prePromoteHead = engine.getSnapshot().boardHead;
+
+        // Promote in-place
+        const promoted = await engine.promoteReconRun(reconRun.id, {
+          title: "Build API v2",
+          objective: "Implement v2 API endpoints",
+          strategy: "Inherit disjoint slices",
+          acceptanceCriteria: "npm test passes",
+          baseBranch: "main",
+          maxConcurrency: 4,
+          validatorEnabled: false,
+          milestones: [{ label: "M1", status: "pending" }],
+          assertions: [
+            {
+              id: "VAL-API-001",
+              title: "API works",
+              description: "GET /v2 returns 200",
+              status: "pending",
+              updatedAt: new Date().toISOString(),
+            },
+          ],
+          features: [
+            {
+              id: "feat-1",
+              title: "Endpoint",
+              description: "Add GET /v2",
+              milestone: "M1",
+              filesOwned: ["src/api.ts"],
+              fulfills: ["VAL-API-001"],
+              status: "pending",
+              updatedAt: new Date().toISOString(),
+            },
+          ],
+        });
+
+        assert.equal(promoted.id, reconRun.id);
+        assert.equal(promoted.runMode, "executing");
+        assert.equal(isReconRun(promoted), false);
+        assert.equal(promoted.phase, undefined);
+        assert.equal(promoted.title, "Build API v2");
+        assert.equal(promoted.maxConcurrency, 4);
+        // Preserves library & board history
+        const libAfter = await engine.manageMission({
+          op: "read_library",
+          libraryTopic: "testing",
+        });
+        assert.match(libAfter.libraryContent ?? "", /Run npm test/);
+        const boardAfter = await engine.readBoard({ since: prePromoteHead });
+        assert.equal(boardAfter.messages.length, 1);
+        assert.equal(boardAfter.messages[0]!.kind, "decision");
+        assert.deepEqual(boardAfter.messages[0]!.mentions, []);
+
+        // Warm recon worker stays waiting, retains recon:true, and was NOT woken!
+        await new Promise((r) => setTimeout(r, 40));
+        assert.equal(scoutWakeCount, 0);
+        assert.equal(engine.getSnapshot().run?.members["scout-warm"]?.state, "waiting");
+        assert.equal(engine.getSnapshot().run?.members["scout-warm"]?.recon, true);
+
+        // Writable wave-1 author can now spawn AND fork from warm recon scout!
+        const [author] = await engine.addMembers({
+          name: "author-1",
+          brief: "Implement feat-1",
+          workspace: "share",
+          fork: "scout-warm",
+        });
+        assert.equal(author!.recon, undefined);
+        assert.equal(author!.workspace, "share");
+        assert.equal(author!.forkedFrom, "scout-warm");
+        await waitUntil(
+          () => engine.getSnapshot().run?.members["author-1"]?.state === "waiting",
+        );
+        const authorReq = spawnedRequests.find((r) => r.name === "author-1");
+        assert.equal(authorReq?.readOnlyRecon, undefined);
+
+        // Revert helper rolls runMode back cleanly
+        const reverted = await engine.revertReconPromotion(reconRun.id);
+        assert.equal(reverted.runMode, "recon");
+        assert.equal(reverted.phase, "recon");
+        assert.equal(isReconRun(reverted), true);
+      } finally {
+        await engine.dispose();
+      }
+    } finally {
+      await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  it("4. swarm-tools supports ensureReconRun lazy init, drafting status message, and recon labels", async () => {
+    const store = new MockSwarmStore();
+    const worktree = new MockWorktreeManager();
+    const transport = new ScriptedTransport();
+    transport.onMember("recon-a", async ({ request }) => {
+      await request.engineApi?.postMessage({
+        text: "@orchestrator [done] Done recon.",
+      });
+      return { outcome: "waiting", summary: "done" };
+    });
+
+    const engine = new SwarmEngine({
+      store,
+      worktree,
+      transport,
+      scratchRoot: nextTestScratchRoot("recon-tools"),
+      settings: { keepWorkersWarm: true, stallWatchdogEnabled: false },
+    });
+    let ensureCalled = 0;
+    try {
+      const tools = createSwarmTools({
+        engine,
+        isDraftingRecon: () => true,
+        ensureReconRun: async () => {
+          ensureCalled += 1;
+          const r = await store.createRun({
+            id: "run-lazy-recon",
+            title: "Recon: Lazy",
+            objective: "Lazy recon objective",
+            baseBranch: "main",
+            ownerSessionId: "sess-lazy",
+            runMode: "recon",
+            phase: "recon",
+          });
+          await engine.startRun(r.id);
+          return r;
+        },
+      });
+      const swarmTool = tools.find((t) => t.name === SWARM_TOOL)!;
+
+      // Status before any recon worker is spawned
+      const preStatus = await swarmTool.execute(
+        "c1",
+        { action: "status" },
+        undefined,
+        undefined,
+        {} as ExtensionToolContext,
+      );
+      const preText = (preStatus.content[0] as { text: string }).text;
+      assert.match(preText, /Drafting\/Recon ready \(0 recon workers spawned\)/);
+
+      // Adding a recon worker triggers ensureReconRun lazily
+      const addRes = await swarmTool.execute(
+        "c2",
+        { action: "add", name: "recon-a", brief: "Trace files" },
+        undefined,
+        undefined,
+        {} as ExtensionToolContext,
+      );
+      assert.equal(ensureCalled, 1);
+      const addText = (addRes.content[0] as { text: string }).text;
+      assert.match(addText, /\(worker:recon\)/);
+
+      await waitUntil(
+        () => engine.getSnapshot().run?.members["recon-a"]?.state === "waiting",
+      );
+
+      const postStatus = await swarmTool.execute(
+        "c3",
+        { action: "status" },
+        undefined,
+        undefined,
+        {} as ExtensionToolContext,
+      );
+      const postText = (postStatus.content[0] as { text: string }).text;
+      assert.match(postText, /mode=recon/);
+      assert.match(postText, /@recon-a \(worker:recon\)/);
+      assert.match(
+        formatRosterStatusText(postStatus.details as any),
+        /mode=recon/,
+      );
+
+      // swarm{action:"done"} returns INVALID_INPUT in recon mode
+      const doneRes = await swarmTool.execute(
+        "c4",
+        { action: "done", summary: "Too early" },
+        undefined,
+        undefined,
+        {} as ExtensionToolContext,
+      );
+      assert.equal((doneRes as any).isError, true);
+      assert.match((doneRes.content[0] as { text: string }).text, /propose_swarm_plan/);
+    } finally {
+      await engine.dispose();
+    }
+  });
+});
+
+describe("Wave 2a: Fluid Live Validator Continuous Teammate Mechanics", () => {
+  it("1. suppresses duplicate [milestone-review] wake when @worker hands off directly to live @validator [done] and auto-seals milestone", async () => {
+    const store = new MockSwarmStore();
+    const worktree = new MockWorktreeManager();
+    const transport = new ScriptedTransport();
+    let validatorWakeCalls = 0;
+
+    transport.onMember("val-api", async ({ request, turnIndex }) => {
+      if (turnIndex > 1) {
+        validatorWakeCalls += 1;
+        await request.engineApi?.manageMission?.({
+          op: "verify_assertion",
+          assertionId: "VAL-FLUID-001",
+          assertionStatus: "passed",
+          evidence: "Verified feat-fluid-1 directly on shared inherit repo (10/10 tests passed)",
+        });
+        await request.engineApi?.postMessage({
+          text: "@orchestrator [done] Audited feat-fluid-1 and passed VAL-FLUID-001.",
+        });
+      }
+      return { outcome: "waiting", summary: `val turn ${turnIndex}` };
+    });
+
+    transport.onMember("author-api", async ({ request }) => {
+      await request.engineApi?.postMessage({
+        text: "@val-api [done] Implemented feat-fluid-1 on shared inherit repo.",
+        featureId: "feat-fluid-1",
+        verificationEvidence: "npm test passed (10/10)",
+      });
+      return { outcome: "waiting", summary: "author done" };
+    });
+
+    const engine = new SwarmEngine({
+      store,
+      worktree,
+      transport,
+      scratchRoot: nextTestScratchRoot("fluid-no-dup-wake"),
+      settings: { keepWorkersWarm: true, stallWatchdogEnabled: false },
+    });
+    try {
+      const run = await store.createRun({
+        id: "run-fluid-1",
+        title: "Fluid Validator Run",
+        objective: "Continuous validation without double-wake",
+        baseBranch: "main",
+        ownerSessionId: "sess-fluid-1",
+        validatorEnabled: true,
+        milestones: [{ label: "M1", status: "pending" }],
+        assertions: [
+          {
+            id: "VAL-FLUID-001",
+            title: "Fluid feature works",
+            description: "Endpoint returns 200",
+            status: "pending",
+            updatedAt: new Date().toISOString(),
+          },
+        ],
+        features: [
+          {
+            id: "feat-fluid-1",
+            title: "Fluid Feature",
+            description: "Implement fluid feature",
+            milestone: "M1",
+            filesOwned: ["src/fluid.ts"],
+            fulfills: ["VAL-FLUID-001"],
+            status: "in_progress",
+            assignedMember: "author-api",
+            updatedAt: new Date().toISOString(),
+          },
+        ],
+      });
+      await engine.startRun(run.id);
+
+      // Start warm live inherit validator first
+      await engine.addMembers({
+        name: "val-api",
+        role: "validator",
+        workspace: "inherit",
+        brief: "Stand by as continuous peer reviewer for API slices.",
+      });
+      await waitUntil(
+        () => engine.getSnapshot().run?.members["val-api"]?.state === "waiting",
+      );
+
+      // Now author finishes final feature of M1 and hands off directly to @val-api [done]
+      await engine.addMembers({
+        name: "author-api",
+        role: "worker",
+        workspace: "inherit",
+        brief: "Implement feat-fluid-1 and hand off to @val-api.",
+      });
+
+      await waitUntil(() => {
+        const snap = engine.getSnapshot().run;
+        return (
+          snap?.assertions?.find((a) => a.id === "VAL-FLUID-001")?.status === "passed" &&
+          snap?.milestones?.find((m) => m.label === "M1")?.sealed === true
+        );
+      });
+
+      const board = await engine.readBoard({ limit: 50 });
+      const milestoneReviewPosts = board.messages.filter((m) =>
+        m.text.includes("[milestone-review]"),
+      );
+      assert.equal(
+        milestoneReviewPosts.length,
+        0,
+        "Direct @worker -> @val-api [done] must NOT emit a duplicate [milestone-review] wake",
+      );
+      assert.equal(validatorWakeCalls, 1);
+    } finally {
+      await engine.dispose();
+    }
+  });
+
+  it("2. routes dispatch_ready doorbell to live inherit validator (falling back to @orchestrator), coerces validator workspace to inherit, and builds inherit-aware milestone review brief with warm author handles", async () => {
+    const store = new MockSwarmStore();
+    const worktree = new MockWorktreeManager();
+    const transport = new ScriptedTransport();
+
+    transport.onMember("val-api", async () => ({
+      outcome: "waiting",
+      summary: "val standing by",
+    }));
+    transport.onMember("feat-a", async ({ request }) => {
+      await request.engineApi?.postMessage({
+        text: "@orchestrator [done] Finished feat-a.",
+        featureId: "feat-a",
+        verificationEvidence: "npm test passed (5/5)",
+      });
+      return { outcome: "waiting", summary: "feat-a done" };
+    });
+    transport.onMember("feat-b", async () => ({
+      outcome: "waiting",
+      summary: "feat-b done",
+    }));
+
+    const engine = new SwarmEngine({
+      store,
+      worktree,
+      transport,
+      scratchRoot: nextTestScratchRoot("fluid-dispatch"),
+      settings: { keepWorkersWarm: true, stallWatchdogEnabled: false },
+    });
+    try {
+      const run = await store.createRun({
+        id: "run-fluid-2",
+        title: "Fluid Dispatch & Coercion",
+        objective: "Verify validator workspace coercion, dispatch doorbell, and inherit milestone brief",
+        baseBranch: "main",
+        ownerSessionId: "sess-fluid-2",
+        validatorEnabled: true,
+        milestones: [{ label: "M1", status: "pending" }],
+        assertions: [
+          {
+            id: "VAL-D-001",
+            title: "Feature A",
+            description: "A passes",
+            status: "pending",
+            updatedAt: new Date().toISOString(),
+          },
+          {
+            id: "VAL-D-002",
+            title: "Feature B",
+            description: "B passes",
+            status: "pending",
+            updatedAt: new Date().toISOString(),
+          },
+        ],
+        features: [
+          {
+            id: "feat-a",
+            title: "Feature A",
+            description: "Build A",
+            milestone: "M1",
+            filesOwned: ["src/a.ts"],
+            fulfills: ["VAL-D-001"],
+            status: "pending",
+            updatedAt: new Date().toISOString(),
+          },
+          {
+            id: "feat-b",
+            title: "Feature B",
+            description: "Build B",
+            milestone: "M1",
+            dependsOn: ["feat-a"],
+            filesOwned: ["src/b.ts"],
+            fulfills: ["VAL-D-002"],
+            status: "pending",
+            updatedAt: new Date().toISOString(),
+          },
+        ],
+      });
+      await engine.startRun(run.id);
+
+      // (A) Dispatch feat-a with NO live validator -> doorbell defaults to @orchestrator
+      const d1 = await engine.manageMission({ op: "dispatch_ready" });
+      assert.deepEqual(d1.dispatchedFeatures, ["feat-a"]);
+      const featABrief = engine.getSnapshot().run?.members["feat-a"]?.brief ?? "";
+      assert.match(featABrief, /@orchestrator \[done\] workspace=<cwd>/);
+      await waitUntil(
+        () => engine.getSnapshot().run?.members["feat-a"]?.state === "waiting",
+      );
+
+      // (B) Validator workspace coercion: requesting workspace:"share" coerces to "inherit" with 0 worktrees
+      const [val] = await engine.addMembers({
+        name: "val-api",
+        role: "validator",
+        workspace: "share",
+        brief: "Live API validator",
+      });
+      assert.equal(val!.workspace, "inherit");
+      assert.equal(worktree.createdWorktrees.length, 0);
+      await waitUntil(
+        () => engine.getSnapshot().run?.members["val-api"]?.state === "waiting",
+      );
+
+      // (C) Dispatch feat-b with live inherit @val-api -> doorbell routes to @val-api!
+      const d2 = await engine.manageMission({ op: "dispatch_ready" });
+      assert.deepEqual(d2.dispatchedFeatures, ["feat-b"]);
+      const featBBrief = engine.getSnapshot().run?.members["feat-b"]?.brief ?? "";
+      assert.match(featBBrief, /@val-api \[done\] workspace=<cwd>/);
+      assert.match(featBBrief, /@orchestrator \[done\]/);
+      await waitUntil(
+        () => engine.getSnapshot().run?.members["feat-b"]?.state === "waiting",
+      );
+
+      // (D) When feat-b reports @orchestrator [done] (bypassing @val-api), milestone safety net wakes @val-api
+      // with "completed on `main`" (NOT "merged") AND lists warm authors @feat-a & @feat-b!
+      await engine.postMessage({
+        from: "feat-b",
+        fromRole: "worker",
+        text: "@orchestrator [done] Finished feat-b.",
+        featureId: "feat-b",
+        verificationEvidence: "npm test passed (8/8)",
+      });
+
+      const board = await engine.readBoard({ limit: 50 });
+      const reviewPost = board.messages.find((m) =>
+        m.text.includes("[milestone-review]"),
+      );
+      assert.ok(reviewPost, "Expected milestone-review safety net post");
+      assert.match(reviewPost!.text, /are completed on `main`/);
+      assert.doesNotMatch(reviewPost!.text, /completed and merged onto/);
+      assert.match(reviewPost!.text, /@feat-a/);
+      assert.match(reviewPost!.text, /@feat-b/);
+    } finally {
+      await engine.dispose();
+    }
+  });
+});
+
 
 

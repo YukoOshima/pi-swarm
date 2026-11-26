@@ -76,6 +76,7 @@ import {
   type SwarmMemberState,
   type SwarmMilestone,
   type SwarmRoleModels,
+  type SwarmRunMode,
   type SwarmRunState,
   type SwarmRunStatus,
   type SwarmWorkspaceMode,
@@ -109,6 +110,11 @@ const VALID_RUN_STATUSES: ReadonlySet<SwarmRunStatus> = new Set<SwarmRunStatus>(
   "paused",
   "completed",
   "abandoned",
+]);
+
+const VALID_RUN_MODES: ReadonlySet<SwarmRunMode> = new Set<SwarmRunMode>([
+  "recon",
+  "executing",
 ]);
 
 const VALID_MEMBER_ROLES: ReadonlySet<SwarmMemberRole> =
@@ -919,6 +925,16 @@ function backfillRunState(state: SwarmRunState): SwarmRunState {
   } else {
     state.boardHead = Math.floor(raw.boardHead);
   }
+  if (raw.runMode !== undefined) {
+    if (
+      typeof raw.runMode === "string" &&
+      VALID_RUN_MODES.has(raw.runMode as SwarmRunMode)
+    ) {
+      state.runMode = raw.runMode as SwarmRunMode;
+    } else {
+      delete state.runMode;
+    }
+  }
   if (raw.phase !== undefined) {
     const normalizedPhase = normalizeOptionalNonEmptyString(raw.phase);
     if (normalizedPhase !== undefined) {
@@ -1020,6 +1036,13 @@ function backfillRunState(state: SwarmRunState): SwarmRunState {
     }
     if (typeof member.turns !== "number" || !Number.isFinite(member.turns)) {
       member.turns = 0;
+    }
+    if (rawMember.recon !== undefined) {
+      if (rawMember.recon === true) {
+        member.recon = true;
+      } else {
+        delete member.recon;
+      }
     }
     if (rawMember.llmTurns !== undefined) {
       const normalizedLlmTurns = normalizeOptionalNonNegativeInt(rawMember.llmTurns);
@@ -1975,6 +1998,14 @@ export class SwarmStore implements ISwarmStore {
         },
       };
 
+      if (input.runMode !== undefined && !VALID_RUN_MODES.has(input.runMode)) {
+        throw new SwarmProtocolError(
+          "INVALID_INPUT",
+          `Invalid runMode "${String(input.runMode)}" for run "${runId}".`,
+          { runId, runMode: input.runMode },
+        );
+      }
+
       const initialPhase = normalizeOptionalNonEmptyString(input.phase);
       const initialMilestones = normalizeMilestones(input.milestones);
       const initialAssertions = normalizeAssertions(input.assertions, now);
@@ -1998,6 +2029,7 @@ export class SwarmStore implements ISwarmStore {
         ownerSessionId,
         ownerPid: input.ownerPid ?? process.pid,
         status: "active",
+        ...(input.runMode !== undefined ? { runMode: input.runMode } : {}),
         ...(initialPhase !== undefined ? { phase: initialPhase } : {}),
         ...(initialMilestones !== undefined
           ? { milestones: initialMilestones }
@@ -2093,6 +2125,7 @@ export class SwarmStore implements ISwarmStore {
             objective: state.objective,
             baseBranch: state.baseBranch,
             status: state.status,
+            ...(state.runMode !== undefined ? { runMode: state.runMode } : {}),
             memberCount: allMembers.length,
             workingCount,
             waitingCount,
@@ -2144,6 +2177,13 @@ export class SwarmStore implements ISwarmStore {
           { runId, status: patch.status },
         );
       }
+      if (patch.runMode !== undefined && !VALID_RUN_MODES.has(patch.runMode)) {
+        throw new SwarmProtocolError(
+          "INVALID_INPUT",
+          `Invalid runMode "${String(patch.runMode)}" for run "${runId}".`,
+          { runId, runMode: patch.runMode },
+        );
+      }
 
       const previousStatus = state.status;
       const previousTitle = state.title;
@@ -2189,6 +2229,9 @@ export class SwarmStore implements ISwarmStore {
       }
       if (patch.status !== undefined) {
         state.status = patch.status;
+      }
+      if (patch.runMode !== undefined) {
+        state.runMode = patch.runMode;
       }
       if (
         patch.maxConcurrency !== undefined &&
@@ -2456,6 +2499,7 @@ export class SwarmStore implements ISwarmStore {
         name,
         agentId,
         role: member.role,
+        ...(member.recon === true ? { recon: true } : {}),
         state: initialState,
         parentName,
         ...(member.groupPrefix !== undefined

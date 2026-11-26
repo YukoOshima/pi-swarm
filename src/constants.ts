@@ -35,6 +35,9 @@ export const ALL_SWARM_EXTENSION_TOOLS = [
   ...DRAFTING_TOOLS,
 ] as const;
 
+/** Tools active during Recon-in-Swarm drafting mode (exact same 7 already-registered tools). */
+export const RECON_SWARM_TOOLS = ALL_SWARM_EXTENSION_TOOLS;
+
 /** Tools active when no Swarm run or draft is in progress (`swarm{action:"status"}` stays accessible). */
 export const IDLE_SWARM_TOOLS = [SWARM_TOOL] as const;
 
@@ -134,6 +137,7 @@ export const VALIDATOR_BUILTIN_TOOLS = ["read", "grep", "find", "ls"] as const;
 export type DraftingToolName = (typeof DRAFTING_TOOLS)[number];
 export type SwarmCoreToolName = (typeof SWARM_CORE_TOOLS)[number];
 export type SwarmExtensionToolName = (typeof ALL_SWARM_EXTENSION_TOOLS)[number];
+export type ReconSwarmToolName = (typeof RECON_SWARM_TOOLS)[number];
 export type IdleSwarmToolName = (typeof IDLE_SWARM_TOOLS)[number];
 export type StandbySwarmToolName = (typeof STANDBY_SWARM_TOOLS)[number];
 export type WorkerBuiltinToolName = (typeof WORKER_BUILTIN_TOOLS)[number];

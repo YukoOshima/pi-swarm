@@ -18,6 +18,7 @@ import {
   HANDOFF_RESOLUTIONS,
   ORCHESTRATOR_NAME,
   POST_MESSAGE_TOOL,
+  PROPOSE_SWARM_PLAN_TOOL,
   READ_BOARD_TOOL,
   SWARM_ACTIONS,
   SWARM_CHANNEL_ACTIONS,
@@ -213,7 +214,7 @@ export const SwarmToolParamsSchema = Type.Object({
   role: Type.Optional(
     stringEnum(MEMBER_ROLES, {
       description:
-        'Member role for action="add": "worker" (default) or read-only "validator" (includes an isolated OS scratch directory for temporary builds/fixtures/mutation checks; never spawn a "worker" solely to run temporary verification builds).',
+        'Member role for action="add": "worker" (default; forced strictly read-only during recon planning mode) or read-only "validator" (continuous live peer reviewer during execution with an isolated OS scratch directory for temporary builds/fixtures/mutation checks; never spawn a "worker" solely to run temporary verification builds).',
       default: "worker",
     }),
   ),
@@ -704,8 +705,9 @@ async function runToolSafe(
 }
 
 export function formatRosterStatusText(status: SwarmRosterStatus): string {
+  const modePart = status.runMode === "recon" ? " | mode=recon" : "";
   const lines: string[] = [
-    `Swarm "${status.title}" (${status.runId}) | status=${status.status} | base=${status.baseBranch} | board=#${status.boardHead}`,
+    `Swarm "${status.title}" (${status.runId}) | status=${status.status}${modePart} | base=${status.baseBranch} | board=#${status.boardHead}`,
   ];
   if (status.channels.length > 0) {
     lines.push(
@@ -743,8 +745,9 @@ export function formatRosterStatusText(status: SwarmRosterStatus): string {
         : m.parkedOn
           ? ` — ${m.parkedOn}`
           : "";
+      const roleLabel = m.recon ? `${m.role}:recon` : m.role;
       lines.push(
-        `- @${m.name} (${m.role}) [${m.state}] ws=${ws}${cwd}${merged} parent=@${m.parentName}${model} turns=${m.turns}${lastPost}${parkBlocked}${info}`,
+        `- @${m.name} (${roleLabel}) [${m.state}] ws=${ws}${cwd}${merged} parent=@${m.parentName}${model} turns=${m.turns}${lastPost}${parkBlocked}${info}`,
       );
     }
   }
@@ -762,6 +765,7 @@ function snapshotToRosterStatus(snapshot: SwarmSnapshot): SwarmRosterStatus | nu
     .map((m) => ({
       name: m.name,
       role: m.role,
+      ...(m.recon === true ? { recon: true } : {}),
       state: m.state,
       parentName: m.parentName,
       groupPrefix: m.groupPrefix,
@@ -789,6 +793,7 @@ function snapshotToRosterStatus(snapshot: SwarmSnapshot): SwarmRosterStatus | nu
     runId: run.id,
     title: run.title,
     status: run.status,
+    ...(run.runMode !== undefined ? { runMode: run.runMode } : {}),
     baseBranch: run.baseBranch,
     boardHead: snapshot.boardHead,
     members,
@@ -835,7 +840,8 @@ function formatAddedMembers(members: readonly SwarmMemberRecord[]): string {
     const model = m.model ? ` model=${m.model}` : "";
     const fork = m.forkedFrom ? ` forkedFrom=@${m.forkedFrom}` : "";
     const seq = m.briefSeq ? ` brief=#${m.briefSeq}` : "";
-    lines.push(`- @${m.name} (${m.role}) ws=${ws}${cwd}${model}${fork}${seq} channels=[${m.channels.join(",")}]`);
+    const roleLabel = m.recon ? `${m.role}:recon` : m.role;
+    lines.push(`- @${m.name} (${roleLabel}) ws=${ws}${cwd}${model}${fork}${seq} channels=[${m.channels.join(",")}]`);
   }
   return lines.join("\n");
 }
@@ -1923,7 +1929,14 @@ export interface SwarmToolDeps {
     thinkingLevel?: ThinkingLevel,
     reason?: string,
   ) => Promise<SwitchModelResult | void> | SwitchModelResult | void;
+  /** Optional host callback that lazily creates and attaches a read-only `runMode: "recon"` run when drafting. */
+  ensureReconRun?: (ctx?: ExtensionContext) => Promise<SwarmRunState | null | void>;
+  /** Optional host callback indicating a Swarm draft is active (for clean `swarm{action:"status"}` when 0 recon workers exist). */
+  isDraftingRecon?: () => boolean;
 }
+
+/** Alias for `SwarmToolDeps` used by host extension wiring. */
+export type SwarmToolContext = SwarmToolDeps;
 
 export function createSwarmTool(deps: SwarmToolDeps): ToolDefinition {
   const getCallerRole = (): CallerRole => deps.getCallerRole?.() ?? "orchestrator";
@@ -1933,7 +1946,7 @@ export function createSwarmTool(deps: SwarmToolDeps): ToolDefinition {
     name: SWARM_TOOL,
     label: "Swarm",
     description:
-      'Manage the dynamic Pi Swarm & Mission Goal Engine: set run title/direction ("title"), spawn workers/validators/sharded groups ("add", defaulting to workspace="inherit" shared workspace with zero Git worktrees unless workspace="share"|"branch" is explicitly requested), inspect roster/channels ("status"), list models ("models"), hot-switch & resume a waiting member model ("model"), steer/redirect a member mid-flight ("steer"), stop a member ("stop"), permanently retire a member ("kill"), land a share/branch worktree ("merge"), manage channels ("channel"), manage dynamic Mission VAL-* assertions/features/handoffs/manifest or dispatch ready features ("mission"; dispatch_ready defaults to workspace="inherit" on disjoint filesOwned), or complete the run ("done").',
+      'Manage the dynamic Pi Swarm & Mission Goal Engine: set run title/direction ("title"), spawn read-only recon workers during planning or writable workers/continuous live validators/sharded groups during execution ("add", defaulting to workspace="inherit" shared workspace with zero Git worktrees unless workspace="share"|"branch" is explicitly requested), inspect roster/channels ("status"), list models ("models"), hot-switch & resume a waiting member model ("model"), steer/redirect a member mid-flight ("steer"), stop a member ("stop"), permanently retire a member ("kill"), land a share/branch worktree ("merge"), manage channels ("channel"), manage dynamic Mission VAL-* assertions/features/handoffs/manifest or dispatch ready features ("mission"; dispatch_ready defaults to workspace="inherit" on disjoint filesOwned), or complete the run ("done").',
     promptSnippet:
       "Manage dynamic swarm members, mission features/assertions/handoffs, steering, models, worktrees, channels, and run lifecycle.",
     promptGuidelines: [
@@ -2022,6 +2035,9 @@ export function createSwarmTool(deps: SwarmToolDeps): ToolDefinition {
                 'Both "name" and "brief" are required for swarm{action:"add"}.',
               );
             }
+            if (!deps.engine.getSnapshot().run && deps.ensureReconRun) {
+              await deps.ensureReconRun(ctx);
+            }
             const members = await deps.engine.addMembers({
               name,
               role: params.role,
@@ -2044,6 +2060,12 @@ export function createSwarmTool(deps: SwarmToolDeps): ToolDefinition {
             const snapshot = deps.engine.getSnapshot();
             const status = snapshotToRosterStatus(snapshot);
             if (!status) {
+              if (deps.isDraftingRecon?.()) {
+                return okResult(
+                  `Drafting/Recon ready (0 recon workers spawned). Spawn parallel read-only recon workers via \`${SWARM_TOOL}{action:"add"}\` or call \`${PROPOSE_SWARM_PLAN_TOOL}\` when ready.`,
+                  { activeRunId: null, runMode: "recon", drafting: true },
+                );
+              }
               return okResult(
                 "No active Swarm run. Start a Swarm run with `/swarm <goal>`.",
                 { activeRunId: null },
@@ -2288,6 +2310,9 @@ export function createSwarmTool(deps: SwarmToolDeps): ToolDefinition {
 
           case "channel": {
             const op = normalizeChannelAction(params.op);
+            if (op === "create" && !deps.engine.getSnapshot().run && deps.ensureReconRun) {
+              await deps.ensureReconRun(ctx);
+            }
             const result = await deps.engine.manageChannel({
               action: op,
               name: params.channel,
@@ -2342,6 +2367,13 @@ export function createSwarmTool(deps: SwarmToolDeps): ToolDefinition {
             }
 
             let snapshot = deps.engine.getSnapshot();
+            if (snapshot.run?.runMode === "recon") {
+              throw new SwarmProtocolError(
+                "INVALID_INPUT",
+                `Cannot complete Swarm run "${snapshot.run.id}" while in read-only recon mode. Propose and confirm the execution plan via ${PROPOSE_SWARM_PLAN_TOOL} first (or cancel via /swarm cancel).`,
+                { runId: snapshot.run.id, runMode: "recon" },
+              );
+            }
             if (!humanForce && snapshot.workingMemberNames.length > 0) {
               // Allow in-flight post-turn persistence (e.g. just-resolved turn flushing run.json) to settle briefly
               for (
@@ -2603,6 +2635,12 @@ export function createReadBoardTool(deps: SwarmToolDeps): ToolDefinition {
           const snapshot = deps.engine.getSnapshot();
           const status = snapshotToRosterStatus(snapshot);
           if (!status) {
+            if (deps.isDraftingRecon?.()) {
+              return okResult(
+                `Drafting/Recon ready (0 recon workers spawned). Spawn parallel read-only recon workers via \`${SWARM_TOOL}{action:"add"}\` or call \`${PROPOSE_SWARM_PLAN_TOOL}\` when ready.`,
+                { activeRunId: null, runMode: "recon", drafting: true },
+              );
+            }
             return okResult("No active Swarm run.", { activeRunId: null });
           }
           return okResult(formatRosterStatusText(status), status);

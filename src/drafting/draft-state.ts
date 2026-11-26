@@ -4,6 +4,7 @@ import {
   DEFAULT_SWARM_SETTINGS,
   DRAFTING_TOOLS,
   IDLE_SWARM_TOOLS,
+  RECON_SWARM_TOOLS,
   STANDBY_SWARM_TOOLS,
   SWARM_CORE_TOOLS,
   SWARM_DRAFT_ENTRY,
@@ -16,7 +17,12 @@ import type { ActiveSwarmDraft, SwarmDraftMode, SwarmSettings } from "../types.j
 // Types
 // ============================================================================
 
-export type SwarmToolProfileMode = "idle" | "drafting" | "running" | "standby";
+export type SwarmToolProfileMode =
+  | "idle"
+  | "drafting"
+  | "recon"
+  | "running"
+  | "standby";
 
 /**
  * Branch-local durable Swarm draft state persisted via `pi.appendEntry` (`version: 2`).
@@ -27,6 +33,7 @@ export interface StartDraftOptions {
   mode?: SwarmDraftMode;
   seed: string;
   targetRunId?: string;
+  reconRunId?: string;
   validatorEnabled?: boolean;
   maxConcurrency?: number;
   baseBranch?: string;
@@ -67,12 +74,14 @@ export type DraftPersistenceAPI = Pick<
 // Tool Profile Swap (Idempotent — Preserves Host & Third-Party Tools)
 // ============================================================================
 
-export { IDLE_SWARM_TOOLS, STANDBY_SWARM_TOOLS };
+export { IDLE_SWARM_TOOLS, RECON_SWARM_TOOLS, STANDBY_SWARM_TOOLS };
 
 export function getSwarmToolsForMode(mode: SwarmToolProfileMode): readonly string[] {
   switch (mode) {
     case "drafting":
       return DRAFTING_TOOLS;
+    case "recon":
+      return RECON_SWARM_TOOLS;
     case "running":
       return SWARM_CORE_TOOLS;
     case "standby":
@@ -89,6 +98,7 @@ export function getSwarmToolsForMode(mode: SwarmToolProfileMode): readonly strin
  *
  * - `"idle"`     -> `IDLE_SWARM_TOOLS` (`["swarm"]`)
  * - `"drafting"` -> `DRAFTING_TOOLS` (`["swarm_question", "swarm_questionnaire", "propose_swarm_plan"]`)
+ * - `"recon"`    -> `RECON_SWARM_TOOLS` (all 7 `ALL_SWARM_EXTENSION_TOOLS`: 4 core + 3 drafting)
  * - `"running"`  -> `SWARM_CORE_TOOLS` (`["swarm", "post_message", "read_board", "swarm_wait"]`)
  * - `"standby"`  -> `STANDBY_SWARM_TOOLS` (`["swarm", "read_board", "swarm_question", "swarm_questionnaire", "propose_swarm_plan"]`)
  *
@@ -169,6 +179,9 @@ function cloneDraft(draft: SwarmDraftState): SwarmDraftState {
   if (draft.targetRunId !== undefined) {
     cloned.targetRunId = draft.targetRunId;
   }
+  if (draft.reconRunId !== undefined) {
+    cloned.reconRunId = draft.reconRunId;
+  }
   if (draft.baseBranch !== undefined) {
     cloned.baseBranch = draft.baseBranch;
   }
@@ -205,6 +218,7 @@ function isSwarmDraftState(value: unknown): value is SwarmDraftState {
     typeof obj.maxConcurrency === "number" &&
     Number.isFinite(obj.maxConcurrency) &&
     (obj.targetRunId === undefined || typeof obj.targetRunId === "string") &&
+    (obj.reconRunId === undefined || typeof obj.reconRunId === "string") &&
     (obj.baseBranch === undefined || typeof obj.baseBranch === "string") &&
     (obj.autoConfirm === undefined || typeof obj.autoConfirm === "boolean") &&
     (obj.skipContractReview === undefined ||
@@ -300,6 +314,9 @@ export function startDraft(
   if (options.targetRunId?.trim()) {
     draft.targetRunId = options.targetRunId.trim();
   }
+  if (options.reconRunId?.trim()) {
+    draft.reconRunId = options.reconRunId.trim();
+  }
   const resolvedBaseBranch =
     options.baseBranch?.trim() || opts?.defaultBaseBranch?.trim();
   if (resolvedBaseBranch) {
@@ -359,6 +376,15 @@ export function updateDraft(
       ? { skipContractReview: patch.skipContractReview }
       : {}),
   };
+
+  if (patch.reconRunId !== undefined) {
+    const trimmedReconId = patch.reconRunId.trim();
+    if (trimmedReconId) {
+      next.reconRunId = trimmedReconId;
+    } else {
+      delete next.reconRunId;
+    }
+  }
 
   const cleanedEcho = cloneEcho(mergedEcho);
   if (cleanedEcho) {
@@ -517,6 +543,9 @@ export async function startOrResolveDraft(
       }
       if (options.baseBranch !== undefined && options.baseBranch.trim()) {
         patch.baseBranch = options.baseBranch.trim();
+      }
+      if (options.reconRunId !== undefined && options.reconRunId.trim()) {
+        patch.reconRunId = options.reconRunId.trim();
       }
       if (options.autoConfirm !== undefined) {
         patch.autoConfirm = options.autoConfirm;
