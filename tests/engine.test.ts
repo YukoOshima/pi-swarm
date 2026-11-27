@@ -13251,5 +13251,693 @@ describe("Wave 2a: Fluid Live Validator Continuous Teammate Mechanics", () => {
   });
 });
 
+// ============================================================================
+// Goldilocks Calibration: Barrier Wait, Sandwich Wakeup Suppression,
+// Batch verify_assertion, Recon Ghost Retirement, filesOwned & Validator Pre-Check
+// ============================================================================
+
+describe("Goldilocks Calibration: SwarmEngine De-Bloat & Safety Guardrails", () => {
+  it("1. swarm_wait barrier mode (wait_for_all) auto-defaults to true in recon mode, suppresses intermediate posts until all settle, and wakes immediately on [blocker]/[error]/[NEEDS_HUMAN] or member turn error", async () => {
+    const store = new MockSwarmStore();
+    const worktree = new MockWorktreeManager();
+    const transport = new ScriptedTransport();
+
+    let releaseScout2!: () => void;
+    const scout2Gate = new Promise<void>((r) => {
+      releaseScout2 = r;
+    });
+
+    transport.onMember("scout-1", async ({ request }) => {
+      await request.engineApi?.postMessage({
+        text: "@orchestrator [done] Scout 1 traced auth module.",
+      });
+      return { outcome: "waiting", summary: "scout-1 done" };
+    });
+    transport.onMember("scout-2", async ({ request }) => {
+      await scout2Gate;
+      await request.engineApi?.postMessage({
+        text: "@orchestrator [done] Scout 2 traced billing module.",
+      });
+      return { outcome: "waiting", summary: "scout-2 done" };
+    });
+
+    const engine = new SwarmEngine({
+      store,
+      worktree,
+      transport,
+      scratchRoot: nextTestScratchRoot("gold-barrier-recon"),
+      settings: { keepWorkersWarm: true, stallWatchdogEnabled: false },
+    });
+
+    const wakeEvents: SwarmEngineEvent[] = [];
+    engine.subscribe((ev) => {
+      if (ev.type === "wakeup_needed") wakeEvents.push(ev);
+    });
+
+    try {
+      const reconRun = await store.createRun({
+        id: "run-barrier-recon",
+        title: "Recon Barrier Test",
+        objective: "Parallel recon barrier consolidation",
+        baseBranch: "main",
+        ownerSessionId: "sess-barrier-1",
+        runMode: "recon",
+        phase: "recon",
+      });
+      await engine.startRun(reconRun.id);
+
+      await engine.addMembers({ name: "scout-1", brief: "Trace auth" });
+      await engine.addMembers({ name: "scout-2", brief: "Trace billing" });
+      const briefHead = engine.getSnapshot().boardHead;
+
+      // Wait for scout-1 to finish & post BEFORE/WHILE scout-2 is still working:
+      // In recon mode, omitting waitForAll defaults waitForAll = true and STILL parks because scout-2 is active!
+      await waitUntil(
+        () => engine.getSnapshot().run?.members["scout-1"]?.state === "waiting",
+      );
+      wakeEvents.length = 0;
+
+      const parkedRecon = await engine.parkOrchestratorWait({ since: briefHead });
+      assert.equal(parkedRecon.parked, true, "Recon wait must default to waitForAll=true while scout-2 is working");
+      assert.equal(parkedRecon.waitForAll, true);
+      assert.deepEqual(parkedRecon.activeMembers, ["scout-2"]);
+
+      // Normal chat post while scout-2 is still working must NOT wake orchestrator
+      await engine.postMessage({
+        from: "scout-1",
+        fromRole: "worker",
+        text: "@orchestrator Additional note from scout-1.",
+      });
+      assert.equal(wakeEvents.length, 0, "Intermediate normal post must be suppressed in waitForAll mode");
+
+      // Release scout-2 -> when scout-2 settles, ONE consolidated wakeup_needed fires with ALL unread posts!
+      releaseScout2();
+      await waitUntil(() => wakeEvents.length === 1);
+      assert.equal(wakeEvents.length, 1);
+      const consolidatedSeqs = (wakeEvents[0]!.messages ?? []).map((m) => m.from);
+      assert.ok(consolidatedSeqs.includes("scout-1"));
+      assert.ok(consolidatedSeqs.includes("scout-2"));
+
+      // Urgent [blocker] / [NEEDS_HUMAN] and member turn errors MUST wake immediately even when sibling is still working!
+      await engine.promoteReconRun(reconRun.id, {
+        title: "Exec Barrier Urgent",
+        objective: "Urgent bypass check",
+        baseBranch: "main",
+        maxConcurrency: 4,
+        validatorEnabled: false,
+      });
+      await engine.retireReconMembers(reconRun.id);
+
+      let releaseSlowWorker!: () => void;
+      const slowGate = new Promise<void>((r) => {
+        releaseSlowWorker = r;
+      });
+      transport.onMember("slow-w", async () => {
+        await slowGate;
+        return { outcome: "waiting", summary: "slow done" };
+      });
+      transport.onMember("err-w", async () => {
+        return {
+          outcome: "failed",
+          summary: "Provider crashed",
+          error: "Simulated provider failure",
+          stopReason: "error",
+        };
+      });
+
+      await engine.addMembers({ name: "slow-w", brief: "Long running slice" });
+      const execHead = engine.getSnapshot().boardHead;
+      wakeEvents.length = 0;
+
+      const parkedExec = await engine.parkOrchestratorWait({
+        since: execHead,
+        waitForAll: true,
+      });
+      assert.equal(parkedExec.parked, true);
+      assert.equal(parkedExec.waitForAll, true);
+
+      // Urgent [blocker] post wakes immediately while slow-w is still working
+      await engine.postMessage({
+        from: "slow-w",
+        fromRole: "worker",
+        text: "@orchestrator [blocker] Missing Redis port configuration",
+      });
+      assert.equal(wakeEvents.length, 1, "[blocker] must bypass waitForAll barrier immediately");
+
+      // Re-arm waitForAll and verify member turn error also wakes immediately while slow-w is working
+      const headAfterBlocker = engine.getSnapshot().boardHead;
+      wakeEvents.length = 0;
+      const parkedBeforeErr = await engine.parkOrchestratorWait({
+        since: headAfterBlocker,
+        waitForAll: true,
+      });
+      assert.equal(parkedBeforeErr.parked, true);
+
+      await engine.addMembers({ name: "err-w", brief: "Will error" });
+      await waitUntil(() => wakeEvents.length >= 1);
+      assert.match(wakeEvents[0]!.summary, /\[error\]/);
+
+      releaseSlowWorker();
+      await waitUntil(
+        () => engine.getSnapshot().run?.members["slow-w"]?.state === "waiting",
+      );
+    } finally {
+      await engine.dispose();
+    }
+  });
+
+  it("2. suppresses premature sandwich @orchestrator wakeup when worker [done] auto-triggers @validator (with 0 DAG-ready pending features), while waking peers & waking normally when validatorEnabled=false or debt exists", async () => {
+    const store = new MockSwarmStore();
+    const worktree = new MockWorktreeManager();
+    const transport = new ScriptedTransport();
+
+    let releaseValidator!: () => void;
+    const validatorGate = new Promise<void>((r) => {
+      releaseValidator = r;
+    });
+    let peerHelperWoken = 0;
+
+    transport.onMember("helper-peer", async ({ turnIndex }) => {
+      if (turnIndex > 1) peerHelperWoken += 1;
+      return { outcome: "waiting", summary: "helper ready" };
+    });
+
+    transport.onMember("impl-1", async ({ request }) => {
+      await request.engineApi?.postMessage({
+        text: "@helper-peer @orchestrator [done] Implemented feat-sandwich.",
+        featureId: "feat-sandwich",
+        verificationEvidence: "npm test passed (12/12)",
+      });
+      return { outcome: "waiting", summary: "impl-1 done" };
+    });
+
+    transport.onMember("validator", async ({ request }) => {
+      await validatorGate;
+      await request.engineApi?.manageMission?.({
+        op: "verify_assertion",
+        assertionIds: ["VAL-SW-001"],
+        assertionStatus: "passed",
+        evidence: "Verified feat-sandwich end-to-end (12/12 passing)",
+      });
+      await request.engineApi?.postMessage({
+        text: "@orchestrator [done] Milestone M1 verified and sealed.",
+      });
+      return { outcome: "waiting", summary: "validator done" };
+    });
+
+    const engine = new SwarmEngine({
+      store,
+      worktree,
+      transport,
+      scratchRoot: nextTestScratchRoot("gold-sandwich"),
+      settings: { keepWorkersWarm: true, stallWatchdogEnabled: false },
+    });
+
+    const wakeEvents: SwarmEngineEvent[] = [];
+    engine.subscribe((ev) => {
+      if (ev.type === "wakeup_needed") wakeEvents.push(ev);
+    });
+
+    try {
+      const run = await store.createRun({
+        id: "run-sandwich-1",
+        title: "Zero Sandwich Wakeup",
+        objective: "Sleep cleanly through worker -> auto-validator handoff",
+        baseBranch: "main",
+        ownerSessionId: "sess-sw-1",
+        validatorEnabled: true,
+        milestones: [{ label: "M1", status: "in_progress" }],
+        assertions: [
+          {
+            id: "VAL-SW-001",
+            title: "Feature works",
+            description: "Passes tests",
+            status: "pending",
+            updatedAt: new Date().toISOString(),
+          },
+        ],
+        features: [
+          {
+            id: "feat-sandwich",
+            title: "Sandwich Feature",
+            description: "Single feature milestone",
+            milestone: "M1",
+            filesOwned: ["src/sw.ts"],
+            fulfills: ["VAL-SW-001"],
+            status: "in_progress",
+            assignedMember: "impl-1",
+            updatedAt: new Date().toISOString(),
+          },
+        ],
+      });
+      await engine.startRun(run.id);
+
+      await engine.addMembers({ name: "helper-peer", brief: "Stand by" });
+      await waitUntil(
+        () => engine.getSnapshot().run?.members["helper-peer"]?.state === "waiting",
+      );
+
+      let releaseImplStart!: () => void;
+      const implStartGate = new Promise<void>((r) => {
+        releaseImplStart = r;
+      });
+      transport.onMember("impl-1", async ({ request }) => {
+        await implStartGate;
+        await request.engineApi?.postMessage({
+          text: "@helper-peer @orchestrator [done] Implemented feat-sandwich.",
+          featureId: "feat-sandwich",
+          verificationEvidence: "npm test passed (12/12)",
+        });
+        return { outcome: "waiting", summary: "impl-1 done" };
+      });
+
+      await engine.addMembers({ name: "impl-1", brief: "Implement feat-sandwich" });
+      const headAfterAdd = engine.getSnapshot().boardHead;
+      wakeEvents.length = 0;
+
+      const parked = await engine.parkOrchestratorWait({
+        since: headAfterAdd,
+        mentionsOnly: true,
+      });
+      assert.equal(parked.parked, true);
+
+      // Let impl-1 complete and post @helper-peer @orchestrator [done] -> auto-spawns @validator!
+      releaseImplStart();
+      await waitUntil(() =>
+        Boolean(engine.getSnapshot().run?.members["validator"]),
+      );
+      await waitUntil(() => peerHelperWoken === 1);
+
+      // Non-orchestrator peer woke immediately, @validator auto-spawned, AND @orchestrator did NOT get a premature sandwich wakeup!
+      assert.equal(peerHelperWoken, 1);
+      assert.equal(
+        wakeEvents.length,
+        0,
+        "Premature @orchestrator wakeup must be suppressed while auto-spawned @validator audits milestone",
+      );
+
+      // Once @validator finishes and posts @orchestrator [done], @orchestrator wakes ONCE with full history!
+      releaseValidator();
+      await waitUntil(() => wakeEvents.length === 1);
+      assert.equal(wakeEvents.length, 1);
+      assert.equal(
+        engine.getSnapshot().run?.milestones?.find((m) => m.label === "M1")?.sealed,
+        true,
+      );
+
+      // When validatorEnabled is false, @orchestrator wakes immediately on worker [done] as usual
+      const runNoVal = await store.createRun({
+        id: "run-sandwich-noval",
+        title: "No Validator Run",
+        objective: "Wake directly when validatorEnabled=false",
+        baseBranch: "main",
+        ownerSessionId: "sess-sw-2",
+        validatorEnabled: false,
+        milestones: [{ label: "M1", status: "in_progress" }],
+        features: [
+          {
+            id: "feat-nv",
+            title: "NV Feature",
+            description: "Direct wake",
+            milestone: "M1",
+            fulfills: [],
+            status: "in_progress",
+            assignedMember: "nv-worker",
+            updatedAt: new Date().toISOString(),
+          },
+        ],
+      });
+      await engine.startRun(runNoVal.id);
+      transport.onMember("nv-worker", async () => ({
+        outcome: "waiting",
+        summary: "standing by",
+      }));
+      await engine.addMembers({ name: "nv-worker", brief: "Build feat-nv" });
+      await waitUntil(
+        () => engine.getSnapshot().run?.members["nv-worker"]?.state === "waiting",
+      );
+      wakeEvents.length = 0;
+      await engine.postMessage({
+        from: "nv-worker",
+        fromRole: "worker",
+        text: "@orchestrator [done] Finished feat-nv.",
+        featureId: "feat-nv",
+        verificationEvidence: "npm test passed (5/5)",
+      });
+      assert.equal(wakeEvents.length, 1, "Must wake @orchestrator normally when validatorEnabled=false");
+    } finally {
+      await engine.dispose();
+    }
+  });
+
+  it("3. supports atomic batch verify_assertion (assertion_ids + assertion_id deduplicated in 1 store.updateRun write) and enforces validator [done] pre-check", async () => {
+    const store = new MockSwarmStore();
+    const worktree = new MockWorktreeManager();
+    const transport = new ScriptedTransport();
+
+    transport.onMember("val-batch", async () => ({
+      outcome: "waiting",
+      summary: "ready",
+    }));
+    transport.onMember("dev-1", async () => ({
+      outcome: "waiting",
+      summary: "ready",
+    }));
+
+    const engine = new SwarmEngine({
+      store,
+      worktree,
+      transport,
+      scratchRoot: nextTestScratchRoot("gold-batch-val"),
+      settings: { keepWorkersWarm: true, stallWatchdogEnabled: false },
+    });
+
+    try {
+      const now = new Date().toISOString();
+      const run = await store.createRun({
+        id: "run-batch-val",
+        title: "Batch Verify & Validator Pre-Check",
+        objective: "Test atomic batch verification and validator [done] guard",
+        baseBranch: "main",
+        ownerSessionId: "sess-bv-1",
+        validatorEnabled: true,
+        milestones: [{ label: "M1", status: "in_progress" }],
+        assertions: [
+          {
+            id: "VAL-BV-001",
+            title: "First assertion",
+            description: "Check 1",
+            status: "pending",
+            updatedAt: now,
+          },
+          {
+            id: "VAL-BV-002",
+            title: "Second assertion",
+            description: "Check 2",
+            status: "pending",
+            updatedAt: now,
+          },
+          {
+            id: "VAL-BV-003",
+            title: "Third assertion",
+            description: "Check 3",
+            status: "pending",
+            updatedAt: now,
+          },
+        ],
+        features: [
+          {
+            id: "feat-bv",
+            title: "Batch Feature",
+            description: "Implements all 3 assertions",
+            milestone: "M1",
+            fulfills: ["VAL-BV-001", "VAL-BV-002", "VAL-BV-003"],
+            status: "completed",
+            assignedMember: "dev-1",
+            updatedAt: now,
+          },
+        ],
+      });
+      await engine.startRun(run.id);
+      await engine.addMembers({ name: "dev-1", role: "worker", brief: "Author" });
+      await engine.addMembers({
+        name: "val-batch",
+        role: "validator",
+        brief: "Audit M1",
+      });
+      await waitUntil(
+        () =>
+          engine.getSnapshot().run?.members["val-batch"]?.state === "waiting" &&
+          engine.getSnapshot().run?.members["dev-1"]?.state === "waiting",
+      );
+
+      // (A) Validator [done] pre-check: rejects @orchestrator [done] while completed feature assertions are ALL pending!
+      await assert.rejects(
+        () =>
+          engine.postMessage({
+            from: "val-batch",
+            fromRole: "validator",
+            text: "@orchestrator [done] Tests passed, forgot to call verify_assertion!",
+          }),
+        (err: unknown) =>
+          err instanceof SwarmProtocolError &&
+          err.code === "INVALID_INPUT" &&
+          err.message.includes("verify_assertion") &&
+          err.message.includes("VAL-BV-001"),
+      );
+
+      // (B) Validator defect bounce to @dev-1 and [blocker]/[NEEDS_HUMAN] posts are NOT blocked!
+      const bounceMsg = await engine.postMessage({
+        from: "val-batch",
+        fromRole: "validator",
+        text: "@dev-1 [done] Found edge-case bug in handler; please fix.",
+      });
+      assert.ok(bounceMsg.seq > 0);
+
+      const blockerMsg = await engine.postMessage({
+        from: "val-batch",
+        fromRole: "validator",
+        text: "@orchestrator [done] [blocker] Port 5432 unavailable in test sandbox.",
+      });
+      assert.ok(blockerMsg.seq > 0);
+
+      // (C) Unknown ID in assertion_ids rejects with NOT_FOUND and performs 0 partial writes
+      let updateRunCalls = 0;
+      const origUpdateRun = store.updateRun.bind(store);
+      store.updateRun = async (rId, patch) => {
+        updateRunCalls += 1;
+        return origUpdateRun(rId, patch);
+      };
+
+      await assert.rejects(
+        () =>
+          engine.manageMission({
+            op: "verify_assertion",
+            assertionIds: ["VAL-BV-001", "VAL-UNKNOWN-999"],
+            assertionStatus: "passed",
+            evidence: "npm test passed",
+            callerName: "val-batch",
+            callerRole: "validator",
+          }),
+        (err: unknown) =>
+          err instanceof SwarmProtocolError && err.code === "NOT_FOUND",
+      );
+      assert.equal(updateRunCalls, 0, "Failed batch verify_assertion must not partially write");
+
+      // (D) Valid batch verify_assertion (combining assertionId + assertionIds with duplicate) writes atomically in ONE store.updateRun call and seals M1!
+      const batchRes = await engine.manageMission({
+        op: "verify_assertion",
+        assertionId: "VAL-BV-001",
+        assertionIds: ["VAL-BV-001", "VAL-BV-002", "VAL-BV-003"],
+        assertionStatus: "passed",
+        evidence: "npm run typecheck && npm test passed (30/30)",
+        callerName: "val-batch",
+        callerRole: "validator",
+      });
+      assert.equal(updateRunCalls, 1, "Batch verify_assertion must execute in 1 atomic store.updateRun write");
+      assert.equal(
+        batchRes.assertions?.every((a) => a.status === "passed"),
+        true,
+      );
+      assert.equal(
+        batchRes.milestones?.find((m) => m.label === "M1")?.sealed,
+        true,
+      );
+
+      // (E) Now @orchestrator [done] from validator succeeds cleanly!
+      const finalValDone = await engine.postMessage({
+        from: "val-batch",
+        fromRole: "validator",
+        text: "@orchestrator [done] Verified all 3 VAL-* assertions and sealed M1.",
+      });
+      assert.ok(finalValDone.seq > 0);
+    } finally {
+      await engine.dispose();
+    }
+  });
+
+  it("4. retires recon ghosts cleanly via retireReconMembers and excludes unretired recon ghosts from @all, #channel, waitingMemberNames, and stall watchdog during execution", async () => {
+    const store = new MockSwarmStore();
+    const worktree = new MockWorktreeManager();
+    const transport = new ScriptedTransport();
+
+    let scoutWakes = 0;
+    let execWorkerWakes = 0;
+    const spawnedRequests: SpawnMemberRequest[] = [];
+    const origSpawn = transport.spawnMember.bind(transport);
+    transport.spawnMember = async (req) => {
+      spawnedRequests.push(req);
+      return origSpawn(req);
+    };
+
+    transport.onMember("scout-ghost", async ({ turnIndex }) => {
+      if (turnIndex > 1) scoutWakes += 1;
+      return { outcome: "waiting", summary: "scout parked" };
+    });
+    transport.onMember("exec-author", async ({ turnIndex }) => {
+      if (turnIndex > 1) execWorkerWakes += 1;
+      return { outcome: "waiting", summary: "author parked" };
+    });
+
+    const engine = new SwarmEngine({
+      store,
+      worktree,
+      transport,
+      scratchRoot: nextTestScratchRoot("gold-recon-ghosts"),
+      settings: {
+        keepWorkersWarm: true,
+        stallWatchdogEnabled: true,
+        stallTimeoutMs: 30,
+      },
+    });
+
+    try {
+      const reconRun = await store.createRun({
+        id: "run-ghosts-1",
+        title: "Recon Ghosts Elimination",
+        objective: "Prevent recon ghosts from waking or stalling execution",
+        baseBranch: "main",
+        ownerSessionId: "sess-ghosts-1",
+        runMode: "recon",
+        phase: "recon",
+      });
+      await engine.startRun(reconRun.id);
+      await engine.manageChannel({ action: "create", name: "backend" });
+      await engine.addMembers({
+        name: "scout-ghost",
+        brief: "Recon backend",
+        channels: ["backend"],
+      });
+      await waitUntil(
+        () => engine.getSnapshot().run?.members["scout-ghost"]?.state === "waiting",
+      );
+      assert.deepEqual(engine.getSnapshot().waitingMemberNames, ["scout-ghost"]);
+
+      // Promote to executing WITHOUT retiring yet -> test defensive exclusions!
+      const now = new Date().toISOString();
+      await engine.promoteReconRun(reconRun.id, {
+        title: "Executing Run",
+        objective: "Build backend & ui",
+        baseBranch: "main",
+        maxConcurrency: 4,
+        validatorEnabled: false,
+        features: [
+          {
+            id: "feat-backend",
+            title: "Backend Slice",
+            description: "Edit backend",
+            milestone: "M1",
+            filesOwned: ["src/backend/**"],
+            fulfills: [],
+            status: "in_progress",
+            assignedMember: "exec-author",
+            updatedAt: now,
+          },
+          {
+            id: "feat-ui",
+            title: "UI Slice",
+            description: "Edit UI",
+            milestone: "M1",
+            filesOwned: ["src/ui/**"],
+            fulfills: [],
+            status: "pending",
+            assignedMember: "ui-author",
+            updatedAt: now,
+          },
+        ],
+      });
+
+      // Even before retireReconMembers, scout-ghost is excluded from execution waitingMemberNames AND stall watchdog!
+      assert.deepEqual(engine.getSnapshot().waitingMemberNames, []);
+      const headAfterPromote = engine.getSnapshot().boardHead;
+      await delay(80);
+      assert.equal(
+        engine.getSnapshot().boardHead,
+        headAfterPromote,
+        "Unretired recon ghost alone must NOT trigger execution stall watchdog",
+      );
+
+      // Spawn execution author (also verifies SpawnMemberRequest receives filesOwned & peerFilesOwned!)
+      await engine.addMembers({
+        name: "exec-author",
+        brief: "Implement feat-backend",
+        channels: ["backend"],
+        fork: "scout-ghost",
+      });
+      await waitUntil(
+        () => engine.getSnapshot().run?.members["exec-author"]?.state === "waiting",
+      );
+      const execReq = spawnedRequests.find((r) => r.name === "exec-author");
+      assert.deepEqual(execReq?.filesOwned, ["src/backend/**"]);
+      assert.deepEqual(execReq?.peerFilesOwned, { "ui-author": ["src/ui/**"] });
+
+      // Live getFilesOwnedScope reflects upsert_features updates dynamically!
+      await engine.manageMission({
+        op: "upsert_features",
+        features: [
+          {
+            id: "feat-backend",
+            title: "Backend Slice",
+            description: "Edit backend + shared config",
+            milestone: "M1",
+            filesOwned: ["src/backend/**", "src/config.ts"],
+            fulfills: [],
+            status: "in_progress",
+            assignedMember: "exec-author",
+          },
+        ],
+      });
+      assert.deepEqual(execReq?.engineApi?.getFilesOwnedScope?.().filesOwned, [
+        "src/backend/**",
+        "src/config.ts",
+      ]);
+
+      // @all and @#backend broadcasts wake exec-author ONLY, NEVER unretired scout-ghost!
+      await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        text: "@all Global architecture rule update.",
+      });
+      await waitUntil(() => execWorkerWakes === 1);
+      await waitUntil(
+        () => engine.getSnapshot().run?.members["exec-author"]?.state === "waiting",
+      );
+      assert.equal(scoutWakes, 0, "@all must NOT wake recon:true member in executing mode");
+
+      await engine.postMessage({
+        from: ORCHESTRATOR_NAME,
+        fromRole: "orchestrator",
+        channel: "backend",
+        text: "@#backend Channel broadcast update.",
+      });
+      await waitUntil(() => execWorkerWakes === 2);
+      await waitUntil(
+        () => engine.getSnapshot().run?.members["exec-author"]?.state === "waiting",
+      );
+      assert.equal(scoutWakes, 0, "@#channel must NOT wake recon:true member in executing mode");
+
+      // Now call retireReconMembers -> marks scout-ghost killed with endedAt and 0 noisy board posts!
+      const headBeforeRetire = engine.getSnapshot().boardHead;
+      const retired = await engine.retireReconMembers(reconRun.id);
+      assert.deepEqual(retired, ["scout-ghost"]);
+      assert.equal(
+        engine.getSnapshot().boardHead,
+        headBeforeRetire,
+        "retireReconMembers must NOT post noisy board messages",
+      );
+      const ghostAfter = engine.getSnapshot().run?.members["scout-ghost"];
+      assert.equal(ghostAfter?.state, "killed");
+      assert.ok(ghostAfter?.endedAt);
+
+      // Idempotent second call returns []
+      const retiredAgain = await engine.retireReconMembers(reconRun.id);
+      assert.deepEqual(retiredAgain, []);
+    } finally {
+      await engine.dispose();
+    }
+  });
+});
+
+
 
 

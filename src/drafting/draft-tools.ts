@@ -301,7 +301,7 @@ export const MissionFeatureProposalSchema = Type.Object({
   files_owned: Type.Optional(
     Type.Array(Type.String(), {
       description:
-        "Optional disjoint file or directory paths owned by this feature so parallel workers (default workspace: 'inherit' in the shared repo, or opt-in 'share' worktrees) never collide on the same file.",
+        "Disjoint file or directory paths owned by this feature — required on concurrent parallel same-milestone features without depends_on ordering so parallel workers (default workspace: 'inherit' in the shared repo, or opt-in 'share' worktrees) never collide on the same file; optional for single-feature milestones or depends_on-sequenced features.",
     }),
   ),
   preconditions: Type.Optional(
@@ -325,7 +325,7 @@ export const MissionFeatureProposalSchema = Type.Object({
   fulfills: Type.Optional(
     Type.Array(Type.String(), {
       description:
-        "Validation assertion IDs (VAL-*) claimed and fulfilled by this feature (100% of assertions must be claimed; each VAL-* ID must be claimed by a single feature).",
+        "Validation assertion IDs (VAL-*) claimed and fulfilled by this feature (100% of assertions must be claimed; each standard VAL-* leaf ID must be claimed 1-to-1 by a single feature, while cross-cutting VAL-CROSS-* IDs may be claimed by 1 or multiple participating features).",
     }),
   ),
 });
@@ -420,12 +420,12 @@ export const ProposeSwarmPlanParamsSchema = Type.Object({
   assertions: Type.Array(MissionAssertionProposalSchema, {
     minItems: 1,
     description:
-      "Mandatory contract-first validation assertions (e.g. VAL-AUTH-001, plus VAL-CROSS-* for cross-feature integration) defining concrete testable behaviors and required evidence (minItems: 1). Features must claim 100% of assertions via fulfills.",
+      "Mandatory contract-first validation assertions (e.g. VAL-AUTH-001 1-to-1 leaf assertions, plus VAL-CROSS-* cross-cutting integration assertions claimable by 1 or multiple participating features) defining concrete testable behaviors and required evidence (minItems: 1). Features must claim 100% of assertions via fulfills.",
   }),
   features: Type.Array(MissionFeatureProposalSchema, {
     minItems: 1,
     description:
-      "Mandatory ordered vertical features grouped by milestone with acyclic depends_on, disjoint files_owned for parallel workers (workspace: 'inherit' default; 'share' opt-in only for overlapping concurrent edits), and 1-to-1 fulfills coverage of assertions (minItems: 1).",
+      "Mandatory ordered vertical features grouped by milestone with acyclic depends_on, disjoint files_owned required on concurrent parallel same-milestone features (workspace: 'inherit' default; 'share' opt-in only for overlapping concurrent edits), and 100% fulfills coverage of assertions (1-to-1 for standard VAL-* leaf IDs; 1 or multiple participating features for VAL-CROSS-*; minItems: 1).",
   }),
   commands: Type.Optional(
     Type.Array(MissionCommandProposalSchema, {
@@ -448,7 +448,7 @@ export const ProposeSwarmPlanParamsSchema = Type.Object({
   skip_contract_review: Type.Optional(
     Type.Boolean({
       description:
-        "Optional fast-path flag to bypass the adversarial contract reviewer LLM pass for small or focused plans while keeping 0ms local contract validation active.",
+        "Optional fast-path flag (recommended: true for straightforward localized 1–4 file / <= 2 feature edits) to bypass the adversarial contract reviewer LLM pass while keeping 0ms local contract validation active.",
     }),
   ),
 });
@@ -598,6 +598,12 @@ function isValidWorkspaceMode(value: unknown): value is SwarmWorkspaceMode {
 
 function isReservedMemberName(name: string): name is ReservedMemberName {
   return (RESERVED_MEMBER_NAMES as readonly string[]).includes(name);
+}
+
+const CROSS_CUTTING_ASSERTION_ID_PATTERN = /^VAL-CROSS-/i;
+
+function isCrossCuttingAssertionId(id: string): boolean {
+  return CROSS_CUTTING_ASSERTION_ID_PATTERN.test(id.trim());
 }
 
 export interface ValidateProposedSwarmPlanOptions {
@@ -1002,12 +1008,12 @@ export function mergeTweakedMissionContract(
     }
 
     // Carry forward omitted already-completed features; reject contradictory VAL-* reclaims
-    // rather than silently dropping completed history or creating duplicate assertion ownership.
+    // on 1-to-1 leaf assertions (while allowing cross-cutting VAL-CROSS-* assertions to be shared).
     for (const prev of existingRun.features ?? []) {
       if (prev.status === "completed" && !incomingFeatureIds.has(prev.id)) {
         for (const valId of prev.fulfills ?? []) {
           const reclaimingFeatureId = incomingClaimOwner.get(valId);
-          if (reclaimingFeatureId) {
+          if (reclaimingFeatureId && !isCrossCuttingAssertionId(valId)) {
             throw new SwarmProtocolError(
               "INVALID_INPUT",
               `Feature "${reclaimingFeatureId}" cannot reclaim assertion "${valId}" already fulfilled by completed feature "${prev.id}" — keep "${prev.id}" in features or define a new assertion ID instead.`,
@@ -1316,11 +1322,44 @@ function ownedPathEntriesCollide(
   );
 }
 
+function collectIsolatedWorkspaceFeatureIds(
+  members: readonly InitialMemberProposal[],
+  definedFeatureIds: ReadonlySet<string>,
+): Set<string> {
+  const isolated = new Set<string>();
+  const claimedFeatures = new Set<string>();
+
+  for (const m of members) {
+    if (m.role !== "worker" || !m.featureId) continue;
+    if (!definedFeatureIds.has(m.featureId) || claimedFeatures.has(m.featureId)) {
+      continue;
+    }
+    claimedFeatures.add(m.featureId);
+    if (m.workspace === "share" || m.workspace === "branch") {
+      isolated.add(m.featureId);
+    }
+  }
+
+  for (const m of members) {
+    if (m.role !== "worker" || m.featureId) continue;
+    if (!definedFeatureIds.has(m.name) || claimedFeatures.has(m.name)) {
+      continue;
+    }
+    claimedFeatures.add(m.name);
+    if (m.workspace === "share" || m.workspace === "branch") {
+      isolated.add(m.name);
+    }
+  }
+
+  return isolated;
+}
+
 function collectFeatureFileOverlapIssues(
   features: readonly Pick<
     MissionFeature,
     "id" | "milestone" | "dependsOn" | "filesOwned" | "status"
   >[],
+  isolatedWorkspaceFeatureIds?: ReadonlySet<string>,
 ): DraftPlanValidationIssue[] {
   const issues: DraftPlanValidationIssue[] = [];
   if (features.length < 2) {
@@ -1364,22 +1403,49 @@ function collectFeatureFileOverlapIssues(
       : (feat.filesOwned ?? [])
           .map(normalizeOwnedPath)
           .filter((p): p is NormalizedOwnedPath => p !== null);
-    return { feat, milestone: feat.milestone.trim(), parsedPaths };
+    return { feat, milestone: feat.milestone.trim(), isTerminal, parsedPaths };
   });
 
   for (let i = 0; i < parsedByFeature.length; i++) {
     const a = parsedByFeature[i]!;
-    if (a.parsedPaths.length === 0) continue;
+    if (a.isTerminal) continue;
 
     for (let j = i + 1; j < parsedByFeature.length; j++) {
       const b = parsedByFeature[j]!;
-      if (b.parsedPaths.length === 0) continue;
+      if (b.isTerminal) continue;
       if (a.milestone !== b.milestone) continue;
 
       if (
         getAncestors(a.feat.id).has(b.feat.id) ||
         getAncestors(b.feat.id).has(a.feat.id)
       ) {
+        continue;
+      }
+
+      if (a.parsedPaths.length === 0 || b.parsedPaths.length === 0) {
+        const bothIsolatedWorktrees =
+          isolatedWorkspaceFeatureIds?.has(a.feat.id) === true &&
+          isolatedWorkspaceFeatureIds?.has(b.feat.id) === true;
+        if (!bothIsolatedWorktrees) {
+          const missingDetail =
+            a.parsedPaths.length === 0 && b.parsedPaths.length === 0
+              ? `neither "${a.feat.id}" nor "${b.feat.id}" declares files_owned`
+              : `"${a.parsedPaths.length === 0 ? a.feat.id : b.feat.id}" omits files_owned`;
+          const missingBoundaryErr = new SwarmProtocolError(
+            "INVALID_INPUT",
+            `Missing files_owned boundary between parallel features "${a.feat.id}" and "${b.feat.id}" in milestone "${a.milestone}" without depends_on ordering (${missingDetail}) — declare disjoint files_owned on parallel same-milestone features, add depends_on ordering between them, or assign both isolated workspace: "share" / "branch" worktrees in initial_members.`,
+            {
+              field: "features",
+              milestone: a.milestone,
+              features: [a.feat.id, b.feat.id],
+            },
+          );
+          issues.push({
+            code: missingBoundaryErr.code,
+            field: "features",
+            message: missingBoundaryErr.message,
+          });
+        }
         continue;
       }
 
@@ -2715,7 +2781,14 @@ export function validateProposedSwarmPlan(
         ]
       : effectiveIncomingFeatures;
 
-    const overlapIssues = collectFeatureFileOverlapIssues(effectiveAllFeatures);
+    const isolatedWorkspaceFeatureIds = collectIsolatedWorkspaceFeatureIds(
+      normalizedMembers,
+      new Set(effectiveAllFeatures.map((f) => f.id)),
+    );
+    const overlapIssues = collectFeatureFileOverlapIssues(
+      effectiveAllFeatures,
+      isolatedWorkspaceFeatureIds,
+    );
     for (const overlapIssue of overlapIssues) {
       issues.push(overlapIssue);
     }
@@ -2723,8 +2796,9 @@ export function validateProposedSwarmPlan(
 
   // Validate fulfills references:
   // - Every ID in feature.fulfills[] must match a defined assertion.id in assertions
-  // - Reject contradictory reclaims of assertions already fulfilled by omitted completed features
-  // - Reject duplicate fulfills claiming the same VAL-* across multiple features (1-to-1 leaf rule)
+  // - Reject contradictory reclaims of 1-to-1 leaf assertions already fulfilled by omitted completed features
+  // - Reject duplicate fulfills claiming the same standard VAL-* leaf ID across multiple features (1-to-1 leaf rule),
+  //   while permitting cross-cutting VAL-CROSS-* IDs (/^VAL-CROSS-/i) to be claimed by 1 or multiple participating features
   // - If assertions is non-empty, require features to claim 100% of assertions (zero orphan assertions)
   const claimedAssertions = new Map<string, string>();
   for (const [valId, prevFeatId] of carriedCompletedOwnerByVal.entries()) {
@@ -2742,8 +2816,9 @@ export function validateProposedSwarmPlan(
         });
         continue;
       }
+      const isCrossCutting = isCrossCuttingAssertionId(valId);
       const carriedOwner = carriedCompletedOwnerByVal.get(valId);
-      if (carriedOwner) {
+      if (carriedOwner && !isCrossCutting) {
         issues.push({
           code: "INVALID_INPUT",
           field: "features",
@@ -2752,13 +2827,13 @@ export function validateProposedSwarmPlan(
         continue;
       }
       const existingOwner = claimedAssertions.get(valId);
-      if (existingOwner && existingOwner !== feat.id) {
+      if (existingOwner && existingOwner !== feat.id && !isCrossCutting) {
         issues.push({
           code: "INVALID_INPUT",
           field: "features",
           message: `Duplicate fulfills claim for assertion "${valId}" across features "${existingOwner}" and "${feat.id}" — each assertion must be claimed by a single feature (1-to-1).`,
         });
-      } else {
+      } else if (!existingOwner) {
         claimedAssertions.set(valId, feat.id);
       }
     }
@@ -3812,7 +3887,7 @@ export function createProposeSwarmPlanTool(
     promptSnippet:
       "Validate and present a Contract-First Dynamic Swarm Plan (title, objective, strategy, acceptance criteria, mandatory VAL-* assertions & milestone features, commands, services, boundaries, optional initial members) for user confirmation before launching.",
     promptGuidelines: [
-      `Call \`${PROPOSE_SWARM_PLAN_TOOL}\` once requirements are clear with wave-by-wave disjoint file/directory ownership in \`strategy\` (defaulting to \`workspace:"inherit"\` in the shared repo; use opt-in \`workspace:"share"\` only when concurrent workers must edit overlapping files), exact runnable verification commands using already-installed repo scripts (no speculative \`npx -y\` downloads) in \`acceptance_criteria\` and \`commands\` (including optional \`"init"\` worktree setup), optional \`services\` with unique \`port\`s and acyclic \`depends_on\`, **mandatory** testable \`VAL-<AREA>-<NNN>\` (and \`VAL-CROSS-*\` for multi-module/milestone integration) \`assertions\` (\`minItems: 1\`) paired with ordered \`features\` (\`minItems: 1\`, 100% \`fulfills\` coverage + acyclic \`depends_on\` + disjoint \`files_owned\`), and wave-1 workers only in \`initial_members\` (\`workspace:"inherit"\` default, optional \`feature_id\` matching \`features[]\`, optional \`fork\` from a warm recon worker; spawn \`validator\` on demand as soon as the first slice is ready — ~1 read-only validator per 2–4 authors for continuous peer-to-peer \`@worker <-> @validator\` review & fix loops, domain names like \`val-api\`/\`val-ui\` allowed); do NOT duplicate the full plan in prose beforehand because the expandable proposal card and confirmation modal present it automatically.`,
+      `Call \`${PROPOSE_SWARM_PLAN_TOOL}\` once requirements are clear with wave-by-wave disjoint file/directory ownership in \`strategy\` (defaulting to \`workspace:"inherit"\` in the shared repo; use opt-in \`workspace:"share"\` only when concurrent workers must edit overlapping files), exact runnable verification commands using already-installed repo scripts (no speculative \`npx -y\` downloads) in \`acceptance_criteria\` and \`commands\` (including optional \`"init"\` worktree setup), optional \`services\` with unique \`port\`s and acyclic \`depends_on\`, **mandatory** testable \`VAL-<AREA>-<NNN>\` (1-to-1 leaf \`fulfills\`) and \`VAL-CROSS-*\` (claimable by 1 or multiple participating features in \`fulfills[]\`) \`assertions\` (\`minItems: 1\`) paired with ordered \`features\` (\`minItems: 1\`, 100% \`fulfills\` coverage + acyclic \`depends_on\` + disjoint \`files_owned\` required on parallel same-milestone features), \`skip_contract_review: true\` for straightforward localized 1–4 file / \`<= 2\` feature edits, and wave-1 workers only in \`initial_members\` (\`workspace:"inherit"\` default, optional \`feature_id\` matching \`features[]\`, optional \`fork\` from a warm recon worker; spawn \`validator\` on demand as soon as the first slice is ready — ~1 read-only validator per 2–4 authors for continuous peer-to-peer \`@worker <-> @validator\` review & fix loops, domain names like \`val-api\`/\`val-ui\` allowed); do NOT duplicate the full plan in prose beforehand because the expandable proposal card and confirmation modal present it automatically.`,
     ],
     exposure: "model-only",
     defaultActive: false,

@@ -3635,6 +3635,7 @@ describe("v0.8.0 Mission-Level TDD planning, 100% fulfills & DAG gates, tweak me
             title: "Alpha",
             description: "First claimant",
             milestone: "M1",
+            files_owned: ["src/alpha.ts"],
             fulfills: ["VAL-SHARED-001"],
           },
           {
@@ -3642,6 +3643,7 @@ describe("v0.8.0 Mission-Level TDD planning, 100% fulfills & DAG gates, tweak me
             title: "Beta",
             description: "Second claimant",
             milestone: "M1",
+            files_owned: ["src/beta.ts"],
             fulfills: ["VAL-SHARED-001"],
           },
         ],
@@ -4968,6 +4970,7 @@ describe("v0.9.0 mandatory contract schema, services manifest & adversarial cont
             title: "JWT Login",
             description: "Implement POST /login",
             milestone: "M1",
+            files_owned: ["src/login.ts"],
             fulfills: ["VAL-AUTH-001"],
           },
           {
@@ -4975,6 +4978,7 @@ describe("v0.9.0 mandatory contract schema, services manifest & adversarial cont
             title: "Login Rate Limiter",
             description: "Enforce 5-attempt window",
             milestone: "M1",
+            files_owned: ["src/rate-limiter.ts"],
             fulfills: ["VAL-RATE-001"],
           },
         ],
@@ -7992,6 +7996,426 @@ describe("wave-2b: recon tool profile, reconRunId, fork/collision validation, on
         `${label} must preserve initial validator restraint`,
       );
     }
+  });
+});
+
+// ============================================================================
+// 16. Goldilocks Calibration: Task-Scope Recon, VAL-CROSS-* Fulfills & Parallel files_owned Boundary
+// ============================================================================
+
+describe("goldilocks-drafting: task-scope recon calibration, VAL-CROSS-* shared fulfills & parallel files_owned enforcement", () => {
+  it("calibrates recon by task scope (1–4 file direct reads + 0 recon workers + skip_contract_review vs 5+ file recon workers + wait_for_all) across prompts & tool schema", () => {
+    const kickoff = buildDraftingKickoffPrompt("Fix login button alignment", "swarm", {
+      baseBranch: "main",
+      maxConcurrency: 4,
+      validatorEnabled: true,
+    });
+    const overlay = buildDraftingSystemOverlay({
+      version: 2,
+      mode: "swarm",
+      seed: "Fix login button alignment",
+      startedAt: new Date().toISOString(),
+      validatorEnabled: true,
+      maxConcurrency: 4,
+      baseBranch: "main",
+    });
+    const direct = buildDirectPlanPrompt("Fix login button alignment", "main", {
+      maxConcurrency: 4,
+      validatorEnabled: true,
+    });
+
+    for (const [label, text] of [
+      ["kickoff", kickoff],
+      ["overlay", overlay],
+      ["direct", direct],
+    ] as const) {
+      assert.match(
+        text,
+        /by task scope,\s*NOT repo size/i,
+        `${label} must explicitly distinguish by task scope, NOT repo size`,
+      );
+      assert.match(
+        text,
+        /1–4 file tasks/i,
+        `${label} must define localized 1–4 file fast-path`,
+      );
+      assert.match(
+        text,
+        /even inside a large repo/i,
+        `${label} must clarify 1–4 file fast-path applies even inside a large repo`,
+      );
+      assert.match(
+        text,
+        /0 recon workers/i,
+        `${label} must instruct 0 recon workers for 1–4 file localized tasks`,
+      );
+      assert.match(
+        text,
+        /skip_contract_review:\s*true/,
+        `${label} must document skip_contract_review: true fast-path`,
+      );
+      assert.match(
+        text,
+        /<= 2/,
+        `${label} must mention <= 2 features threshold for skip_contract_review`,
+      );
+      assert.match(
+        text,
+        /5\+ file cross-module refactors/i,
+        `${label} must define 5+ file cross-module recon worker path`,
+      );
+      assert.match(
+        text,
+        /wait_for_all:\s*true/,
+        `${label} must instruct swarm_wait{since, wait_for_all:true} for parallel recon workers`,
+      );
+    }
+
+    const skipReviewDesc = String(
+      (
+        ProposeSwarmPlanParamsSchema.properties.skip_contract_review as {
+          description?: string;
+        }
+      )?.description ?? "",
+    );
+    assert.match(skipReviewDesc, /1–4 file/);
+    assert.match(skipReviewDesc, /<= 2/);
+  });
+
+  it("allows cross-cutting VAL-CROSS-* assertions to be claimed by 1 OR multiple participating features while keeping strict 1-to-1 fulfills on standard VAL-* assertions", () => {
+    // 1. Multiple features claiming VAL-CROSS-001 (case-insensitive) alongside unique leaf VAL-* IDs succeeds
+    const multiCrossRes = validateProposedSwarmPlan(
+      makeSamplePlanParams({
+        assertions: [
+          {
+            id: "VAL-AUTH-001",
+            title: "Auth Token",
+            description: "Issues JWT token",
+          },
+          {
+            id: "VAL-BILLING-001",
+            title: "Billing Webhook",
+            description: "Processes invoice webhook",
+          },
+          {
+            id: "VAL-CROSS-001",
+            title: "End-to-End Authenticated Checkout",
+            description: "Authenticated session completes billing checkout cleanly",
+          },
+          {
+            id: "val-cross-002",
+            title: "Case-insensitive cross assertion",
+            description: "Shared observability trace across auth and billing",
+          },
+        ],
+        features: [
+          {
+            id: "feat-auth",
+            title: "Auth Slice",
+            description: "Implement auth",
+            milestone: "M1",
+            files_owned: ["src/auth.ts"],
+            fulfills: ["VAL-AUTH-001", "VAL-CROSS-001", "val-cross-002"],
+          },
+          {
+            id: "feat-billing",
+            title: "Billing Slice",
+            description: "Implement billing",
+            milestone: "M1",
+            files_owned: ["src/billing.ts"],
+            fulfills: ["VAL-BILLING-001", "VAL-CROSS-001", "val-cross-002"],
+          },
+        ],
+      }),
+    );
+    assert.equal(
+      multiCrossRes.valid,
+      true,
+      `Expected shared VAL-CROSS-* fulfills to succeed: ${multiCrossRes.valid ? "" : JSON.stringify(multiCrossRes.issues)}`,
+    );
+    if (multiCrossRes.valid) {
+      assert.deepEqual(multiCrossRes.features?.[0]?.fulfills, [
+        "VAL-AUTH-001",
+        "VAL-CROSS-001",
+        "val-cross-002",
+      ]);
+      assert.deepEqual(multiCrossRes.features?.[1]?.fulfills, [
+        "VAL-BILLING-001",
+        "VAL-CROSS-001",
+        "val-cross-002",
+      ]);
+    }
+
+    // 2. Single feature claiming VAL-CROSS-001 also succeeds
+    const singleCrossRes = validateProposedSwarmPlan(
+      makeSamplePlanParams({
+        assertions: [
+          {
+            id: "VAL-CROSS-001",
+            title: "Cross integration",
+            description: "Single integration feature",
+          },
+        ],
+        features: [
+          {
+            id: "feat-int",
+            title: "Integration",
+            description: "Wire modules",
+            milestone: "M1",
+            fulfills: ["VAL-CROSS-001"],
+          },
+        ],
+      }),
+    );
+    assert.equal(singleCrossRes.valid, true);
+
+    // 3. Unclaimed VAL-CROSS-001 (0 features claiming it) is STILL rejected as an orphan assertion
+    const orphanCrossRes = validateProposedSwarmPlan(
+      makeSamplePlanParams({
+        assertions: [
+          { id: "VAL-AUTH-001", title: "Auth", description: "Auth" },
+          { id: "VAL-CROSS-001", title: "Orphan Cross", description: "Unclaimed" },
+        ],
+        features: [
+          {
+            id: "feat-auth",
+            title: "Auth",
+            description: "Auth",
+            milestone: "M1",
+            fulfills: ["VAL-AUTH-001"],
+          },
+        ],
+      }),
+    );
+    assert.equal(orphanCrossRes.valid, false);
+    if (!orphanCrossRes.valid) {
+      assert.match(orphanCrossRes.issues[0]?.message ?? "", /VAL-CROSS-001/);
+    }
+
+    // 4. Duplicate standard VAL-* leaf fulfills is STILL strictly rejected with INVALID_INPUT
+    const dupLeafRes = validateProposedSwarmPlan(
+      makeSamplePlanParams({
+        assertions: [
+          { id: "VAL-AUTH-001", title: "Auth", description: "Leaf assertion" },
+          { id: "VAL-CROSS-001", title: "Cross", description: "Cross assertion" },
+        ],
+        features: [
+          {
+            id: "feat-a",
+            title: "A",
+            description: "A",
+            milestone: "M1",
+            files_owned: ["src/a.ts"],
+            fulfills: ["VAL-AUTH-001", "VAL-CROSS-001"],
+          },
+          {
+            id: "feat-b",
+            title: "B",
+            description: "B",
+            milestone: "M1",
+            files_owned: ["src/b.ts"],
+            fulfills: ["VAL-AUTH-001", "VAL-CROSS-001"],
+          },
+        ],
+      }),
+    );
+    assert.equal(dupLeafRes.valid, false);
+    if (!dupLeafRes.valid) {
+      assert.equal(dupLeafRes.issues.length, 1);
+      assert.equal(dupLeafRes.issues[0]?.code, "INVALID_INPUT");
+      assert.match(dupLeafRes.issues[0]?.message ?? "", /Duplicate fulfills claim.*VAL-AUTH-001/);
+    }
+  });
+
+  it("rejects parallel same-milestone features omitting files_owned with INVALID_INPUT while allowing single-feature milestones, depends_on-ordered features, and explicit share/branch pairs", () => {
+    // 1. Two parallel same-milestone features where BOTH omit files_owned -> REJECTED with INVALID_INPUT
+    assert.throws(
+      () =>
+        assertProposedSwarmPlan(
+          makeSamplePlanParams({
+            assertions: [
+              { id: "VAL-P-1", title: "P1", description: "P1" },
+              { id: "VAL-P-2", title: "P2", description: "P2" },
+            ],
+            features: [
+              {
+                id: "feat-left",
+                title: "Left",
+                description: "Left slice",
+                milestone: "M1: Core",
+                fulfills: ["VAL-P-1"],
+              },
+              {
+                id: "feat-right",
+                title: "Right",
+                description: "Right slice",
+                milestone: "M1: Core",
+                fulfills: ["VAL-P-2"],
+              },
+            ],
+          }),
+        ),
+      (err: unknown) =>
+        err instanceof SwarmProtocolError &&
+        err.code === "INVALID_INPUT" &&
+        /files_owned/i.test(err.message) &&
+        /feat-left/.test(err.message) &&
+        /feat-right/.test(err.message),
+    );
+
+    // 2. Two parallel same-milestone features where ONLY ONE omits files_owned -> REJECTED with INVALID_INPUT
+    const oneOmitted = validateProposedSwarmPlan(
+      makeSamplePlanParams({
+        assertions: [
+          { id: "VAL-P-1", title: "P1", description: "P1" },
+          { id: "VAL-P-2", title: "P2", description: "P2" },
+        ],
+        features: [
+          {
+            id: "feat-owned",
+            title: "Owned",
+            description: "Declares files_owned",
+            milestone: "M1: Core",
+            files_owned: ["src/owned.ts"],
+            fulfills: ["VAL-P-1"],
+          },
+          {
+            id: "feat-unbounded",
+            title: "Unbounded",
+            description: "Omits files_owned",
+            milestone: "M1: Core",
+            fulfills: ["VAL-P-2"],
+          },
+        ],
+      }),
+    );
+    assert.equal(oneOmitted.valid, false);
+    if (!oneOmitted.valid) {
+      assert.equal(oneOmitted.issues[0]?.code, "INVALID_INPUT");
+      assert.match(oneOmitted.issues[0]?.message ?? "", /feat-unbounded.*omits files_owned/);
+    }
+
+    // 3. Single-feature milestones omitting files_owned (both 1-feature plan and multi-milestone 1-feature-each plan) -> ALLOWED
+    const singleFeaturePlan = validateProposedSwarmPlan(
+      makeSamplePlanParams({
+        assertions: [{ id: "VAL-SINGLE-1", title: "Single", description: "Single" }],
+        features: [
+          {
+            id: "feat-solo",
+            title: "Solo",
+            description: "Lightweight 1-feature plan",
+            milestone: "M1",
+            fulfills: ["VAL-SINGLE-1"],
+          },
+        ],
+      }),
+    );
+    assert.equal(singleFeaturePlan.valid, true);
+
+    const separateMilestonesPlan = validateProposedSwarmPlan(
+      makeSamplePlanParams({
+        assertions: [
+          { id: "VAL-M1-1", title: "M1", description: "M1" },
+          { id: "VAL-M2-1", title: "M2", description: "M2" },
+        ],
+        features: [
+          {
+            id: "feat-m1",
+            title: "M1",
+            description: "M1 solo",
+            milestone: "M1",
+            fulfills: ["VAL-M1-1"],
+          },
+          {
+            id: "feat-m2",
+            title: "M2",
+            description: "M2 solo",
+            milestone: "M2",
+            fulfills: ["VAL-M2-1"],
+          },
+        ],
+      }),
+    );
+    assert.equal(separateMilestonesPlan.valid, true);
+
+    // 4. Transitive depends_on-sequenced features in the SAME milestone omitting files_owned -> ALLOWED
+    const sequencedSameMilestone = validateProposedSwarmPlan(
+      makeSamplePlanParams({
+        assertions: [
+          { id: "VAL-SEQ-1", title: "Step 1", description: "Step 1" },
+          { id: "VAL-SEQ-2", title: "Step 2", description: "Step 2" },
+          { id: "VAL-SEQ-3", title: "Step 3", description: "Step 3" },
+        ],
+        features: [
+          {
+            id: "step-1",
+            title: "Step 1",
+            description: "First",
+            milestone: "M1",
+            fulfills: ["VAL-SEQ-1"],
+          },
+          {
+            id: "step-2",
+            title: "Step 2",
+            description: "Second",
+            milestone: "M1",
+            depends_on: ["step-1"],
+            fulfills: ["VAL-SEQ-2"],
+          },
+          {
+            id: "step-3",
+            title: "Step 3",
+            description: "Third",
+            milestone: "M1",
+            depends_on: ["step-2"],
+            fulfills: ["VAL-SEQ-3"],
+          },
+        ],
+      }),
+    );
+    assert.equal(sequencedSameMilestone.valid, true);
+
+    // 5. Explicit workspace: "share" / "branch" on BOTH parallel features in initial_members -> ALLOWED
+    const explicitIsolatedWorktrees = validateProposedSwarmPlan(
+      makeSamplePlanParams({
+        assertions: [
+          { id: "VAL-ISO-1", title: "Iso 1", description: "Iso 1" },
+          { id: "VAL-ISO-2", title: "Iso 2", description: "Iso 2" },
+        ],
+        features: [
+          {
+            id: "feat-share",
+            title: "Share slice",
+            description: "Isolated share worktree",
+            milestone: "M1",
+            fulfills: ["VAL-ISO-1"],
+          },
+          {
+            id: "feat-branch",
+            title: "Branch slice",
+            description: "Isolated branch worktree",
+            milestone: "M1",
+            fulfills: ["VAL-ISO-2"],
+          },
+        ],
+        initial_members: [
+          {
+            name: "worker-a",
+            role: "worker",
+            workspace: "share",
+            feature_id: "feat-share",
+            brief: "Run in isolated share worktree",
+          },
+          {
+            name: "feat-branch",
+            role: "worker",
+            workspace: "branch",
+            brief: "Auto-matched isolated branch worktree",
+          },
+        ],
+      }),
+    );
+    assert.equal(explicitIsolatedWorktrees.valid, true);
   });
 });
 

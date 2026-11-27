@@ -327,6 +327,12 @@ export const SwarmToolParamsSchema = Type.Object({
         'Target VAL-* assertion ID for mission_op="verify_assertion", "override_assertion", or "remove_assertion".',
     }),
   ),
+  assertion_ids: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        'Optional batch VAL-* assertion IDs for mission_op="verify_assertion" sharing the same assertion_status and evidence.',
+    }),
+  ),
   assertion_status: Type.Optional(
     stringEnum(ASSERTION_STATUSES, {
       description:
@@ -651,6 +657,12 @@ export const SwarmWaitToolParamsSchema = Type.Object({
       description: "Optional maximum wait duration in milliseconds.",
     }),
   ),
+  wait_for_all: Type.Optional(
+    Type.Boolean({
+      description:
+        "When true (default automatically in recon mode), wait until ALL currently working members settle to waiting/stopped (or a member errors/blocks) instead of waking on the first member's post.",
+    }),
+  ),
 });
 
 export type SwarmWaitToolParams = Static<typeof SwarmWaitToolParamsSchema>;
@@ -971,6 +983,7 @@ function buildManageMissionInputFromParams(
     op,
     ...(assertions !== undefined ? { assertions } : {}),
     ...(params.assertion_id !== undefined ? { assertionId: params.assertion_id } : {}),
+    ...(params.assertion_ids !== undefined ? { assertionIds: params.assertion_ids } : {}),
     ...(params.assertion_status !== undefined
       ? { assertionStatus: params.assertion_status as AssertionStatus }
       : {}),
@@ -1312,8 +1325,23 @@ function renderSwarmCall(
           : "status";
       const metaParts: string[] = [];
       if (missionOp === "verify_assertion") {
-        if (typeof args?.assertion_id === "string" && args.assertion_id.trim()) {
-          metaParts.push(args.assertion_id.trim());
+        const batchIds = [
+          ...(typeof args?.assertion_id === "string" && args.assertion_id.trim()
+            ? [args.assertion_id.trim()]
+            : []),
+          ...(Array.isArray(args?.assertion_ids)
+            ? args.assertion_ids
+                .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+                .map((id) => id.trim())
+            : []),
+        ];
+        const uniqueIds = Array.from(new Set(batchIds));
+        if (uniqueIds.length === 1) {
+          metaParts.push(uniqueIds[0]!);
+        } else if (uniqueIds.length === 2) {
+          metaParts.push(uniqueIds.join(", "));
+        } else if (uniqueIds.length > 2) {
+          metaParts.push(`${uniqueIds.length} VAL`);
         }
         if (typeof args?.assertion_status === "string" && args.assertion_status.trim()) {
           metaParts.push(`-> ${args.assertion_status.trim()}`);
@@ -1824,6 +1852,9 @@ function renderSwarmWaitCall(
       ? `#${Math.max(0, Math.floor(args.since))}`
       : "#…";
   const parts = [`since ${sinceText}`];
+  if (args?.wait_for_all === true) {
+    parts.push("wait_for_all");
+  }
   if (args?.mentions_only === false) {
     parts.push("all posts");
   }
@@ -2695,6 +2726,7 @@ export function createSwarmWaitTool(deps: SwarmToolDeps): ToolDefinition {
           since: params.since,
           mentionsOnly: params.mentions_only ?? true,
           timeoutMs: params.timeout_ms,
+          ...(params.wait_for_all !== undefined ? { waitForAll: params.wait_for_all } : {}),
         });
 
         if (res.parked) {
@@ -3344,6 +3376,12 @@ export function createMemberScopedTools(
       assertion_id: Type.Optional(
         Type.String({
           description: 'Target VAL-* assertion ID for mission_op="verify_assertion".',
+        }),
+      ),
+      assertion_ids: Type.Optional(
+        Type.Array(Type.String(), {
+          description:
+            'Optional batch VAL-* assertion IDs for mission_op="verify_assertion" sharing the same assertion_status and evidence.',
         }),
       ),
       assertion_status: Type.Optional(

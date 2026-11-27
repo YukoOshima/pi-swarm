@@ -96,6 +96,8 @@ export interface StatusDashboardOptions {
 export interface FormatStatusLineOptions {
   draftActive?: boolean;
   orchestratorStandby?: boolean;
+  /** True when the live above-editor SwarmDashboardComponent widget is mounted. */
+  widgetActive?: boolean;
 }
 
 export interface BoardViewOptions {
@@ -1682,6 +1684,10 @@ export function formatStatusLine(
     typeof draftActiveOrState === "boolean"
       ? Boolean(orchestratorStandby)
       : Boolean(draftActiveOrState?.orchestratorStandby ?? orchestratorStandby);
+  const widgetActive =
+    typeof draftActiveOrState === "object" && draftActiveOrState !== null
+      ? Boolean(draftActiveOrState.widgetActive)
+      : false;
 
   const run = snapshot.run;
   if (!run) {
@@ -1713,21 +1719,31 @@ export function formatStatusLine(
     leadTokens.join(" "),
     formatFleetSummary(workingCount, waitingCount, stoppedCount, mergedCount),
   ];
-  const goal = summarizeGoalProgress(run);
-  if (goal.hasCompactBadges) {
-    parts.push(
-      formatCompactGoalBadges(goal, {
-        includeBar: false,
-        includeSealed: false,
-      }),
-    );
+
+  // When the live above-editor SwarmDashboardComponent widget is active on an
+  // executing run, omit redundant Goal/awaiting/token chatter that is already
+  // rendered right above the editor so the footer stays crisp and compact.
+  const suppressExecutingWidgetDuplication =
+    widgetActive && run.status === "active" && !reconMode;
+
+  if (!suppressExecutingWidgetDuplication) {
+    const goal = summarizeGoalProgress(run);
+    if (goal.hasCompactBadges) {
+      parts.push(
+        formatCompactGoalBadges(goal, {
+          includeBar: false,
+          includeSealed: false,
+        }),
+      );
+    }
+    if (run.status === "active" && workingCount === 0 && waitingCount > 0) {
+      parts.push(`⏳ awaiting @${ORCHESTRATOR_NAME}`);
+    }
+    if (snapshot.totalTokens > 0) {
+      parts.push(`${formatTokens(snapshot.totalTokens)} tok`);
+    }
   }
-  if (run.status === "active" && workingCount === 0 && waitingCount > 0) {
-    parts.push(`⏳ awaiting @${ORCHESTRATOR_NAME}`);
-  }
-  if (snapshot.totalTokens > 0) {
-    parts.push(`${formatTokens(snapshot.totalTokens)} tok`);
-  }
+
   if (draftActive && (run.status !== "active" || reconMode)) {
     parts.push("draft");
   } else if (standby && isTerminalRunStatus(run.status)) {

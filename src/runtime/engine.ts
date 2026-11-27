@@ -140,6 +140,18 @@ const WAIT_TELEMETRY_RE = /^swarm_wait since=#(\d+) mentions_only=(true|false)$/
 const DONE_PREFIX_RE =
   /^\s*(?:@#?[A-Za-z0-9._-]+\s+)*\[done\](?=\s|$|[:,.;!\])-])/i;
 
+const BARRIER_URGENT_TAG_RE =
+  /\[(?:blocker|error|rate-limit|hop-cap|stall|NEEDS_HUMAN)\]/i;
+const WORKER_DONE_URGENT_TAG_RE = /\[(?:blocker|error|NEEDS_HUMAN)\]/i;
+
+function isUrgentBarrierBypassMessage(msg: BoardMessage): boolean {
+  return (
+    msg.fromRole === "human" ||
+    msg.fromRole === "monitor" ||
+    BARRIER_URGENT_TAG_RE.test(msg.text)
+  );
+}
+
 const BOARD_CACHE_LIMIT = 200;
 const EVENT_CACHE_LIMIT = 50;
 const MAX_SHARD_COUNT = 32;
@@ -635,7 +647,7 @@ function buildFeatureWorkerBrief(
   }
   const wsInstruction =
     workspace === "inherit"
-      ? '- Verify baseline health before editing and implement/verify all changes strictly within your owned files in the shared `inherit` workspace (do NOT touch sibling files or run destructive workspace-wide git commands).'
+      ? '- Implement and verify all changes strictly within your owned files in the shared `inherit` workspace (skip full-repo baseline build/test suites before editing if `library/testing.md` already records baseline health; run targeted verification after editing, and do NOT switch branches or run `git commit` / destructive workspace-wide git commands).'
       : `- Verify baseline health before editing, implement and verify all changes inside your isolated \`${workspace}\` worktree, and commit cleanly on your branch (\`git status\` clean).`;
   const doorbellTarget = liveValidatorHandle?.trim() || ORCHESTRATOR_NAME;
   const doneHeaderExample =
@@ -725,7 +737,7 @@ function buildMilestoneValidationBrief(
     `[milestone-review] All features in milestone "${milestoneLabel}" (${mergedFeatureSummary}) are ${completionPhrase}. Execute Dual-Layer Milestone Validation now:`,
     `1. Layer 1 (Scrutiny): Run operational commands (${cmdManifest}) on \`${run.baseBranch}\` and review ${diffTargetPhrase}.`,
     `2. ${layer2Instruction}`,
-    `3. Stamp every verified assertion via \`${SWARM_TOOL}{action:"mission", mission_op:"verify_assertion", assertion_id, assertion_status, evidence}\` and record reusable testing/environment findings in \`${SWARM_DIR}/${SWARM_RUNS_DIR}/${run.id}/${SWARM_LIBRARY_DIR}/testing.md\` via \`${SWARM_TOOL}{action:"mission", mission_op:"write_library", library_topic:"testing", library_content:"...", library_append:true}\`;${defectBounceClause} and call \`${SWARM_WAIT_TOOL}\`.`,
+    `3. Stamp every verified assertion via \`${SWARM_TOOL}{action:"mission", mission_op:"verify_assertion", assertion_ids:[...], assertion_status, evidence}\` (use \`assertion_ids\` to batch-stamp multiple assertions sharing outcome and evidence in 1 call, or \`assertion_id\` for one) and record reusable testing/environment findings in \`${SWARM_DIR}/${SWARM_RUNS_DIR}/${run.id}/${SWARM_LIBRARY_DIR}/testing.md\` via \`${SWARM_TOOL}{action:"mission", mission_op:"write_library", library_topic:"testing", library_content:"...", library_append:true}\`;${defectBounceClause} and call \`${SWARM_WAIT_TOOL}\`.`,
   ].join("\n");
 }
 
@@ -844,7 +856,7 @@ function analyzeMissionCoverage(
     .map((a) => a.id);
   const duplicateFulfills: Array<{ assertionId: string; featureIds: string[] }> = [];
   for (const [assertionId, featureIds] of claimedBy.entries()) {
-    if (featureIds.length > 1) {
+    if (featureIds.length > 1 && !/^VAL-CROSS-/i.test(assertionId)) {
       duplicateFulfills.push({ assertionId, featureIds });
     }
   }
@@ -1282,6 +1294,7 @@ export class SwarmEngine implements ISwarmEngine {
   private orchestratorWait: {
     since: number;
     mentionsOnly: boolean;
+    waitForAll: boolean;
     timer: ReturnType<typeof setTimeout> | null;
   } | null = null;
   private runDonePosted = false;
@@ -2062,6 +2075,99 @@ export class SwarmEngine implements ISwarmEngine {
     return reverted;
   }
 
+  /**
+   * Disposes live `AgentSession` handles and marks all non-killed `m.recon === true`
+   * members as `state: "killed"` cleanly after promotion (and after any wave-1 `fork`
+   * has cloned their conversation history), without posting noisy `@` wakes.
+   */
+  async retireReconMembers(runId: string): Promise<string[]> {
+    const current = await this.store.loadRun(runId);
+    const ordered = [
+      ...current.memberOrder
+        .map((n) => getOwnMember(current, n))
+        .filter((m): m is SwarmMemberRecord => Boolean(m)),
+      ...Object.values(current.members).filter(
+        (m) => !current.memberOrder.includes(m.name),
+      ),
+    ];
+    const reconTargets = ordered.filter(
+      (m) => m.recon === true && m.state !== "killed",
+    );
+    if (reconTargets.length === 0) {
+      return [];
+    }
+
+    const nowIso = new Date(this.nowFn()).toISOString();
+    const retiredNames: string[] = [];
+    let updated = current;
+
+    for (const member of reconTargets) {
+      const live =
+        this.activeRunId === runId ? this.liveMembers.get(member.name) : undefined;
+      if (live) {
+        this.cancelMemberRetryTimer(live);
+        live.launchAbort?.abort();
+        live.attemptToken = undefined;
+        live.spawning = false;
+        live.waking = false;
+        live.turnActive = false;
+        live.switchingModel = false;
+        live.pendingSelfModelSwitch = undefined;
+        live.lastWaitRequest = undefined;
+        live.lastSilentSummary = undefined;
+        live.parkedMentionsOnly = true;
+        live.currentActivity = undefined;
+        live.turnStartedAt = undefined;
+        live.pendingWakes.length = 0;
+        if (live.handle) {
+          await live.handle
+            .kill("Retired recon session after promotion")
+            .catch(() => {});
+        }
+        live.releaseSlot?.();
+        live.releaseSlot = undefined;
+        this.liveMembers.delete(member.name);
+      }
+
+      const flushedBreakdown = maxTokenBreakdown(
+        member.tokenBreakdown,
+        live?.liveTokenBreakdown,
+      );
+      const flushedLlmTurns = Math.max(
+        member.llmTurns ?? 0,
+        live?.liveLlmTurns ?? 0,
+      );
+      updated = await this.store.updateMember(runId, member.name, {
+        state: "killed",
+        tokens: Math.max(member.tokens, live?.liveTokens ?? 0),
+        cost: Math.max(member.cost, live?.liveCost ?? 0),
+        ...(flushedBreakdown ? { tokenBreakdown: flushedBreakdown } : {}),
+        logTail:
+          live && live.logTail.length > 0 ? [...live.logTail] : member.logTail,
+        ...(flushedLlmTurns > 0 ? { llmTurns: flushedLlmTurns } : {}),
+        ...(live?.lastTool !== undefined ? { lastTool: live.lastTool } : {}),
+        currentActivity: null,
+        turnStartedAt: null,
+        parkedOn: "retired recon session",
+        endedAt: nowIso,
+        actor: ORCHESTRATOR_NAME,
+      });
+      retiredNames.push(member.name);
+    }
+
+    if (this.activeRunId === runId) {
+      await this.refreshCache(updated);
+      this.emitEngineEvent(
+        "snapshot_changed",
+        `Retired ${retiredNames.length} recon member(s): ${retiredNames.map((n) => `@${n}`).join(", ")}`,
+      );
+      this.checkAllIdleAndNotifyWaiters();
+      this.maybeArmStallWatchdog();
+    }
+
+    return retiredNames;
+  }
+
   // --------------------------------------------------------------------------
   // Dynamic Member Management (addMembers, switchModel, steer, stop, kill, merge)
   // --------------------------------------------------------------------------
@@ -2694,6 +2800,74 @@ export class SwarmEngine implements ISwarmEngine {
       }
     }
 
+    // Validator [done] pre-check: prevent reporting @orchestrator [done] when completed features still have unverified "pending" VAL-* assertions
+    const isValidatorSenderPreCheck =
+      (input.fromRole === "validator" || senderMember?.role === "validator") &&
+      !senderMember?.recon &&
+      !isReconRun(run);
+    if (
+      isValidatorSenderPreCheck &&
+      isCompletionPostPreCheck &&
+      run.assertions &&
+      run.assertions.length > 0
+    ) {
+      const validatorHandle = (
+        senderMember?.name ?? input.from.trim().replace(/^@/, "")
+      ).toLowerCase();
+      const mentionsOrchestrator =
+        parsedMentions.includes(ORCHESTRATOR_NAME) ||
+        parsedMentions.includes("coordinator");
+      const mentionsWorkerPeer = parsedMentions.some((h) => {
+        const m = this.findMember(run, h);
+        return Boolean(m && m.role === "worker" && m.state !== "killed");
+      });
+      const hasBlockerOrHumanTag = /\[(?:blocker|NEEDS_HUMAN)\]/i.test(text);
+
+      if (mentionsOrchestrator && !mentionsWorkerPeer && !hasBlockerOrHumanTag) {
+        const assertionById = new Map(run.assertions.map((a) => [a.id, a]));
+        const anyFailedOrBlocked = run.assertions.some(
+          (a) => a.status === "failed" || a.status === "blocked",
+        );
+        if (!anyFailedOrBlocked) {
+          const otherLiveValidators = Object.values(run.members).filter(
+            (m) =>
+              m.role === "validator" &&
+              !m.recon &&
+              m.state !== "killed" &&
+              m.name.toLowerCase() !== validatorHandle,
+          );
+          const thisValidatorVerifiedAny = run.assertions.some(
+            (a) =>
+              a.verifiedBy?.toLowerCase() === validatorHandle &&
+              a.status !== "pending",
+          );
+          const completedFeaturesWithAllPending = (run.features ?? []).filter(
+            (f) =>
+              f.status === "completed" &&
+              f.fulfills.length > 0 &&
+              f.fulfills.every((id) => assertionById.get(id)?.status === "pending"),
+          );
+          const pendingIdsToVerify = Array.from(
+            new Set(completedFeaturesWithAllPending.flatMap((f) => f.fulfills)),
+          ).filter((id) => assertionById.get(id)?.status === "pending");
+
+          if (
+            pendingIdsToVerify.length > 0 &&
+            (otherLiveValidators.length === 0 || !thisValidatorVerifiedAny)
+          ) {
+            throw new SwarmProtocolError(
+              "INVALID_INPUT",
+              `Validator "@${senderMember?.name ?? input.from}" cannot report @${ORCHESTRATOR_NAME} [done] while completed feature(s) (${completedFeaturesWithAllPending.map((f) => f.id).join(", ")}) still have unverified "pending" VAL-* assertion(s): ${pendingIdsToVerify.join(", ")}. Call swarm{action:"mission", mission_op:"verify_assertion", assertion_ids:${JSON.stringify(pendingIdsToVerify)}, assertion_status:"passed"|"failed", evidence:"..."} before reporting @${ORCHESTRATOR_NAME} [done] (or @mention the author directly to bounce defects).`,
+              {
+                unverifiedAssertionIds: pendingIdsToVerify,
+                completedFeatureIds: completedFeaturesWithAllPending.map((f) => f.id),
+              },
+            );
+          }
+        }
+      }
+    }
+
     const msg = await this.store.postBoardMessage(run.id, {
       ...input,
       text,
@@ -2894,29 +3068,62 @@ export class SwarmEngine implements ISwarmEngine {
       seq: normalizedMsg.seq,
     });
 
-    // Route wakeups SYNCHRONOUSLY marking `live.waking = true` BEFORE resolving waiters or returning!
+    // Coordinate auto-validator trigger with Orchestrator wakeup so worker `@orchestrator [done]`
+    // does not fire a premature sandwich wakeup when `@validator` immediately takes over the milestone!
+    const canDeferOrchWakeForValidator =
+      latestRun.status === "active" &&
+      normalizedMsg.fromRole !== "monitor" &&
+      autoCompletedInheritMilestones.size > 0 &&
+      latestRun.validatorEnabled &&
+      isWorkerSender &&
+      isDonePost &&
+      !hasDiscovered &&
+      !hasUndone &&
+      !WORKER_DONE_URGENT_TAG_RE.test(text) &&
+      !this.hasDagReadyPendingFeatures(latestRun);
+
+    // Route peer wakeups SYNCHRONOUSLY marking `live.waking = true` BEFORE resolving waiters or returning!
     let emittedOrchWakeup = false;
     if (latestRun.status === "active" && normalizedMsg.fromRole !== "monitor") {
-      emittedOrchWakeup = await this.routeBoardMessageWakeups(latestRun, normalizedMsg);
+      emittedOrchWakeup = await this.routeBoardMessageWakeups(
+        latestRun,
+        normalizedMsg,
+        canDeferOrchWakeForValidator ? { suppressOrchestratorWakeup: true } : undefined,
+      );
     }
 
-    // If Orchestrator is parked in non-blocking `swarm_wait`, check if this message wakes it (without double-emitting!)
-    this.maybeWakeParkedOrchestratorOnMessage(normalizedMsg, emittedOrchWakeup);
+    if (!canDeferOrchWakeForValidator) {
+      // If Orchestrator is parked in non-blocking `swarm_wait`, check if this message wakes it (without double-emitting!)
+      this.maybeWakeParkedOrchestratorOnMessage(normalizedMsg, emittedOrchWakeup);
+    }
 
     // Notify blocking `waitForBoard` waiters immediately
     this.notifyWaitersOnMessage(normalizedMsg);
 
     // Auto-trigger milestone @validator when an inherit feature completion finishes all features of a milestone!
+    let autoValidatorTriggered = false;
     if (autoCompletedInheritMilestones.size > 0) {
       const alreadyNotifiedHandles = this.computeNotifiedValidatorHandles(
         latestRun,
         normalizedMsg,
       );
-      await this.maybeTriggerMilestoneValidation(
+      const cues = await this.maybeTriggerMilestoneValidation(
         run.id,
         autoCompletedInheritMilestones,
         alreadyNotifiedHandles.size > 0 ? { alreadyNotifiedHandles } : undefined,
       );
+      autoValidatorTriggered = cues.some((c) =>
+        Boolean(c.validatorWoken || c.validatorSpawned),
+      );
+    }
+
+    if (canDeferOrchWakeForValidator && !autoValidatorTriggered) {
+      const latestAfterVal = this.cachedRun ?? latestRun;
+      const deferredEmitted = this.emitOrchestratorMessageWakeupIfAddressed(
+        latestAfterVal,
+        normalizedMsg,
+      );
+      this.maybeWakeParkedOrchestratorOnMessage(normalizedMsg, deferredEmitted);
     }
 
     // Re-arm watchdog if 0 working and no waiter is blocked (and not done)
@@ -3008,15 +3215,22 @@ export class SwarmEngine implements ISwarmEngine {
     const immediateMatches = mergedUnread.filter((m) =>
       this.doesMessageMatchWaiter(m, ORCHESTRATOR_NAME, mentionsOnly, []),
     );
+    const waitForAll = options.waitForAll ?? isReconRun(this.cachedRun);
     const activeMembers = this.getWorkingOrPendingMemberNames();
 
-    if (immediateMatches.length > 0) {
+    if (
+      immediateMatches.length > 0 &&
+      (!waitForAll ||
+        activeMembers.length === 0 ||
+        immediateMatches.some((m) => isUrgentBarrierBypassMessage(m)))
+    ) {
       return {
         parked: false,
         wokeBy: "message",
         messages: mergedUnread,
         head: latestHead,
         activeMembers,
+        ...(waitForAll ? { waitForAll: true } : {}),
         summary: `${immediateMatches.length} matching board message(s) already waiting since #${since}.`,
       };
     }
@@ -3031,6 +3245,7 @@ export class SwarmEngine implements ISwarmEngine {
         messages: mergedUnread,
         head: latestHead,
         activeMembers: [],
+        ...(waitForAll ? { waitForAll: true } : {}),
         summary: fullDigest
           ? `All swarm members are idle (0 working/pending); nothing left to wait for. ${fullDigest}`
           : "All swarm members are idle (0 working/pending); nothing left to wait for.",
@@ -3071,6 +3286,7 @@ export class SwarmEngine implements ISwarmEngine {
     this.orchestratorWait = {
       since,
       mentionsOnly,
+      waitForAll,
       timer,
     };
 
@@ -3079,7 +3295,8 @@ export class SwarmEngine implements ISwarmEngine {
       messages: [],
       head: latestHead,
       activeMembers,
-      summary: `Parked waiting on ${activeMembers.length} active member(s) since #${since}.`,
+      ...(waitForAll ? { waitForAll: true } : {}),
+      summary: `Parked waiting on ${activeMembers.length} active member(s) since #${since}${waitForAll ? " (wait_for_all)" : ""}.`,
     };
   }
 
@@ -5690,14 +5907,38 @@ export class SwarmEngine implements ISwarmEngine {
               { callerName, callerRole },
             );
           }
-          const assertionId = input.assertionId?.trim() ?? "";
+          const targetAssertionIds: string[] = [];
+          const seenAssertionIds = new Set<string>();
+          const pushAssertionId = (raw: unknown): void => {
+            if (typeof raw !== "string") return;
+            const trimmed = raw.trim();
+            if (!trimmed || seenAssertionIds.has(trimmed)) return;
+            seenAssertionIds.add(trimmed);
+            targetAssertionIds.push(trimmed);
+          };
+          pushAssertionId(input.assertionId);
+          if (Array.isArray(input.assertionIds)) {
+            for (const rawId of input.assertionIds) {
+              pushAssertionId(rawId);
+            }
+          }
+
           const assertionStatus = input.assertionStatus;
-          if (!assertionId || !assertionStatus || !VALID_ASSERTION_STATUS_SET.has(assertionStatus)) {
+          if (
+            targetAssertionIds.length === 0 ||
+            !assertionStatus ||
+            !VALID_ASSERTION_STATUS_SET.has(assertionStatus)
+          ) {
             throw new SwarmProtocolError(
               "INVALID_INPUT",
-              'Both "assertion_id" and a valid "assertion_status" ("pending" | "passed" | "failed" | "blocked") are required for verify_assertion.',
+              'At least one "assertion_id" (or "assertion_ids") and a valid "assertion_status" ("pending" | "passed" | "failed" | "blocked") are required for verify_assertion.',
             );
           }
+
+          const targetLabel =
+            targetAssertionIds.length === 1
+              ? `"${targetAssertionIds[0]!}"`
+              : targetAssertionIds.map((id) => `"${id}"`).join(", ");
 
           if (
             assertionStatus === "passed" &&
@@ -5708,8 +5949,12 @@ export class SwarmEngine implements ISwarmEngine {
           ) {
             throw new SwarmProtocolError(
               "PERMISSION_DENIED",
-              `When validatorEnabled is ON, only an independent read-only "validator" (or human) may mark assertion "${assertionId}" as "passed". Spawn or wake @validator to verify it.`,
-              { assertionId, callerRole },
+              `When validatorEnabled is ON, only an independent read-only "validator" (or human) may mark assertion ${targetLabel} as "passed". Spawn or wake @validator to verify it.`,
+              {
+                assertionId: targetAssertionIds[0],
+                assertionIds: targetAssertionIds,
+                callerRole,
+              },
             );
           }
 
@@ -5720,23 +5965,34 @@ export class SwarmEngine implements ISwarmEngine {
           ) {
             throw new SwarmProtocolError(
               "INVALID_INPUT",
-              `Non-empty "evidence" is required when setting assertion "${assertionId}" to "${assertionStatus}".`,
-              { assertionId, assertionStatus },
+              `Non-empty "evidence" is required when setting assertion ${targetLabel} to "${assertionStatus}".`,
+              {
+                assertionId: targetAssertionIds[0],
+                assertionIds: targetAssertionIds,
+                assertionStatus,
+              },
             );
           }
 
           const currentAssertions = state.assertions ?? [];
-          const targetIdx = currentAssertions.findIndex((a) => a.id === assertionId);
-          if (targetIdx < 0) {
+          const existingIds = new Set(currentAssertions.map((a) => a.id));
+          const missingIds = targetAssertionIds.filter((id) => !existingIds.has(id));
+          if (missingIds.length > 0) {
             throw new SwarmProtocolError(
               "NOT_FOUND",
-              `Assertion "${assertionId}" not found in Validation Contract.`,
-              { assertionId },
+              missingIds.length === 1
+                ? `Assertion "${missingIds[0]!}" not found in Validation Contract.`
+                : `Assertions ${missingIds.map((id) => `"${id}"`).join(", ")} not found in Validation Contract.`,
+              {
+                assertionId: missingIds[0],
+                missingAssertionIds: missingIds,
+              },
             );
           }
 
-          const nextAssertions = currentAssertions.map((a, idx) => {
-            if (idx !== targetIdx) return { ...a };
+          const targetIdSet = new Set(targetAssertionIds);
+          const nextAssertions = currentAssertions.map((a) => {
+            if (!targetIdSet.has(a.id)) return { ...a };
             if (assertionStatus === "pending") {
               const reset: MissionAssertion = {
                 id: a.id,
@@ -5775,7 +6031,11 @@ export class SwarmEngine implements ISwarmEngine {
           // If an assertion explicitly failed, also ensure any milestone claiming it is unsealed & in_progress
           const affectedMilestones = new Set<string>(
             (state.features ?? [])
-              .filter((f) => f.status !== "cancelled" && f.fulfills.includes(assertionId))
+              .filter(
+                (f) =>
+                  f.status !== "cancelled" &&
+                  f.fulfills.some((id) => targetIdSet.has(id)),
+              )
               .map((f) => f.milestone),
           );
           if (assertionStatus === "failed") {
@@ -5801,7 +6061,9 @@ export class SwarmEngine implements ISwarmEngine {
 
           const passedCount = nextAssertions.filter((a) => a.status === "passed").length;
           const notes: string[] = [
-            `Assertion ${assertionId} marked "${assertionStatus}" by @${callerName} (${passedCount}/${nextAssertions.length} VAL passed).`,
+            targetAssertionIds.length === 1
+              ? `Assertion ${targetAssertionIds[0]!} marked "${assertionStatus}" by @${callerName} (${passedCount}/${nextAssertions.length} VAL passed).`
+              : `Assertions ${targetAssertionIds.join(", ")} (${targetAssertionIds.length}) marked "${assertionStatus}" by @${callerName} (${passedCount}/${nextAssertions.length} VAL passed).`,
           ];
           if (milestoneSync.newlySealed.length > 0) {
             notes.push(
@@ -5810,7 +6072,9 @@ export class SwarmEngine implements ISwarmEngine {
           }
           if (assertionStatus === "failed") {
             const claimingFeatures = (state.features ?? []).filter(
-              (f) => f.status !== "cancelled" && f.fulfills.includes(assertionId),
+              (f) =>
+                f.status !== "cancelled" &&
+                f.fulfills.some((id) => targetIdSet.has(id)),
             );
             const owners = claimingFeatures
               .map((f) =>
@@ -5821,7 +6085,7 @@ export class SwarmEngine implements ISwarmEngine {
               notes.push(`Unsealed milestone(s): ${milestoneSync.unsealed.join(", ")}.`);
             }
             notes.push(
-              `Action needed: fix failure (${evidence.slice(0, 140)})${owners ? ` on ${owners}` : ""}, merge/re-test, and re-verify ${assertionId}.`,
+              `Action needed: fix failure (${evidence.slice(0, 140)})${owners ? ` on ${owners}` : ""}, merge/re-test, and re-verify ${targetAssertionIds.join(", ")}.`,
             );
           }
 
@@ -5832,7 +6096,8 @@ export class SwarmEngine implements ISwarmEngine {
             actor: callerName,
             summary,
             data: {
-              assertionId,
+              assertionId: targetAssertionIds[0],
+              assertionIds: targetAssertionIds,
               status: assertionStatus,
               verifiedBy: callerName,
               verifiedByRole: callerRole,
@@ -7155,7 +7420,7 @@ export class SwarmEngine implements ISwarmEngine {
           live?.handle?.getState() === "working";
         if (isWorking && m.state !== "killed") {
           workingMemberNames.push(m.name);
-        } else if (m.state === "waiting") {
+        } else if (m.state === "waiting" && (isReconRun(run) || !m.recon)) {
           waitingMemberNames.push(m.name);
         }
       }
@@ -7300,6 +7565,11 @@ export class SwarmEngine implements ISwarmEngine {
       const isIsolatedWorktree =
         member.workspace !== "inherit" ||
         path.resolve(member.cwd) !== path.resolve(this.store.projectRoot);
+      const ownedScope = this.computeMemberFilesOwnedScope(
+        run,
+        member,
+        isIsolatedWorktree,
+      );
       live.lastWaitRequest = undefined;
       live.turnStartPostSeq = member.lastPostSeq ?? 0;
       live.lastSilentSummary = undefined;
@@ -7314,6 +7584,10 @@ export class SwarmEngine implements ISwarmEngine {
         baseBranch: run.baseBranch,
         workspace: member.workspace,
         isIsolatedWorktree,
+        ...(ownedScope.filesOwned ? { filesOwned: ownedScope.filesOwned } : {}),
+        ...(ownedScope.peerFilesOwned
+          ? { peerFilesOwned: ownedScope.peerFilesOwned }
+          : {}),
         parentName: member.parentName,
         brief: member.brief,
         channels: member.channels,
@@ -7782,6 +8056,11 @@ export class SwarmEngine implements ISwarmEngine {
       const isIsolatedWorktree =
         member.workspace !== "inherit" ||
         path.resolve(member.cwd) !== path.resolve(this.store.projectRoot);
+      const reviveOwnedScope = this.computeMemberFilesOwnedScope(
+        run,
+        member,
+        isIsolatedWorktree,
+      );
       live.lastWaitRequest = undefined;
       live.turnStartPostSeq = member.lastPostSeq ?? 0;
       live.lastSilentSummary = undefined;
@@ -7832,6 +8111,12 @@ export class SwarmEngine implements ISwarmEngine {
           baseBranch: run.baseBranch,
           workspace: member.workspace,
           isIsolatedWorktree,
+          ...(reviveOwnedScope.filesOwned
+            ? { filesOwned: reviveOwnedScope.filesOwned }
+            : {}),
+          ...(reviveOwnedScope.peerFilesOwned
+            ? { peerFilesOwned: reviveOwnedScope.peerFilesOwned }
+            : {}),
           parentName: member.parentName,
           brief: member.brief,
           channels: member.channels,
@@ -8778,9 +9063,209 @@ export class SwarmEngine implements ISwarmEngine {
   // Board Wakeup Routing & Coalescing
   // --------------------------------------------------------------------------
 
+  private hasDagReadyPendingFeatures(run: SwarmRunState): boolean {
+    const features = run.features ?? [];
+    if (features.length === 0 || !features.some((f) => f.status === "pending")) {
+      return false;
+    }
+
+    const orderedMilestoneLabels: string[] = [];
+    const seenMs = new Set<string>();
+    for (const m of run.milestones ?? []) {
+      const lbl = m.label.trim();
+      if (lbl && !seenMs.has(lbl)) {
+        seenMs.add(lbl);
+        orderedMilestoneLabels.push(lbl);
+      }
+    }
+    for (const f of features) {
+      const lbl = f.milestone.trim();
+      if (lbl && !seenMs.has(lbl)) {
+        seenMs.add(lbl);
+        orderedMilestoneLabels.push(lbl);
+      }
+    }
+    const activeMilestoneLabel = orderedMilestoneLabels.find((lbl) =>
+      features.some(
+        (f) =>
+          f.milestone.trim() === lbl &&
+          (f.status === "pending" ||
+            f.status === "in_progress" ||
+            f.status === "failed"),
+      ),
+    );
+
+    const featureById = new Map(features.map((f) => [f.id, f]));
+    const activeCollisionFeatures = features.filter((f) => {
+      if (f.status === "in_progress") return true;
+      if (f.status === "failed" && f.assignedMember && !f.mergedCommitSha) {
+        const assigned = getOwnMember(run, f.assignedMember);
+        if (assigned && assigned.state !== "killed") {
+          return true;
+        }
+      }
+      return false;
+    });
+
+    for (const feat of features) {
+      if (feat.status !== "pending") continue;
+      if (activeMilestoneLabel && feat.milestone.trim() !== activeMilestoneLabel) {
+        continue;
+      }
+      const depsSatisfied = (feat.dependsOn ?? []).every((depId) => {
+        const dep = featureById.get(depId);
+        return Boolean(
+          dep && (dep.status === "completed" || dep.status === "cancelled"),
+        );
+      });
+      if (!depsSatisfied) continue;
+      const featOwned = effectiveDispatchOwnedPaths(feat);
+      const collidesWithActive = activeCollisionFeatures.some((active) =>
+        ownedPathsOverlap(featOwned, effectiveDispatchOwnedPaths(active)),
+      );
+      if (!collidesWithActive) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private computeMemberFilesOwnedScope(
+    run: SwarmRunState | null | undefined,
+    member: SwarmMemberRecord,
+    isIsolatedWorktree: boolean,
+  ): { filesOwned?: string[]; peerFilesOwned?: Record<string, string[]> } {
+    if (
+      !run ||
+      member.workspace !== "inherit" ||
+      isIsolatedWorktree ||
+      member.recon ||
+      isReconRun(run) ||
+      member.role !== "worker"
+    ) {
+      return {};
+    }
+    const features = run.features ?? [];
+    if (features.length === 0) {
+      return {};
+    }
+    const assigned = features.filter(
+      (f) => f.status !== "cancelled" && f.assignedMember === member.name,
+    );
+    if (assigned.length === 0) {
+      return {};
+    }
+
+    const hasUnrestrictedAssigned = assigned.some((f) => {
+      if (!f.filesOwned || f.filesOwned.length === 0) return true;
+      return f.filesOwned.some((raw) => {
+        const norm = raw.trim().replace(/\\/g, "/").replace(/^\.\//, "");
+        return norm === "*" || norm === "." || norm === "**" || norm === "**/*";
+      });
+    });
+    if (hasUnrestrictedAssigned) {
+      return { filesOwned: ["*"] };
+    }
+
+    const seenOwned = new Set<string>();
+    const filesOwned: string[] = [];
+    for (const f of assigned) {
+      for (const raw of f.filesOwned ?? []) {
+        const trimmed = raw.trim();
+        if (trimmed && !seenOwned.has(trimmed)) {
+          seenOwned.add(trimmed);
+          filesOwned.push(trimmed);
+        }
+      }
+    }
+
+    const peerFilesOwned: Record<string, string[]> = {};
+    for (const f of features) {
+      if (
+        f.status === "cancelled" ||
+        f.assignedMember === member.name ||
+        !f.filesOwned ||
+        f.filesOwned.length === 0
+      ) {
+        continue;
+      }
+      const ownerKey = f.assignedMember?.trim() || f.id;
+      const existing = peerFilesOwned[ownerKey] ?? [];
+      for (const p of f.filesOwned) {
+        const trimmed = p.trim();
+        if (trimmed && !existing.includes(trimmed)) {
+          existing.push(trimmed);
+        }
+      }
+      if (existing.length > 0) {
+        peerFilesOwned[ownerKey] = existing;
+      }
+    }
+
+    return {
+      ...(filesOwned.length > 0 ? { filesOwned } : {}),
+      ...(Object.keys(peerFilesOwned).length > 0 ? { peerFilesOwned } : {}),
+    };
+  }
+
+  private shouldSuppressOrchestratorBarrierWake(msg: BoardMessage): boolean {
+    if (!this.orchestratorWait?.waitForAll) {
+      return false;
+    }
+    if (isUrgentBarrierBypassMessage(msg)) {
+      return false;
+    }
+    return this.getWorkingOrPendingMemberNames().length > 0;
+  }
+
+  private emitOrchestratorMessageWakeupIfAddressed(
+    run: SwarmRunState,
+    msg: BoardMessage,
+  ): boolean {
+    if (
+      this.disposed ||
+      this.runDonePosted ||
+      run.status !== "active" ||
+      this.activeRunId !== run.id
+    ) {
+      return false;
+    }
+    const mentionsLower = new Set(msg.mentions.map((m) => m.toLowerCase()));
+    const chMentionsLower = new Set(msg.channelMentions.map((c) => c.toLowerCase()));
+    const wakesOrchestrator =
+      msg.fromRole !== "orchestrator" &&
+      (mentionsLower.has(ORCHESTRATOR_NAME) ||
+        mentionsLower.has("coordinator") ||
+        mentionsLower.has(ALL_MENTION_NAME) ||
+        chMentionsLower.size > 0);
+    if (!wakesOrchestrator) {
+      return false;
+    }
+    if (this.shouldSuppressOrchestratorBarrierWake(msg)) {
+      return false;
+    }
+    let unreadMessages: BoardMessage[] = [msg];
+    if (this.orchestratorWait && msg.seq > this.orchestratorWait.since) {
+      const since = this.orchestratorWait.since;
+      this.clearOrchestratorWait();
+      unreadMessages = this.getCachedMessagesSince(since);
+      if (unreadMessages.length === 0) {
+        unreadMessages = [msg];
+      }
+    }
+    this.emitEngineEvent(
+      "wakeup_needed",
+      `Board #${msg.seq} from ${msg.from} addressed @${ORCHESTRATOR_NAME}`,
+      { seq: msg.seq, messages: unreadMessages },
+    );
+    return true;
+  }
+
   private async routeBoardMessageWakeups(
     run: SwarmRunState,
     msg: BoardMessage,
+    options?: { suppressOrchestratorWakeup?: boolean },
   ): Promise<boolean> {
     if (this.disposed || this.runDonePosted || run.status !== "active" || this.activeRunId !== run.id) {
       return false;
@@ -8788,31 +9273,7 @@ export class SwarmEngine implements ISwarmEngine {
     const senderLower = msg.from.toLowerCase();
     const mentionsLower = new Set(msg.mentions.map((m) => m.toLowerCase()));
     const chMentionsLower = new Set(msg.channelMentions.map((c) => c.toLowerCase()));
-
-    // Check if @orchestrator / @coordinator / @all / @#channel should wake the main Pi session
-    const wakesOrchestrator =
-      msg.fromRole !== "orchestrator" &&
-      (mentionsLower.has(ORCHESTRATOR_NAME) ||
-        mentionsLower.has("coordinator") ||
-        mentionsLower.has(ALL_MENTION_NAME) ||
-        chMentionsLower.size > 0);
-
-    if (wakesOrchestrator) {
-      let unreadMessages: BoardMessage[] = [msg];
-      if (this.orchestratorWait && msg.seq > this.orchestratorWait.since) {
-        const since = this.orchestratorWait.since;
-        this.clearOrchestratorWait();
-        unreadMessages = this.getCachedMessagesSince(since);
-        if (unreadMessages.length === 0) {
-          unreadMessages = [msg];
-        }
-      }
-      this.emitEngineEvent(
-        "wakeup_needed",
-        `Board #${msg.seq} from ${msg.from} addressed @${ORCHESTRATOR_NAME}`,
-        { seq: msg.seq, messages: unreadMessages },
-      );
-    }
+    const isExecutingRun = !isReconRun(run);
 
     // Resolve all target non-killed members (never wake the sender!)
     const targetNames = new Set<string>();
@@ -8823,6 +9284,7 @@ export class SwarmEngine implements ISwarmEngine {
     for (const handle of mentionsLower) {
       if (handle === ALL_MENTION_NAME) {
         for (const m of allMembers) {
+          if (isExecutingRun && m.recon === true) continue;
           targetNames.add(m.name);
         }
         continue;
@@ -8837,6 +9299,7 @@ export class SwarmEngine implements ISwarmEngine {
       }
       // Group prefix wakeup (`@parser` wakes `parser-1..k`)
       for (const m of allMembers) {
+        if (isExecutingRun && m.recon === true) continue;
         if (m.groupPrefix && m.groupPrefix.toLowerCase() === handle) {
           targetNames.add(m.name);
         }
@@ -8848,6 +9311,7 @@ export class SwarmEngine implements ISwarmEngine {
       const chRecord = getOwnChannel(run, ch);
       if (!chRecord || chRecord.archived) continue;
       for (const m of allMembers) {
+        if (isExecutingRun && m.recon === true) continue;
         if (m.channels.includes(ch) || chRecord.subscribers.includes(m.name)) {
           targetNames.add(m.name);
         }
@@ -8857,6 +9321,7 @@ export class SwarmEngine implements ISwarmEngine {
     // Wake parked members who explicitly waited with `swarm_wait{mentions_only: false}`
     // on any non-self post in DEFAULT_CHANNEL or one of their subscribed channels!
     for (const m of allMembers) {
+      if (isExecutingRun && m.recon === true) continue;
       if (m.state !== "waiting") continue;
       const live = this.liveMembers.get(m.name);
       if (live && live.parkedMentionsOnly === false) {
@@ -8880,31 +9345,37 @@ export class SwarmEngine implements ISwarmEngine {
       eligibleTargets.push(name);
     }
 
-    if (eligibleTargets.length === 0) {
-      return wakesOrchestrator;
-    }
-
-    // Enforce SWARM_MAX_BOARD_HOPS safety cap on peer-to-peer bounce chains!
-    if (msg.fromRole === "worker" || msg.fromRole === "validator") {
-      if (this.boardHopCount >= SWARM_MAX_BOARD_HOPS) {
-        if (!this.hopCapAlerted) {
-          this.hopCapAlerted = true;
-          await this.postMonitorOrchestratorAlert(
-            run.id,
-            `@${ORCHESTRATOR_NAME} [hop-cap] Reached SWARM_MAX_BOARD_HOPS (${SWARM_MAX_BOARD_HOPS}) peer-to-peer wakeups at #${msg.seq}. Inspect the board and post an orchestrator decision to reset hops.`,
-            "update",
-          );
+    let hopCapped = false;
+    if (eligibleTargets.length > 0) {
+      // Enforce SWARM_MAX_BOARD_HOPS safety cap on peer-to-peer bounce chains!
+      if (msg.fromRole === "worker" || msg.fromRole === "validator") {
+        if (this.boardHopCount >= SWARM_MAX_BOARD_HOPS) {
+          hopCapped = true;
+          if (!this.hopCapAlerted) {
+            this.hopCapAlerted = true;
+            await this.postMonitorOrchestratorAlert(
+              run.id,
+              `@${ORCHESTRATOR_NAME} [hop-cap] Reached SWARM_MAX_BOARD_HOPS (${SWARM_MAX_BOARD_HOPS}) peer-to-peer wakeups at #${msg.seq}. Inspect the board and post an orchestrator decision to reset hops.`,
+              "update",
+            );
+          }
+        } else {
+          this.boardHopCount += 1;
         }
-        return wakesOrchestrator;
       }
-      this.boardHopCount += 1;
+
+      if (!hopCapped) {
+        // Deliver to each eligible target cleanly with synchronous waking lock + coalescing BEFORE checking barrier wake!
+        for (const targetName of eligibleTargets) {
+          this.deliverBoardMessageToMember(run.id, targetName, msg);
+        }
+      }
     }
 
-    // Deliver to each eligible target cleanly with synchronous waking lock + coalescing
-    for (const targetName of eligibleTargets) {
-      this.deliverBoardMessageToMember(run.id, targetName, msg);
+    if (options?.suppressOrchestratorWakeup) {
+      return false;
     }
-    return wakesOrchestrator;
+    return this.emitOrchestratorMessageWakeupIfAddressed(run, msg);
   }
 
   private maybeWakeParkedOrchestratorOnMessage(
@@ -8915,6 +9386,9 @@ export class SwarmEngine implements ISwarmEngine {
       return;
     }
     if (msg.seq <= this.orchestratorWait.since) {
+      return;
+    }
+    if (this.shouldSuppressOrchestratorBarrierWake(msg)) {
       return;
     }
     if (
@@ -9146,7 +9620,9 @@ export class SwarmEngine implements ISwarmEngine {
         fullDigest
           ? `All active swarm members have finished and parked (all_idle). ${fullDigest}`
           : "All active swarm members have finished and parked (all_idle).",
-        unread.length > 0 ? { messages: unread } : undefined,
+        unread.length > 0
+          ? { seq: unread[unread.length - 1]!.seq, messages: unread }
+          : undefined,
       );
     }
     if (this.boardWaiters.size === 0) {
@@ -9226,8 +9702,10 @@ export class SwarmEngine implements ISwarmEngine {
     if (this.monitorRunning) {
       return;
     }
-    // Require at least one live (non-killed) member parked before considering swarm stalled
-    const nonKilled = Object.values(run.members).filter((m) => m.state !== "killed");
+    // Require at least one live (non-killed, non-recon) member parked before considering swarm stalled
+    const nonKilled = Object.values(run.members).filter(
+      (m) => m.state !== "killed" && !m.recon,
+    );
     if (nonKilled.length === 0) {
       return;
     }
@@ -9311,7 +9789,7 @@ export class SwarmEngine implements ISwarmEngine {
 
     const rosterSummary = run.memberOrder
       .map((name) => getOwnMember(run, name))
-      .filter((m): m is SwarmMemberRecord => Boolean(m && m.state !== "killed"))
+      .filter((m): m is SwarmMemberRecord => Boolean(m && m.state !== "killed" && !m.recon))
       .map((m) => `${m.name}[${m.state}${m.parkedOn ? `:${m.parkedOn.slice(0, 32)}` : ""}]`)
       .join(", ");
 
@@ -9474,7 +9952,7 @@ export class SwarmEngine implements ISwarmEngine {
 
       const rosterLines = run.memberOrder
         .map((n) => getOwnMember(run, n))
-        .filter((m): m is SwarmMemberRecord => Boolean(m && m.state !== "killed"))
+        .filter((m): m is SwarmMemberRecord => Boolean(m && m.state !== "killed" && !m.recon))
         .map(
           (m) =>
             `- @${m.name} (${m.role}) state=${m.state} parent=@${m.parentName} turns=${m.turns} lastPost=${m.lastPostSeq ? `#${m.lastPostSeq}` : "none"} parkedOn=${m.parkedOn ?? "-"} error=${m.error ?? "-"}`,
@@ -10098,6 +10576,15 @@ export class SwarmEngine implements ISwarmEngine {
         };
       },
 
+      getFilesOwnedScope: () => {
+        const run = this.cachedRun;
+        const current = getOwnMember(run, member.name) ?? member;
+        const isIsolatedWorktree =
+          current.workspace !== "inherit" ||
+          path.resolve(current.cwd) !== path.resolve(this.store.projectRoot);
+        return this.computeMemberFilesOwnedScope(run, current, isIsolatedWorktree);
+      },
+
       recordParkBlocked: async (seq: number) => {
         if (!Number.isFinite(seq) || seq < 0) {
           return;
@@ -10217,9 +10704,11 @@ export class SwarmEngine implements ISwarmEngine {
   private getWorkingOrPendingMemberNames(): string[] {
     const run = this.cachedRun;
     if (!run) return [];
+    const reconMode = isReconRun(run);
     const active = new Set<string>();
     for (const member of Object.values(run.members)) {
       if (member.state === "killed") continue;
+      if (!reconMode && member.recon === true) continue;
       const live = this.liveMembers.get(member.name);
       if (
         member.state === "working" ||

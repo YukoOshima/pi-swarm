@@ -20,6 +20,7 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
+  ORCHESTRATOR_NAME,
   POST_MESSAGE_TOOL,
   READ_BOARD_TOOL,
   SWARM_CORE_TOOLS,
@@ -283,6 +284,16 @@ export function isPathInScope(relPath: string, scope: readonly string[]): boolea
     }
   }
 
+  return false;
+}
+
+function hasUnrestrictedScopeWildcard(scope: readonly string[]): boolean {
+  for (const rawEntry of scope) {
+    const entry = normalizeRepoPath(rawEntry);
+    if (entry === "." || entry === "*" || entry === "**" || entry === "**/*") {
+      return true;
+    }
+  }
   return false;
 }
 
@@ -1538,7 +1549,9 @@ export function isForbiddenWorkerBashCommand(
   command: string,
   baseBranch = "",
   worktreePath = "",
-  options?: { workspace?: SwarmWorkspaceMode } | SwarmWorkspaceMode,
+  options?:
+    | { workspace?: SwarmWorkspaceMode; isIsolatedWorktree?: boolean }
+    | SwarmWorkspaceMode,
 ): CommandGuardResult {
   const trimmed = stripWordAdjacentEmptyQuotes(command.trim());
   if (!trimmed) {
@@ -1574,20 +1587,14 @@ export function isForbiddenWorkerBashCommand(
   }
 
   const masked = maskQuotedShellLiterals(trimmed);
-  const workerGitRe = new RegExp(
-    `${GIT_PREFIX_RE}\\s+(?:merge|push|worktree)(?=\\s|$|[;&|)\\r\\n\`"'])`,
-  );
-  if (workerGitRe.test(masked)) {
-    return {
-      allowed: false,
-      reason:
-        "Workers must not run `git merge`, `git push`, or `git worktree`. Only the Swarm Orchestrator merges.",
-    };
-  }
-
   const effectiveWorkspace =
     typeof options === "string" ? options : options?.workspace;
-  if (effectiveWorkspace === "inherit") {
+  const isIsolatedInheritHelper =
+    typeof options === "object" && options?.isIsolatedWorktree === true;
+  const isSharedTreeInherit =
+    effectiveWorkspace === "inherit" && !isIsolatedInheritHelper;
+
+  if (isSharedTreeInherit) {
     const inheritResetRe = new RegExp(
       `${GIT_PREFIX_RE}\\s+reset\\b[^\\n;&|]*\\s--(?:hard|merge|keep)(?=\\s|$|[;&|)\\r\\n\`"'])`,
     );
@@ -1620,6 +1627,38 @@ export function isForbiddenWorkerBashCommand(
           'Workers in shared `workspace: "inherit"` must not run destructive workspace-wide git commands (`git reset --hard`, `git clean`, `git checkout -- .`, `git restore .`, `git stash`) because sibling workers share the working tree.',
       };
     }
+
+    const inheritSharedIndexOrBranchRe = new RegExp(
+      `${GIT_PREFIX_RE}\\s+(?:commit|switch|merge|rebase|cherry-pick)(?=\\s|$|[;&|)\\r\\n\`"'])`,
+    );
+    const inheritCheckoutBranchRe = new RegExp(
+      `${GIT_PREFIX_RE}\\s+checkout(?!\\s+--\\s+\\S)(?=\\s|$|[;&|)\\r\\n\`"'])|${GIT_PREFIX_RE}\\s+checkout\\b[^\\n;&|()\`]*\\s(?:-[bBt]|--(?:orphan|detach|track|merge))\\b`,
+    );
+    const inheritMutatingBranchFlagRe = new RegExp(
+      `${GIT_PREFIX_RE}\\s+branch\\b[^\\n;&|]*\\s(?:-[dDmMcCf]+\\b|--(?:delete|move|copy|force)(?=\\s|$|[;&|)]))`,
+    );
+    if (
+      inheritSharedIndexOrBranchRe.test(masked) ||
+      inheritCheckoutBranchRe.test(masked) ||
+      inheritMutatingBranchFlagRe.test(masked)
+    ) {
+      return {
+        allowed: false,
+        reason:
+          'Workers in shared `workspace: "inherit"` must not switch branches or create shared-index git commits/merges (`git checkout <branch>`, `git checkout -b`, `git switch`, `git commit`, `git merge`, `git rebase`, `git cherry-pick`) because `workspace: "inherit"` shares the live working tree with sibling workers so branch switches and git commits belong to the user (unlike opt-in `share`/`branch` worktrees).',
+      };
+    }
+  }
+
+  const workerGitRe = new RegExp(
+    `${GIT_PREFIX_RE}\\s+(?:merge|push|worktree)(?=\\s|$|[;&|)\\r\\n\`"'])`,
+  );
+  if (workerGitRe.test(masked)) {
+    return {
+      allowed: false,
+      reason:
+        "Workers must not run `git merge`, `git push`, or `git worktree`. Only the Swarm Orchestrator merges.",
+    };
   }
 
   if (baseBranch) {
@@ -1922,7 +1961,13 @@ export function createWorkerGuardExtensionFactory(
   return (pi) => {
     pi.on("tool_call", (event) => {
       if (isToolCallEventType("write", event) || isToolCallEventType("edit", event)) {
-        const rawPath = event.input.path;
+        const rawInput = event.input as { path?: unknown; file_path?: unknown };
+        const rawPath =
+          typeof rawInput?.path === "string"
+            ? rawInput.path
+            : typeof rawInput?.file_path === "string"
+              ? rawInput.file_path
+              : "";
         const rel = resolveWorktreeRelativePath(request.cwd, rawPath);
         if (rel === null) {
           return {
@@ -1936,6 +1981,43 @@ export function createWorkerGuardExtensionFactory(
             reason: `Workers are forbidden from editing protected path "${rel}" (${SWARM_DIR}/, .swarm/, or .git/). ${allowedLocationHint}`,
           };
         }
+        if (request.workspace === "inherit" && !request.isIsolatedWorktree) {
+          const liveScope = request.engineApi?.getFilesOwnedScope?.();
+          const effectiveFilesOwned = liveScope
+            ? liveScope.filesOwned
+            : request.filesOwned;
+          const effectivePeerFilesOwned = liveScope
+            ? liveScope.peerFilesOwned
+            : request.peerFilesOwned;
+          if (
+            effectiveFilesOwned &&
+            effectiveFilesOwned.length > 0 &&
+            !hasUnrestrictedScopeWildcard(effectiveFilesOwned) &&
+            !isPathInScope(rel, effectiveFilesOwned)
+          ) {
+            let ownerHint = "";
+            if (effectivePeerFilesOwned) {
+              for (const [peerOwner, peerPaths] of Object.entries(effectivePeerFilesOwned)) {
+                if (
+                  Array.isArray(peerPaths) &&
+                  peerPaths.length > 0 &&
+                  !hasUnrestrictedScopeWildcard(peerPaths) &&
+                  isPathInScope(rel, peerPaths)
+                ) {
+                  const ownerLabel = peerOwner.startsWith("@")
+                    ? peerOwner
+                    : `@${peerOwner}`;
+                  ownerHint = ` (owned by ${ownerLabel})`;
+                  break;
+                }
+              }
+            }
+            return {
+              block: true,
+              reason: `Path "${rel}"${ownerHint} is outside @${request.name}'s filesOwned slice [${effectiveFilesOwned.join(", ")}] in shared workspace "inherit". Stay within your owned files, or ask @${ORCHESTRATOR_NAME} to update filesOwned via swarm{action:"mission", mission_op:"upsert_features"}. ${allowedLocationHint}`,
+            };
+          }
+        }
         return undefined;
       }
 
@@ -1948,7 +2030,10 @@ export function createWorkerGuardExtensionFactory(
           event.input.command,
           enforceBaseBranchGuard ? (baseBranch ?? "") : "",
           request.cwd,
-          { workspace: request.workspace },
+          {
+            workspace: request.workspace,
+            isIsolatedWorktree: Boolean(request.isIsolatedWorktree),
+          },
         );
         if (!check.allowed) {
           const baseReason = check.reason ?? "Command is forbidden in worker sessions.";

@@ -7768,6 +7768,70 @@ describe("Wave 2b: Recon-in-Swarm TUI Dashboard & Overlay Indicators", () => {
       overlay.dispose();
     }
   });
+
+  it("trims redundant Goal/awaiting/token footer duplication when live widget is mounted on an executing run while preserving non-widget, recon, and standby cues", () => {
+    const baseSnap = makeSampleSnapshot({
+      members: [
+        makeSampleMember({ name: "impl-1", role: "worker", state: "waiting", parkedOn: "awaiting review" }),
+      ],
+      boardHead: 9,
+    });
+    baseSnap.totalTokens = 18_400;
+    baseSnap.run!.features = [
+      {
+        id: "feat-footer",
+        title: "Compact footer",
+        description: "Trim widget duplication",
+        milestone: "m1",
+        status: "in_progress",
+        assignedMember: "impl-1",
+        fulfills: ["VAL-UI-001"],
+        updatedAt: "2026-11-20T17:40:00.000Z",
+      },
+    ];
+    baseSnap.run!.assertions = [
+      {
+        id: "VAL-UI-001",
+        title: "Footer stays crisp",
+        description: "No redundant duplication when widget is active",
+        status: "pending",
+        updatedAt: "2026-11-20T17:40:00.000Z",
+      },
+    ];
+
+    // Without widgetActive (headless/unit callers), full badges remain intact
+    const fullFooter = formatStatusLine(baseSnap, false) ?? "";
+    assert.match(fullFooter, /^🐝 swarm:Live #9 · 0 working · 1 waiting/);
+    assert.match(fullFooter, /Feat 0\/1 · VAL 0\/1/);
+    assert.match(fullFooter, /⏳ awaiting @orchestrator/);
+    assert.match(fullFooter, /18\.4k tok/);
+
+    // With widgetActive: true on an active executing run, redundant Goal/awaiting/token chatter is omitted
+    const compactFooter = formatStatusLine(baseSnap, { widgetActive: true }) ?? "";
+    assert.equal(compactFooter, "🐝 swarm:Live #9 · 0 working · 1 waiting");
+
+    // Recon mode & completed standby still surface their essential cues even when widgetActive is true
+    const reconSnap: SwarmSnapshot = {
+      ...baseSnap,
+      run: { ...baseSnap.run!, runMode: "recon", phase: "recon" },
+    };
+    const reconFooter =
+      formatStatusLine(reconSnap, { draftActive: true, widgetActive: true }) ?? "";
+    assert.match(reconFooter, /^🐝 swarm:recon #9/);
+    assert.match(reconFooter, /draft$/);
+
+    const completedSnap: SwarmSnapshot = {
+      ...baseSnap,
+      run: { ...baseSnap.run!, status: "completed" },
+    };
+    const standbyFooter =
+      formatStatusLine(completedSnap, {
+        orchestratorStandby: true,
+        widgetActive: true,
+      }) ?? "";
+    assert.match(standbyFooter, /🐝 swarm:completed #9/);
+    assert.match(standbyFooter, /@orchestrator standby \(\/swarm exit\)/);
+  });
 });
 
 

@@ -1783,12 +1783,17 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       0,
     );
 
-    // Transition to idle and emit `agent_settled` -> single kickoff wakeup fires!
+    // Transition to idle and emit `agent_settled` -> single post-completion `all_idle` wakeup flushes (kickoff suppressed)!
     harness.setIdle(true);
     await harness.emit("agent_settled", { aborted: false });
+    const postSettleWakeups = harness.sentMessages.filter(
+      (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
+    );
+    assert.equal(postSettleWakeups.length, 1);
     assert.equal(
-      harness.sentMessages.filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE).length,
-      1,
+      Boolean((postSettleWakeups[0]!.message.details as { kickoff?: boolean } | undefined)?.kickoff),
+      false,
+      "Redundant post-confirmation kickoff turn must be suppressed when all wave-1 work was already launched",
     );
 
     // Clear idle flag until after scout completes its post-wakeup test in real timing:
@@ -2403,20 +2408,27 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
         { name: "worker", role: "worker", workspace: "inherit", brief: "Work" },
       ],
     });
-    await waitFor(() =>
-      ownerHarness.sentMessages.some((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE),
-    );
-    const kickoffMsg = ownerHarness.sentMessages
-      .filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE)
-      .pop()!;
-    assert.ok(
-      !String(kickoffMsg.message.content).includes("validate independently"),
-      "Kickoff must omit validator prompt when validatorEnabled=false",
-    );
-
     const statusRes = await ownerHarness.executeTool(SWARM_TOOL, { action: "status" });
     const runId = String(statusRes.details?.runId ?? "");
     assert.ok(runId);
+
+    // Wave-1 `worker` is already actively running with 0 unassigned ready features -> redundant kickoff turn suppressed!
+    await new Promise((r) => setTimeout(r, 25));
+    assert.equal(
+      ownerHarness.sentMessages.filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE)
+        .length,
+      0,
+      "Redundant kickoff wakeup must be suppressed when initial_members already run all wave-1 work",
+    );
+    const loadedForKickoffCheck = await new SwarmStore(repoDir).loadRun(runId);
+    const kickoffPromptPreview = buildLaunchKickoffPrompt(
+      loadedForKickoffCheck,
+      Object.values(loadedForKickoffCheck.members),
+    );
+    assert.ok(
+      !kickoffPromptPreview.includes("validate independently"),
+      "Kickoff must omit validator prompt when validatorEnabled=false",
+    );
 
     // Foreign session tries destructive commands + unknown teardown flag
     const foreignHarness = createMockPiHarness(repoDir, {
@@ -2610,9 +2622,6 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       strategy: "Single worker",
       acceptance_criteria: "No duplicate wakeups",
       base_branch: "main",
-      initial_members: [
-        { name: "worker", role: "worker", workspace: "inherit", brief: "Stand by" },
-      ],
     });
     assert.equal(planRes.isError, undefined);
     assert.match(
@@ -2621,8 +2630,16 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       "handlePlanConfirmed must update activeRunSections.swarm for multi-tool Turn 2",
     );
 
-    // Simulate Turn 2 inside the same agent run -> drops pending kickoff wakeup
+    // Simulate Turn 2 inside the same agent run (spawning worker in Turn 2) -> drops pending kickoff wakeup
     await harness.emit("turn_start", { turnIndex: 1, timestamp: Date.now() });
+    const turn2AddRes = await harness.executeTool(SWARM_TOOL, {
+      action: "add",
+      name: "worker",
+      role: "worker",
+      workspace: "inherit",
+      brief: "Stand by",
+    });
+    assert.equal(turn2AddRes.isError, undefined);
     harness.setIdle(true);
     await harness.emit("agent_settled", { aborted: false });
     await new Promise((r) => setTimeout(r, 30));
@@ -6595,7 +6612,7 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       const livePass1 = await liveHost.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
         title: "Live Ephemeral Reviewer Check",
         objective: "Verify package.json script checks",
-        strategy: "Single milestone",
+        strategy: "Parallel multi-feature milestone",
         acceptance_criteria: "Tests pass",
         base_branch: "main",
         assertions: [
@@ -6604,6 +6621,11 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
             title: "Tests pass cleanly",
             description: "Test command exits 0",
           },
+          {
+            id: "VAL-CMD-002",
+            title: "Runner exit code verified",
+            description: "Runner exits 0",
+          },
         ],
         features: [
           {
@@ -6611,7 +6633,16 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
             title: "Run check",
             description: "Verify script",
             milestone: "m1",
+            files_owned: ["src/cmd.ts"],
             fulfills: ["VAL-CMD-001"],
+          },
+          {
+            id: "feat-runner",
+            title: "Runner check",
+            description: "Verify runner",
+            milestone: "m1",
+            files_owned: ["src/runner.ts"],
+            fulfills: ["VAL-CMD-002"],
           },
         ],
         commands: [{ name: "lint", command: "npm run lint:missing" }],
@@ -6638,7 +6669,7 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       const livePass2 = await liveHost.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
         title: "Live Ephemeral Reviewer Check",
         objective: "Verify package.json script checks",
-        strategy: "Single milestone",
+        strategy: "Parallel multi-feature milestone",
         acceptance_criteria: "Tests pass",
         base_branch: "main",
         assertions: [
@@ -6647,6 +6678,11 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
             title: "Tests pass cleanly",
             description: "Test command exits 0",
           },
+          {
+            id: "VAL-CMD-002",
+            title: "Runner exit code verified",
+            description: "Runner exits 0",
+          },
         ],
         features: [
           {
@@ -6654,7 +6690,16 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
             title: "Run check",
             description: "Verify script",
             milestone: "m1",
+            files_owned: ["src/cmd.ts"],
             fulfills: ["VAL-CMD-001"],
+          },
+          {
+            id: "feat-runner",
+            title: "Runner check",
+            description: "Verify runner",
+            milestone: "m1",
+            files_owned: ["src/runner.ts"],
+            fulfills: ["VAL-CMD-002"],
           },
         ],
         commands: [{ name: "test", command: "npm test" }],
@@ -10527,7 +10572,7 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     await host.emit("session_shutdown", { reason: "quit" });
   });
 
-  it("34. v1.0.1: Drafting Recon Brake blocks heavy test/lint/build commands, enforces 10-call recon cap with soft nudge at call 5, and preserves benign recon", async () => {
+  it("34. v1.0.1: Drafting Recon Brake blocks heavy test/lint/build commands, enforces 14-call recon cap with soft nudge at call 8, and preserves benign recon", async () => {
     const repoDir = await createTempGitRepo("v101-draft-recon-brake");
     tempDirs.push(repoDir);
 
@@ -10569,8 +10614,8 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     }
 
     // 2. Benign read-only structural recon (including grep for "vitest" in package.json) stays allowed
-    //    and triggers soft <draft_recon_brake> at calls 5..10, then hard-blocks call 11!
-    for (let i = 1; i <= 10; i++) {
+    //    and triggers soft <draft_recon_brake> at calls 8..14, then hard-blocks call 15!
+    for (let i = 1; i <= 14; i++) {
       const callRes = (
         await host.emit("tool_call", {
           type: "tool_call",
@@ -10594,7 +10639,7 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
           isError: false,
         })
       ).find(Boolean);
-      if (i < 5) {
+      if (i < 8) {
         assert.equal(resultRes, undefined, `Call #${i} must not inject brake yet`);
       } else {
         const appended = (resultRes?.content ?? [])
@@ -10604,17 +10649,17 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       }
     }
 
-    // 3. Call #11 hits the hard recon cap and redirects directly to propose_swarm_plan
+    // 3. Call #15 hits the hard recon cap and redirects directly to propose_swarm_plan
     const capped = (
       await host.emit("tool_call", {
         type: "tool_call",
-        toolCallId: "tc-recon-11",
+        toolCallId: "tc-recon-15",
         toolName: "read",
         input: { path: "src/components/ui/terminal.tsx" },
       })
     ).find(Boolean);
-    assert.equal(capped?.block, true, "Recon call #11 must be hard-blocked at cap 10");
-    assert.match(String(capped?.reason), /recon cap \(10 calls\) reached/);
+    assert.equal(capped?.block, true, "Recon call #15 must be hard-blocked at cap 14");
+    assert.match(String(capped?.reason), /recon cap \(14 calls\) reached/);
 
     // 4. propose_swarm_plan itself is NEVER blocked by the recon cap, and a bounce grants 4 refinement checks
     const proposeCheck = (
@@ -10873,23 +10918,27 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       "Confirm must promote the recon run IN-PLACE under the exact same runId",
     );
 
-    // Wait for impl-arch to finish initial turn and kickoff wakeup to flush
+    // Wait for impl-arch to finish initial turn and [done] wakeup to flush (redundant kickoff suppressed!)
+    const wakeupsBeforeConfirm = reconWakeup ? host.sentMessages.indexOf(reconWakeup) + 1 : 0;
     await waitFor(async () => (await store.loadRun(reconRunId)).members["impl-arch"]?.state === "waiting");
     await waitFor(() =>
-      host.sentMessages.some(
-        (m) =>
-          m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE &&
-          (m.message.details as { kickoff?: boolean } | undefined)?.kickoff === true,
-      ),
+      host.sentMessages
+        .slice(wakeupsBeforeConfirm)
+        .some((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE),
     );
 
     const promotedRun = await store.loadRun(reconRunId);
     assert.equal(promotedRun.runMode, "executing");
     assert.equal(promotedRun.phase, undefined);
     assert.equal(
+      promotedRun.members["research-arch"]?.state,
+      "killed",
+      "Warm :recon session must be auto-retired to killed after fork completes on plan confirmation",
+    );
+    assert.equal(
       wakeCounts.get("research-arch") ?? 0,
       0,
-      "Silent promotion [decision] must NOT wake warm waiting recon worker",
+      "Retired recon worker must never be woken during promotion or execution",
     );
     const preservedArch = await store.readLibraryTopic(reconRunId, "architecture");
     assert.match(preservedArch ?? "", /Discovered modular plugin layout during recon/);
@@ -10898,15 +10947,24 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
       promotedBoard.messages.some((m) => m.text.includes("Architecture mapped in library/architecture.md")),
       "Pre-promotion recon board messages must be preserved",
     );
-    const kickoffMsg = host.sentMessages
-      .filter(
-        (m) =>
-          m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE &&
-          (m.message.details as { kickoff?: boolean } | undefined)?.kickoff === true,
-      )
-      .pop()!;
-    assert.match(String(kickoffMsg.message.content), /Promoted from Recon/);
-    assert.match(String(kickoffMsg.message.content), /@research-arch/);
+    const postConfirmWakeups = host.sentMessages
+      .slice(wakeupsBeforeConfirm)
+      .filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE);
+    assert.equal(
+      postConfirmWakeups.some(
+        (m) => (m.message.details as { kickoff?: boolean } | undefined)?.kickoff === true,
+      ),
+      false,
+      "Redundant kickoff wakeup must be suppressed when forked wave-1 worker already covers execution",
+    );
+    assert.match(String(postConfirmWakeups[postConfirmWakeups.length - 1]!.message.content), /Implemented feature cleanly/);
+    assert.match(
+      buildLaunchKickoffPrompt(promotedRun, [], [], undefined, {
+        promotedFromRecon: true,
+        warmReconHandles: [],
+      }),
+      /Promoted from Recon/,
+    );
 
     // Active tools narrowed to 4 SWARM_CORE_TOOLS
     const runningTools = host.pi.getActiveTools();
@@ -11337,6 +11395,393 @@ describe("pi-swarm v0.2.0 cross-module E2E integration", () => {
     const reconExcludedVerdict = extractValidatorVerdict(reconOnlyValidatorRun, reconPostBoard);
     assert.equal(reconExcludedVerdict, "Enabled (no validator spawned)");
 
+    await host.emit("session_shutdown", { reason: "quit" });
+  });
+
+  it("37. Goldilocks Calibration: 1-feature commands bypass @contract-reviewer, Standby add fails fast with INVALID_STATE & Continue refining keeps 7 recon tools, 1-feature mismatched worker auto-links + skips kickoff, and promoted recon forks + retires ghosts against @all", async () => {
+    const repoDir = await createTempGitRepo("goldilocks-host-calibration");
+    tempDirs.push(repoDir);
+
+    const store = new SwarmStore(repoDir);
+    const spawnedReviewRequests: SpawnMemberRequest[] = [];
+    const wakeCounts = new Map<string, number>();
+    let releaseImplWorker!: () => void;
+    const implGate = new Promise<void>((resolve) => {
+      releaseImplWorker = resolve;
+    });
+
+    const liveSimRuntime = {
+      ...createMockModelRuntime(),
+      stream: () => {
+        throw new Error("Mock transport intercepts before network stream");
+      },
+    } as unknown as ModelRuntime;
+
+    const mockTransport: ISwarmTransport = {
+      async spawnMember(request: SpawnMemberRequest): Promise<PersistentAgentHandle> {
+        if (request.runId === "draft-contract-review") {
+          spawnedReviewRequests.push(request);
+          return createMockPersistentMemberHandle({
+            request,
+            runInitialTurn: async ({ pushAssistantMessage }) => {
+              pushAssistantMessage("<approved/>");
+              return {
+                agentId: request.agentId,
+                name: request.name,
+                role: request.role,
+                outcome: "stopped",
+                summary: "<approved/>",
+                tokens: 80,
+                cost: 0.0008,
+              };
+            },
+          }).handle;
+        }
+
+        return createMockPersistentMemberHandle({
+          request,
+          runInitialTurn: async ({ pushAssistantMessage }) => {
+            if (request.name === "impl") {
+              await implGate;
+              pushAssistantMessage("Implemented compact footer.");
+              await request.engineApi!.postMessage({
+                text: "@orchestrator [done] Shipped compact footer cleanly.",
+                kind: "done",
+                verificationEvidence: "npm test && npm run typecheck exited 0",
+              });
+              return {
+                agentId: request.agentId,
+                name: request.name,
+                role: request.role,
+                outcome: "waiting",
+                summary: "Footer done",
+                tokens: 150,
+                cost: 0.0015,
+              };
+            }
+
+            if (request.name === "recon-scout") {
+              assert.equal(request.readOnlyRecon, true);
+              pushAssistantMessage("Scouted src/auth/session.ts: token rotation hook at line 42.");
+              await request.engineApi!.postMessage({
+                text: "@orchestrator [done] Mapped session rotation hook.",
+                kind: "done",
+              });
+              return {
+                agentId: request.agentId,
+                name: request.name,
+                role: request.role,
+                outcome: "waiting",
+                summary: "Scout done",
+                tokens: 120,
+                cost: 0.0012,
+              };
+            }
+
+            if (request.name === "wave1-forked") {
+              assert.equal(request.readOnlyRecon ?? false, false);
+              assert.ok(
+                Array.isArray(request.seedMessages) &&
+                  request.seedMessages.some((m) =>
+                    JSON.stringify(m).includes("token rotation hook at line 42"),
+                  ),
+                "wave1-forked must inherit recon-scout conversation history via fork",
+              );
+              pushAssistantMessage("Implemented rotation fix from forked recon context.");
+              return {
+                agentId: request.agentId,
+                name: request.name,
+                role: request.role,
+                outcome: "waiting",
+                summary: "Wave1 forked parked",
+                tokens: 180,
+                cost: 0.0018,
+              };
+            }
+
+            pushAssistantMessage(`${request.name} ready`);
+            return {
+              agentId: request.agentId,
+              name: request.name,
+              role: request.role,
+              outcome: "waiting",
+              summary: "Parked",
+              tokens: 50,
+              cost: 0.0005,
+            };
+          },
+          runWakeTurn: async () => {
+            wakeCounts.set(request.name, (wakeCounts.get(request.name) ?? 0) + 1);
+            return {
+              agentId: request.agentId,
+              name: request.name,
+              role: request.role,
+              outcome: "waiting",
+              summary: "Woken",
+              tokens: 40,
+              cost: 0.0004,
+            };
+          },
+        }).handle;
+      },
+    };
+
+    let nextModalAction: "confirm" | "continue" | "cancel" = "confirm";
+    const host = createMockPiHarness(repoDir, {
+      mode: "tui",
+      sessionId: "sess-goldilocks-37",
+      modelRuntime: liveSimRuntime,
+    });
+    createPiSwarmExtension({
+      transportFactory: () => mockTransport,
+      settingsLoader: async () => ({
+        ...DEFAULT_SWARM_SETTINGS,
+        validatorEnabled: true,
+        stallWatchdogEnabled: false,
+      }),
+      questionnaireUI: {
+        async askQuestion() {
+          return { cancelled: false, answer: "ok", isCustom: false };
+        },
+        async askQuestionnaire() {
+          return { cancelled: false, answers: {}, items: [] };
+        },
+        async confirmProposal(_ctx, plan) {
+          return {
+            action: nextModalAction,
+            validatorEnabled: plan.validatorEnabled,
+            maxConcurrency: plan.maxConcurrency,
+          };
+        },
+      },
+    })(host.pi);
+    await host.emit("session_start", { reason: "startup" });
+
+    // Also verify `/swarm --fast <goal>` defaults validator_enabled="false" + skip_contract_review="true" when --validator is omitted
+    await host.runCommand("swarm", "--fast Quick footer polish");
+    const fastKickoffPrompt = String(host.sentUserMessages[0]?.content ?? "");
+    assert.match(fastKickoffPrompt, /validator_enabled="false"/);
+    assert.match(fastKickoffPrompt, /skip_contract_review="true"/);
+    await host.runCommand("swarm", "cancel");
+
+    // -------------------------------------------------------------------------
+    // 1 & 3. 1-feature plan WITH `commands` populated auto-skips live @contract-reviewer,
+    //        auto-links mismatched initial_member (`name: "impl"`, `feature.id: "feat-footer"`),
+    //        skips redundant kickoff turn (parks directly in swarm_wait), and auto-completes on [done]!
+    // -------------------------------------------------------------------------
+    await host.runCommand("swarm", "Polish status footer");
+    nextModalAction = "confirm";
+    const plan1Res = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Compact Footer Polish",
+      objective: "Trim footer status duplication",
+      strategy: "Single inherit worker",
+      acceptance_criteria: "Tests and typecheck pass",
+      base_branch: "main",
+      validator_enabled: false,
+      assertions: [
+        {
+          id: "VAL-FOOT-001",
+          title: "Footer avoids widget duplication",
+          description: "Compact status line when widget is active",
+        },
+      ],
+      features: [
+        {
+          id: "feat-footer",
+          title: "Compact status footer",
+          description: "Update dashboard-widget status line",
+          milestone: "m1",
+          files_owned: ["src/ui/dashboard-widget.ts"],
+          fulfills: ["VAL-FOOT-001"],
+        },
+      ],
+      commands: [
+        { name: "test", command: "npm test" },
+        { name: "typecheck", command: "npm run typecheck" },
+        { name: "lint", command: "npm run lint" },
+      ],
+      initial_members: [
+        {
+          name: "impl",
+          role: "worker",
+          workspace: "inherit",
+          brief: "Implement compact status footer and verify tests.",
+        },
+      ],
+    });
+    assert.equal(plan1Res.isError, undefined, JSON.stringify(plan1Res));
+    assert.equal(
+      spawnedReviewRequests.length,
+      0,
+      "1-feature plan WITH commands populated must auto-skip live @contract-reviewer",
+    );
+
+    const run1Id: string = plan1Res.details.runId;
+    const run1AtLaunch = await store.loadRun(run1Id);
+    const featFooterAtLaunch = run1AtLaunch.features!.find((f) => f.id === "feat-footer")!;
+    assert.equal(
+      featFooterAtLaunch.status,
+      "in_progress",
+      "Sole worker must auto-link to sole pending feature even when worker.name !== feature.id",
+    );
+    assert.equal(featFooterAtLaunch.assignedMember, "impl");
+
+    // Settle host turn while `impl` is still working -> 0 kickoff wakeups (parked directly in swarm_wait)!
+    host.setIdle(true);
+    await host.emit("agent_settled", { aborted: false });
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(
+      host.sentMessages.filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE).length,
+      0,
+      "Redundant post-confirmation kickoff turn must be skipped when wave-1 worker is already running",
+    );
+
+    // Release `impl` -> posts `@orchestrator [done]` with verificationEvidence -> auto-completes `feat-footer` AND wakes parked Orchestrator!
+    releaseImplWorker();
+    await waitFor(
+      () =>
+        host.sentMessages.filter((m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE).length ===
+        1,
+    );
+    const doneWakeup = host.sentMessages.find(
+      (m) => m.message.customType === SWARM_WAKEUP_CUSTOM_TYPE,
+    )!;
+    assert.equal((doneWakeup.message.details as { kickoff?: boolean })?.kickoff, false);
+    assert.match(String(doneWakeup.message.content), /Shipped compact footer cleanly/);
+
+    const run1AfterDone = await store.loadRun(run1Id);
+    assert.equal(
+      run1AfterDone.features!.find((f) => f.id === "feat-footer")?.status,
+      "completed",
+      "Auto-linked mismatched worker [done] must auto-complete feat-footer",
+    );
+
+    await host.runCommand("swarm", "done --force Footer mission complete");
+
+    // -------------------------------------------------------------------------
+    // 2. Standby Mode: `swarm{action:"add"}` throws clear INVALID_STATE (zero recon runs created!),
+    //    and `propose_swarm_plan` -> `Continue refining` activates all 7 `"recon"` tools!
+    // -------------------------------------------------------------------------
+    assert.deepEqual(
+      host.pi
+        .getActiveTools()
+        .filter((t) => ALL_SWARM_EXTENSION_TOOLS.includes(t as any))
+        .sort(),
+      [...STANDBY_SWARM_TOOLS].sort(),
+    );
+    const runsCountInStandby = (await store.listRuns()).length;
+
+    const standbyAddRes = await host.executeTool(SWARM_TOOL, {
+      action: "add",
+      name: "accidental-standby-worker",
+      role: "worker",
+      brief: "Try to edit files from Standby without propose_swarm_plan",
+    });
+    assert.equal(standbyAddRes.isError, true, "Standby swarm{action:'add'} must fail fast");
+    assert.equal(standbyAddRes.details?.errorCode, "INVALID_STATE");
+    assert.match(
+      String(standbyAddRes.content?.[0]?.text ?? ""),
+      /INVALID_STATE.*No active Swarm run in Standby Mode.*propose_swarm_plan.*\/swarm exit/,
+    );
+    assert.equal(
+      (await store.listRuns()).length,
+      runsCountInStandby,
+      "Failed Standby swarm{action:'add'} must NOT create a hidden recon run",
+    );
+
+    // Call propose_swarm_plan from Standby and choose `Continue refining` (`outcome: "continue"`) -> all 7 recon tools active!
+    nextModalAction = "continue";
+    const continueRefineRes = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Session Rotation Fix",
+      objective: "Fix token rotation hook",
+      strategy: "Recon then fork into wave-1 worker",
+      acceptance_criteria: "Tests pass",
+      base_branch: "main",
+      skip_contract_review: true,
+    });
+    assert.equal(continueRefineRes.details?.outcome, "continue");
+    const activeAfterRefine = host.pi.getActiveTools();
+    for (const toolName of RECON_SWARM_TOOLS) {
+      assert.ok(
+        activeAfterRefine.includes(toolName),
+        `Expected "${toolName}" active in "recon" profile after Standby Continue refining, got: ${JSON.stringify(activeAfterRefine)}`,
+      );
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. Promoted recon run `fork`s context into wave-1 worker AND auto-retires warm `:recon`
+    //    ghosts so `@all` never wakes them!
+    // -------------------------------------------------------------------------
+    const addScoutRes = await host.executeTool(SWARM_TOOL, {
+      action: "add",
+      name: "recon-scout",
+      brief: "Inspect src/auth/session.ts before finalizing plan",
+    });
+    assert.equal(addScoutRes.isError, undefined, JSON.stringify(addScoutRes));
+    const reconRunSummary = (await store.listRuns()).find(
+      (r) => r.runMode === "recon" && r.status === "active",
+    )!;
+    assert.ok(reconRunSummary, "Active draft after Continue refining must allow Recon-in-Swarm");
+    await waitFor(
+      async () => (await store.loadRun(reconRunSummary.id)).members["recon-scout"]?.state === "waiting",
+    );
+
+    nextModalAction = "confirm";
+    const promoteRes = await host.executeTool(PROPOSE_SWARM_PLAN_TOOL, {
+      title: "Session Rotation Fix",
+      objective: "Fix token rotation hook",
+      strategy: "Fork recon-scout into wave1-forked",
+      acceptance_criteria: "Rotation verified",
+      base_branch: "main",
+      validator_enabled: false,
+      skip_contract_review: true,
+      initial_members: [
+        {
+          name: "wave1-forked",
+          role: "worker",
+          workspace: "inherit",
+          fork: "recon-scout",
+          brief: "Implement token rotation fix using forked context.",
+        },
+      ],
+    });
+    assert.equal(promoteRes.isError, undefined, JSON.stringify(promoteRes));
+    assert.equal(promoteRes.details?.runId, reconRunSummary.id);
+
+    await waitFor(
+      async () =>
+        (await store.loadRun(reconRunSummary.id)).members["wave1-forked"]?.state === "waiting",
+    );
+    const promotedAfterConfirm = await store.loadRun(reconRunSummary.id);
+    assert.equal(promotedAfterConfirm.runMode, "executing");
+    assert.equal(
+      promotedAfterConfirm.members["recon-scout"]?.state,
+      "killed",
+      "Promoted recon run must auto-retire warm :recon ghost after fork",
+    );
+
+    // Broadcast `@all` on the board -> wakes `wave1-forked` ONLY; retired `recon-scout` NEVER wakes!
+    await host.executeTool(POST_MESSAGE_TOOL, {
+      text: "@all [decision] Finalize verification before closing run.",
+      kind: "decision",
+    });
+    await waitFor(() => (wakeCounts.get("wave1-forked") ?? 0) >= 1);
+    assert.equal(
+      wakeCounts.get("recon-scout") ?? 0,
+      0,
+      "Retired :recon ghost must NEVER wake on @all broadcasts",
+    );
+
+    await waitFor(
+      async () =>
+        (await store.loadRun(reconRunSummary.id)).members["wave1-forked"]?.state === "waiting",
+    );
+    const donePromoted = await host.executeTool(SWARM_TOOL, {
+      action: "done",
+      summary: "Session rotation fix verified",
+    });
+    assert.equal(donePromoted.isError, undefined, JSON.stringify(donePromoted));
+    await host.runCommand("swarm", "exit");
     await host.emit("session_shutdown", { reason: "quit" });
   });
 });

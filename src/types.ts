@@ -650,6 +650,7 @@ export type SwarmErrorCode =
   | "REVISION_CONFLICT"
   | "NOT_FOUND"
   | "GIT_ERROR"
+  | "INVALID_STATE"
   | "INVALID_INPUT";
 
 export class SwarmProtocolError extends Error {
@@ -1142,6 +1143,7 @@ export interface ManageMissionInput {
   op: SwarmMissionOp;
   assertions?: MissionAssertionInput[];
   assertionId?: string;
+  assertionIds?: string[];
   assertionStatus?: AssertionStatus;
   evidence?: string;
   features?: MissionFeatureInput[];
@@ -1201,7 +1203,10 @@ export interface ParkOrchestratorWaitOptions {
   since: number;
   mentionsOnly?: boolean;
   timeoutMs?: number;
+  waitForAll?: boolean;
 }
+
+export type OrchestratorWaitOptions = ParkOrchestratorWaitOptions;
 
 export interface ParkOrchestratorWaitResult {
   parked: boolean;
@@ -1209,6 +1214,7 @@ export interface ParkOrchestratorWaitResult {
   messages: BoardMessage[];
   head: number;
   activeMembers: string[];
+  waitForAll?: boolean;
   summary: string;
 }
 
@@ -1269,6 +1275,11 @@ export interface MemberEngineBridge {
     broadcastChannels?: readonly string[];
     groupPrefix?: string;
   };
+  /** Synchronously inspect live file ownership slices for shared `inherit` workers. */
+  getFilesOwnedScope?(): {
+    filesOwned?: string[];
+    peerFilesOwned?: Record<string, string[]>;
+  };
   /** Record the unread matching `seq` that blocked a `swarm_wait` park attempt. */
   recordParkBlocked?(seq: number): Promise<void>;
 }
@@ -1284,6 +1295,10 @@ export interface SpawnMemberRequest {
   workspace: SwarmWorkspaceMode;
   /** True when cwd is inside an isolated share/branch worktree (including inherit helpers of isolated parents). */
   isIsolatedWorktree?: boolean;
+  /** Exclusive repo-relative paths/globs owned by this `workspace: "inherit"` worker (derived from assigned `run.features`). */
+  filesOwned?: string[];
+  /** Peer member/feature file ownership map used for actionable collision diagnostics in `workspace: "inherit"`. */
+  peerFilesOwned?: Record<string, string[]>;
   parentName: string;
   brief: string;
   channels?: string[];
@@ -1543,6 +1558,7 @@ export interface ISwarmEngine {
     input: PromoteReconRunInput,
   ): Promise<SwarmRunState>;
   revertReconPromotion?(runId: string): Promise<SwarmRunState>;
+  retireReconMembers?(runId: string): Promise<string[]>;
   pause(runId?: string, reason?: string): Promise<SwarmRunState>;
   resume(runId?: string, hostContext?: ExtensionContext): Promise<SwarmRunState>;
   teardown(options?: TeardownOptions): Promise<SafeTeardownResult>;
